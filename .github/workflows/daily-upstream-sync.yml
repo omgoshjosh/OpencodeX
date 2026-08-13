@@ -51,15 +51,11 @@ jobs:
           BRANCH="sync/upstream-main-$(date +%Y%m%d)"
           git checkout -b "$BRANCH" upstream/main
           git push origin "$BRANCH"
-          BODY="Upstream has diverged from our main. This PR brings in upstream changes but could not be fast-forwarded — review for conflicts.
-
-**Commits behind:** ${{ steps.check.outputs.behind }}
-**Our unique commits:** ${{ steps.check.outputs.ahead }}"
           gh api -X POST "repos/${{ github.repository }}/pulls" \
             --field title="chore: sync main with upstream ($(date +%Y-%m-%d))" \
             --field head="$BRANCH" \
             --field base="main" \
-            --field body="$BODY"
+            --field body="Upstream has diverged from our main. This PR brings in upstream changes but could not be fast-forwarded - review for conflicts. Commits behind: ${{ steps.check.outputs.behind }}. Our unique commits: ${{ steps.check.outputs.ahead }}."
 
   sync-branches:
     runs-on: ubuntu-latest
@@ -129,14 +125,8 @@ jobs:
           git checkout -b "sync/rebase-${{ matrix.branch }}-$(date +%Y%m%d)" "$BRANCH"
           git merge upstream/main --no-edit -m "chore: merge upstream/main into ${{ matrix.branch }}" || true
           git push origin "HEAD:sync/rebase-${{ matrix.branch }}-$(date +%Y%m%d)"
-          BODY="Rebasing \`${{ matrix.branch }}\` onto latest upstream/main resulted in conflicts. This PR is a merge of upstream/main into the branch so the changes can be reviewed and reconciled.
-
-**Unique commit(s) on branch:** ${{ steps.check.outputs.unique }}
-**Commits behind upstream:** ${{ steps.check.outputs.behind }}
-
-Any conflicts need manual resolution before this can merge. See the workflow log for details."
           gh api -X POST "repos/${{ github.repository }}/pulls" \
             --field title="chore: reconcile ${{ matrix.branch }} with upstream ($(date +%Y-%m-%d))" \
             --field head="sync/rebase-${{ matrix.branch }}-$(date +%Y%m%d)" \
             --field base="main" \
-            --field body="$BODY"
+            --field body="Rebasing ${{ matrix.branch }} onto latest upstream/main resulted in conflicts. This PR merges upstream/main into the branch so the changes can be reviewed and reconciled. Unique commit(s) on branch: ${{ steps.check.outputs.unique }}. Commits behind upstream: ${{ steps.check.outputs.behind }}. Any conflicts need manual resolution before this can merge. See the workflow log for details."

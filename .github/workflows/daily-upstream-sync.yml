@@ -51,14 +51,15 @@ jobs:
           BRANCH="sync/upstream-main-$(date +%Y%m%d)"
           git checkout -b "$BRANCH" upstream/main
           git push origin "$BRANCH"
-          gh pr create \
-            --title "chore: sync main with upstream ($(date +%Y-%m-%d))" \
-            --body "Upstream has diverged from our main. This PR brings in upstream changes but could not be fast-forwarded — review for conflicts.
+          BODY="Upstream has diverged from our main. This PR brings in upstream changes but could not be fast-forwarded — review for conflicts.
 
-            **Commits behind:** ${{ steps.check.outputs.behind }}
-            **Our unique commits:** ${{ steps.check.outputs.ahead }}" \
-            --base main \
-            --head "$BRANCH"
+**Commits behind:** ${{ steps.check.outputs.behind }}
+**Our unique commits:** ${{ steps.check.outputs.ahead }}"
+          gh api -X POST "repos/${{ github.repository }}/pulls" \
+            --field title="chore: sync main with upstream ($(date +%Y-%m-%d))" \
+            --field head="$BRANCH" \
+            --field base="main" \
+            --field body="$BODY"
 
   sync-branches:
     runs-on: ubuntu-latest
@@ -71,7 +72,6 @@ jobs:
           - feat/gui-hub-sync
           - feat/restart-safe-sidecar
           - fix/stale-session-command-recovery
-          - test/cross-client-realtime-contract
     steps:
       - uses: actions/checkout@v4
         with:
@@ -118,21 +118,25 @@ jobs:
         run: |
           git push origin HEAD:${{ matrix.branch }} --force-with-lease
 
-      - name: Create rebase PR (conflicts)
+      - name: Create sync PR for conflicting branch
         if: steps.rebase.outputs.clean == 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          BRANCH="sync/rebase-${{ matrix.branch }}-$(date +%Y%m%d)"
-          git checkout -b "$BRANCH" upstream/main
-          git push origin "$BRANCH"
-          gh pr create \
-            --title "chore: rebase ${{ matrix.branch }} onto upstream ($(date +%Y-%m-%d))" \
-            --body "Rebasing \`${{ matrix.branch }}\` onto latest upstream/main resulted in conflicts.
+          BRANCH="${{ matrix.branch }}"
+          git checkout main
+          git merge upstream/main --no-edit || true
+          git checkout -b "sync/rebase-${{ matrix.branch }}-$(date +%Y%m%d)" "$BRANCH"
+          git merge upstream/main --no-edit -m "chore: merge upstream/main into ${{ matrix.branch }}" || true
+          git push origin "HEAD:sync/rebase-${{ matrix.branch }}-$(date +%Y%m%d)"
+          BODY="Rebasing \`${{ matrix.branch }}\` onto latest upstream/main resulted in conflicts. This PR is a merge of upstream/main into the branch so the changes can be reviewed and reconciled.
 
-            **Unique commits(s) on branch:** ${{ steps.check.outputs.unique }}
-            **Commits behind upstream:** ${{ steps.check.outputs.behind }}
+**Unique commit(s) on branch:** ${{ steps.check.outputs.unique }}
+**Commits behind upstream:** ${{ steps.check.outputs.behind }}
 
-            Manual conflict resolution needed." \
-            --base main \
-            --head "$BRANCH"
+Any conflicts need manual resolution before this can merge. See the workflow log for details."
+          gh api -X POST "repos/${{ github.repository }}/pulls" \
+            --field title="chore: reconcile ${{ matrix.branch }} with upstream ($(date +%Y-%m-%d))" \
+            --field head="sync/rebase-${{ matrix.branch }}-$(date +%Y%m%d)" \
+            --field base="main" \
+            --field body="$BODY"

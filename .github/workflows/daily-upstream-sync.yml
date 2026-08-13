@@ -2,7 +2,7 @@ name: Daily upstream sync
 
 on:
   schedule:
-    - cron: "0 4 * * *"
+    - cron: "0 11 * * *" # 4 AM Los Angeles (UTC-7/PDT)
   workflow_dispatch:
 
 permissions:
@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   sync-main:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
@@ -61,7 +61,7 @@ jobs:
             --head "$BRANCH"
 
   sync-branches:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     needs: sync-main
     strategy:
       fail-fast: false

@@ -120,9 +120,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           BRANCH="${{ matrix.branch }}"
-          git checkout main
-          git merge upstream/main --no-edit || true
-          git checkout -b "sync/rebase-${{ matrix.branch }}-$(date +%Y%m%d)" "$BRANCH"
+          git fetch origin "$BRANCH:$BRANCH"
+          git checkout -b "sync/rebase-${{ matrix.branch }}-$(date +%Y%m%d)" "origin/$BRANCH"
           git merge upstream/main --no-edit -m "chore: merge upstream/main into ${{ matrix.branch }}" || true
           git push origin "HEAD:sync/rebase-${{ matrix.branch }}-$(date +%Y%m%d)"
           gh api -X POST "repos/${{ github.repository }}/pulls" \

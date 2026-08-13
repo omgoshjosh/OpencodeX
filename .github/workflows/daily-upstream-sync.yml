@@ -1,0 +1,138 @@
+name: Daily upstream sync
+
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync-main:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/ecgreen/OpencodeX.git 2>/dev/null || true
+          git fetch upstream --prune
+
+      - name: Check if main is behind upstream
+        id: check
+        run: |
+          BEHIND=$(git rev-list --count HEAD..upstream/main)
+          AHEAD=$(git rev-list --count upstream/main..HEAD)
+          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+          echo "ahead=$AHEAD" >> "$GITHUB_OUTPUT"
+          echo "main is $BEHIND behind, $AHEAD ahead of upstream"
+
+      - name: Fast-forward main
+        if: steps.check.outputs.behind != '0' && steps.check.outputs.ahead == '0'
+        run: |
+          git merge --ff-only upstream/main
+          git push origin main
+
+      - name: Create sync PR for main (conflicts)
+        if: steps.check.outputs.behind != '0' && steps.check.outputs.ahead != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH="sync/upstream-main-$(date +%Y%m%d)"
+          git checkout -b "$BRANCH" upstream/main
+          git push origin "$BRANCH"
+          gh pr create \
+            --title "chore: sync main with upstream ($(date +%Y-%m-%d))" \
+            --body "Upstream has diverged from our main. This PR brings in upstream changes but could not be fast-forwarded — review for conflicts.
+
+            **Commits behind:** ${{ steps.check.outputs.behind }}
+            **Our unique commits:** ${{ steps.check.outputs.ahead }}" \
+            --base main \
+            --head "$BRANCH"
+
+  sync-branches:
+    runs-on: self-hosted
+    needs: sync-main
+    strategy:
+      fail-fast: false
+      matrix:
+        branch:
+          - feat/graph-eng-visualizer
+          - feat/gui-hub-sync
+          - feat/restart-safe-sidecar
+          - fix/stale-session-command-recovery
+          - test/cross-client-realtime-contract
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ matrix.branch }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/ecgreen/OpencodeX.git 2>/dev/null || true
+          git fetch upstream --prune
+
+      - name: Check divergence
+        id: check
+        run: |
+          git fetch origin main
+          BEHIND=$(git rev-list --count HEAD..upstream/main)
+          UNIQUE=$(git rev-list --count origin/main..HEAD)
+          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+          echo "unique=$UNIQUE" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if no unique commits
+        if: steps.check.outputs.unique == '0'
+        run: echo "No unique commits on ${{ matrix.branch }}, skipping"
+
+      - name: Attempt rebase onto upstream/main
+        if: steps.check.outputs.unique != '0'
+        id: rebase
+        run: |
+          if git rebase upstream/main; then
+            echo "clean=true" >> "$GITHUB_OUTPUT"
+          else
+            git rebase --abort
+            echo "clean=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Force-push rebased branch
+        if: steps.rebase.outputs.clean == 'true'
+        run: |
+          git push origin HEAD:${{ matrix.branch }} --force-with-lease
+
+      - name: Create rebase PR (conflicts)
+        if: steps.rebase.outputs.clean == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH="sync/rebase-${{ matrix.branch }}-$(date +%Y%m%d)"
+          git checkout -b "$BRANCH" upstream/main
+          git push origin "$BRANCH"
+          gh pr create \
+            --title "chore: rebase ${{ matrix.branch }} onto upstream ($(date +%Y-%m-%d))" \
+            --body "Rebasing \`${{ matrix.branch }}\` onto latest upstream/main resulted in conflicts.
+
+            **Unique commits(s) on branch:** ${{ steps.check.outputs.unique }}
+            **Commits behind upstream:** ${{ steps.check.outputs.behind }}
+
+            Manual conflict resolution needed." \
+            --base main \
+            --head "$BRANCH"

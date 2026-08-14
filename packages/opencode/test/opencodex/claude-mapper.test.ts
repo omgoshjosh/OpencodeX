@@ -27,8 +27,21 @@ function context(): MapperContext {
   }
 }
 
-function run(events: ClaudeEvent[], ctx = context()) {
-  let state = initialState()
+function run(events: ClaudeEvent[], initialStateOrCtx?: MapperState | MapperContext) {
+  let state: MapperState
+  let ctx: MapperContext
+
+  // Determine if the second argument is a state or context
+  if (initialStateOrCtx && "toolParts" in initialStateOrCtx) {
+    // It's a state
+    state = initialStateOrCtx
+    ctx = context()
+  } else {
+    // It's a context or undefined
+    state = initialState()
+    ctx = (initialStateOrCtx as MapperContext) || context()
+  }
+
   const writes: SessionWrite[] = []
   for (const event of events) {
     const result = mapEvent(event, state, ctx)
@@ -101,6 +114,105 @@ describe("claude stream-json mapper", () => {
     })
   })
 
+  test("normalizes file tool inputs to native keys so transcript titles resolve", () => {
+    const { writes } = run([
+      {
+        type: "assistant",
+        message: {
+          id: "m1",
+          content: [{ type: "tool_use", id: "call_1", name: "Read", input: { file_path: "C:/repo/a.ts", offset: 10 } }],
+        },
+      },
+      {
+        type: "user",
+        message: { content: [{ type: "tool_result", tool_use_id: "call_1", content: "1\tconst a = 1" }] },
+      },
+    ])
+    const tool = parts(writes).filter((part) => part.type === "tool").at(-1)
+    expect(tool).toMatchObject({
+      state: { input: { filePath: "C:/repo/a.ts", file_path: "C:/repo/a.ts", offset: 10 } },
+    })
+  })
+
+  test("read results carry a preview so the transcript expander has content", () => {
+    const output = Array.from({ length: 30 }, (_, i) => `${i + 1}\tline ${i + 1}`).join("\n")
+    const { writes } = run([
+      {
+        type: "assistant",
+        message: { id: "m1", content: [{ type: "tool_use", id: "call_r", name: "Read", input: { file_path: "C:/repo/a.ts" } }] },
+      },
+      { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "call_r", content: output }] } },
+    ])
+    const tool = parts(writes).filter((part) => part.type === "tool").at(-1)
+    if (tool?.type !== "tool" || tool.state.status !== "completed") throw new Error("expected completed tool part")
+    expect(String(tool.state.metadata?.preview).split("\n")).toHaveLength(20)
+    expect(tool.state.metadata?.truncated).toBe(true)
+  })
+
+  test("stream deltas build text parts that the final event reuses", () => {
+    const { writes } = run([
+      { type: "stream_event", event: { type: "message_start", message: { id: "m9" } } },
+      { type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } } },
+      { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Hello " } } },
+      { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "world" } } },
+      { type: "assistant", message: { id: "m9", content: [{ type: "text", text: "Hello world" }] } },
+    ])
+    const texts = parts(writes).filter((part) => part.type === "text")
+    expect(texts.length).toBeGreaterThan(1)
+    expect(texts.at(-1)).toMatchObject({ text: "Hello world" })
+    expect(new Set(texts.map((part) => part.id)).size).toBe(1)
+  })
+
+  test("thinking deltas build reasoning parts the final event reuses", () => {
+    const { writes } = run([
+      { type: "stream_event", event: { type: "message_start", message: { id: "m9" } } },
+      { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "Weighing " } } },
+      { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "options" } } },
+      { type: "assistant", message: { id: "m9", content: [{ type: "thinking", thinking: "Weighing options" }] } },
+    ])
+    const reasoning = parts(writes).filter((part) => part.type === "reasoning")
+    expect(reasoning.length).toBeGreaterThan(1)
+    expect(reasoning.at(-1)).toMatchObject({ text: "Weighing options" })
+    expect(new Set(reasoning.map((part) => part.id)).size).toBe(1)
+  })
+
+  test("stripped thinking deltas still leave streamed reasoning in place", () => {
+    // Fable-style turns strip thinking from the final event (empty text +
+    // signature). The streamed content must not be erased by that final write.
+    const { writes } = run([
+      { type: "stream_event", event: { type: "message_start", message: { id: "m9" } } },
+      { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "Real reasoning" } } },
+      { type: "assistant", message: { id: "m9", content: [{ type: "thinking", thinking: "", signature: "sig" }] } },
+    ])
+    const reasoning = parts(writes).filter((part) => part.type === "reasoning")
+    expect(reasoning.at(-1)).toMatchObject({ text: "Real reasoning" })
+  })
+
+  test("per-block final events reconcile with stream parts by content, not position", () => {
+    // The CLI emits one assistant event per content block, so a text block that
+    // streamed at index 1 (after a thinking block) arrives in a final event
+    // whose content array puts it at position 0. Without content reconciliation
+    // this produced duplicate text parts (observed live, 2026-08-09).
+    const { writes } = run([
+      { type: "stream_event", event: { type: "message_start", message: { id: "m9" } } },
+      { type: "stream_event", event: { type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "Now the mapper side" } } },
+      { type: "assistant", message: { id: "m9", content: [{ type: "thinking", thinking: "" }] } },
+      { type: "assistant", message: { id: "m9", content: [{ type: "text", text: "Now the mapper side" }] } },
+    ])
+    const texts = parts(writes).filter((part) => part.type === "text")
+    expect(new Set(texts.map((part) => part.id)).size).toBe(1)
+    expect(texts.at(-1)).toMatchObject({ text: "Now the mapper side" })
+  })
+
+  test("distinct api messages in one turn keep distinct text parts", () => {
+    const { writes } = run([
+      { type: "assistant", message: { id: "m1", content: [{ type: "text", text: "First words" }] } },
+      { type: "assistant", message: { id: "m2", content: [{ type: "text", text: "Second words" }] } },
+    ])
+    const texts = parts(writes).filter((part) => part.type === "text")
+    expect(new Set(texts.map((part) => part.id)).size).toBe(2)
+  })
+
   test("marks failed tool results as errors", () => {
     const { writes } = run([
       {
@@ -160,6 +272,124 @@ describe("claude stream-json mapper", () => {
     const step = parts(second).find((part) => part.type === "step-finish")
     expect(step?.type === "step-finish" ? step.cost : undefined).toBeCloseTo(0.04, 10)
     expect(step).toMatchObject({ tokens: { input: 12, output: 6, cache: { read: 0, write: 0 } } })
+  })
+
+  test("stamps the completed message with the last request's usage, not the turn total", () => {
+    // The result event's usage sums every API request in the turn. A long
+    // tool-using turn re-reads its cached context on each step, so the summed
+    // cache reads grow into the millions - shown as context, that read
+    // "8.1m (808%)". The conversation's actual context is the LAST request's
+    // usage, reported per-request on assistant events.
+    const { writes } = run([
+      {
+        type: "assistant",
+        message: {
+          id: "m1",
+          content: [{ type: "text", text: "step one" }],
+          usage: { input_tokens: 3, output_tokens: 10, cache_read_input_tokens: 50_000, cache_creation_input_tokens: 2_000 },
+        },
+      },
+      {
+        type: "assistant",
+        message: {
+          id: "m2",
+          content: [{ type: "text", text: "step two" }],
+          usage: { input_tokens: 5, output_tokens: 20, cache_read_input_tokens: 60_000, cache_creation_input_tokens: 1_000 },
+        },
+      },
+      {
+        type: "result",
+        subtype: "success",
+        usage: { input_tokens: 8, output_tokens: 30, cache_read_input_tokens: 110_000, cache_creation_input_tokens: 3_000 },
+      },
+    ])
+    const completed = messages(writes).findLast((message) => message.time.completed !== undefined)
+    expect(completed?.tokens).toEqual({
+      input: 5,
+      output: 20,
+      reasoning: 0,
+      cache: { read: 60_000, write: 1_000 },
+    })
+  })
+
+  test("a result without per-request usage still falls back to the reported usage", () => {
+    const { writes } = run([
+      { type: "assistant", message: { id: "m1", content: [{ type: "text", text: "hi" }] } },
+      { type: "result", subtype: "success", usage: { input_tokens: 12, output_tokens: 6 } },
+    ])
+    const completed = messages(writes).findLast((message) => message.time.completed !== undefined)
+    expect(completed?.tokens).toMatchObject({ input: 12, output: 6 })
+  })
+
+  test("completed edits carry metadata.diff so the transcript renders a patch", () => {
+    // The transcript's edit card renders ONLY metadata.diff / metadata.files.
+    // Native edits stamp diff server-side; the Claude CLI sends just the input
+    // snippets, so without synthesis the expander shows nothing but "The file
+    // has been updated successfully".
+    const { writes } = run([
+      {
+        type: "assistant",
+        message: {
+          id: "m1",
+          content: [
+            {
+              type: "tool_use",
+              id: "tool_edit",
+              name: "Edit",
+              input: { file_path: "C:/repo/app.ts", old_string: "const a = 1", new_string: "const a = 2" },
+            },
+          ],
+        },
+      },
+      {
+        type: "user",
+        message: {
+          content: [{ type: "tool_result", tool_use_id: "tool_edit", content: "The file C:/repo/app.ts has been updated successfully." }],
+        },
+      },
+    ])
+    const part = parts(writes).findLast((item) => item.type === "tool")
+    const metadata = part?.type === "tool" && part.state.status === "completed" ? part.state.metadata : undefined
+    const diff = typeof metadata?.diff === "string" ? metadata.diff : ""
+    expect(diff).toContain("-const a = 1")
+    expect(diff).toContain("+const a = 2")
+  })
+
+  test("completed multi-edits carry metadata.files with one patch per edit", () => {
+    const { writes } = run([
+      {
+        type: "assistant",
+        message: {
+          id: "m1",
+          content: [
+            {
+              type: "tool_use",
+              id: "tool_multi",
+              name: "MultiEdit",
+              input: {
+                file_path: "C:/repo/app.ts",
+                edits: [
+                  { old_string: "let x", new_string: "let y" },
+                  { old_string: "return x", new_string: "return y" },
+                ],
+              },
+            },
+          ],
+        },
+      },
+      {
+        type: "user",
+        message: {
+          content: [{ type: "tool_result", tool_use_id: "tool_multi", content: "Applied 2 edits." }],
+        },
+      },
+    ])
+    const part = parts(writes).findLast((item) => item.type === "tool")
+    const metadata = part?.type === "tool" && part.state.status === "completed" ? part.state.metadata : undefined
+    const files = Array.isArray(metadata?.files) ? metadata.files : []
+    expect(files).toHaveLength(2)
+    expect(String((files[0] as Record<string, unknown>).patch)).toContain("+let y")
+    expect(String((files[1] as Record<string, unknown>).patch)).toContain("+return y")
   })
 
   test("records an error and flags auth failures from a failed result", () => {
@@ -229,6 +459,191 @@ describe("claude stream-json mapper", () => {
 
     const malformed = run([{ type: "assistant", message: { id: "m1", content: "plain string" } }])
     expect(parts(malformed.writes).map((part) => part.type)).toEqual(["step-start", "text"])
+  })
+
+  test("regression: per-block no-index finals do not duplicate streamed parts", () => {
+    const events = [
+      { type: "stream_event", event: { type: "message_start", message: { id: "msg_real" } } },
+      { type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "thinking" } } },
+      { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "Pondering deeply" } } },
+      // final thinking: stripped to empty, single block, no index field
+      { type: "assistant", message: { id: "msg_real", content: [{ type: "thinking", thinking: "" }] } },
+      { type: "stream_event", event: { type: "content_block_stop", index: 0 } },
+      { type: "stream_event", event: { type: "content_block_start", index: 1, content_block: { type: "text" } } },
+      { type: "stream_event", event: { type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "alpha and " } } },
+      { type: "stream_event", event: { type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "more prose" } } },
+      // final text: full content, single block, no index field (position 0 ≠ stream index 1)
+      { type: "assistant", message: { id: "msg_real", content: [{ type: "text", text: "alpha and more prose" }] } },
+    ] as ClaudeEvent[]
+    const { writes } = run(events)
+    const ids = new Map<string, string>()
+    for (const w of writes) {
+      if (w.kind === "part" && (w.part.type === "text" || w.part.type === "reasoning")) ids.set(w.part.id, w.part.type)
+    }
+    expect([...ids.values()].sort()).toEqual(["reasoning", "text"])
+  })
+})
+
+describe("background subagents keep the turn open", () => {
+  // The SDK ends the main model's turn (a `result` event) while backgrounded
+  // subagents are still running, then re-wakes the model on the same stream
+  // when they report back. Finishing on that first result is what flipped
+  // sessions to idle mid-delegation and orphaned the continuation.
+  const agentTask = { task_id: "a1", task_type: "local_agent", description: "probe agent" }
+
+  test("a result while background tasks are live does not finish the turn", () => {
+    const { writes, state } = run([
+      { type: "system", subtype: "init", session_id: "cc-1" },
+      { type: "assistant", message: { id: "m1", content: [{ type: "text", text: "Waiting for the agents..." }] } },
+      { type: "system", subtype: "background_tasks_changed", tasks: [agentTask] } as ClaudeEvent,
+      { type: "result", subtype: "success", total_cost_usd: 0.02, usage: { input_tokens: 10, output_tokens: 5 } },
+    ])
+
+    expect(state.finished).toBeFalsy()
+    // The turn stays open: no completed assistant message yet.
+    expect(messages(writes).some((message) => message.time.completed !== undefined)).toBe(false)
+    // But the step's cost still lands, so billing survives even an abandoned wait.
+    expect(parts(writes).find((part) => part.type === "step-finish")).toMatchObject({ cost: 0.02 })
+  })
+
+  test("the turn finishes on the result that arrives after background tasks drain", () => {
+    const { writes, state } = run([
+      { type: "system", subtype: "init", session_id: "cc-1" },
+      { type: "assistant", message: { id: "m1", content: [{ type: "text", text: "Waiting for the agents..." }] } },
+      { type: "system", subtype: "background_tasks_changed", tasks: [agentTask] } as ClaudeEvent,
+      { type: "result", subtype: "success", total_cost_usd: 0.02, usage: { input_tokens: 10, output_tokens: 5 } },
+      // The agent reports back; the CLI re-wakes the model on the same stream.
+      { type: "assistant", message: { id: "m2", content: [{ type: "text", text: "FINISHED" }] } },
+      { type: "system", subtype: "background_tasks_changed", tasks: [] } as ClaudeEvent,
+      { type: "result", subtype: "success", total_cost_usd: 0.05, usage: { input_tokens: 20, output_tokens: 8 } },
+    ])
+
+    expect(state.finished).toBe(true)
+    const completed = messages(writes).at(-1)
+    expect(completed?.time.completed).toBeGreaterThan(0)
+    // The whole wait is one assistant message; the continuation lands on it.
+    const texts = parts(writes).flatMap((part) => (part.type === "text" ? [part] : []))
+    expect(texts.map((part) => part.text)).toEqual(["Waiting for the agents...", "FINISHED"])
+    expect(new Set(texts.map((part) => part.messageID)).size).toBe(1)
+    // Each step billed its own delta of the cumulative total; the message
+    // carries the whole turn's cost.
+    const steps = parts(writes).flatMap((part) => (part.type === "step-finish" ? [part] : []))
+    expect(steps.length).toBe(2)
+    expect(steps[0]?.cost).toBeCloseTo(0.02, 10)
+    expect(steps[1]?.cost).toBeCloseTo(0.03, 10)
+    expect(completed?.cost).toBeCloseTo(0.05, 10)
+  })
+
+  test("a malformed background_tasks_changed payload counts as no live tasks", () => {
+    const { state } = run([
+      { type: "system", subtype: "background_tasks_changed" } as ClaudeEvent,
+      { type: "result", subtype: "success", total_cost_usd: 0.01 },
+    ])
+    expect(state.finished).toBe(true)
+  })
+})
+
+describe("task tools feed the todo system", () => {
+  function toolTurn(tool: string, input: Record<string, unknown>, resultText: string) {
+    return [
+      { type: "assistant", message: { id: "m1", content: [{ type: "tool_use", id: `call_${tool}`, name: tool, input }] } },
+      { type: "user", message: { content: [{ type: "tool_result", tool_use_id: `call_${tool}`, content: [{ type: "text", text: resultText }] }] } },
+    ] as ClaudeEvent[]
+  }
+
+  test("taskcreate registers a pending todo and emits the todos write", () => {
+    const { writes } = run([
+      ...toolTurn("TaskCreate", { subject: "Fix login", description: "d" }, "Task #1 created successfully: Fix login"),
+    ])
+    const todos = writes.filter((w) => w.kind === "todos").at(-1)
+    expect(todos).toMatchObject({ kind: "todos", todos: [{ content: "Fix login", status: "pending", priority: "medium" }] })
+  })
+
+  test("taskupdate changes status; deleted removes; unknown id is ignored", () => {
+    const { writes } = run([
+      ...toolTurn("TaskCreate", { subject: "Fix login" }, "Task #1 created successfully: Fix login"),
+      ...toolTurn("TaskUpdate", { taskId: "1", status: "in_progress" }, "Updated task #1 status"),
+      ...toolTurn("TaskUpdate", { taskId: "99", status: "completed" }, "no such task"),
+      ...toolTurn("TaskUpdate", { taskId: "1", status: "deleted" }, "deleted"),
+    ])
+    const lists = writes.filter((w) => w.kind === "todos").map((w) => w.todos)
+    expect(lists.at(0)).toEqual([{ content: "Fix login", status: "pending", priority: "medium" }])
+    expect(lists.at(1)).toEqual([{ content: "Fix login", status: "in_progress", priority: "medium" }])
+    expect(lists.at(-1)).toEqual([])
+    // the unknown-id update emitted no todos write
+    expect(lists.length).toBe(3)
+  })
+
+  test("taskcreate result without a parseable id falls back to a local id", () => {
+    const { state } = run([
+      ...toolTurn("TaskCreate", { subject: "A" }, "ok"),
+      ...toolTurn("TaskCreate", { subject: "B" }, "ok"),
+    ])
+    expect([...state.tasks.keys()]).toEqual(["local-1", "local-2"])
+  })
+
+  test("taskcreate fallback ids stay monotonic across a deletion, so ids never collide", () => {
+    // Regression: the old fallback (`local-${state.tasks.size + 1}`) reused ids
+    // once the registry shrank - creating A, deleting it, then creating B would
+    // both land on "local-1".
+    const { state } = run([
+      ...toolTurn("TaskCreate", { subject: "A" }, "ok"),
+      ...toolTurn("TaskUpdate", { taskId: "local-1", status: "deleted" }, "deleted"),
+      ...toolTurn("TaskCreate", { subject: "B" }, "ok"),
+    ])
+    expect([...state.tasks.keys()]).toEqual(["local-2"])
+  })
+
+  test("completed task-tool parts carry metadata.todos for the transcript widget", () => {
+    const { writes } = run([
+      ...toolTurn("TaskCreate", { subject: "Fix login" }, "Task #1 created successfully: Fix login"),
+    ])
+    const part = writes.filter((w) => w.kind === "part").map((w) => w.part).findLast((p) => p.type === "tool")
+    expect(part?.state).toMatchObject({
+      status: "completed",
+      metadata: { todos: [{ content: "Fix login", status: "pending", priority: "medium" }] },
+    })
+  })
+
+  test("tasks seed from a prior turn's registry", () => {
+    const state = initialState({ tasks: [{ id: "1", subject: "Fix login", status: "in_progress" }] })
+    const { writes } = run([
+      ...toolTurn("TaskUpdate", { taskId: "1", status: "completed" }, "Updated"),
+    ], state)
+    const todos = writes.filter((w) => w.kind === "todos").at(-1)
+    expect(todos?.todos).toEqual([{ content: "Fix login", status: "completed", priority: "medium" }])
+  })
+
+  test("regression: every todo emitted by taskcreate/taskupdate and by todowrite carries a priority string", () => {
+    // A DB column (`todo.priority`) is NOT NULL with no default - any todos
+    // write missing a priority defects Todo.update and, unrecovered, kills the
+    // whole turn on the first TaskCreate. Pin that every path always sets one.
+    const { writes: taskWrites } = run([
+      ...toolTurn("TaskCreate", { subject: "Fix login" }, "Task #1 created successfully: Fix login"),
+      ...toolTurn("TaskUpdate", { taskId: "1", status: "in_progress" }, "Updated task #1 status"),
+    ])
+    const { writes: todoWriteWrites } = run([
+      {
+        type: "assistant",
+        message: {
+          id: "m1",
+          content: [
+            { type: "tool_use", id: "toolu_1", name: "TodoWrite", input: { todos: [{ content: "No priority given", status: "pending" }] } },
+          ],
+        },
+      },
+    ] as ClaudeEvent[])
+
+    for (const writes of [taskWrites, todoWriteWrites]) {
+      const todoLists = writes.filter((w) => w.kind === "todos").map((w) => w.todos)
+      expect(todoLists.length).toBeGreaterThan(0)
+      for (const todos of todoLists) {
+        for (const todo of todos) {
+          expect(typeof todo.priority).toBe("string")
+          expect(todo.priority).toBeTruthy()
+        }
+      }
+    }
   })
 })
 

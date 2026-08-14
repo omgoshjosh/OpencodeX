@@ -1,8 +1,9 @@
 import type { Part } from "@opencode-ai/sdk/v2/client"
-import { For, Match, Show, Switch, createMemo } from "solid-js"
+import { For, Match, Show, Switch, createMemo, onCleanup } from "solid-js"
 import { Markdown } from "@opencode-ai/ui/markdown"
 import type { MessageBundle } from "../lib/session-api"
 import { autoOpenForStatus, createDisclosure, createMountedOnce } from "../lib/disclosure"
+import { observeTranscriptFileLinks } from "../lib/transcript-file-links"
 import type { DisplayPart, ToolPart } from "../lib/transcript-grouping"
 import { isStaleRunningTool, toolGroupStatus, toolGroupSummary, toolGroupTitle } from "../lib/transcript-grouping"
 import {
@@ -22,27 +23,28 @@ import {
   toolVisibleOutput,
 } from "../lib/tool-display"
 import { isStructuralPart } from "../lib/transcript-visibility"
+import { taskSubagentSessionID } from "../lib/transcript-subagent-link"
 import { Icon } from "./icon"
 import { PartErrorPreview, PartHeader, ToolStatusIndicator, partIconName, useTranscriptChrome } from "./session-part-chrome"
 import { ThinkingGroupView } from "./session-thinking"
 import { ToolDetails } from "./session-tool-details"
 import { ToolCodeBlock, ToolPreviewText } from "./session-tool-text"
-import { Button } from "./ui"
+import { Button, IconButton } from "./ui"
 
 export type { DisplayPart, ToolPart } from "../lib/transcript-grouping"
 export { groupTranscriptParts } from "../lib/transcript-grouping"
 
 /** Tools whose completed output is the deliverable, not a step along the way. */
-const KEEP_OPEN_WHEN_COMPLETE = new Set(["todowrite", "apply_patch"])
+const KEEP_OPEN_WHEN_COMPLETE = new Set(["todowrite", "apply_patch", "plan_exit"])
 
 export function activeTranscriptStreamingPartID(messages: MessageBundle[], running: boolean) {
-  if (!running) return
+  if (!running) return undefined
   const message = messages.at(-1)
-  if (!message || message.info.role !== "assistant" || typeof message.info.time.completed === "number") return
+  if (!message || message.info.role !== "assistant" || typeof message.info.time.completed === "number") return undefined
   const part = message.parts.at(-1)
-  if (!part || (part.type !== "text" && part.type !== "reasoning")) return
-  if (!part.text.trim() || part.time === undefined || part.time.end !== undefined) return
-  if (part.type === "text" && (part.synthetic || part.ignored)) return
+  if (!part || (part.type !== "text" && part.type !== "reasoning")) return undefined
+  if (!part.text.trim() || part.time === undefined || part.time.end !== undefined) return undefined
+  if (part.type === "text" && (part.synthetic || part.ignored)) return undefined
   return part.id
 }
 
@@ -180,7 +182,7 @@ function TextPartView(props: { part: Extract<Part, { type: "text" }>; streaming:
   const text = createMemo(() => props.part.synthetic || props.part.ignored ? "" : props.part.text.trim())
   return (
     <Show when={text()}>
-      <div class="part text">
+      <div class="part text" ref={(element) => onCleanup(observeTranscriptFileLinks(element))}>
         <Markdown text={text()} cacheKey={props.part.id} streaming={props.streaming} />
       </div>
     </Show>
@@ -254,6 +256,11 @@ function ToolPartView(props: { part: ToolPart; showDetails: boolean; showGeneric
   })
   const bodyMounted = createMountedOnce(disclosure.open)
   const rawMounted = createMountedOnce(raw.open)
+  // The child session an agent part delegates to, stamped by the task tool
+  // before the sub-agent starts - so the row links while it is still running.
+  // The session page's delegated click handler opens it in the same embedded
+  // view a graph node opens into.
+  const subagentSessionID = createMemo(() => taskSubagentSessionID(props.part.tool, metadata()))
   const header = (isStatic: boolean) => (
     <PartHeader
       static={isStatic}
@@ -261,7 +268,22 @@ function ToolPartView(props: { part: ToolPart; showDetails: boolean; showGeneric
       title={title()}
       meta={patchSummary() || (shellCommand() ? <code class="part-meta-command" title={shellCommand()}>{shellCommand()}</code> : "")}
       status={<ToolStatusIndicator state={state()} stale={stale()} />}
-      trailing={<PartErrorPreview state={state()} when={!disclosure.open()} />}
+      subagentSessionID={subagentSessionID()}
+      trailing={
+        <>
+          <PartErrorPreview state={state()} when={!disclosure.open()} />
+          <Show when={subagentSessionID()}>
+            <IconButton
+              appearance="ghost"
+              size="compact"
+              class="part-open-subagent"
+              icon="chevronRight"
+              label="Open sub-agent session"
+              tooltip="Open sub-agent session"
+            />
+          </Show>
+        </>
+      }
     />
   )
   return (

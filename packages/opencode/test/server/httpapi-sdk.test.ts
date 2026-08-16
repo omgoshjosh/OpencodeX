@@ -7,7 +7,7 @@ import { ChildProcessSpawner } from "effect/unstable/process"
 import { AppFileSystem } from "@opencode-ai/core/filesystem"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Flag } from "@opencode-ai/core/flag/flag"
-import { createOpencodeClient } from "@opencode-ai/sdk/v2"
+import { createOpencodeClient, waitForRestartReadiness } from "@opencode-ai/sdk/v2"
 import { validateSession } from "../../src/cli/cmd/tui/validate-session"
 import { InstanceBootstrap } from "../../src/project/bootstrap-service"
 import { InstanceStore } from "../../src/project/instance-store"
@@ -27,6 +27,8 @@ import { awaitWithTimeout, testEffect } from "../lib/effect"
 import { testProviderConfig } from "../lib/test-provider"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { Database } from "@opencode-ai/core/database/database"
+import { OpencodeXJobTable, OpencodeXSwarmTable } from "@opencode-ai/core/opencodex/sql"
+import { SessionCommandTable, SessionExecutionTable, SessionInteractionTable } from "@opencode-ai/core/session/sql"
 import { httpApiLayer } from "./httpapi-layer"
 
 const noopBootstrap = Layer.succeed(InstanceBootstrap.Service, InstanceBootstrap.Service.of({ run: Effect.void }))
@@ -54,6 +56,7 @@ type LlmProjectFixture = ProjectFixture & { llm: TestLLMServer["Service"] }
 type TestServices =
   | AppFileSystem.Service
   | ChildProcessSpawner.ChildProcessSpawner
+  | Database.Service
   | InstanceStore.Service
   | HttpServer.HttpServer
 type TestScope = Scope.Scope | TestServices
@@ -326,7 +329,9 @@ describe("HttpApi SDK", () => {
     expect(sessionStatusSnapshot(new Map([[sessionID, { type: "busy" }]]))).toEqual({
       [sessionID]: { type: "busy" },
     })
-    expect(sessionStatusSnapshot(new Map([[sessionID, { type: "retry", attempt: 1, message: "retrying", next: 1 }]]))).toEqual({
+    expect(
+      sessionStatusSnapshot(new Map([[sessionID, { type: "retry", attempt: 1, message: "retrying", next: 1 }]])),
+    ).toEqual({
       [sessionID]: { type: "retry", attempt: 1, message: "retrying", next: 1 },
     })
   })
@@ -346,6 +351,118 @@ describe("HttpApi SDK", () => {
       expect(log.response.status).toBe(200)
       expect(log.data).toBe(true)
       yield* expectStatus(() => sdk.auth.set({ providerID: "test" }), 400)
+    }),
+  )
+
+  httpapi(
+    "reports authoritative restart blockers until all work stops executing",
+    Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      const sdk = yield* client("raw")
+      const now = Date.now()
+      const sessionID = SessionID.make("ses_restart_readiness")
+
+      yield* Effect.all(
+        [
+          db.insert(SessionExecutionTable).values({
+            session_id: sessionID,
+            project_id: "project",
+            directory: ".",
+            state: "running",
+            lease_expires_at: now + 60_000,
+            time_created: now,
+            time_updated: now,
+          }),
+          db.insert(SessionCommandTable).values({
+            id: "sec_restart_readiness",
+            session_id: sessionID,
+            message_id: MessageID.make("msg_restart_readiness"),
+            project_id: "project",
+            directory: ".",
+            status: "queued",
+            time_created: now,
+            time_updated: now,
+          }),
+          db.insert(SessionInteractionTable).values({
+            id: "interaction_restart_readiness",
+            kind: "question",
+            session_id: sessionID,
+            project_id: "project",
+            directory: ".",
+            state: "pending",
+            request_json: {},
+            time_created: now,
+            time_updated: now,
+          }),
+          db.insert(OpencodeXJobTable).values({
+            id: "job_restart_readiness",
+            kind: "task",
+            status: "claimed",
+            source: "test",
+            time_created: now,
+            time_updated: now,
+          }),
+          db.insert(OpencodeXSwarmTable).values({
+            id: "swarm_restart_readiness",
+            title: "Restart readiness",
+            prompt: "test",
+            status: "running",
+            source: "test",
+            time_created: now,
+            time_updated: now,
+          }),
+        ].map((query) => query.run().pipe(Effect.orDie)),
+        { concurrency: "unbounded" },
+      )
+
+      const blocked = yield* call(() => sdk.global.restartReadiness())
+      expect(blocked.response.status).toBe(200)
+      expect(blocked.data).toMatchObject({
+        ready: false,
+        blockers: {
+          sessionExecutions: true,
+          sessionCommands: true,
+          sessionInteractions: true,
+          jobs: true,
+          swarms: true,
+        },
+      })
+
+      yield* Effect.all(
+        [
+          db.update(SessionExecutionTable).set({ state: "idle", completed_at: now }),
+          db.update(SessionCommandTable).set({ status: "succeeded", completed_at: now }),
+          db.update(SessionInteractionTable).set({ state: "replied", responded_at: now }),
+          db.update(OpencodeXJobTable).set({ status: "completed", completed_at: now }),
+          // Reusable planned swarms are definitions, not executing work.
+          db.update(OpencodeXSwarmTable).set({ status: "planned" }),
+        ].map((query) => query.run().pipe(Effect.orDie)),
+        { concurrency: "unbounded" },
+      )
+
+      const ready = yield* call(() => sdk.global.restartReadiness())
+      const health = yield* call(() => sdk.global.health())
+      expect(ready.data).toMatchObject({
+        ready: true,
+        blockers: {
+          sessionExecutions: false,
+          sessionCommands: false,
+          sessionInteractions: false,
+          jobs: false,
+          swarms: false,
+        },
+      })
+      // Restart readiness ignores reusable definitions without changing the
+      // existing health activity contract for non-terminal swarm records.
+      expect(health.data).toMatchObject({ active: true })
+      expect(
+        yield* Effect.promise(() =>
+          waitForRestartReadiness(sdk, {
+            consecutiveSamples: 1,
+            intervalMs: 0,
+          }),
+        ),
+      ).toMatchObject({ ready: true })
     }),
   )
 

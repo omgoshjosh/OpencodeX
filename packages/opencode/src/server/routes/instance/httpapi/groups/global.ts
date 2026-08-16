@@ -19,6 +19,18 @@ const GlobalHealth = Schema.Struct({
   eventBusID: Schema.String,
 })
 
+const GlobalRestartReadiness = Schema.Struct({
+  ready: Schema.Boolean,
+  checkedAt: Schema.Number,
+  blockers: Schema.Struct({
+    sessionExecutions: Schema.Boolean,
+    sessionCommands: Schema.Boolean,
+    sessionInteractions: Schema.Boolean,
+    jobs: Schema.Boolean,
+    swarms: Schema.Boolean,
+  }),
+})
+
 const SyncEventSchemas = EventV2.registry
   .values()
   .flatMap((definition) => {
@@ -69,6 +81,7 @@ const GlobalUpgradeResult = Schema.Union([
 
 export const GlobalPaths = {
   health: "/global/health",
+  restartReadiness: "/global/restart-readiness",
   event: "/global/event",
   config: "/global/config",
   dispose: "/global/dispose",
@@ -88,6 +101,15 @@ export const GlobalApi = HttpApi.make("global").add(
           identifier: "global.health",
           summary: "Get health",
           description: "Get health information about the OpenCode server.",
+        }),
+      ),
+      HttpApiEndpoint.get("restartReadiness", GlobalPaths.restartReadiness, {
+        success: described(GlobalRestartReadiness, "Restart readiness information"),
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "global.restartReadiness",
+          summary: "Check restart readiness",
+          description: "Check whether authoritative session and automation work is idle before restarting the server.",
         }),
       ),
       HttpApiEndpoint.get("event", GlobalPaths.event, {

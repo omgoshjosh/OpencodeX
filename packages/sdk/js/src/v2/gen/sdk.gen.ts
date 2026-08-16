@@ -79,6 +79,8 @@ import type {
   GlobalGuiBridgeUnregisterResponses,
   GlobalHealthErrors,
   GlobalHealthResponses,
+  GlobalRestartReadinessErrors,
+  GlobalRestartReadinessResponses,
   GlobalUpgradeErrors,
   GlobalUpgradeResponses,
   InstanceDisposeErrors,
@@ -921,6 +923,19 @@ export class Global extends HeyApiClient {
       url: "/global/health",
       ...options,
     })
+  }
+
+  /**
+   * Check restart readiness
+   *
+   * Check whether authoritative session and automation work is idle before restarting the server.
+   */
+  public restartReadiness<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
+    return (options?.client ?? this.client).get<
+      GlobalRestartReadinessResponses,
+      GlobalRestartReadinessErrors,
+      ThrowOnError
+    >({ url: "/global/restart-readiness", ...options })
   }
 
   /**

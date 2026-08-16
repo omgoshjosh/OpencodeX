@@ -3,6 +3,7 @@ export * from "./client-sync.js"
 export * from "./session-order.js"
 export * from "./swarm-presentation.js"
 export * from "./work-item.js"
+export * from "./restart-readiness.js"
 export * from "./server.js"
 
 import { createOpencodeClient } from "./client.js"

@@ -192,7 +192,7 @@ function withContext<A, E>(
         return result
       }).pipe(Effect.ensuring(context.llm ? context.llm.reset : Effect.void)),
     ),
-    Effect.ensuring(scenario.reset ? resetState : Effect.void),
+    Effect.ensuring(options.mode !== "auth" && scenario.reset ? resetState : Effect.void),
   )
 }
 

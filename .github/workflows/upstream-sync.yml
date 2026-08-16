@@ -11,26 +11,67 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: upstream-sync-report
+  cancel-in-progress: false
+
 jobs:
   report:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
-      - uses: ./.github/actions/setup-bun
-      - name: Fetch the selected upstream ref
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: package.json
+      - name: Validate and fetch the selected upstream ref
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_REF: ${{ inputs.ref }}
         run: |
-          git remote add upstream https://github.com/anomalyco/opencode.git
-          git fetch --no-tags upstream "${{ inputs.ref }}"
+          if [[ ! "$UPSTREAM_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ && ! "$UPSTREAM_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "ref must be an exact release tag or 40-character commit SHA" >&2
+            exit 1
+          fi
+          repository="$(jq -er '.repository | select(. == "https://github.com/anomalyco/opencode.git")' upstream/lock.json)"
+          git remote add upstream "$repository"
+          if [[ "$UPSTREAM_REF" == v* ]]; then
+            immutable="$(gh api "repos/anomalyco/opencode/releases/tags/$UPSTREAM_REF" --jq .immutable)"
+            [[ "$immutable" == "true" ]] || {
+              echo "release must be immutable" >&2
+              exit 1
+            }
+            type="$(gh api "repos/anomalyco/opencode/git/ref/tags/$UPSTREAM_REF" --jq .object.type)"
+            expected="$(gh api "repos/anomalyco/opencode/git/ref/tags/$UPSTREAM_REF" --jq .object.sha)"
+            while [[ "$type" == "tag" ]]; do
+              type="$(gh api "repos/anomalyco/opencode/git/tags/$expected" --jq .object.type)"
+              expected="$(gh api "repos/anomalyco/opencode/git/tags/$expected" --jq .object.sha)"
+            done
+            [[ "$type" == "commit" && "$expected" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          else
+            expected="$UPSTREAM_REF"
+          fi
+          git fetch --no-tags upstream "$expected"
+          sha="$(git rev-parse 'FETCH_HEAD^{commit}')"
+          if [[ "$sha" != "$expected" ]]; then
+            echo "fetched commit does not match requested SHA" >&2
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
       - name: Generate review report
+        env:
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
         run: |
-          bun run upstream:status FETCH_HEAD --markdown > upstream-report.md
+          bun run upstream:status "$UPSTREAM_SHA" --markdown > upstream-report.md
           printf '\n## Merge-tree rehearsal\n\n```text\n' >> upstream-report.md
-          bun run upstream:rehearse FETCH_HEAD >> upstream-report.md
+          bun run upstream:rehearse "$UPSTREAM_SHA" >> upstream-report.md
           printf '```\n' >> upstream-report.md
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: upstream-${{ inputs.ref }}
+          name: upstream-${{ steps.upstream.outputs.sha }}
           path: upstream-report.md
           retention-days: 14

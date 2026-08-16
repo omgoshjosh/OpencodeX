@@ -2,8 +2,12 @@ name: Upstream status
 
 on:
   schedule:
-    - cron: "17 18 1 * *"
+    - cron: "17 18 * * *"
   workflow_dispatch:
+
+concurrency:
+  group: upstream-status
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -12,8 +16,11 @@ permissions:
 jobs:
   status:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
       - name: Update the single tracking issue when the release changes
         shell: bash
         env:
@@ -21,19 +28,25 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           release="$(gh api repos/anomalyco/opencode/releases/latest --jq .tag_name)"
+          [[ "$release" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
           pinned="$(jq -r .ref upstream/lock.json)"
           [[ "$release" != "$pinned" ]] || exit 0
+          owner="<!-- opencodex-upstream-status-owner:v1 -->"
           marker="<!-- upstream-release:${release} -->"
-          issue="$(gh issue list --state all --search 'Upstream opencode status in:title' --json number --jq '.[0].number // empty')"
-          if [[ -n "$issue" ]] && gh issue view "$issue" --json body --jq .body | grep -Fq "$marker"; then
+          issue=9
+          issue_json="$(gh issue view "$issue" --json title,body)"
+          title="$(jq -r .title <<< "$issue_json")"
+          current_body="$(jq -r .body <<< "$issue_json")"
+          [[ "$title" == "Upstream opencode status:"* ]] || exit 1
+          if ! grep -Fq "$owner" <<< "$current_body" && ! grep -Fq '<!-- upstream-release:' <<< "$current_body"; then
+            exit 1
+          fi
+          if grep -Fq "$marker" <<< "$current_body"; then
             exit 0
           fi
-          body="${marker}
+          body="${owner}
+          ${marker}
           OpencodeX is pinned to \`${pinned}\`; upstream now offers \`${release}\`.
 
           Run \`bun run upstream:status ${release} --markdown\`, then start the manual upstream-sync workflow."
-          if [[ -n "$issue" ]]; then
-            gh issue edit "$issue" --title "Upstream opencode status: ${release}" --body "$body"
-          else
-            gh issue create --title "Upstream opencode status: ${release}" --body "$body"
-          fi
+          gh issue edit "$issue" --title "Upstream opencode status: ${release}" --body "$body"

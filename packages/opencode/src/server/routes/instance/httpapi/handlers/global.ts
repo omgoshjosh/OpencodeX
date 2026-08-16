@@ -17,11 +17,7 @@ import { GlobalUpgradeInput } from "../groups/global"
 import { makeGuiBridgeHandlers } from "./gui-bridge"
 import { Database } from "@opencode-ai/core/database/database"
 import { OpencodeXJobTable, OpencodeXSwarmTable } from "@opencode-ai/core/opencodex/sql"
-import {
-  SessionCommandTable,
-  SessionExecutionTable,
-  SessionInteractionTable,
-} from "@opencode-ai/core/session/sql"
+import { SessionCommandTable, SessionExecutionTable, SessionInteractionTable } from "@opencode-ai/core/session/sql"
 import { and, eq, gt, inArray, notInArray, or } from "drizzle-orm"
 import { ensureProcessMetadata } from "@opencode-ai/core/util/opencode-process"
 
@@ -93,55 +89,98 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
     const processMetadata = ensureProcessMetadata("main")
     const databaseID = Bun.hash(Database.path()).toString(36)
 
-    const health = Effect.fn("GlobalHttpApi.health")(function* () {
+    const activity = Effect.fn("GlobalHttpApi.activity")(function* () {
       const now = Date.now()
       const activity = yield* Effect.all(
-        [
-          db
+        {
+          sessionExecutions: db
             .select({ id: SessionExecutionTable.session_id })
             .from(SessionExecutionTable)
             .where(
               or(
                 eq(SessionExecutionTable.state, "queued"),
-                and(
-                  eq(SessionExecutionTable.state, "running"),
-                  gt(SessionExecutionTable.lease_expires_at, now),
-                ),
+                and(eq(SessionExecutionTable.state, "running"), gt(SessionExecutionTable.lease_expires_at, now)),
               ),
             )
             .limit(1)
-            .get(),
-          db
+            .get()
+            .pipe(Effect.map((row) => row !== undefined)),
+          sessionCommands: db
             .select({ id: SessionCommandTable.id })
             .from(SessionCommandTable)
             .where(inArray(SessionCommandTable.status, ["queued", "running"]))
             .limit(1)
-            .get(),
-          db
+            .get()
+            .pipe(Effect.map((row) => row !== undefined)),
+          sessionInteractions: db
             .select({ id: SessionInteractionTable.id })
             .from(SessionInteractionTable)
             .where(eq(SessionInteractionTable.state, "pending"))
             .limit(1)
-            .get(),
-          db
+            .get()
+            .pipe(Effect.map((row) => row !== undefined)),
+          jobs: db
             .select({ id: OpencodeXJobTable.id })
             .from(OpencodeXJobTable)
             .where(inArray(OpencodeXJobTable.status, ["queued", "claimed", "running"]))
             .limit(1)
-            .get(),
-          db
+            .get()
+            .pipe(Effect.map((row) => row !== undefined)),
+          swarms: db
+            .select({ id: OpencodeXSwarmTable.id })
+            .from(OpencodeXSwarmTable)
+            .where(
+              inArray(OpencodeXSwarmTable.status, ["queued", "running", "cancelling", "approval_needed", "blocked"]),
+            )
+            .limit(1)
+            .get()
+            .pipe(Effect.map((row) => row !== undefined)),
+          healthSwarms: db
             .select({ id: OpencodeXSwarmTable.id })
             .from(OpencodeXSwarmTable)
             .where(notInArray(OpencodeXSwarmTable.status, ["completed", "partially_failed", "failed", "cancelled"]))
             .limit(1)
-            .get(),
-        ].map((query) => query.pipe(Effect.map((row) => row !== undefined), Effect.orDie)),
+            .get()
+            .pipe(Effect.map((row) => row !== undefined)),
+        },
         { concurrency: "unbounded" },
       )
+      const { healthSwarms, ...blockers } = activity
+      return {
+        blockers,
+        checkedAt: now,
+        active: Object.values({ ...blockers, swarms: healthSwarms }).some(Boolean),
+      }
+    })
+
+    const restartReadiness = Effect.fn("GlobalHttpApi.restartReadiness")(function* () {
+      const result = yield* activity().pipe(
+        Effect.catch(() =>
+          Effect.succeed({
+            checkedAt: Date.now(),
+            blockers: {
+              sessionExecutions: true,
+              sessionCommands: true,
+              sessionInteractions: true,
+              jobs: true,
+              swarms: true,
+            },
+          }),
+        ),
+      )
+      return {
+        ready: Object.values(result.blockers).every((blocked) => !blocked),
+        checkedAt: result.checkedAt,
+        blockers: result.blockers,
+      }
+    })
+
+    const health = Effect.fn("GlobalHttpApi.health")(function* () {
+      const result = yield* activity().pipe(Effect.orDie)
       return {
         healthy: true as const,
         version: InstallationVersion,
-        active: activity.some(Boolean),
+        active: result.active,
         processRole: processMetadata.processRole,
         runID: processMetadata.runID,
         databaseID,
@@ -222,6 +261,7 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
 
     return handlers
       .handle("health", health)
+      .handle("restartReadiness", restartReadiness)
       .handleRaw("event", event)
       .handle("configGet", configGet)
       .handle("configUpdate", configUpdate)

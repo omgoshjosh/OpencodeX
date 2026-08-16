@@ -4483,6 +4483,41 @@ export type GlobalHealthResponses = {
 
 export type GlobalHealthResponse = GlobalHealthResponses[keyof GlobalHealthResponses]
 
+export type GlobalRestartReadinessData = {
+  body?: never
+  path?: never
+  query?: never
+  url: "/global/restart-readiness"
+}
+
+export type GlobalRestartReadinessErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type GlobalRestartReadinessError = GlobalRestartReadinessErrors[keyof GlobalRestartReadinessErrors]
+
+export type GlobalRestartReadinessResponses = {
+  /**
+   * Restart readiness information
+   */
+  200: {
+    ready: boolean
+    checkedAt: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    blockers: {
+      sessionExecutions: boolean
+      sessionCommands: boolean
+      sessionInteractions: boolean
+      jobs: boolean
+      swarms: boolean
+    }
+  }
+}
+
+export type GlobalRestartReadinessResponse = GlobalRestartReadinessResponses[keyof GlobalRestartReadinessResponses]
+
 export type GlobalEventData = {
   body?: never
   path?: never

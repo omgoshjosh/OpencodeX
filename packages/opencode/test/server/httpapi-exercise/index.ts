@@ -59,6 +59,13 @@ const scenarios: Scenario[] = [
       check(body.healthy === true, "server should report healthy")
     }),
   http.protected
+    .get("/global/restart-readiness", "global.restartReadiness")
+    .global()
+    .json(200, (body) => {
+      object(body)
+      check(typeof body.ready === "boolean", "server should report restart readiness")
+    }),
+  http.protected
     .get("/global/event", "global.event")
     .global()
     .stream()

@@ -12,7 +12,7 @@ export type Runtime = {
   Tui: typeof import("../../../src/server/shared/tui-control")
   disposeAllInstances: (typeof import("../../fixture/fixture"))["disposeAllInstances"]
   tmpdir: (typeof import("../../fixture/fixture"))["tmpdir"]
-  resetDatabase: (typeof import("../../fixture/db"))["resetDatabase"]
+  resetDatabase: () => Promise<void>
 }
 
 let runtimePromise: Promise<Runtime> | undefined
@@ -31,7 +31,9 @@ export function runtime() {
     const project = await import("../../../src/project/project")
     const tui = await import("../../../src/server/shared/tui-control")
     const fixture = await import("../../fixture/fixture")
-    const db = await import("../../fixture/db")
+    const database = await import("@opencode-ai/core/database/database")
+    const drizzle = await import("drizzle-orm")
+    const effect = await import("effect")
     return {
       PublicApi: publicApi.PublicApi,
       HttpApiApp: httpApiServer.HttpApiApp,
@@ -46,7 +48,22 @@ export function runtime() {
       Tui: tui,
       disposeAllInstances: fixture.disposeAllInstances,
       tmpdir: fixture.tmpdir,
-      resetDatabase: db.resetDatabase,
+      resetDatabase: () =>
+        appRuntime.AppRuntime.runPromise(
+          database.Database.Service.use(({ db }) =>
+            effect.Effect.gen(function* () {
+              const tables = yield* db.all<{ name: string }>(
+                drizzle.sql`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`,
+              )
+              yield* db.run("PRAGMA foreign_keys = OFF")
+              yield* effect.Effect.forEach(
+                tables.filter((table) => table.name !== "migration" && table.name !== "__drizzle_migrations"),
+                (table) => db.run(drizzle.sql`DELETE FROM ${drizzle.sql.identifier(table.name)}`),
+                { discard: true },
+              ).pipe(effect.Effect.ensuring(db.run("PRAGMA foreign_keys = ON").pipe(effect.Effect.ignore)))
+            }),
+          ),
+        ),
     }
   })())
 }

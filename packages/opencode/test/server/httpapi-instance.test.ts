@@ -67,6 +67,7 @@ describe("instance HttpApi", () => {
         info: expect.any(Object),
         paths: expect.objectContaining({
           "/global/health": expect.any(Object),
+          "/global/restart-readiness": expect.any(Object),
           "/session": expect.any(Object),
         }),
       })

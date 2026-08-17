@@ -50,3 +50,9 @@ test-results/
 # Claude Code registered worktrees (do not delete/modify the worktrees themselves)
 .claude/worktrees/
 .superpowers/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/

@@ -4,10 +4,8 @@ import { rememberBackendAuthority } from "./backend-authority.js"
 import fs from "node:fs"
 import {
   checkCoordinatorCompatibility,
-  fetchCoordinatorHealth,
   isCoordinatorProcessAlive,
-  isMissingCoordinatorFile,
-  readCoordinatorManifestFile,
+  observeCoordinatorAuthority,
   removeCoordinatorManifest as removeCoordinatorManifestIn,
   startCoordinatorClientLease as startCoordinatorClientLeaseIn,
 } from "@opencode-ai/sdk/coordinator"
@@ -16,7 +14,6 @@ import {
   COORDINATOR_USERNAME,
   coordinatorDatabaseIdentity,
   coordinatorKey,
-  coordinatorManifestPath,
   coordinatorStartupLogPath,
   createSidecarLaunch,
   createStartupLog,
@@ -29,13 +26,17 @@ import {
   type CoordinatorManifest,
   type SidecarLaunch,
 } from "./sidecar-launch.js"
-import { stopDetachedChild } from "./sidecar-lifecycle.js"
+import { stopOwnedCoordinatorUnderAuthority } from "./sidecar-lifecycle.js"
 
 export type SidecarConnection = {
   url: string
   username: string
   password: string
   directory: string
+  key: string
+  database: string
+  token: string
+  authorityEpoch?: string
 }
 
 type SidecarState = {
@@ -98,8 +99,7 @@ export function startSidecar(signal?: AbortSignal) {
         throw startupStoppedError()
       }
       state.lease = lease
-      if (state.child?.process.pid === manifest.pid && process.env.OPENCODEX_GUI_SMOKE !== "1")
-        state.child = undefined
+      if (state.child?.process.pid === manifest.pid && process.env.OPENCODEX_GUI_SMOKE !== "1") state.child = undefined
       const connection = connectionFromManifest(manifest, directory)
       state.connection = connection
       return connection
@@ -152,25 +152,42 @@ function connectionFromManifest(manifest: CoordinatorManifest, directory: string
     username: manifest.username,
     password: manifest.password,
     directory,
+    key: manifest.key,
+    database: manifest.database,
+    token: manifest.token,
+    authorityEpoch: manifest.authorityEpoch,
   }
 }
 
+export async function isSidecarConnectionActive(connection: SidecarConnection) {
+  const manifest = await activeCoordinator(connection.key, connection.database)
+  return manifest?.token === connection.token
+}
+
 async function activeCoordinator(key: string, database: string) {
-  const manifest = await readActiveManifest(key)
-  if (!manifest) return undefined
+  const observation = await observeCoordinatorAuthority({ stateRoot: COORDINATOR_STATE_ROOT, key })
+  if (observation.state === "progressing") throw coordinatorAuthorityError("progressing")
+  const manifest = observation.manifest
+  if (!manifest) {
+    if (observation.authority.state === "absent") return undefined
+    throw coordinatorAuthorityError(observation.authority)
+  }
   if (
     manifest.key !== key ||
     coordinatorDatabaseIdentity(manifest.database) !== coordinatorDatabaseIdentity(database)
   ) {
-    await removeCoordinatorManifest(key, manifest.token)
+    if (observation.handoff !== undefined) throw coordinatorAuthorityError(observation.authority)
+    const removed = await removeCoordinatorManifest(key, manifest)
+    if (removed.state === "progressing") throw coordinatorAuthorityError("progressing")
     return undefined
   }
-  const health = await fetchCoordinatorHealth(manifest)
-  if (health?.healthy === true) {
+  const health = observation.health
+  const authority = observation.authority
+  if (authority.state === "active" || authority.state === "handoff") {
     const compatibility = checkCoordinatorCompatibility({
       manifest,
       clientVersion: sidecarVersion(),
-      healthVersion: health.version,
+      healthVersion: health?.version,
     })
     if (!compatibility.compatible) {
       throw new CoordinatorVersionMismatchError(compatibility.message ?? "Coordinator version mismatch")
@@ -178,28 +195,24 @@ async function activeCoordinator(key: string, database: string) {
     if (compatibility.reason === "local" && compatibility.message) console.warn(compatibility.message)
     return manifest
   }
+  if (observation.handoff !== undefined || authority.state !== "blocked" || authority.reason !== "unhealthy") {
+    throw coordinatorAuthorityError(authority)
+  }
   if (isCoordinatorProcessAlive(manifest.pid)) {
     throw new Error(`OpencodeX coordinator process ${manifest.pid} is alive but unhealthy; refusing to replace it`)
   }
-  await removeCoordinatorManifest(key, manifest.token)
+  const removed = await removeCoordinatorManifest(key, manifest)
+  if (removed.state === "progressing") throw coordinatorAuthorityError("progressing")
   return undefined
 }
 
-async function readActiveManifest(key: string) {
-  try {
-    return await readCoordinatorManifest(key)
-  } catch (error) {
-    if (isMissingCoordinatorFile(error)) return undefined
-    throw new Error("Invalid TUI coordinator manifest; refusing to replace it", { cause: error })
-  }
+function coordinatorAuthorityError(authority: { state: string; reason?: string } | "progressing") {
+  const reason = authority === "progressing" ? authority : authority.state === "blocked" ? authority.reason : authority.state
+  return new Error(`OpencodeX coordinator authority is ${reason}; refusing election or replacement`)
 }
 
-function readCoordinatorManifest(key: string) {
-  return readCoordinatorManifestFile(coordinatorManifestPath(key))
-}
-
-function removeCoordinatorManifest(key: string, token: string) {
-  return removeCoordinatorManifestIn(COORDINATOR_STATE_ROOT, key, token)
+function removeCoordinatorManifest(key: string, manifest: CoordinatorManifest) {
+  return removeCoordinatorManifestIn(COORDINATOR_STATE_ROOT, key, manifest)
 }
 
 function startCoordinatorClientLease(key: string) {
@@ -269,7 +282,9 @@ async function waitForCoordinator(directory: string, child: ChildProcess, starte
     failure = startError(error, started)
   })
   child.once("exit", (code, signal) => {
-    failure = new Error(`OpencodeX coordinator exited before startup (${signal ?? code ?? "unknown"})${startupLogDetails(started)}`)
+    failure = new Error(
+      `OpencodeX coordinator exited before startup (${signal ?? code ?? "unknown"})${startupLogDetails(started)}`,
+    )
   })
   while (Date.now() - startedAt < START_TIMEOUT) {
     throwIfStartupStopped(signal)
@@ -310,9 +325,10 @@ function startupDelay(signal: AbortSignal) {
 }
 
 async function stopOwnedCoordinator(owned: NonNullable<SidecarState["child"]>) {
-  const child = owned.process
-  await stopDetachedChild(child)
-  const manifest = await readCoordinatorManifest(owned.key).catch(() => undefined)
-  if (!manifest || manifest.pid !== child.pid || manifest.token !== owned.token) return
-  await removeCoordinatorManifest(owned.key, owned.token).catch(() => undefined)
+  await stopOwnedCoordinatorUnderAuthority({
+    stateRoot: COORDINATOR_STATE_ROOT,
+    key: owned.key,
+    token: owned.token,
+    child: owned.process,
+  })
 }

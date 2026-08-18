@@ -1,4 +1,8 @@
 import type { ChildProcess } from "node:child_process"
+import {
+  removeCoordinatorManifestLocked,
+  runCoordinatorAuthorityTransaction,
+} from "@opencode-ai/sdk/coordinator"
 
 type SidecarLifecycleOptions<Connection> = {
   start: (signal: AbortSignal) => Promise<Connection>
@@ -77,6 +81,25 @@ export async function stopDetachedChild(child: ChildProcess) {
   if (child.exitCode === null && child.signalCode === null) {
     throw new Error(`Detached sidecar process ${child.pid ?? "unknown"} did not exit`)
   }
+}
+
+export function stopOwnedCoordinatorUnderAuthority(input: {
+  stateRoot: string
+  key: string
+  token: string
+  child: ChildProcess
+}) {
+  return runCoordinatorAuthorityTransaction({
+    stateRoot: input.stateRoot,
+    key: input.key,
+    requireHandoffAbsent: true,
+    action: async (lock, manifest) => {
+      if (manifest && (manifest.pid !== input.child.pid || manifest.token !== input.token)) return false
+      await stopDetachedChild(input.child)
+      if (manifest) await removeCoordinatorManifestLocked(lock, manifest)
+      return true
+    },
+  })
 }
 
 function waitForExit(child: ChildProcess, timeout: number) {

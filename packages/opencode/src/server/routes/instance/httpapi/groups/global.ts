@@ -12,6 +12,9 @@ const GlobalHealth = Schema.Struct({
   healthy: Schema.Literal(true),
   version: Schema.String,
   active: Schema.Boolean,
+  authorityEpoch: Schema.optional(Schema.String),
+  admission: Schema.optional(Schema.Boolean),
+  ready: Schema.optional(Schema.Boolean),
 })
 
 const SyncEventSchemas = EventV2.registry

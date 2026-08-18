@@ -1,6 +1,19 @@
 import { describe, expect, test } from "bun:test"
 import { spawn } from "node:child_process"
-import { createSidecarLifecycle, stopDetachedChild } from "../src/main/sidecar-lifecycle"
+import { mkdtemp, rm, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import path from "node:path"
+import {
+  COORDINATOR_HANDOFF_VERSION,
+  coordinatorHandoffPath,
+  withCoordinatorAuthorityLock,
+  publishCoordinatorManifest,
+} from "@opencode-ai/sdk/coordinator"
+import {
+  createSidecarLifecycle,
+  stopDetachedChild,
+  stopOwnedCoordinatorUnderAuthority,
+} from "../src/main/sidecar-lifecycle"
 
 describe("sidecar lifecycle", () => {
   test("shares a successful startup and resets it on stop", async () => {
@@ -183,5 +196,61 @@ describe("sidecar lifecycle", () => {
     await stopped
     expect(child.exitCode !== null || child.signalCode !== null).toBe(true)
     await expect(startup).rejects.toMatchObject({ name: "AbortError" })
+  })
+
+  test("does not kill an owned child when handoff creation wins the authority lock", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "opencodex-gui-authority-"))
+    const key = "c".repeat(40)
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true,
+    })
+    child.unref()
+    const release = Promise.withResolvers<void>()
+    try {
+      await publishCoordinatorManifest(root, {
+      version: 2,
+      key,
+      directory: root,
+      database: path.join(root, "authority.db"),
+      pid: child.pid!,
+      url: "http://127.0.0.1:4096/",
+      username: "gui",
+      password: "secret",
+      token: "owned-token",
+      createdAt: "2026-08-18T20:00:00.000Z",
+      serverVersion: "local",
+      authorityEpoch: "source-1",
+      admission: true,
+      ready: true,
+      }, undefined)
+      const entered = Promise.withResolvers<void>()
+      const creating = withCoordinatorAuthorityLock(root, key, async () => {
+        await writeFile(coordinatorHandoffPath(root, key), JSON.stringify({
+        version: COORDINATOR_HANDOFF_VERSION,
+        request: "request-1",
+        phase: "requested",
+        revision: 0,
+        sourceEpoch: "source-1",
+        createdAt: "2026-08-18T20:00:00.000Z",
+        updatedAt: "2026-08-18T20:00:00.000Z",
+        }))
+        entered.resolve()
+        await release.promise
+      })
+      await entered.promise
+
+      const guarded = stopOwnedCoordinatorUnderAuthority({ stateRoot: root, key, token: "owned-token", child })
+      release.resolve()
+      await creating
+
+      expect(await guarded).toEqual({ state: "progressing", reason: "handoff_present" })
+      expect(child.exitCode).toBeNull()
+    } finally {
+      release.resolve()
+      await stopDetachedChild(child).catch(() => undefined)
+      await rm(root, { recursive: true, force: true })
+    }
   })
 })

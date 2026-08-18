@@ -157,6 +157,24 @@ describe("coordinator transport", () => {
     expect(backend.calls[1].authorization).toBe(basic(samePort))
   })
 
+  test("refreshes authority but does not replay a POST after 401", async () => {
+    const backend = fakeBackend({ alive: [new URL(manifestA.url).origin], password: manifestB.password })
+    const transport = createCoordinatorTransport({
+      manifest: manifestA,
+      resolve: async () => manifestB,
+      fetch: backend.fetch,
+    })
+
+    const response = await transport.fetch(new URL("/session/prompt", manifestA.url), {
+      method: "POST",
+      body: JSON.stringify({ prompt: "hello" }),
+    })
+
+    expect(response.status).toBe(401)
+    expect(backend.calls).toHaveLength(1)
+    expect(transport.manifest).toBe(manifestB)
+  })
+
   test("returns the 401 when recovery does not change the outcome", async () => {
     const backend = fakeBackend({ alive: [new URL(manifestA.url).origin], password: "different-password" })
     let resolves = 0
@@ -229,15 +247,7 @@ describe("coordinator transport", () => {
     })
   })
 
-  test("retries a POST body against the replacement coordinator without disturbing it", async () => {
-    // Regression test: SDK calls arrive as `Request` objects with a body
-    // (see client.gen.ts: `new Request(url, requestInit)`). The retry path
-    // used to build both send attempts straight off the caller's `Request`,
-    // which disturbs its body on the first construction and makes the
-    // second construction throw once the first attempt's body is actually
-    // read - exactly the prompt-send recovery case. This must fail under
-    // the old implementation (see streamBody's doc comment for why the body
-    // needs to be a real ReadableStream to reproduce it under Bun).
+  test("refreshes authority but does not replay a POST after ambiguous connection loss", async () => {
     const bodies: { origin: string; body: string }[] = []
     let resolves = 0
     const fetchWithBodyCapture: typeof globalThis.fetch = Object.assign(
@@ -268,12 +278,11 @@ describe("coordinator transport", () => {
       body: streamBody(payload),
     })
 
-    const response = await transport.fetch(request)
-    expect(response.status).toBe(200)
+    expect(await rejection(transport.fetch(request))).toMatchObject({ code: "ConnectionRefused" })
     expect(resolves).toBe(1)
-    expect(bodies).toHaveLength(2)
+    expect(bodies).toHaveLength(1)
     expect(bodies[0]).toEqual({ origin: new URL(manifestA.url).origin, body: payload })
-    expect(bodies[1]).toEqual({ origin: new URL(manifestB.url).origin, body: payload })
+    expect(transport.manifest).toBe(manifestB)
   })
 
   test("failed recovery cools down before it is attempted again", async () => {

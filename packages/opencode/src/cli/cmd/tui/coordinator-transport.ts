@@ -59,6 +59,11 @@ export function isCoordinatorConnectionError(error: unknown): boolean {
   )
 }
 
+function mayReplay(request: Parameters<typeof globalThis.fetch>[0], init?: RequestInit) {
+  const method = (init?.method ?? (request instanceof Request ? request.method : "GET")).toUpperCase()
+  return method === "GET" || method === "HEAD" || method === "OPTIONS"
+}
+
 export function createCoordinatorTransport(input: {
   manifest: CoordinatorManifest
   resolve: () => Promise<CoordinatorManifest>
@@ -139,12 +144,12 @@ export function createCoordinatorTransport(input: {
         // its refusal of the old ones marks the manifest as stale.
         if (response.status !== 401) return response
         const recovered = await recover().catch(() => false)
-        if (!recovered) return response
+        if (!recovered || !mayReplay(request, init)) return response
         return send(request, init)
       } catch (error) {
         if (init?.signal?.aborted || !isCoordinatorConnectionError(error)) throw error
         const recovered = await recover().catch(() => false)
-        if (!recovered) throw error
+        if (!recovered || !mayReplay(request, init)) throw error
         return send(request, init)
       }
     },

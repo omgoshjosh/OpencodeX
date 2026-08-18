@@ -8,23 +8,28 @@ import {
   COORDINATOR_MANIFEST_VERSION,
   checkCoordinatorCompatibility,
   checkCoordinatorHandoffTransition,
+  acquireCoordinatorAuthorityLock,
+  coordinatorAuthorityLockPath,
   coordinatorClientDir,
   coordinatorDatabaseIdentity,
   coordinatorHandoffPath,
   coordinatorKey,
   coordinatorManifestPath,
   fetchCoordinatorHealth,
+  observeCoordinatorAuthority,
   isCoordinatorHandoffRecord,
   isLegacyCoordinatorHandoffRecord,
   isCoordinatorKey,
   isCoordinatorManifest,
   parseCoordinatorHandoffRecord,
+  publishCoordinatorManifest,
   readCoordinatorManifest,
   readCoordinatorHandoff,
   removeCoordinatorManifest,
+  replaceCoordinatorManifest,
   resolveCoordinatorAuthority,
   startCoordinatorClientLease,
-  writeCoordinatorManifest,
+  withCoordinatorAuthorityLock,
   type CoordinatorManifest,
   type CoordinatorHandoffRecord,
 } from "../src/coordinator/manifest"
@@ -44,7 +49,7 @@ async function stateRoot() {
 function manifest(overrides: Partial<CoordinatorManifest> = {}): CoordinatorManifest {
   return {
     version: COORDINATOR_MANIFEST_VERSION,
-    key: "abc123",
+    key: "a".repeat(40),
     directory: "/work/project",
     database: "/data/opencode.db",
     pid: process.pid,
@@ -62,7 +67,7 @@ describe("coordinator manifest validation", () => {
   test("round-trips a manifest through disk", async () => {
     const root = await stateRoot()
     const written = manifest()
-    await writeCoordinatorManifest(root, written)
+    await publishCoordinatorManifest(root, written, undefined)
     expect(await readCoordinatorManifest(root, written.key)).toEqual(written)
     const stat = await fs.stat(coordinatorManifestPath(root, written.key))
     expect(stat.isFile()).toBe(true)
@@ -293,6 +298,70 @@ describe("coordinator authority resolver", () => {
     ).toMatchObject({ state: "handoff", handoff })
   })
 
+  test("keeps pre-commit source authority attachable and waits for the selected target after ready", () => {
+    const accepted = {
+      ...handoff,
+      phase: "accepted" as const,
+      revision: 1,
+      targetEpoch: "target-generation-1",
+      updatedAt: "2026-08-18T20:00:01.000Z",
+    }
+    expect(
+      resolveCoordinatorAuthority({ manifest: activeManifest, health: activeHealth, handoff: accepted }),
+    ).toMatchObject({
+      state: "handoff",
+      authorityEpoch: "source-generation-1",
+    })
+
+    const ready = {
+      ...accepted,
+      phase: "ready" as const,
+      revision: 2,
+      updatedAt: "2026-08-18T20:00:02.000Z",
+    }
+    expect(resolveCoordinatorAuthority({ manifest: activeManifest, health: activeHealth, handoff: ready })).toEqual({
+      state: "blocked",
+      reason: "incompatible_handoff",
+    })
+    expect(
+      resolveCoordinatorAuthority({
+        manifest: { ...activeManifest, authorityEpoch: "target-generation-1" },
+        health: { ...activeHealth, authorityEpoch: "target-generation-1" },
+        handoff: ready,
+      }),
+    ).toMatchObject({ state: "handoff", authorityEpoch: "target-generation-1" })
+  })
+
+  test("requires complete live authority health throughout handoff", () => {
+    expect(
+      resolveCoordinatorAuthority({
+        manifest: activeManifest,
+        health: { healthy: true, version: "1.2.3" },
+        handoff,
+      }),
+    ).toEqual({ state: "blocked", reason: "invalid_authority" })
+  })
+
+  test("attaches committed handoff only to its exact target epoch", () => {
+    const committed = {
+      ...handoff,
+      phase: "committed" as const,
+      revision: 3,
+      targetEpoch: "target-generation-1",
+      updatedAt: "2026-08-18T20:00:03.000Z",
+    }
+    expect(
+      resolveCoordinatorAuthority({ manifest: activeManifest, health: activeHealth, handoff: committed }),
+    ).toEqual({ state: "blocked", reason: "incompatible_handoff" })
+    expect(
+      resolveCoordinatorAuthority({
+        manifest: { ...activeManifest, authorityEpoch: "target-generation-1" },
+        health: { ...activeHealth, authorityEpoch: "target-generation-1" },
+        handoff: committed,
+      }),
+    ).toMatchObject({ state: "handoff", authorityEpoch: "target-generation-1" })
+  })
+
   test("blocks incompatible authority observations and explicit admission/readiness refusal", () => {
     expect(
       resolveCoordinatorAuthority({
@@ -324,9 +393,7 @@ describe("coordinator authority resolver", () => {
 describe("coordinator key derivation", () => {
   test("is the sha1 of the resolved database identity", () => {
     const absolute = path.resolve("/data/opencode.db")
-    expect(coordinatorDatabaseIdentity(absolute)).toBe(
-      process.platform === "win32" ? absolute.toLowerCase() : absolute,
-    )
+    expect(coordinatorDatabaseIdentity(absolute)).toBe(process.platform === "win32" ? absolute.toLowerCase() : absolute)
     expect(coordinatorKey(absolute)).toMatch(/^[0-9a-f]{40}$/)
     expect(coordinatorKey(absolute)).toBe(coordinatorKey(absolute.toUpperCase() === absolute ? absolute : absolute))
   })
@@ -349,23 +416,270 @@ describe("token-guarded removal", () => {
   test("keeps the manifest when the token does not match", async () => {
     const root = await stateRoot()
     const written = manifest()
-    await writeCoordinatorManifest(root, written)
-    expect(await removeCoordinatorManifest(root, written.key, "other-token")).toBe(false)
+    await publishCoordinatorManifest(root, written, undefined)
+    expect(await removeCoordinatorManifest(root, written.key, { token: "other-token", authorityEpoch: undefined })).toEqual({
+      state: "progressing",
+      reason: "manifest_changed",
+    })
     expect(await readCoordinatorManifest(root, written.key)).toEqual(written)
   })
 
   test("removes the manifest when the token matches", async () => {
     const root = await stateRoot()
     const written = manifest()
-    await writeCoordinatorManifest(root, written)
-    expect(await removeCoordinatorManifest(root, written.key, written.token)).toBe(true)
+    await publishCoordinatorManifest(root, written, undefined)
+    expect(await removeCoordinatorManifest(root, written.key, written)).toEqual({ state: "committed", value: true })
     await expect(readCoordinatorManifest(root, written.key)).rejects.toThrow()
+  })
+
+  test("preserves the manifest while any handoff observation exists", async () => {
+    const root = await stateRoot()
+    const written = manifest({ key: "a".repeat(40) })
+    await publishCoordinatorManifest(root, written, undefined)
+    await fs.writeFile(coordinatorHandoffPath(root, written.key), "{malformed")
+
+    expect(await removeCoordinatorManifest(root, written.key, written)).toEqual({
+      state: "progressing",
+      reason: "handoff_present",
+    })
+    expect(await readCoordinatorManifest(root, written.key)).toEqual(written)
   })
 
   test("is a no-op when there is nothing to remove", async () => {
     const root = await stateRoot()
-    expect(await removeCoordinatorManifest(root, "missing", "token")).toBe(false)
+    expect(
+      await removeCoordinatorManifest(root, "f".repeat(40), { token: "token", authorityEpoch: undefined }),
+    ).toEqual({ state: "progressing", reason: "manifest_absent" })
   })
+
+  test("serializes manifest removal behind concurrent handoff creation", async () => {
+    const root = await stateRoot()
+    const written = manifest({ key: "d".repeat(40), authorityEpoch: "source-1" })
+    await publishCoordinatorManifest(root, written, undefined)
+    const entered = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    const handoff = {
+      version: COORDINATOR_HANDOFF_VERSION,
+      request: "request-1",
+      phase: "requested",
+      revision: 0,
+      sourceEpoch: "source-1",
+      createdAt: "2026-08-18T20:00:00.000Z",
+      updatedAt: "2026-08-18T20:00:00.000Z",
+    } as const
+    const creating = withCoordinatorAuthorityLock(root, written.key, async () => {
+      await fs.writeFile(coordinatorHandoffPath(root, written.key), JSON.stringify(handoff))
+      entered.resolve()
+      await release.promise
+    })
+    await entered.promise
+
+    const removing = removeCoordinatorManifest(root, written.key, written)
+    release.resolve()
+    await creating
+
+    expect(await removing).toEqual({ state: "progressing", reason: "handoff_present" })
+    expect(await readCoordinatorManifest(root, written.key)).toEqual(written)
+  })
+})
+
+describe("coordinator manifest transactions", () => {
+  test("publishes only into exact manifest and handoff absence", async () => {
+    const root = await stateRoot()
+    const written = manifest({ key: "6".repeat(40), authorityEpoch: "source-1" })
+
+    expect(await publishCoordinatorManifest(root, written, undefined)).toEqual({ state: "committed", value: written })
+    expect(await publishCoordinatorManifest(root, { ...written, token: "other" }, undefined)).toEqual({
+      state: "progressing",
+      reason: "manifest_changed",
+    })
+  })
+
+  test("replaces only under exact manifest and handoff fences", async () => {
+    const root = await stateRoot()
+    const source = manifest({ key: "5".repeat(40), authorityEpoch: "source-1" })
+    const target = { ...source, token: "target-token", authorityEpoch: "target-1" }
+    const handoff = {
+      version: COORDINATOR_HANDOFF_VERSION,
+      request: "request-1",
+      phase: "accepted" as const,
+      revision: 1,
+      sourceEpoch: "source-1",
+      targetEpoch: "target-1",
+      createdAt: "2026-08-18T20:00:00.000Z",
+      updatedAt: "2026-08-18T20:00:01.000Z",
+    }
+    await publishCoordinatorManifest(root, source, undefined)
+    await fs.writeFile(coordinatorHandoffPath(root, source.key), JSON.stringify(handoff))
+
+    expect(
+      await replaceCoordinatorManifest({
+        stateRoot: root,
+        manifest: target,
+        expectedManifest: { ...source, token: "wrong" },
+        expectedHandoff: handoff,
+      }),
+    ).toEqual({ state: "progressing", reason: "manifest_changed" })
+    expect(
+      await replaceCoordinatorManifest({
+        stateRoot: root,
+        manifest: target,
+        expectedManifest: source,
+        expectedHandoff: { ...handoff, revision: 2 },
+      }),
+    ).toEqual({ state: "progressing", reason: "handoff_changed" })
+    expect(
+      await replaceCoordinatorManifest({
+        stateRoot: root,
+        manifest: target,
+        expectedManifest: source,
+        expectedHandoff: handoff,
+      }),
+    ).toEqual({ state: "committed", value: target })
+  })
+})
+
+describe("coordinator authority observation", () => {
+  test("retries when the phase changes during probe and observes the committed target", async () => {
+    const root = await stateRoot()
+    const key = "e".repeat(40)
+    const source = manifest({ key, authorityEpoch: "source-1", admission: false, ready: true })
+    const target = { ...source, token: "target-token", authorityEpoch: "target-1", admission: true }
+    const requested = {
+      version: COORDINATOR_HANDOFF_VERSION,
+      request: "request-1",
+      phase: "requested",
+      revision: 0,
+      sourceEpoch: "source-1",
+      createdAt: "2026-08-18T20:00:00.000Z",
+      updatedAt: "2026-08-18T20:00:00.000Z",
+    } as const
+    const committed = {
+      ...requested,
+      phase: "committed" as const,
+      revision: 3,
+      targetEpoch: "target-1",
+      updatedAt: "2026-08-18T20:00:03.000Z",
+    }
+    await publishCoordinatorManifest(root, source, undefined)
+    await fs.writeFile(coordinatorHandoffPath(root, key), JSON.stringify(requested))
+    const probing = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    let calls = 0
+    const fetch: typeof globalThis.fetch = Object.assign(
+      async () => {
+        calls += 1
+        if (calls === 1) {
+          probing.resolve()
+          await release.promise
+          return Response.json({ healthy: true, authorityEpoch: "source-1", admission: false, ready: true })
+        }
+        return Response.json({ healthy: true, authorityEpoch: "target-1", admission: true, ready: true })
+      },
+      { preconnect: globalThis.fetch.preconnect },
+    )
+    const observing = observeCoordinatorAuthority({ stateRoot: root, key, fetch })
+    await probing.promise
+    await withCoordinatorAuthorityLock(root, key, async () => {
+      await fs.writeFile(coordinatorHandoffPath(root, key), JSON.stringify(committed))
+    })
+    await replaceCoordinatorManifest({
+      stateRoot: root,
+      manifest: target,
+      expectedManifest: source,
+      expectedHandoff: committed,
+    })
+    release.resolve()
+
+    expect(await observing).toMatchObject({
+      state: "observed",
+      manifest: { token: "target-token", authorityEpoch: "target-1" },
+      authority: { state: "handoff", authorityEpoch: "target-1", handoff: { phase: "committed" } },
+    })
+    expect(calls).toBe(2)
+  })
+
+  test("returns progressing when the authority fence changes on both probes", async () => {
+    const root = await stateRoot()
+    const key = "f".repeat(40)
+    const initial = manifest({ key, authorityEpoch: "source-1" })
+    await publishCoordinatorManifest(root, initial, undefined)
+    const fetch: typeof globalThis.fetch = Object.assign(
+      async () => Response.json({ healthy: true, authorityEpoch: "source-1", admission: true, ready: true }),
+      { preconnect: globalThis.fetch.preconnect },
+    )
+
+    let current = initial
+    expect(
+      await observeCoordinatorAuthority({
+        stateRoot: root,
+        key,
+        fetch,
+        afterProbe: async (attempt) => {
+          const replacement = { ...initial, token: `replacement-${attempt}` }
+          await replaceCoordinatorManifest({
+            stateRoot: root,
+            manifest: replacement,
+            expectedManifest: current,
+            expectedHandoff: undefined,
+          })
+          current = replacement
+        },
+      }),
+    ).toEqual({ state: "progressing" })
+  })
+})
+
+describe("coordinator authority lock recovery", () => {
+  test("immediately reclaims a lock whose recorded PID is dead", async () => {
+    const root = await stateRoot()
+    const key = "9".repeat(40)
+    const lockPath = coordinatorAuthorityLockPath(root, key)
+    await fs.mkdir(lockPath, { recursive: true })
+    await fs.writeFile(path.join(lockPath, "owner.json"), JSON.stringify({ pid: 424242, token: "dead-owner" }))
+    let sleeps = 0
+
+    const lock = await acquireCoordinatorAuthorityLock(root, key, {
+      timeout: 100,
+      now: () => 0,
+      sleep: async () => {
+        sleeps += 1
+      },
+      processAlive: () => false,
+    })
+
+    expect(lock.token).not.toBe("dead-owner")
+    expect(sleeps).toBe(1)
+    await lock.release()
+  })
+
+  for (const metadata of [undefined, "{malformed"] as const) {
+    test(`does not reclaim ${metadata === undefined ? "missing" : "malformed"} owner metadata`, async () => {
+      const root = await stateRoot()
+      const key = metadata === undefined ? "7".repeat(40) : "8".repeat(40)
+      const lockPath = coordinatorAuthorityLockPath(root, key)
+      await fs.mkdir(lockPath, { recursive: true })
+      if (metadata !== undefined) await fs.writeFile(path.join(lockPath, "owner.json"), metadata)
+      let now = 0
+      let checkedPID = false
+
+      await expect(
+        acquireCoordinatorAuthorityLock(root, key, {
+          timeout: 50,
+          now: () => now,
+          sleep: async (milliseconds) => {
+            now += milliseconds
+          },
+          processAlive: () => {
+            checkedPID = true
+            return false
+          },
+        }),
+      ).rejects.toThrow("Timed out acquiring coordinator authority lock")
+      expect(checkedPID).toBe(false)
+      expect((await fs.stat(lockPath)).isDirectory()).toBe(true)
+    })
+  }
 })
 
 describe("compatibility policy", () => {
@@ -420,9 +734,7 @@ describe("compatibility policy", () => {
   })
 
   test("a legacy manifest is not rescued by a local client", () => {
-    expect(
-      checkCoordinatorCompatibility({ manifest: {}, clientVersion: "local", skip: false }).reason,
-    ).toBe("legacy")
+    expect(checkCoordinatorCompatibility({ manifest: {}, clientVersion: "local", skip: false }).reason).toBe("legacy")
   })
 
   test("cross-checks the manifest against the live health version", () => {
@@ -447,9 +759,10 @@ describe("compatibility policy", () => {
   })
 
   test("the skip escape bypasses every refusal", () => {
-    expect(
-      checkCoordinatorCompatibility({ manifest: {}, clientVersion: "1.2.3", skip: true }),
-    ).toEqual({ compatible: true, reason: "skipped" })
+    expect(checkCoordinatorCompatibility({ manifest: {}, clientVersion: "1.2.3", skip: true })).toEqual({
+      compatible: true,
+      reason: "skipped",
+    })
     expect(
       checkCoordinatorCompatibility({
         manifest: { serverVersion: "9.9.9" },
@@ -464,9 +777,7 @@ describe("compatibility policy", () => {
     const previous = process.env.OPENCODEX_SKIP_VERSION_CHECK
     try {
       process.env.OPENCODEX_SKIP_VERSION_CHECK = "1"
-      expect(
-        checkCoordinatorCompatibility({ manifest: {}, clientVersion: "1.2.3" }).reason,
-      ).toBe("skipped")
+      expect(checkCoordinatorCompatibility({ manifest: {}, clientVersion: "1.2.3" }).reason).toBe("skipped")
       delete process.env.OPENCODEX_SKIP_VERSION_CHECK
       expect(checkCoordinatorCompatibility({ manifest: {}, clientVersion: "1.2.3" }).reason).toBe("legacy")
     } finally {

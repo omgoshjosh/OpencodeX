@@ -134,7 +134,13 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
         ].map((query) => query.pipe(Effect.map((row) => row !== undefined), Effect.orDie)),
         { concurrency: "unbounded" },
       )
-      return { healthy: true as const, version: InstallationVersion, active: activity.some(Boolean) }
+      const authorityEpoch = process.env.OPENCODE_COORDINATOR_AUTHORITY_EPOCH
+      return {
+        healthy: true as const,
+        version: InstallationVersion,
+        active: activity.some(Boolean),
+        ...(authorityEpoch ? { authorityEpoch, admission: true, ready: true } : {}),
+      }
     })
 
     const event = Effect.fn("GlobalHttpApi.event")(function* () {

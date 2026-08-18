@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { Database } from "bun:sqlite"
 import fs from "fs/promises"
 import path from "path"
+import { COORDINATOR_HANDOFF_VERSION, coordinatorRoot } from "@opencode-ai/sdk/coordinator"
 import {
   coordinatorDatabaseIdentity,
   coordinatorClientDir,
@@ -37,8 +38,9 @@ describe("local coordinator database selection", () => {
   test("discovers a healthy coordinator with an active GUI lease", async () => {
     await using tmp = await tmpdir()
     const database = path.join(tmp.path, "gui.db")
-    const key = "gui-authority"
-    const clients = path.join(tmp.path, `${key}.clients`)
+    const key = "b".repeat(40)
+    const root = coordinatorRoot(tmp.path)
+    const clients = path.join(root, `${key}.clients`)
     await Bun.write(database, "")
     await Bun.write(path.join(clients, `${process.pid}.gui.json`), JSON.stringify({
       version: 1,
@@ -50,7 +52,7 @@ describe("local coordinator database selection", () => {
       port: 0,
       fetch: () => Response.json({ healthy: true }),
     })
-    await Bun.write(path.join(tmp.path, `${key}.json`), JSON.stringify({
+    await Bun.write(path.join(root, `${key}.json`), JSON.stringify({
       version: 2,
       key,
       directory: tmp.path,
@@ -64,7 +66,65 @@ describe("local coordinator database selection", () => {
     }))
 
     try {
-      expect(await discoverActiveGuiCoordinatorDatabase(tmp.path)).toBe(coordinatorDatabaseIdentity(database))
+      expect(await discoverActiveGuiCoordinatorDatabase(root)).toBe(coordinatorDatabaseIdentity(database))
+    } finally {
+      await server.stop(true)
+    }
+  })
+
+  test("keeps a GUI handoff database selected while ready waits for its target", async () => {
+    await using tmp = await tmpdir()
+    const database = path.join(tmp.path, "gui-handoff.db")
+    const key = "a".repeat(40)
+    const root = coordinatorRoot(tmp.path)
+    await Bun.write(database, "")
+    await Bun.write(
+      path.join(root, `${key}.clients`, `${process.pid}.gui.json`),
+      JSON.stringify({
+        version: 1,
+        key,
+        pid: process.pid,
+        updatedAt: Date.now(),
+      }),
+    )
+    const server = Bun.serve({
+      port: 0,
+      fetch: () => Response.json({ healthy: true, authorityEpoch: "source-1", admission: false, ready: true }),
+    })
+    await Bun.write(
+      path.join(root, `${key}.json`),
+      JSON.stringify({
+        version: 2,
+        key,
+        directory: tmp.path,
+        database,
+        pid: process.pid,
+        url: server.url.href,
+        username: "gui",
+        password: "secret",
+        token: "token",
+        createdAt: new Date().toISOString(),
+        authorityEpoch: "source-1",
+        admission: false,
+        ready: true,
+      }),
+    )
+    await Bun.write(
+      path.join(root, `${key}.handoff.json`),
+      JSON.stringify({
+        version: COORDINATOR_HANDOFF_VERSION,
+        request: "request-1",
+        phase: "ready",
+        revision: 2,
+        sourceEpoch: "source-1",
+        targetEpoch: "target-1",
+        createdAt: "2026-08-18T20:00:00.000Z",
+        updatedAt: "2026-08-18T20:00:02.000Z",
+      }),
+    )
+
+    try {
+      expect(await discoverActiveGuiCoordinatorDatabase(root)).toBe(coordinatorDatabaseIdentity(database))
     } finally {
       await server.stop(true)
     }

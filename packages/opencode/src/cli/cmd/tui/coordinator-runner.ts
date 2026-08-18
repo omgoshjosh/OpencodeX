@@ -1,6 +1,7 @@
 import { ensureRunID, OPENCODE_PROCESS_ROLE } from "@opencode-ai/core/util/opencode-process"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { fetchCoordinatorHealth } from "@opencode-ai/sdk/coordinator"
+import { randomBytes } from "node:crypto"
 import * as Log from "@opencode-ai/core/util/log"
 import { Effect } from "effect"
 import { ServerAuth } from "@/server/auth"
@@ -15,7 +16,8 @@ import {
   readActiveCoordinator,
   readActiveCoordinatorClientLeases,
   removeCoordinatorManifest,
-  writeCoordinatorManifest,
+  retireCoordinatorForIdleShutdown,
+  publishCoordinatorManifest,
   type TuiCoordinatorManifest,
 } from "./coordinator-registry"
 
@@ -30,6 +32,7 @@ type OwnedCoordinator = {
   server: Awaited<ReturnType<typeof Server.listen>>
   reason?: string
   stopped: boolean
+  retired: boolean
 }
 
 export type CoordinatorRunnerOptions = {
@@ -106,6 +109,8 @@ function startCoordinator(
       if (input.beforeStart) yield* input.beforeStart
       input.signal?.throwIfAborted()
 
+      const authorityEpoch = randomBytes(32).toString("base64url")
+      process.env.OPENCODE_COORDINATOR_AUTHORITY_EPOCH = authorityEpoch
       const server = yield* Effect.promise(() =>
         Server.listen({
           hostname: "127.0.0.1",
@@ -130,14 +135,21 @@ function startCoordinator(
            number stays at 2 so older readers keep accepting this manifest
            instead of deleting a live coordinator's claim. */
         serverVersion: InstallationVersion,
+        authorityEpoch,
+        admission: true,
+        ready: true,
       }
-      return yield* Effect.promise(() => writeCoordinatorManifest(manifest)).pipe(
+      return yield* Effect.promise(async () => {
+        const published = await publishCoordinatorManifest(manifest)
+        if (published.state === "progressing") throw new Error(`Coordinator manifest publish ${published.reason}`)
+      }).pipe(
         Effect.as({
           owned: true as const,
           manifest,
           ownerLock,
           server,
           stopped: false,
+          retired: false,
           reason: undefined as string | undefined,
         }),
         Effect.onError(() => Effect.promise(() => server.stop(true)).pipe(Effect.ignore)),
@@ -158,9 +170,10 @@ function startCoordinator(
 function waitForShutdown(resource: OwnedCoordinator, signal?: AbortSignal) {
   return Effect.callback<string>((resume) => {
     let completed = false
-    const finish = (reason: string) => {
+    const finish = (reason: string, retired = false) => {
       if (completed) return
       completed = true
+      resource.retired = retired
       resume(Effect.succeed(reason))
     }
     const onSignal = () => finish("signal")
@@ -191,40 +204,43 @@ function stopCoordinator(resource: OwnedCoordinator, reason: string) {
     if (resource.stopped) return
     resource.stopped = true
     Log.Default.info("tui coordinator stopping", { reason })
-    yield* Effect.tryPromise(() =>
-      fetch(new URL("/global/dispose", resource.server.url), {
-        method: "POST",
-        headers: ServerAuth.headers({
-          username: resource.manifest.username,
-          password: resource.manifest.password,
-        }),
-      }).then(async (response) => {
-        if (!response.ok) throw new Error(await response.text())
+    const shutdown = yield* Effect.promise(() =>
+      stopCoordinatorServices({
+        dispose: () =>
+          fetch(new URL("/global/dispose", resource.server.url), {
+            method: "POST",
+            headers: ServerAuth.headers({
+              username: resource.manifest.username,
+              password: resource.manifest.password,
+            }),
+          }).then(async (response) => {
+            if (!response.ok) throw new Error(await response.text())
+          }),
+        stop: () => resource.server.stop(true),
+        onError: (step, error) => Log.Default.warn(`tui coordinator ${step} failed`, { error: errorMessage(error) }),
       }),
-    ).pipe(
-      Effect.catch((error) =>
-        Effect.sync(() => Log.Default.warn("tui coordinator dispose failed", { error: errorMessage(error) })),
-      ),
     )
-    yield* Effect.tryPromise(() => resource.server.stop(true)).pipe(
-      Effect.catch((error) =>
-        Effect.sync(() => Log.Default.warn("tui coordinator server stop failed", { error: errorMessage(error) })),
-      ),
-    )
-    yield* Effect.tryPromise(() => removeCoordinatorManifest(resource.manifest.key, resource.manifest.token)).pipe(
-      Effect.ignore,
-    )
-    yield* Effect.tryPromise(() => resource.ownerLock.release()).pipe(
-      Effect.catch((error) =>
-        Effect.sync(() =>
-          Log.Default.warn("tui coordinator owner lock release failed", { error: errorMessage(error) }),
+    if (!resource.retired) {
+      yield* Effect.tryPromise(() => removeCoordinatorManifest(resource.manifest.key, resource.manifest)).pipe(
+        Effect.ignore,
+      )
+    }
+    if (shutdown.stop) {
+      yield* Effect.tryPromise(() => resource.ownerLock.release()).pipe(
+        Effect.catch((error) =>
+          Effect.sync(() =>
+            Log.Default.warn("tui coordinator owner lock release failed", { error: errorMessage(error) }),
+          ),
         ),
-      ),
-    )
+      )
+    }
   })
 }
 
-function createClientMonitor(manifest: TuiCoordinatorManifest, stop: (reason: string) => void) {
+function createClientMonitor(
+  manifest: TuiCoordinatorManifest,
+  stop: (reason: string, retired?: boolean) => void,
+) {
   let sawClient = false
   let disposed = false
   let lastClientCount = -1
@@ -255,7 +271,9 @@ function createClientMonitor(manifest: TuiCoordinatorManifest, stop: (reason: st
               sawClient = true
               return
             }
-            stop(reason)
+            const retired = await retireCoordinatorForIdleShutdown(manifest.key, manifest)
+            if (retired.state === "progressing") return
+            stop(reason, true)
             return
           }
           sawClient = true
@@ -298,7 +316,9 @@ function createClientMonitor(manifest: TuiCoordinatorManifest, stop: (reason: st
     void coordinatorHasDurableActivity(manifest).then((active) => {
       if (disposed) return
       if (!active) {
-        stop("no coordinator clients connected")
+        void retireCoordinatorForIdleShutdown(manifest.key, manifest).then((retired) => {
+          if (retired.state === "committed") stop("no coordinator clients connected", true)
+        })
         return
       }
       sawClient = true
@@ -331,6 +351,39 @@ async function coordinatorHasDurableActivity(manifest: TuiCoordinatorManifest) {
      on a failed probe would drop work the server may still be doing. */
   Log.Default.warn("tui coordinator activity check failed")
   return true
+}
+
+export async function stopCoordinatorServices(input: {
+  dispose: () => Promise<unknown>
+  stop: () => Promise<unknown>
+  timeout?: number
+  onError?: (step: "dispose" | "server stop", error: unknown) => void
+}) {
+  const result = { dispose: false, stop: false }
+  for (const [step, action] of [["dispose", input.dispose], ["server stop", input.stop]] as const) {
+    await boundedCoordinatorShutdownStep(action, input.timeout ?? 5_000).then(
+      () => {
+        result[step === "dispose" ? "dispose" : "stop"] = true
+      },
+      (error) => input.onError?.(step, error),
+    )
+  }
+  return result
+}
+
+async function boundedCoordinatorShutdownStep(action: () => Promise<unknown>, timeout: number) {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    await Promise.race([
+      action(),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Coordinator shutdown step timed out")), timeout)
+        timer.unref?.()
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
 }
 
 function requiredEnv(name: string) {

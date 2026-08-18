@@ -11,8 +11,7 @@ import {
   shell,
   type MessageBoxOptions,
 } from "electron"
-import { isCoordinatorHealthy } from "@opencode-ai/sdk/coordinator"
-import { type SidecarConnection, startSidecar, stopSidecar } from "./sidecar.js"
+import { type SidecarConnection, isSidecarConnectionActive, startSidecar, stopSidecar } from "./sidecar.js"
 import { editorCommand } from "./editor-command.js"
 import { registerBrowserIpc, secureSession } from "./browser-ipc.js"
 import { registerNotificationIpc } from "./notification-ipc.js"
@@ -40,7 +39,7 @@ const RENDERER_CSP = [
 let authorizedSidecar: { origin: string; header: string } | undefined
 const sidecarLifecycle = createSidecarLifecycle({
   start: startSidecar,
-  health: isCoordinatorHealthy,
+  health: isSidecarConnectionActive,
   install: authorizeSidecar,
   reset: () => {
     authorizedSidecar = undefined

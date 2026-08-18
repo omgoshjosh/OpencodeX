@@ -15,17 +15,18 @@ import {
   coordinatorKey as coordinatorKeyOf,
   coordinatorManifestPath as coordinatorManifestPathIn,
   coordinatorRoot,
-  fetchCoordinatorHealth,
   isCoordinatorClientLease,
   isCoordinatorHandoffRecord,
   isCoordinatorKey,
   isCoordinatorProcessAlive,
   isMissingCoordinatorFile,
+  observeCoordinatorAuthority,
   readCoordinatorManifestFile,
   readCoordinatorHandoff,
   removeCoordinatorManifest as removeCoordinatorManifestIn,
+  withCoordinatorAuthorityLock,
   startCoordinatorClientLease as startCoordinatorClientLeaseIn,
-  writeCoordinatorManifest as writeCoordinatorManifestIn,
+  publishCoordinatorManifest as publishCoordinatorManifestIn,
   type CoordinatorClientLease,
   type CoordinatorHandoffRecord,
   type CoordinatorManifest,
@@ -74,12 +75,12 @@ export function coordinatorHeaders(manifest: TuiCoordinatorManifest) {
   return coordinatorHeadersFor(manifest)
 }
 
-export function writeCoordinatorManifest(manifest: TuiCoordinatorManifest) {
-  return writeCoordinatorManifestIn(STATE_ROOT, manifest)
+export function publishCoordinatorManifest(manifest: TuiCoordinatorManifest) {
+  return publishCoordinatorManifestIn(STATE_ROOT, manifest, undefined)
 }
 
-export async function removeCoordinatorManifest(key: string, token: string) {
-  await removeCoordinatorManifestIn(STATE_ROOT, key, token)
+export async function removeCoordinatorManifest(key: string, manifest: TuiCoordinatorManifest) {
+  return removeCoordinatorManifestIn(STATE_ROOT, key, manifest)
 }
 
 export function startCoordinatorClientLease(key: string) {
@@ -90,6 +91,14 @@ export function startCoordinatorClientLease(key: string) {
       void lease.dispose().catch(() => {})
     },
   }
+}
+
+export function retireCoordinatorForIdleShutdown(
+  key: string,
+  manifest: TuiCoordinatorManifest,
+  stateRoot = STATE_ROOT,
+) {
+  return removeCoordinatorManifestIn(stateRoot, key, manifest)
 }
 
 export async function readActiveCoordinatorClientLeases(key: string) {
@@ -152,21 +161,31 @@ export async function readActiveCoordinator(
   database = coordinatorDatabaseIdentity(),
   stateRoot = STATE_ROOT,
 ) {
-  const manifest = await readActiveManifest(key, stateRoot)
-  if (!manifest) return undefined
+  const observation = await observeCoordinatorAuthority({ stateRoot, key }).catch((error) => {
+    throw new Error("Invalid TUI coordinator manifest; refusing to replace it", { cause: error })
+  })
+  if (observation.state === "progressing") throw coordinatorAuthorityError("progressing")
+  const manifest = observation.manifest
+  if (!manifest) {
+    if (observation.authority.state === "absent") return undefined
+    throw coordinatorAuthorityError(observation.authority)
+  }
   if (
     manifest.key !== key ||
     coordinatorDatabaseIdentity(manifest.database) !== coordinatorDatabaseIdentity(database)
   ) {
-    await removeCoordinatorManifestIn(stateRoot, key, manifest.token)
+    if (observation.handoff !== undefined) throw coordinatorAuthorityError(observation.authority)
+    const removed = await removeCoordinatorManifestIn(stateRoot, key, manifest)
+    if (removed.state === "progressing") throw coordinatorAuthorityError("progressing")
     return undefined
   }
-  const health = await fetchCoordinatorHealth(manifest)
-  if (health?.healthy === true) {
+  const health = observation.health
+  const authority = observation.authority
+  if (authority.state === "active" || authority.state === "handoff") {
     const compatibility = checkCoordinatorCompatibility({
       manifest,
       clientVersion: InstallationVersion,
-      healthVersion: health.version,
+      healthVersion: health?.version,
     })
     if (!compatibility.compatible) {
       throw new CoordinatorVersionMismatchError(manifest, compatibility.message ?? "Coordinator version mismatch")
@@ -176,11 +195,22 @@ export async function readActiveCoordinator(
     }
     return manifest
   }
+  if (observation.handoff !== undefined || authority.state !== "blocked" || authority.reason !== "unhealthy") {
+    throw coordinatorAuthorityError(authority)
+  }
   if (isCoordinatorProcessAlive(manifest.pid)) {
     throw new Error(`TUI coordinator process ${manifest.pid} is alive but unhealthy; refusing to replace it`)
   }
-  await removeCoordinatorManifestIn(stateRoot, key, manifest.token)
+  const removed = await removeCoordinatorManifestIn(stateRoot, key, manifest)
+  if (removed.state === "progressing") throw coordinatorAuthorityError("progressing")
   return undefined
+}
+
+function coordinatorAuthorityError(
+  authority: { state: string; reason?: string } | "progressing",
+) {
+  const reason = authority === "progressing" ? authority : authority.state === "blocked" ? authority.reason : authority.state
+  return new Error(`TUI coordinator authority is ${reason}; refusing election or replacement`)
 }
 
 export async function readPreferredCoordinator() {
@@ -228,63 +258,63 @@ export function compareAndSwapCoordinatorHandoff(
   stateRoot = STATE_ROOT,
 ) {
   if (!isCoordinatorKey(key)) throw new Error("Invalid coordinator key")
-  return Flock.withLock(
-    `tui-coordinator-handoff:${key}`,
-    async () => {
-      const current = await readCoordinatorHandoff(stateRoot, key).catch((error) => {
-        if (isMissingCoordinatorFile(error)) return undefined
-        throw error
-      })
-      const matches = expected
-        ? isCoordinatorHandoffRecord(current) &&
-          current.request === expected.request &&
-          current.phase === expected.phase &&
-          current.sourceEpoch === expected.sourceEpoch &&
-          current.revision === expected.revision &&
-          current.targetEpoch === expected.targetEpoch
-        : current === undefined
-      if (!matches) return false
+  return withCoordinatorAuthorityLock(stateRoot, key, async () => {
+    const current = await readCoordinatorHandoff(stateRoot, key).catch((error) => {
+      if (isMissingCoordinatorFile(error)) return undefined
+      throw error
+    })
+    const matches = expected
+      ? isCoordinatorHandoffRecord(current) &&
+        current.request === expected.request &&
+        current.phase === expected.phase &&
+        current.sourceEpoch === expected.sourceEpoch &&
+        current.revision === expected.revision &&
+        current.targetEpoch === expected.targetEpoch
+      : current === undefined
+    if (!matches) return false
 
-      const file = coordinatorHandoffPath(stateRoot, key)
-      if (!replacement) {
-        if (!isCoordinatorHandoffRecord(current) || current.targetEpoch === undefined) return false
-        await fs.rm(file)
-        return true
-      }
-      if (!isCoordinatorHandoffRecord(replacement)) throw new Error("Invalid replacement coordinator handoff record")
-      if (!checkCoordinatorHandoffTransition(isCoordinatorHandoffRecord(current) ? current : undefined, replacement)) {
-        throw new Error("Illegal coordinator handoff transition")
-      }
-
-      await fs.mkdir(path.dirname(file), { recursive: true })
-      const temporary = `${file}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`
-      try {
-        await fs.writeFile(
-          temporary,
-          JSON.stringify(
-            {
-              version: replacement.version,
-              request: replacement.request,
-              phase: replacement.phase,
-              revision: replacement.revision,
-              sourceEpoch: replacement.sourceEpoch,
-              ...(replacement.targetEpoch === undefined ? {} : { targetEpoch: replacement.targetEpoch }),
-              createdAt: replacement.createdAt,
-              updatedAt: replacement.updatedAt,
-            },
-            null,
-            2,
-          ),
-          { mode: 0o600 },
-        )
-        await fs.rename(temporary, file)
-      } finally {
-        await fs.rm(temporary, { force: true }).catch(() => {})
-      }
+    const file = coordinatorHandoffPath(stateRoot, key)
+    if (!replacement) {
+      if (!isCoordinatorHandoffRecord(current) || current.targetEpoch === undefined) return false
+      await fs.rm(file)
       return true
-    },
-    { dir: LockProtocol.rootDir(stateRoot) },
-  )
+    }
+    if (!isCoordinatorHandoffRecord(replacement)) throw new Error("Invalid replacement coordinator handoff record")
+    if (!current) {
+      const manifest = await readCoordinatorManifestFile(coordinatorManifestPathIn(stateRoot, key)).catch(() => undefined)
+      if (!manifest || manifest.authorityEpoch !== replacement.sourceEpoch) return false
+    }
+    if (!checkCoordinatorHandoffTransition(isCoordinatorHandoffRecord(current) ? current : undefined, replacement)) {
+      throw new Error("Illegal coordinator handoff transition")
+    }
+
+    await fs.mkdir(path.dirname(file), { recursive: true })
+    const temporary = `${file}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`
+    try {
+      await fs.writeFile(
+        temporary,
+        JSON.stringify(
+          {
+            version: replacement.version,
+            request: replacement.request,
+            phase: replacement.phase,
+            revision: replacement.revision,
+            sourceEpoch: replacement.sourceEpoch,
+            ...(replacement.targetEpoch === undefined ? {} : { targetEpoch: replacement.targetEpoch }),
+            createdAt: replacement.createdAt,
+            updatedAt: replacement.updatedAt,
+          },
+          null,
+          2,
+        ),
+        { mode: 0o600 },
+      )
+      await fs.rename(temporary, file)
+    } finally {
+      await fs.rm(temporary, { force: true }).catch(() => {})
+    }
+    return true
+  })
 }
 
 export function acquireCoordinatorOwnerLock(key: string) {
@@ -411,7 +441,14 @@ export async function discoverActiveGuiCoordinatorDatabase(root = ROOT) {
       manifest
         ? [
             hasActiveGuiClient(manifest.key, root).then(async (active) => {
-              if (!active || (await fetchCoordinatorHealth(manifest))?.healthy !== true) return undefined
+              if (!active) return undefined
+              const observation = await observeCoordinatorAuthority({
+                stateRoot: path.dirname(root),
+                key: manifest.key,
+              })
+              if (observation.state === "progressing") return coordinatorDatabaseIdentity(manifest.database)
+              if (observation.authority.state === "absent") return undefined
+              if (observation.authority.state === "blocked" && observation.handoff === undefined) return undefined
               return coordinatorDatabaseIdentity(manifest.database)
             }),
           ]

@@ -34,6 +34,7 @@ export const COORDINATOR_SKIP_VERSION_CHECK_ENV = "OPENCODEX_SKIP_VERSION_CHECK"
 
 const CLIENT_HEARTBEAT_INTERVAL = 2_000
 const HEALTH_TIMEOUT = 1_500
+const AUTHORITY_LOCK_TIMEOUT = 15_000
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]", "::1"])
 
 export type CoordinatorManifest = {
@@ -123,6 +124,36 @@ export type CoordinatorAuthorityResolution =
         | "admission_closed"
     }
 
+export type CoordinatorAuthorityTransactionResult<T> =
+  | { state: "committed"; value: T }
+  | {
+      state: "progressing"
+      reason: "manifest_changed" | "handoff_changed" | "handoff_present" | "manifest_absent" | "invalid_manifest"
+    }
+
+export type CoordinatorAuthorityObservation =
+  | {
+      state: "observed"
+      manifest?: CoordinatorManifest
+      health?: CoordinatorHealth
+      handoff?: unknown
+      authority: CoordinatorAuthorityResolution
+    }
+  | { state: "progressing" }
+
+export type CoordinatorManifestFence = Pick<CoordinatorManifest, "token" | "authorityEpoch">
+export type CoordinatorHandoffFence = Pick<
+  CoordinatorHandoffRecord,
+  "request" | "phase" | "revision" | "sourceEpoch" | "targetEpoch"
+>
+
+export type CoordinatorAuthorityLock = {
+  stateRoot: string
+  key: string
+  token: string
+  release: () => Promise<void>
+}
+
 export type CoordinatorCompatibilityReason =
   | "match"
   | "skipped"
@@ -161,6 +192,11 @@ export function isCoordinatorKey(key: string) {
 export function coordinatorHandoffPath(stateRoot: string, key: string) {
   if (!isCoordinatorKey(key)) throw new Error("Invalid coordinator key")
   return path.join(coordinatorRoot(stateRoot), `${key}.handoff.json`)
+}
+
+export function coordinatorAuthorityLockPath(stateRoot: string, key: string) {
+  if (!isCoordinatorKey(key)) throw new Error("Invalid coordinator key")
+  return path.join(coordinatorRoot(stateRoot), `${key}.authority.lock`)
 }
 
 /**
@@ -361,6 +397,209 @@ export async function readCoordinatorHandoff(stateRoot: string, key: string) {
 }
 
 /**
+ * Reads the handoff as an authority observation. Invalid JSON is returned as a
+ * present, malformed value so election callers cannot mistake it for absence.
+ */
+export async function readCoordinatorHandoffObservation(stateRoot: string, key: string): Promise<unknown> {
+  return readCoordinatorHandoffFileObservation(coordinatorHandoffPath(stateRoot, key))
+}
+
+export async function readCoordinatorHandoffFileObservation(file: string): Promise<unknown> {
+  try {
+    const raw = await fs.readFile(file, "utf8")
+    try {
+      return JSON.parse(raw) as unknown
+    } catch {
+      return raw
+    }
+  } catch (error) {
+    if (isMissingCoordinatorFile(error)) return undefined
+    throw error
+  }
+}
+
+export async function acquireCoordinatorAuthorityLock(
+  stateRoot: string,
+  key: string,
+  options?: {
+    timeout?: number
+    now?: () => number
+    sleep?: (milliseconds: number) => Promise<void>
+    processAlive?: (pid: number) => boolean
+  },
+): Promise<CoordinatorAuthorityLock> {
+  const root = coordinatorRoot(stateRoot)
+  const lock = coordinatorAuthorityLockPath(stateRoot, key)
+  const token = randomBytes(16).toString("hex")
+  const now = options?.now ?? Date.now
+  const sleep = options?.sleep ?? ((milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)))
+  const started = now()
+  await fs.mkdir(root, { recursive: true })
+  while (true) {
+    try {
+      await fs.mkdir(lock)
+      try {
+        await fs.writeFile(
+          path.join(lock, "owner.json"),
+          JSON.stringify({ pid: process.pid, token, createdAt: Date.now() }),
+          { mode: 0o600 },
+        )
+      } catch (error) {
+        await fs.rm(lock, { recursive: true, force: true }).catch(() => undefined)
+        throw error
+      }
+      return {
+        stateRoot,
+        key,
+        token,
+        release: async () => {
+          const owner = await readAuthorityLockOwner(lock)
+          if (owner?.token !== token) return
+          await fs.rm(lock, { recursive: true, force: true })
+        },
+      }
+    } catch (error) {
+      if (!isAlreadyExists(error)) throw error
+    }
+    await reclaimCoordinatorAuthorityLock(lock, options?.processAlive ?? isCoordinatorProcessAlive)
+    if (now() - started >= (options?.timeout ?? AUTHORITY_LOCK_TIMEOUT)) {
+      throw new Error(`Timed out acquiring coordinator authority lock for ${key}`)
+    }
+    await sleep(25)
+  }
+}
+
+export async function withCoordinatorAuthorityLock<T>(
+  stateRoot: string,
+  key: string,
+  fn: (lock: CoordinatorAuthorityLock) => Promise<T>,
+) {
+  const lock = await acquireCoordinatorAuthorityLock(stateRoot, key)
+  try {
+    return await fn(lock)
+  } finally {
+    await lock.release()
+  }
+}
+
+export async function runCoordinatorAuthorityTransaction<T>(input: {
+  stateRoot: string
+  key: string
+  manifest?: CoordinatorManifestFence
+  requireHandoffAbsent?: boolean
+  action: (lock: CoordinatorAuthorityLock, manifest: CoordinatorManifest | undefined) => Promise<T>
+}): Promise<CoordinatorAuthorityTransactionResult<T>> {
+  return withCoordinatorAuthorityLock(input.stateRoot, input.key, async (lock) => {
+    const snapshot = await readCoordinatorAuthoritySnapshot(input.stateRoot, input.key).catch(() => undefined)
+    if (!snapshot) return { state: "progressing", reason: "invalid_manifest" }
+    if (input.manifest && !snapshot.manifest) return { state: "progressing", reason: "manifest_absent" }
+    if (
+      input.manifest &&
+      (snapshot.manifest?.token !== input.manifest.token ||
+        snapshot.manifest.authorityEpoch !== input.manifest.authorityEpoch)
+    ) {
+      return { state: "progressing", reason: "manifest_changed" }
+    }
+    if (input.requireHandoffAbsent && snapshot.handoffRaw !== undefined) {
+      return { state: "progressing", reason: "handoff_present" }
+    }
+    return { state: "committed", value: await input.action(lock, snapshot.manifest) }
+  })
+}
+
+export async function observeCoordinatorAuthority(input: {
+  stateRoot: string
+  key: string
+  fetch?: typeof globalThis.fetch
+  timeout?: number
+  afterProbe?: (attempt: number) => Promise<void>
+}): Promise<CoordinatorAuthorityObservation> {
+  for (const attempt of [0, 1]) {
+    const before = await withCoordinatorAuthorityLock(input.stateRoot, input.key, () =>
+      readCoordinatorAuthoritySnapshot(input.stateRoot, input.key),
+    )
+    const health = before.manifest
+      ? await fetchCoordinatorHealth(before.manifest, { fetch: input.fetch, timeout: input.timeout })
+      : undefined
+    await input.afterProbe?.(attempt)
+    const observed = await withCoordinatorAuthorityLock(input.stateRoot, input.key, async () => {
+      const after = await readCoordinatorAuthoritySnapshot(input.stateRoot, input.key)
+      if (!sameCoordinatorAuthorityFence(before, after)) return undefined
+      return {
+        state: "observed" as const,
+        manifest: before.manifest,
+        health,
+        handoff: before.handoff,
+        authority: resolveCoordinatorAuthority({ manifest: before.manifest, health, handoff: before.handoff }),
+      }
+    })
+    if (observed) return observed
+  }
+  return { state: "progressing" }
+}
+
+async function readCoordinatorAuthoritySnapshot(stateRoot: string, key: string) {
+  const manifestRaw = await readOptionalCoordinatorFile(coordinatorManifestPath(stateRoot, key))
+  const handoffRaw = await readOptionalCoordinatorFile(coordinatorHandoffPath(stateRoot, key))
+  const manifest = manifestRaw === undefined ? undefined : parseCoordinatorManifest(manifestRaw)
+  const handoff = handoffRaw === undefined ? undefined : parseAuthorityHandoffObservation(handoffRaw)
+  return { manifest, handoff, handoffRaw }
+}
+
+function sameCoordinatorAuthorityFence(
+  before: Awaited<ReturnType<typeof readCoordinatorAuthoritySnapshot>>,
+  after: Awaited<ReturnType<typeof readCoordinatorAuthoritySnapshot>>,
+) {
+  return (
+    before.manifest?.token === after.manifest?.token &&
+    before.manifest?.authorityEpoch === after.manifest?.authorityEpoch &&
+    before.handoffRaw === after.handoffRaw
+  )
+}
+
+function parseAuthorityHandoffObservation(raw: string): unknown {
+  try {
+    return JSON.parse(raw) as unknown
+  } catch {
+    return raw
+  }
+}
+
+async function readOptionalCoordinatorFile(file: string) {
+  return fs.readFile(file, "utf8").catch((error) => {
+    if (isMissingCoordinatorFile(error)) return undefined
+    throw error
+  })
+}
+
+async function readAuthorityLockOwner(lock: string) {
+  return fs
+    .readFile(path.join(lock, "owner.json"), "utf8")
+    .then((raw): unknown => JSON.parse(raw))
+    .then((value) => {
+      if (typeof value !== "object" || value === null) return undefined
+      if (!("pid" in value) || typeof value.pid !== "number") return undefined
+      if (!("token" in value) || typeof value.token !== "string") return undefined
+      return { pid: value.pid, token: value.token }
+    })
+    .catch(() => undefined)
+}
+
+async function reclaimCoordinatorAuthorityLock(lock: string, processAlive: (pid: number) => boolean) {
+  const owner = await readAuthorityLockOwner(lock)
+  // Node has no portable process-start identity lookup, so PID reuse remains a
+  // residual risk. Ambiguous owner metadata is never reclaimed.
+  if (!owner || processAlive(owner.pid)) return
+  const reclaimed = `${lock}.stale.${process.pid}.${randomBytes(4).toString("hex")}`
+  await fs.rename(lock, reclaimed).catch(() => undefined)
+  await fs.rm(reclaimed, { recursive: true, force: true }).catch(() => undefined)
+}
+
+function isAlreadyExists(error: unknown) {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST"
+}
+
+/**
  * Reads only the token, without validating the rest. Removal is token-guarded,
  * so a manifest that fails validation still has to prove ownership before it
  * can be deleted.
@@ -376,21 +615,90 @@ export async function readCoordinatorManifestToken(file: string) {
     .catch(() => undefined)
 }
 
-export async function writeCoordinatorManifest(stateRoot: string, manifest: CoordinatorManifest) {
+export function publishCoordinatorManifest(
+  stateRoot: string,
+  manifest: CoordinatorManifest,
+  expectedHandoff: CoordinatorHandoffFence | undefined,
+) {
+  return withCoordinatorAuthorityLock(stateRoot, manifest.key, async () => {
+    const snapshot = await readCoordinatorAuthoritySnapshot(stateRoot, manifest.key)
+    if (snapshot.manifest) return { state: "progressing" as const, reason: "manifest_changed" as const }
+    if (!matchesCoordinatorHandoffFence(snapshot.handoff, expectedHandoff)) {
+      return { state: "progressing" as const, reason: "handoff_changed" as const }
+    }
+    await writeCoordinatorManifestLocked(stateRoot, manifest)
+    return { state: "committed" as const, value: manifest }
+  })
+}
+
+export function replaceCoordinatorManifest(input: {
+  stateRoot: string
+  manifest: CoordinatorManifest
+  expectedManifest: CoordinatorManifestFence
+  expectedHandoff: CoordinatorHandoffFence | undefined
+}) {
+  return withCoordinatorAuthorityLock(input.stateRoot, input.manifest.key, async () => {
+    const snapshot = await readCoordinatorAuthoritySnapshot(input.stateRoot, input.manifest.key)
+    if (
+      snapshot.manifest?.token !== input.expectedManifest.token ||
+      snapshot.manifest.authorityEpoch !== input.expectedManifest.authorityEpoch
+    ) {
+      return { state: "progressing" as const, reason: "manifest_changed" as const }
+    }
+    if (!matchesCoordinatorHandoffFence(snapshot.handoff, input.expectedHandoff)) {
+      return { state: "progressing" as const, reason: "handoff_changed" as const }
+    }
+    await writeCoordinatorManifestLocked(input.stateRoot, input.manifest)
+    return { state: "committed" as const, value: input.manifest }
+  })
+}
+
+async function writeCoordinatorManifestLocked(stateRoot: string, manifest: CoordinatorManifest) {
   const root = coordinatorRoot(stateRoot)
   await fs.mkdir(root, { recursive: true })
   const file = coordinatorManifestPath(stateRoot, manifest.key)
   const temporary = `${file}.${process.pid}.${Date.now()}.tmp`
-  await fs.writeFile(temporary, JSON.stringify(manifest, null, 2), { mode: 0o600 })
-  await fs.rename(temporary, file)
+  try {
+    await fs.writeFile(temporary, JSON.stringify(manifest, null, 2), { mode: 0o600 })
+    await fs.rename(temporary, file)
+  } finally {
+    await fs.rm(temporary, { force: true }).catch(() => undefined)
+  }
 }
 
-/** Deletes the manifest only when `token` matches the one on disk. */
-export async function removeCoordinatorManifest(stateRoot: string, key: string, token: string) {
-  const file = coordinatorManifestPath(stateRoot, key)
-  if ((await readCoordinatorManifestToken(file)) !== token) return false
-  await fs.rm(file, { force: true })
-  return true
+function matchesCoordinatorHandoffFence(handoff: unknown, expected: CoordinatorHandoffFence | undefined) {
+  if (!expected) return handoff === undefined
+  if (!isCoordinatorHandoffRecord(handoff)) return false
+  return (
+    handoff.request === expected.request &&
+    handoff.phase === expected.phase &&
+    handoff.revision === expected.revision &&
+    handoff.sourceEpoch === expected.sourceEpoch &&
+    handoff.targetEpoch === expected.targetEpoch
+  )
+}
+
+/** Deletes only under an exact manifest fence while the handoff is absent. */
+export function removeCoordinatorManifest(stateRoot: string, key: string, manifest: CoordinatorManifestFence) {
+  return withCoordinatorAuthorityLock(stateRoot, key, (lock) => removeCoordinatorManifestLocked(lock, manifest))
+}
+
+export async function removeCoordinatorManifestLocked(
+  lock: CoordinatorAuthorityLock,
+  manifest: CoordinatorManifestFence,
+): Promise<CoordinatorAuthorityTransactionResult<boolean>> {
+  const snapshot = await readCoordinatorAuthoritySnapshot(lock.stateRoot, lock.key).catch(() => undefined)
+  if (!snapshot) return { state: "progressing", reason: "invalid_manifest" }
+  if (!snapshot.manifest) return { state: "progressing", reason: "manifest_absent" }
+  if (
+    snapshot.manifest.token !== manifest.token ||
+    snapshot.manifest.authorityEpoch !== manifest.authorityEpoch
+  ) {
+    return { state: "progressing", reason: "manifest_changed" }
+  }
+  if (snapshot.handoffRaw !== undefined) return { state: "progressing", reason: "handoff_present" }
+  await fs.rm(coordinatorManifestPath(lock.stateRoot, lock.key), { force: true })
+  return { state: "committed", value: true }
 }
 
 export function isCoordinatorProcessAlive(pid: number) {
@@ -482,15 +790,28 @@ export function resolveCoordinatorAuthority(input: {
   }
   if (!input.health?.healthy) return { state: "blocked", reason: "unhealthy" }
   if (
+    handoff &&
+    (typeof input.health.authorityEpoch !== "string" ||
+      input.health.authorityEpoch.length === 0 ||
+      typeof input.health.admission !== "boolean" ||
+      typeof input.health.ready !== "boolean")
+  ) {
+    return { state: "blocked", reason: "invalid_authority" }
+  }
+  if (
     input.manifest.authorityEpoch !== undefined &&
     input.health.authorityEpoch !== undefined &&
     input.manifest.authorityEpoch !== input.health.authorityEpoch
   ) {
     return { state: "blocked", reason: "incompatible_authority" }
   }
-  const authorityEpoch = input.health.authorityEpoch ?? input.manifest.authorityEpoch
+  const authorityEpoch = handoff
+    ? input.health.authorityEpoch
+    : input.health.authorityEpoch ?? input.manifest.authorityEpoch
   if (handoff) {
-    if (!authorityEpoch || handoff.sourceEpoch !== authorityEpoch) {
+    const expectedEpoch =
+      handoff.phase === "requested" || handoff.phase === "accepted" ? handoff.sourceEpoch : handoff.targetEpoch
+    if (!authorityEpoch || expectedEpoch !== authorityEpoch) {
       return { state: "blocked", reason: "incompatible_handoff" }
     }
     return { state: "handoff", authorityEpoch, handoff }

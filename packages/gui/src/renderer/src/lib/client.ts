@@ -49,14 +49,20 @@ export async function connectGuiClient(): Promise<GuiClient> {
       const request = new Request(...args)
       const body = request.body ? await request.arrayBuffer() : undefined
       const failedGeneration = generation
+      let unauthorized: Response | undefined
       try {
         const response = await rawFetch(routeRequest(request, connection, body))
         if (response.status !== 401 || !window.opencodex) return response
-        await response.body?.cancel().catch(() => undefined)
+        unauthorized = response
+        if (mayReplay(request.method)) await response.body?.cancel().catch(() => undefined)
       } catch (cause) {
         if (request.signal.aborted || !window.opencodex) throw cause
+        await recover(failedGeneration)
+        if (!mayReplay(request.method)) throw cause
+        return rawFetch(routeRequest(request, connection, body))
       }
       await recover(failedGeneration)
+      if (!mayReplay(request.method)) return unauthorized!
       return rawFetch(routeRequest(request, connection, body))
     },
     { preconnect: fetchPreconnect },
@@ -80,6 +86,10 @@ export async function connectGuiClient(): Promise<GuiClient> {
       return connectionAuthHeader(connection)
     },
   }
+}
+
+function mayReplay(method: string) {
+  return method === "GET" || method === "HEAD" || method === "OPTIONS"
 }
 
 function fetchPreconnect(url: string | URL) {

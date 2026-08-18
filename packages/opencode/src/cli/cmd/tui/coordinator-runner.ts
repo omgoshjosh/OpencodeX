@@ -92,6 +92,7 @@ function startCoordinator(
     token: string
   },
 ) {
+  const ownerRelease = { safe: true }
   const start = Effect.fnUntraced(function* () {
     input.signal?.throwIfAborted()
     const existing = yield* Effect.promise(() => readActiveCoordinator(input.key, input.database))
@@ -119,6 +120,7 @@ function startCoordinator(
           cors: [],
         }),
       )
+      ownerRelease.safe = false
       const manifest = {
         version: 2 as const,
         key: input.key,
@@ -152,10 +154,20 @@ function startCoordinator(
           retired: false,
           reason: undefined as string | undefined,
         }),
-        Effect.onError(() => Effect.promise(() => server.stop(true)).pipe(Effect.ignore)),
+        Effect.onError(() =>
+          Effect.uninterruptible(
+            Effect.promise(() => server.stop(true)).pipe(
+              Effect.tap(() => Effect.sync(() => (ownerRelease.safe = true))),
+            ),
+          ),
+        ),
       )
     })
-    return yield* launch.pipe(Effect.onError(() => Effect.promise(() => ownerLock.release()).pipe(Effect.ignore)))
+    return yield* launch.pipe(
+      Effect.onError(() =>
+        ownerRelease.safe ? Effect.promise(() => ownerLock.release()).pipe(Effect.ignore) : Effect.void,
+      ),
+    )
   })
 
   if (input.startupLock === false) return start()
@@ -226,7 +238,7 @@ function stopCoordinator(resource: OwnedCoordinator, reason: string) {
       )
     }
     if (shutdown.stop) {
-      yield* Effect.tryPromise(() => resource.ownerLock.release()).pipe(
+      yield* Effect.tryPromise(() => releaseCoordinatorOwnerAfterStop(true, resource.ownerLock.release)).pipe(
         Effect.catch((error) =>
           Effect.sync(() =>
             Log.Default.warn("tui coordinator owner lock release failed", { error: errorMessage(error) }),
@@ -237,10 +249,7 @@ function stopCoordinator(resource: OwnedCoordinator, reason: string) {
   })
 }
 
-function createClientMonitor(
-  manifest: TuiCoordinatorManifest,
-  stop: (reason: string, retired?: boolean) => void,
-) {
+function createClientMonitor(manifest: TuiCoordinatorManifest, stop: (reason: string, retired?: boolean) => void) {
   let sawClient = false
   let disposed = false
   let lastClientCount = -1
@@ -360,7 +369,10 @@ export async function stopCoordinatorServices(input: {
   onError?: (step: "dispose" | "server stop", error: unknown) => void
 }) {
   const result = { dispose: false, stop: false }
-  for (const [step, action] of [["dispose", input.dispose], ["server stop", input.stop]] as const) {
+  for (const [step, action] of [
+    ["dispose", input.dispose],
+    ["server stop", input.stop],
+  ] as const) {
     await boundedCoordinatorShutdownStep(action, input.timeout ?? 5_000).then(
       () => {
         result[step === "dispose" ? "dispose" : "stop"] = true
@@ -369,6 +381,12 @@ export async function stopCoordinatorServices(input: {
     )
   }
   return result
+}
+
+export async function releaseCoordinatorOwnerAfterStop(stopped: boolean, release: () => Promise<void>) {
+  if (!stopped) return false
+  await release()
+  return true
 }
 
 async function boundedCoordinatorShutdownStep(action: () => Promise<unknown>, timeout: number) {

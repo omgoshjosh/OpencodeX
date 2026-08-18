@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test"
 import net from "node:net"
 import { Flag } from "@opencode-ai/core/flag/flag"
+import { Effect } from "effect"
 import * as Log from "@opencode-ai/core/util/log"
-import { Server } from "../../src/server/server"
+import { makeListenerStop, Server } from "../../src/server/server"
 import { GlobalPaths } from "../../src/server/routes/instance/httpapi/groups/global"
 import { withTimeout } from "../../src/util/timeout"
 import { resetDatabase } from "../fixture/db"
@@ -46,6 +47,37 @@ function stop(listener: Awaited<ReturnType<typeof startListener>>, label: string
 }
 
 describe("HttpApi Server.listen", () => {
+  test("propagates and caches scope finalizer failure", async () => {
+    const calls: string[] = []
+    const stop = await Effect.runPromise(
+      makeListenerStop({
+        unpublishMdns: Effect.void,
+        forceClose: Effect.sync(() => calls.push("force")),
+        closeScope: Effect.sync(() => calls.push("scope")).pipe(
+          Effect.andThen(Effect.die(new Error("database finalizer failed"))),
+        ),
+      }),
+    )
+
+    await expect(Effect.runPromise(stop(true))).rejects.toThrow("database finalizer failed")
+    await expect(Effect.runPromise(stop(true))).rejects.toThrow("database finalizer failed")
+    expect(calls).toEqual(["force", "scope"])
+  })
+
+  test("attempts scope close after force-close failure and propagates failure", async () => {
+    const calls: string[] = []
+    const stop = await Effect.runPromise(
+      makeListenerStop({
+        unpublishMdns: Effect.void,
+        forceClose: Effect.sync(() => calls.push("force")).pipe(Effect.andThen(Effect.die(new Error("force failed")))),
+        closeScope: Effect.sync(() => calls.push("scope")),
+      }),
+    )
+
+    await expect(Effect.runPromise(stop(true))).rejects.toThrow("force failed")
+    expect(calls).toEqual(["force", "scope"])
+  })
+
   test("serves HTTP routes through Server.listen and stops cleanly", async () => {
     const listener = await startListener()
     let stopped = false

@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test"
-import { stopCoordinatorServices } from "../../../../src/cli/cmd/tui/coordinator-runner"
+import {
+  releaseCoordinatorOwnerAfterStop,
+  stopCoordinatorServices,
+} from "../../../../src/cli/cmd/tui/coordinator-runner"
 
 describe("coordinator shutdown", () => {
   test("bounds stalled dispose and server stop independently", async () => {
@@ -21,7 +24,29 @@ describe("coordinator shutdown", () => {
     })
 
     expect(result).toEqual({ dispose: false, stop: false })
+    expect(
+      await releaseCoordinatorOwnerAfterStop(result.stop, async () => {
+        calls.push("owner release")
+      }),
+    ).toBe(false)
     expect(calls).toEqual(["dispose", "server stop"])
     expect(errors).toEqual(["dispose", "server stop"])
+  })
+
+  test("releases owner lock only after confirmed server stop", async () => {
+    const calls: string[] = []
+    expect(
+      await releaseCoordinatorOwnerAfterStop(false, async () => {
+        calls.push("release")
+      }),
+    ).toBe(false)
+    expect(calls).toEqual([])
+
+    expect(
+      await releaseCoordinatorOwnerAfterStop(true, async () => {
+        calls.push("release")
+      }),
+    ).toBe(true)
+    expect(calls).toEqual(["release"])
   })
 })

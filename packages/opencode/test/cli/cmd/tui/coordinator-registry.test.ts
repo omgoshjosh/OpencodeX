@@ -118,10 +118,10 @@ describe("active coordinator manifest", () => {
     const file = coordinatorManifestPath(tmp.path, key)
     const handoffFile = coordinatorHandoffPath(tmp.path, key)
     let epoch = "source-1"
+    let admission = false
     const server = Bun.serve({
       port: 0,
-      fetch: () =>
-        Response.json({ healthy: true, version: "local", authorityEpoch: epoch, admission: false, ready: true }),
+      fetch: () => Response.json({ healthy: true, version: "local", authorityEpoch: epoch, admission, ready: true }),
     })
     const manifest = {
       ...invalid,
@@ -150,6 +150,7 @@ describe("active coordinator manifest", () => {
       expect(await Bun.file(file).exists()).toBe(true)
 
       epoch = "target-1"
+      admission = true
       await fs.writeFile(file, JSON.stringify({ ...manifest, authorityEpoch: epoch, admission: true }))
       expect(await readActiveCoordinator(key, database, tmp.path)).toMatchObject({ authorityEpoch: "target-1" })
     } finally {

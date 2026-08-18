@@ -165,6 +165,12 @@ export type CoordinatorAuthorityLock = {
   release: () => Promise<void>
 }
 
+export type CoordinatorTargetTransactionHooks = {
+  /** Test instrumentation only. Production callers must not perform work under the authority lock. */
+  afterManifestWrite?: () => Promise<void>
+  beforeHandoffWrite?: () => Promise<void>
+}
+
 export type CoordinatorCompatibilityReason = "match" | "skipped" | "local" | "legacy" | "mismatch" | "health_mismatch"
 
 export type CoordinatorCompatibility = {
@@ -271,6 +277,27 @@ export function parseCoordinatorManifest(raw: string): CoordinatorManifest {
   const parsed = JSON.parse(raw) as unknown
   if (!isCoordinatorManifest(parsed)) throw new Error("Invalid coordinator manifest")
   return parsed
+}
+
+/** Exact equality across every validated canonical manifest field. */
+export function sameCoordinatorManifest(left: unknown, right: unknown): left is CoordinatorManifest {
+  if (!isCoordinatorManifest(left) || !isCoordinatorManifest(right)) return false
+  return (
+    left.version === right.version &&
+    left.key === right.key &&
+    left.directory === right.directory &&
+    left.database === right.database &&
+    left.pid === right.pid &&
+    left.url === right.url &&
+    left.username === right.username &&
+    left.password === right.password &&
+    left.token === right.token &&
+    left.createdAt === right.createdAt &&
+    left.serverVersion === right.serverVersion &&
+    left.authorityEpoch === right.authorityEpoch &&
+    left.admission === right.admission &&
+    left.ready === right.ready
+  )
 }
 
 export function isCoordinatorClientLease(value: unknown): value is CoordinatorClientLease {
@@ -684,6 +711,167 @@ function matchesCoordinatorHandoffFence(handoff: unknown, expected: CoordinatorH
   )
 }
 
+function sameCoordinatorHandoff(left: unknown, right: CoordinatorHandoffRecord) {
+  if (!isCoordinatorHandoffRecord(left) || !isCoordinatorHandoffRecord(right)) return false
+  return (
+    left.version === right.version &&
+    left.request === right.request &&
+    left.phase === right.phase &&
+    left.revision === right.revision &&
+    left.sourceEpoch === right.sourceEpoch &&
+    left.targetEpoch === right.targetEpoch &&
+    left.createdAt === right.createdAt &&
+    left.updatedAt === right.updatedAt
+  )
+}
+
+export async function activateCoordinatorHandoffTarget(input: {
+  stateRoot: string
+  sourceManifest: CoordinatorManifest
+  targetManifest: CoordinatorManifest
+  accepted: CoordinatorHandoffRecord
+  ready: CoordinatorHandoffRecord
+  hooks?: CoordinatorTargetTransactionHooks
+}) {
+  if (!validTargetTransition(input, "accepted", "ready")) return invalidTargetManifestResult()
+  return withCoordinatorAuthorityLock(input.stateRoot, input.sourceManifest.key, async () => {
+    const snapshot = await readCoordinatorAuthoritySnapshot(input.stateRoot, input.sourceManifest.key).catch(
+      () => undefined,
+    )
+    if (!snapshot) return invalidTargetManifestResult()
+    if (
+      sameCoordinatorManifest(snapshot.manifest, input.targetManifest) &&
+      sameCoordinatorHandoff(snapshot.handoff, input.ready)
+    ) {
+      return { state: "committed" as const, value: input.targetManifest }
+    }
+    const source = sameCoordinatorManifest(snapshot.manifest, input.sourceManifest)
+    const target = sameCoordinatorManifest(snapshot.manifest, input.targetManifest)
+    if (!source && !target) return { state: "progressing" as const, reason: "manifest_changed" as const }
+    if (!sameCoordinatorHandoff(snapshot.handoff, input.accepted)) {
+      return { state: "progressing" as const, reason: "handoff_changed" as const }
+    }
+    if (source) await writeCoordinatorManifestLocked(input.stateRoot, input.targetManifest)
+    await input.hooks?.afterManifestWrite?.()
+    await input.hooks?.beforeHandoffWrite?.()
+    await writeCoordinatorHandoffLocked(input.stateRoot, input.targetManifest.key, input.ready)
+    return { state: "committed" as const, value: input.targetManifest }
+  })
+}
+
+export async function commitCoordinatorHandoffTarget(input: {
+  stateRoot: string
+  targetManifest: CoordinatorManifest
+  ready: CoordinatorHandoffRecord
+  committed: CoordinatorHandoffRecord
+  hooks?: CoordinatorTargetTransactionHooks
+}) {
+  if (!validCommittedTransition(input)) return invalidTargetManifestResult()
+  return withCoordinatorAuthorityLock(input.stateRoot, input.targetManifest.key, async () => {
+    const snapshot = await readCoordinatorAuthoritySnapshot(input.stateRoot, input.targetManifest.key).catch(
+      () => undefined,
+    )
+    if (!snapshot) return invalidTargetManifestResult()
+    if (!sameCoordinatorManifest(snapshot.manifest, input.targetManifest)) {
+      return { state: "progressing" as const, reason: "manifest_changed" as const }
+    }
+    if (sameCoordinatorHandoff(snapshot.handoff, input.committed)) {
+      return { state: "committed" as const, value: input.committed }
+    }
+    if (!sameCoordinatorHandoff(snapshot.handoff, input.ready)) {
+      return { state: "progressing" as const, reason: "handoff_changed" as const }
+    }
+    await input.hooks?.beforeHandoffWrite?.()
+    await writeCoordinatorHandoffLocked(input.stateRoot, input.targetManifest.key, input.committed)
+    return { state: "committed" as const, value: input.committed }
+  })
+}
+
+export async function cleanupCommittedCoordinatorHandoff(input: {
+  stateRoot: string
+  targetManifest: CoordinatorManifest
+  committed: CoordinatorHandoffRecord
+}) {
+  if (
+    !isCoordinatorManifest(input.targetManifest) ||
+    !isCoordinatorHandoffRecord(input.committed) ||
+    input.committed.phase !== "committed" ||
+    input.targetManifest.authorityEpoch !== input.committed.targetEpoch
+  ) {
+    return invalidTargetManifestResult()
+  }
+  return withCoordinatorAuthorityLock(input.stateRoot, input.targetManifest.key, async () => {
+    const snapshot = await readCoordinatorAuthoritySnapshot(input.stateRoot, input.targetManifest.key).catch(
+      () => undefined,
+    )
+    if (!snapshot) return invalidTargetManifestResult()
+    if (!sameCoordinatorManifest(snapshot.manifest, input.targetManifest)) {
+      return { state: "progressing" as const, reason: "manifest_changed" as const }
+    }
+    if (snapshot.handoffRaw === undefined) return { state: "committed" as const, value: true }
+    if (!sameCoordinatorHandoff(snapshot.handoff, input.committed)) {
+      return { state: "progressing" as const, reason: "handoff_changed" as const }
+    }
+    await fs.rm(coordinatorHandoffPath(input.stateRoot, input.targetManifest.key))
+    return { state: "committed" as const, value: true }
+  })
+}
+
+function validTargetTransition(
+  input: {
+    sourceManifest: CoordinatorManifest
+    targetManifest: CoordinatorManifest
+    accepted: CoordinatorHandoffRecord
+    ready: CoordinatorHandoffRecord
+  },
+  current: "accepted",
+  next: "ready",
+) {
+  return (
+    isCoordinatorManifest(input.sourceManifest) &&
+    isCoordinatorManifest(input.targetManifest) &&
+    isCoordinatorHandoffRecord(input.accepted) &&
+    isCoordinatorHandoffRecord(input.ready) &&
+    input.sourceManifest.key === input.targetManifest.key &&
+    input.accepted.phase === current &&
+    input.ready.phase === next &&
+    input.sourceManifest.authorityEpoch === input.accepted.sourceEpoch &&
+    input.targetManifest.authorityEpoch === input.accepted.targetEpoch &&
+    checkCoordinatorHandoffTransition(input.accepted, input.ready)
+  )
+}
+
+function validCommittedTransition(input: {
+  targetManifest: CoordinatorManifest
+  ready: CoordinatorHandoffRecord
+  committed: CoordinatorHandoffRecord
+}) {
+  return (
+    isCoordinatorManifest(input.targetManifest) &&
+    isCoordinatorHandoffRecord(input.ready) &&
+    isCoordinatorHandoffRecord(input.committed) &&
+    input.ready.phase === "ready" &&
+    input.committed.phase === "committed" &&
+    input.targetManifest.authorityEpoch === input.ready.targetEpoch &&
+    checkCoordinatorHandoffTransition(input.ready, input.committed)
+  )
+}
+
+function invalidTargetManifestResult() {
+  return { state: "progressing" as const, reason: "invalid_manifest" as const }
+}
+
+async function writeCoordinatorHandoffLocked(stateRoot: string, key: string, handoff: CoordinatorHandoffRecord) {
+  const file = coordinatorHandoffPath(stateRoot, key)
+  const temporary = `${file}.${process.pid}.${Date.now()}.tmp`
+  try {
+    await fs.writeFile(temporary, JSON.stringify(handoff, null, 2), { mode: 0o600 })
+    await fs.rename(temporary, file)
+  } finally {
+    await fs.rm(temporary, { force: true }).catch(() => undefined)
+  }
+}
+
 /** Deletes only under an exact manifest fence while the handoff is absent. */
 export function removeCoordinatorManifest(stateRoot: string, key: string, manifest: CoordinatorManifestFence) {
   return withCoordinatorAuthorityLock(stateRoot, key, (lock) => removeCoordinatorManifestLocked(lock, manifest))
@@ -816,6 +1004,12 @@ export function resolveCoordinatorAuthority(input: {
       handoff.phase === "requested" || handoff.phase === "accepted" ? handoff.sourceEpoch : handoff.targetEpoch
     if (!authorityEpoch || expectedEpoch !== authorityEpoch) {
       return { state: "blocked", reason: "incompatible_handoff" }
+    }
+    if ((handoff.phase === "ready" || handoff.phase === "committed") && input.health.admission !== true) {
+      return { state: "blocked", reason: "admission_closed" }
+    }
+    if ((handoff.phase === "ready" || handoff.phase === "committed") && input.health.ready !== true) {
+      return { state: "blocked", reason: "not_ready" }
     }
     return { state: "handoff", authorityEpoch, handoff }
   }

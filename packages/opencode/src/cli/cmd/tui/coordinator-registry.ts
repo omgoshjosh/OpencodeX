@@ -6,8 +6,11 @@ import { Flock } from "@opencode-ai/core/util/flock"
 import { LockProtocol } from "@opencode-ai/core/util/lock-protocol"
 import { ensureRunID, OPENCODE_PROCESS_ROLE, OPENCODE_RUN_ID } from "@opencode-ai/core/util/opencode-process"
 import {
+  activateCoordinatorHandoffTarget as activateCoordinatorHandoffTargetIn,
   checkCoordinatorCompatibility,
   checkCoordinatorHandoffTransition,
+  cleanupCommittedCoordinatorHandoff as cleanupCommittedCoordinatorHandoffIn,
+  commitCoordinatorHandoffTarget as commitCoordinatorHandoffTargetIn,
   coordinatorClientDir as coordinatorClientDirIn,
   coordinatorDatabaseIdentity as coordinatorDatabaseIdentityOf,
   coordinatorHandoffPath,
@@ -77,6 +80,30 @@ export function coordinatorHeaders(manifest: TuiCoordinatorManifest) {
 
 export function publishCoordinatorManifest(manifest: TuiCoordinatorManifest) {
   return publishCoordinatorManifestIn(STATE_ROOT, manifest, undefined)
+}
+
+export function activateCoordinatorHandoffTarget(input: {
+  sourceManifest: TuiCoordinatorManifest
+  targetManifest: TuiCoordinatorManifest
+  accepted: TuiCoordinatorHandoffRecord
+  ready: TuiCoordinatorHandoffRecord
+}) {
+  return activateCoordinatorHandoffTargetIn({ stateRoot: STATE_ROOT, ...input })
+}
+
+export function commitCoordinatorHandoffTarget(input: {
+  targetManifest: TuiCoordinatorManifest
+  ready: TuiCoordinatorHandoffRecord
+  committed: TuiCoordinatorHandoffRecord
+}) {
+  return commitCoordinatorHandoffTargetIn({ stateRoot: STATE_ROOT, ...input })
+}
+
+export function cleanupCommittedCoordinatorHandoff(input: {
+  targetManifest: TuiCoordinatorManifest
+  committed: TuiCoordinatorHandoffRecord
+}) {
+  return cleanupCommittedCoordinatorHandoffIn({ stateRoot: STATE_ROOT, ...input })
 }
 
 export async function removeCoordinatorManifest(key: string, manifest: TuiCoordinatorManifest) {

@@ -140,6 +140,10 @@ export function createCoordinatorTransport(input: {
     async (request: Parameters<typeof globalThis.fetch>[0], init?: RequestInit) => {
       try {
         const response = await send(request, init)
+        if (response.status === 409 && (await isAuthorityTransition(response))) {
+          await recover().catch(() => false)
+          return response
+        }
         // A replacement coordinator on the same port has new credentials, so
         // its refusal of the old ones marks the manifest as stale.
         if (response.status !== 401) return response
@@ -168,4 +172,12 @@ export function createCoordinatorTransport(input: {
       return manifest
     },
   }
+}
+
+async function isAuthorityTransition(response: Response) {
+  const body = await response
+    .clone()
+    .json()
+    .catch(() => undefined)
+  return typeof body === "object" && body !== null && "code" in body && body.code === "coordinator_admission_closed"
 }

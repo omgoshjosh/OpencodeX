@@ -2,6 +2,8 @@ import { ServerAuth } from "@/server/auth"
 import { Effect, Encoding, Layer, Redacted } from "effect"
 import { HttpEffect, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { HttpApiError, HttpApiMiddleware } from "effect/unstable/httpapi"
+import { CoordinatorAuthority } from "@/server/coordinator-authority"
+import { CoordinatorHandoff } from "@/server/coordinator-handoff"
 
 const AUTH_TOKEN_QUERY = "auth_token"
 const UNAUTHORIZED = 401
@@ -30,14 +32,38 @@ function validateCredential<A, E, R>(
   config: ServerAuth.Info,
 ) {
   return Effect.gen(function* () {
-    if (!ServerAuth.required(config)) return yield* effect
-    if (!ServerAuth.authorized(credential, config)) {
+    if (ServerAuth.required(config) && !ServerAuth.authorized(credential, config)) {
       yield* HttpEffect.appendPreResponseHandler((_request, response) =>
         Effect.succeed(HttpServerResponse.setHeader(response, "www-authenticate", WWW_AUTHENTICATE)),
       )
       return yield* new HttpApiError.Unauthorized({})
     }
-    return yield* effect
+    const request = yield* HttpServerRequest.HttpServerRequest
+    if (new URL(request.url, "http://localhost").pathname === "/global/authority-handoff") {
+      const length = Number(request.headers["content-length"])
+      if (!Number.isInteger(length) || length < 1 || length > 4_096)
+        return yield* Effect.succeed(
+          HttpServerResponse.jsonUnsafe({ error: "request_body_too_large" }, { status: 413 }),
+        )
+      if (
+        !CoordinatorHandoff.available() ||
+        !CoordinatorHandoff.authorized(request.headers[CoordinatorHandoff.CAPABILITY_HEADER])
+      )
+        return yield* Effect.succeed(
+          HttpServerResponse.jsonUnsafe({ error: "handoff_control_unavailable" }, { status: 403 }),
+        )
+    }
+    if (!CoordinatorAuthority.enabled()) return yield* effect
+    const release = CoordinatorAuthority.acquire(request.url)
+    if (!release) {
+      return yield* Effect.succeed(
+        HttpServerResponse.jsonUnsafe(
+          { error: "authority_transition", code: "coordinator_admission_closed" },
+          { status: 409 },
+        ),
+      )
+    }
+    return yield* effect.pipe(Effect.ensuring(Effect.sync(release)))
   })
 }
 
@@ -74,22 +100,29 @@ function validateRawCredential<A, E, R>(
   credential: ServerAuth.DecodedCredentials,
   config: ServerAuth.Info,
 ) {
-  if (!ServerAuth.required(config)) return effect
-  if (!ServerAuth.authorized(credential, config))
+  if (ServerAuth.required(config) && !ServerAuth.authorized(credential, config))
     return Effect.succeed(
       HttpServerResponse.empty({
         status: UNAUTHORIZED,
         headers: { "www-authenticate": WWW_AUTHENTICATE },
       }),
     )
-  return effect
+  return Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest
+    if (!CoordinatorAuthority.enabled()) return yield* effect
+    const release = CoordinatorAuthority.acquire(request.url)
+    if (!release)
+      return HttpServerResponse.jsonUnsafe(
+        { error: "authority_transition", code: "coordinator_admission_closed" },
+        { status: 409 },
+      )
+    return yield* effect.pipe(Effect.ensuring(Effect.sync(release)))
+  })
 }
 
 export const authorizationRouterMiddleware = HttpRouter.middleware()(
   Effect.gen(function* () {
     const config = yield* ServerAuth.Config
-    if (!ServerAuth.required(config)) return (effect) => effect
-
     return (effect) =>
       Effect.gen(function* () {
         const request = yield* HttpServerRequest.HttpServerRequest
@@ -105,7 +138,6 @@ export const authorizationLayer = Layer.effect(
   Authorization,
   Effect.gen(function* () {
     const config = yield* ServerAuth.Config
-    if (!ServerAuth.required(config)) return Authorization.of((effect) => effect)
     return Authorization.of((effect) =>
       Effect.gen(function* () {
         const request = yield* HttpServerRequest.HttpServerRequest

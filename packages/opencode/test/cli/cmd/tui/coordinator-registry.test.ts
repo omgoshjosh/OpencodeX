@@ -54,22 +54,25 @@ function match(value: CoordinatorHandoffRecord) {
 async function publishSource(stateRoot: string, key: string, sourceEpoch: string) {
   const file = coordinatorManifestPath(stateRoot, key)
   await fs.mkdir(path.dirname(file), { recursive: true })
-  await fs.writeFile(file, JSON.stringify({
-    version: COORDINATOR_MANIFEST_VERSION,
-    key,
-    directory: "/tmp",
-    database: "/tmp/authority-handoff.db",
-    pid: process.pid,
-    url: "http://127.0.0.1:4096/",
-    username: "user",
-    password: "password",
-    token: "source-token",
-    createdAt: "2026-08-18T20:00:00.000Z",
-    serverVersion: "local",
-    authorityEpoch: sourceEpoch,
-    admission: true,
-    ready: true,
-  }))
+  await fs.writeFile(
+    file,
+    JSON.stringify({
+      version: COORDINATOR_MANIFEST_VERSION,
+      key,
+      directory: "/tmp",
+      database: "/tmp/authority-handoff.db",
+      pid: process.pid,
+      url: "http://127.0.0.1:4096/",
+      username: "user",
+      password: "password",
+      token: "source-token",
+      createdAt: "2026-08-18T20:00:00.000Z",
+      serverVersion: "local",
+      authorityEpoch: sourceEpoch,
+      admission: true,
+      ready: true,
+    }),
+  )
 }
 
 describe("active coordinator manifest", () => {
@@ -182,13 +185,17 @@ describe("coordinator handoff compare-and-swap", () => {
     expect((await fs.stat(coordinatorHandoffPath(tmp.path, key))).mode & 0o777).toBe(0o600)
   })
 
-  test("replaces and deletes only on an exact authority fence after target selection", async () => {
+  test("aborts requested and accepted handoffs only on an exact authority fence", async () => {
     await using tmp = await tmpdir()
     const first = record("request-1", "source-1")
     const second = accepted(first)
     await publishSource(tmp.path, key, first.sourceEpoch)
     await compareAndSwapCoordinatorHandoff(key, undefined, first, tmp.path)
-    expect(await compareAndSwapCoordinatorHandoff(key, first, undefined, tmp.path)).toBe(false)
+    expect(
+      await compareAndSwapCoordinatorHandoff(key, { ...match(first), sourceEpoch: "wrong" }, undefined, tmp.path),
+    ).toBe(false)
+    expect(await compareAndSwapCoordinatorHandoff(key, first, undefined, tmp.path)).toBe(true)
+    expect(await compareAndSwapCoordinatorHandoff(key, undefined, first, tmp.path)).toBe(true)
 
     expect(
       await compareAndSwapCoordinatorHandoff(key, { ...match(first), sourceEpoch: "wrong" }, second, tmp.path),
@@ -227,6 +234,22 @@ describe("coordinator handoff compare-and-swap", () => {
       compareAndSwapCoordinatorHandoff(key, match(record("request", "source")), undefined, tmp.path),
     ).rejects.toThrow()
     expect(await fs.readFile(file, "utf8")).toBe("{malformed")
+  })
+
+  test("requires exact source process ownership for create and abort", async () => {
+    await using tmp = await tmpdir()
+    const first = record("request-owner", "source-owner")
+    await publishSource(tmp.path, key, first.sourceEpoch)
+    const file = coordinatorManifestPath(tmp.path, key)
+    const manifest = JSON.parse(await fs.readFile(file, "utf8")) as CoordinatorManifest
+    await fs.writeFile(file, JSON.stringify({ ...manifest, pid: process.pid + 1 }))
+
+    expect(await compareAndSwapCoordinatorHandoff(key, undefined, first, tmp.path)).toBe(false)
+    await fs.writeFile(file, JSON.stringify(manifest))
+    expect(await compareAndSwapCoordinatorHandoff(key, undefined, first, tmp.path)).toBe(true)
+    await fs.writeFile(file, JSON.stringify({ ...manifest, pid: process.pid + 1 }))
+    expect(await compareAndSwapCoordinatorHandoff(key, first, undefined, tmp.path)).toBe(false)
+    expect(await readCoordinatorHandoff(tmp.path, key)).toEqual(first)
   })
 
   test("allows exactly one concurrent absent-to-create contender", async () => {
@@ -338,9 +361,13 @@ describe("coordinator idle authority", () => {
     })
     await entered.promise
 
-    const shutdown = retireCoordinatorForIdleShutdown(key, {
-      ...(JSON.parse(await fs.readFile(coordinatorManifestPath(tmp.path, key), "utf8")) as CoordinatorManifest),
-    }, tmp.path)
+    const shutdown = retireCoordinatorForIdleShutdown(
+      key,
+      {
+        ...(JSON.parse(await fs.readFile(coordinatorManifestPath(tmp.path, key), "utf8")) as CoordinatorManifest),
+      },
+      tmp.path,
+    )
     release.resolve()
     await creating
 
@@ -350,9 +377,13 @@ describe("coordinator idle authority", () => {
   test("idle retirement removes the source claim before a handoff can begin", async () => {
     await using tmp = await tmpdir()
     await publishSource(tmp.path, key, "source-1")
-    const manifest = JSON.parse(await fs.readFile(coordinatorManifestPath(tmp.path, key), "utf8")) as CoordinatorManifest
+    const manifest = JSON.parse(
+      await fs.readFile(coordinatorManifestPath(tmp.path, key), "utf8"),
+    ) as CoordinatorManifest
 
     expect(await retireCoordinatorForIdleShutdown(key, manifest, tmp.path)).toEqual({ state: "committed", value: true })
-    expect(await compareAndSwapCoordinatorHandoff(key, undefined, record("request-1", "source-1"), tmp.path)).toBe(false)
+    expect(await compareAndSwapCoordinatorHandoff(key, undefined, record("request-1", "source-1"), tmp.path)).toBe(
+      false,
+    )
   })
 })

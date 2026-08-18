@@ -23,6 +23,17 @@ import path from "node:path"
  * version bump.
  */
 export const COORDINATOR_MANIFEST_VERSION = 2
+
+const COORDINATOR_HANDOFF_REQUEST_DOMAIN = "opencode.coordinator-handoff.request.v1"
+
+/** Deterministic correlation ID, not an authentication secret. */
+export function coordinatorHandoffRequestID(sourceEpoch: string, targetEpoch: string) {
+  return createHash("sha256")
+    .update(COORDINATOR_HANDOFF_REQUEST_DOMAIN)
+    .update("\0")
+    .update(JSON.stringify([sourceEpoch, targetEpoch]))
+    .digest("hex")
+}
 export const COORDINATOR_CLIENT_LEASE_VERSION = 1
 export const COORDINATOR_HANDOFF_LEGACY_VERSION = 1
 export const COORDINATOR_HANDOFF_VERSION = 2
@@ -154,13 +165,7 @@ export type CoordinatorAuthorityLock = {
   release: () => Promise<void>
 }
 
-export type CoordinatorCompatibilityReason =
-  | "match"
-  | "skipped"
-  | "local"
-  | "legacy"
-  | "mismatch"
-  | "health_mismatch"
+export type CoordinatorCompatibilityReason = "match" | "skipped" | "local" | "legacy" | "mismatch" | "health_mismatch"
 
 export type CoordinatorCompatibility = {
   compatible: boolean
@@ -432,7 +437,8 @@ export async function acquireCoordinatorAuthorityLock(
   const lock = coordinatorAuthorityLockPath(stateRoot, key)
   const token = randomBytes(16).toString("hex")
   const now = options?.now ?? Date.now
-  const sleep = options?.sleep ?? ((milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)))
+  const sleep =
+    options?.sleep ?? ((milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)))
   const started = now()
   await fs.mkdir(root, { recursive: true })
   while (true) {
@@ -690,10 +696,7 @@ export async function removeCoordinatorManifestLocked(
   const snapshot = await readCoordinatorAuthoritySnapshot(lock.stateRoot, lock.key).catch(() => undefined)
   if (!snapshot) return { state: "progressing", reason: "invalid_manifest" }
   if (!snapshot.manifest) return { state: "progressing", reason: "manifest_absent" }
-  if (
-    snapshot.manifest.token !== manifest.token ||
-    snapshot.manifest.authorityEpoch !== manifest.authorityEpoch
-  ) {
+  if (snapshot.manifest.token !== manifest.token || snapshot.manifest.authorityEpoch !== manifest.authorityEpoch) {
     return { state: "progressing", reason: "manifest_changed" }
   }
   if (snapshot.handoffRaw !== undefined) return { state: "progressing", reason: "handoff_present" }
@@ -807,7 +810,7 @@ export function resolveCoordinatorAuthority(input: {
   }
   const authorityEpoch = handoff
     ? input.health.authorityEpoch
-    : input.health.authorityEpoch ?? input.manifest.authorityEpoch
+    : (input.health.authorityEpoch ?? input.manifest.authorityEpoch)
   if (handoff) {
     const expectedEpoch =
       handoff.phase === "requested" || handoff.phase === "accepted" ? handoff.sourceEpoch : handoff.targetEpoch
@@ -923,29 +926,31 @@ export function startCoordinatorClientLease(input: {
   let writing = Promise.resolve()
 
   const write = () => {
-    const next = writing.catch(() => {}).then(async () => {
-      if (disposed) return
-      await fs.mkdir(dir, { recursive: true })
-      if (disposed) return
-      const temporary = `${file}.${randomBytes(4).toString("hex")}.tmp`
-      try {
-        await fs.writeFile(
-          temporary,
-          JSON.stringify({
-            version: COORDINATOR_CLIENT_LEASE_VERSION,
-            key: input.key,
-            pid,
-            updatedAt: Date.now(),
-          } satisfies CoordinatorClientLease),
-          { mode: 0o600 },
-        )
+    const next = writing
+      .catch(() => {})
+      .then(async () => {
         if (disposed) return
-        await fs.rename(temporary, file)
-        if (disposed) await fs.rm(file, { force: true })
-      } finally {
-        await fs.rm(temporary, { force: true }).catch(() => {})
-      }
-    })
+        await fs.mkdir(dir, { recursive: true })
+        if (disposed) return
+        const temporary = `${file}.${randomBytes(4).toString("hex")}.tmp`
+        try {
+          await fs.writeFile(
+            temporary,
+            JSON.stringify({
+              version: COORDINATOR_CLIENT_LEASE_VERSION,
+              key: input.key,
+              pid,
+              updatedAt: Date.now(),
+            } satisfies CoordinatorClientLease),
+            { mode: 0o600 },
+          )
+          if (disposed) return
+          await fs.rename(temporary, file)
+          if (disposed) await fs.rm(file, { force: true })
+        } finally {
+          await fs.rm(temporary, { force: true }).catch(() => {})
+        }
+      })
     writing = next
     return next
   }

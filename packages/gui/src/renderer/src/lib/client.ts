@@ -52,6 +52,10 @@ export async function connectGuiClient(): Promise<GuiClient> {
       let unauthorized: Response | undefined
       try {
         const response = await rawFetch(routeRequest(request, connection, body))
+        if (response.status === 409 && (await isAuthorityTransition(response))) {
+          await recover(failedGeneration)
+          return response
+        }
         if (response.status !== 401 || !window.opencodex) return response
         unauthorized = response
         if (mayReplay(request.method)) await response.body?.cancel().catch(() => undefined)
@@ -86,6 +90,14 @@ export async function connectGuiClient(): Promise<GuiClient> {
       return connectionAuthHeader(connection)
     },
   }
+}
+
+async function isAuthorityTransition(response: Response) {
+  const body = await response
+    .clone()
+    .json()
+    .catch(() => undefined)
+  return typeof body === "object" && body !== null && "code" in body && body.code === "coordinator_admission_closed"
 }
 
 function mayReplay(method: string) {

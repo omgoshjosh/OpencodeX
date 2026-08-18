@@ -142,4 +142,31 @@ describe("GUI client recovery", () => {
     expect(gui.url).toBe(second.url)
     expect(connection).toBe(2)
   })
+
+  test("refreshes authority but does not replay a mutation after transition 409", async () => {
+    const first = { url: "http://127.0.0.1:4100", directory: "/repo" }
+    const second = { url: "http://127.0.0.1:4200", directory: "/repo" }
+    let connection = 0
+    let requests = 0
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: { opencodex: { connection: async () => (connection++ === 0 ? first : second) } },
+    })
+    globalThis.fetch = async () => {
+      requests += 1
+      return Response.json({ error: "authority_transition", code: "coordinator_admission_closed" }, { status: 409 })
+    }
+
+    const gui = await connectGuiClient()
+    await gui.client.session.promptAsync({
+      sessionID: "session-1",
+      directory: gui.directory,
+      messageID: "message-1",
+      parts: [{ type: "text", text: "hello" }],
+    })
+
+    expect(requests).toBe(1)
+    expect(connection).toBe(2)
+    expect(gui.url).toBe(second.url)
+  })
 })

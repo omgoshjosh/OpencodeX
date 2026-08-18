@@ -13,6 +13,7 @@ import {
   coordinatorClientDir,
   coordinatorDatabaseIdentity,
   coordinatorHandoffPath,
+  coordinatorHandoffRequestID,
   coordinatorKey,
   coordinatorManifestPath,
   fetchCoordinatorHealth,
@@ -107,6 +108,19 @@ describe("coordinator manifest validation", () => {
 })
 
 describe("coordinator handoff record", () => {
+  test("derives a bounded domain-separated request ID from both epochs", () => {
+    expect(coordinatorHandoffRequestID("source-epoch", "target-epoch")).toBe(
+      "37d3813996d029011d3ee74678026ad6d10d9a983e76f761e758a0f9486a61ae",
+    )
+    expect(coordinatorHandoffRequestID("source-epoch", "target-epoch")).toHaveLength(64)
+    expect(coordinatorHandoffRequestID("source-epoch", "target-epoch-2")).not.toBe(
+      coordinatorHandoffRequestID("source-epoch", "target-epoch"),
+    )
+    expect(coordinatorHandoffRequestID("source-epoch-2", "target-epoch")).not.toBe(
+      coordinatorHandoffRequestID("source-epoch", "target-epoch"),
+    )
+  })
+
   const current = {
     version: COORDINATOR_HANDOFF_VERSION,
     request: "request-1",
@@ -350,9 +364,9 @@ describe("coordinator authority resolver", () => {
       targetEpoch: "target-generation-1",
       updatedAt: "2026-08-18T20:00:03.000Z",
     }
-    expect(
-      resolveCoordinatorAuthority({ manifest: activeManifest, health: activeHealth, handoff: committed }),
-    ).toEqual({ state: "blocked", reason: "incompatible_handoff" })
+    expect(resolveCoordinatorAuthority({ manifest: activeManifest, health: activeHealth, handoff: committed })).toEqual(
+      { state: "blocked", reason: "incompatible_handoff" },
+    )
     expect(
       resolveCoordinatorAuthority({
         manifest: { ...activeManifest, authorityEpoch: "target-generation-1" },
@@ -417,7 +431,9 @@ describe("token-guarded removal", () => {
     const root = await stateRoot()
     const written = manifest()
     await publishCoordinatorManifest(root, written, undefined)
-    expect(await removeCoordinatorManifest(root, written.key, { token: "other-token", authorityEpoch: undefined })).toEqual({
+    expect(
+      await removeCoordinatorManifest(root, written.key, { token: "other-token", authorityEpoch: undefined }),
+    ).toEqual({
       state: "progressing",
       reason: "manifest_changed",
     })

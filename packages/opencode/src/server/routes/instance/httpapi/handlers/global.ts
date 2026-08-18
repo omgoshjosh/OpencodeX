@@ -12,16 +12,15 @@ import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import * as Sse from "effect/unstable/encoding/Sse"
 import { RootHttpApi } from "../api"
-import { GlobalUpgradeInput } from "../groups/global"
+import { GlobalAuthorityHandoffInput, GlobalUpgradeInput } from "../groups/global"
 import { makeGuiBridgeHandlers } from "./gui-bridge"
 import { Database } from "@opencode-ai/core/database/database"
 import { OpencodeXJobTable, OpencodeXSwarmTable } from "@opencode-ai/core/opencodex/sql"
-import {
-  SessionCommandTable,
-  SessionExecutionTable,
-  SessionInteractionTable,
-} from "@opencode-ai/core/session/sql"
+import { SessionCommandTable, SessionExecutionTable, SessionInteractionTable } from "@opencode-ai/core/session/sql"
 import { and, eq, gt, inArray, notInArray, or } from "drizzle-orm"
+import { CoordinatorAuthority } from "@/server/coordinator-authority"
+import { CoordinatorHandoff } from "@/server/coordinator-handoff"
+import { ConflictError } from "../errors"
 
 const log = Log.create({ service: "server" })
 
@@ -99,10 +98,7 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
             .where(
               or(
                 eq(SessionExecutionTable.state, "queued"),
-                and(
-                  eq(SessionExecutionTable.state, "running"),
-                  gt(SessionExecutionTable.lease_expires_at, now),
-                ),
+                and(eq(SessionExecutionTable.state, "running"), gt(SessionExecutionTable.lease_expires_at, now)),
               ),
             )
             .limit(1)
@@ -131,15 +127,20 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
             .where(notInArray(OpencodeXSwarmTable.status, ["completed", "partially_failed", "failed", "cancelled"]))
             .limit(1)
             .get(),
-        ].map((query) => query.pipe(Effect.map((row) => row !== undefined), Effect.orDie)),
+        ].map((query) =>
+          query.pipe(
+            Effect.map((row) => row !== undefined),
+            Effect.orDie,
+          ),
+        ),
         { concurrency: "unbounded" },
       )
-      const authorityEpoch = process.env.OPENCODE_COORDINATOR_AUTHORITY_EPOCH
+      const authority = CoordinatorAuthority.health()
       return {
         healthy: true as const,
         version: InstallationVersion,
         active: activity.some(Boolean),
-        ...(authorityEpoch ? { authorityEpoch, admission: true, ready: true } : {}),
+        ...authority,
       }
     })
 
@@ -213,12 +214,33 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
       return HttpServerResponse.jsonUnsafe(result.body, { status: result.status })
     })
 
+    const authorityHandoff = Effect.fn("GlobalHttpApi.authorityHandoff")(function* (ctx: {
+      payload: typeof GlobalAuthorityHandoffInput.Type
+    }) {
+      if (ctx.payload.action === "request") {
+        const payload = ctx.payload
+        const result = yield* Effect.tryPromise({
+          try: (signal) =>
+            CoordinatorHandoff.request({ request: payload.request, targetEpoch: payload.targetEpoch, signal }),
+          catch: (error) => new ConflictError({ message: String(error), resource: "authority" }),
+        })
+        return { success: true as const, phase: result.phase }
+      }
+      const expected = ctx.payload.expected
+      const result = yield* Effect.tryPromise({
+        try: (signal) => CoordinatorHandoff.abort({ expected, signal }),
+        catch: (error) => new ConflictError({ message: String(error), resource: "authority" }),
+      })
+      return { success: true as const, phase: result.phase }
+    })
+
     return handlers
       .handle("health", health)
       .handleRaw("event", event)
       .handle("configGet", configGet)
       .handle("configUpdate", configUpdate)
       .handle("dispose", dispose)
+      .handle("authorityHandoff", authorityHandoff)
       .handleRaw("upgrade", upgradeRaw)
       .handle("guiBridgeSync", guiBridge.guiBridgeSync)
       .handle("guiBridgeUnregister", guiBridge.guiBridgeUnregister)

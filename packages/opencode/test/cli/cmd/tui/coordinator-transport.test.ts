@@ -175,6 +175,27 @@ describe("coordinator transport", () => {
     expect(transport.manifest).toBe(manifestB)
   })
 
+  test("refreshes authority but does not replay a mutation after transition 409", async () => {
+    let calls = 0
+    const transport = createCoordinatorTransport({
+      manifest: manifestA,
+      resolve: async () => manifestB,
+      fetch: Object.assign(
+        async () => {
+          calls += 1
+          return Response.json({ error: "authority_transition", code: "coordinator_admission_closed" }, { status: 409 })
+        },
+        { preconnect() {} },
+      ),
+    })
+
+    const response = await transport.fetch(new URL("/session/prompt", manifestA.url), { method: "POST" })
+
+    expect(response.status).toBe(409)
+    expect(calls).toBe(1)
+    expect(transport.manifest).toBe(manifestB)
+  })
+
   test("returns the 401 when recovery does not change the outcome", async () => {
     const backend = fakeBackend({ alive: [new URL(manifestA.url).origin], password: "different-password" })
     let resolves = 0

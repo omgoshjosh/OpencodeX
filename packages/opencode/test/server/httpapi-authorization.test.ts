@@ -1,11 +1,16 @@
 import { NodeHttpServer } from "@effect/platform-node"
 import { describe, expect } from "bun:test"
-import { Effect, Layer, Option, Schema } from "effect"
+import { Deferred, Effect, Fiber, Layer, Option, Schema } from "effect"
 import { HttpClient, HttpClientRequest, HttpRouter } from "effect/unstable/http"
 import { HttpApi, HttpApiBuilder, HttpApiEndpoint, HttpApiError, HttpApiGroup } from "effect/unstable/httpapi"
 import { ServerAuth } from "../../src/server/auth"
 import { Authorization, authorizationLayer } from "../../src/server/routes/instance/httpapi/middleware/authorization"
 import { testEffect } from "../lib/effect"
+import { CoordinatorAuthority } from "../../src/server/coordinator-authority"
+import { OPENCODE_PROCESS_ROLE } from "@opencode-ai/core/util/opencode-process"
+
+let held: Deferred.Deferred<void> | undefined
+let heldStarted: Deferred.Deferred<void> | undefined
 
 const Api = HttpApi.make("test-authorization").add(
   HttpApiGroup.make("test")
@@ -17,6 +22,8 @@ const Api = HttpApi.make("test-authorization").add(
         success: Schema.String,
         error: HttpApiError.NotFound,
       }),
+      HttpApiEndpoint.post("hold", "/hold", { success: Schema.String }),
+      HttpApiEndpoint.post("interrupt", "/interrupt", { success: Schema.String }),
     )
     .middleware(Authorization),
 )
@@ -24,7 +31,16 @@ const Api = HttpApi.make("test-authorization").add(
 const handlers = HttpApiBuilder.group(Api, "test", (handlers) =>
   handlers
     .handle("probe", () => Effect.succeed("ok"))
-    .handle("missing", () => Effect.fail(new HttpApiError.NotFound({}))),
+    .handle("missing", () => Effect.fail(new HttpApiError.NotFound({})))
+    .handle("hold", () =>
+      Effect.gen(function* () {
+        if (!held || !heldStarted) return "unused"
+        yield* Deferred.succeed(heldStarted, undefined)
+        yield* Deferred.await(held)
+        return "released"
+      }),
+    )
+    .handle("interrupt", () => Effect.interrupt),
 )
 
 const apiLayer = HttpRouter.serve(
@@ -50,7 +66,7 @@ const getProbe = (headers?: Record<string, string>) =>
     HttpClient.execute,
   )
 
-describe("HttpApi authorization middleware", () => {
+describe.serial("HttpApi authorization middleware", () => {
   it.live("allows requests when server password is not configured", () =>
     Effect.gen(function* () {
       const response = yield* getProbe()
@@ -134,5 +150,62 @@ describe("HttpApi authorization middleware", () => {
 
       expect(response.status).toBe(401)
     }),
+  )
+
+  itSecret.live("acquires admission only after authentication and releases on completion and error", () =>
+    Effect.acquireUseRelease(
+      Effect.sync(() => {
+        process.env[OPENCODE_PROCESS_ROLE] = "coordinator"
+        process.env.OPENCODE_COORDINATOR_AUTHORITY_EPOCH = "authorization-test-epoch"
+        CoordinatorAuthority.resetForTest()
+      }),
+      () =>
+        Effect.gen(function* () {
+          const unauthorized = yield* getProbe()
+          expect(unauthorized.status).toBe(401)
+          yield* Effect.promise(() => CoordinatorAuthority.close())
+          CoordinatorAuthority.reopen()
+
+          held = yield* Deferred.make<void>()
+          heldStarted = yield* Deferred.make<void>()
+          const pending = yield* HttpClientRequest.post("/hold").pipe(
+            HttpClientRequest.setHeader("authorization", basic("opencode", "secret")),
+            HttpClient.execute,
+            Effect.forkScoped,
+          )
+          yield* Deferred.await(heldStarted)
+          const drain = CoordinatorAuthority.close()
+          expect(yield* Effect.promise(() => Promise.race([drain.then(() => true), Promise.resolve(false)]))).toBe(
+            false,
+          )
+          yield* Deferred.succeed(held, undefined)
+          expect((yield* Fiber.join(pending)).status).toBe(200)
+          yield* Effect.promise(() => drain)
+
+          CoordinatorAuthority.reopen()
+          const failed = yield* HttpClientRequest.get("/missing").pipe(
+            HttpClientRequest.setHeader("authorization", basic("opencode", "secret")),
+            HttpClient.execute,
+          )
+          expect(failed.status).toBe(404)
+          yield* Effect.promise(() => CoordinatorAuthority.close())
+
+          CoordinatorAuthority.reopen()
+          yield* HttpClientRequest.post("/interrupt").pipe(
+            HttpClientRequest.setHeader("authorization", basic("opencode", "secret")),
+            HttpClient.execute,
+            Effect.exit,
+          )
+          yield* Effect.promise(() => CoordinatorAuthority.close())
+        }),
+      () =>
+        Effect.sync(() => {
+          held = undefined
+          heldStarted = undefined
+          CoordinatorAuthority.resetForTest()
+          delete process.env[OPENCODE_PROCESS_ROLE]
+          delete process.env.OPENCODE_COORDINATOR_AUTHORITY_EPOCH
+        }),
+    ),
   )
 })

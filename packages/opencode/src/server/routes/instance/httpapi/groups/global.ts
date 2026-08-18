@@ -54,6 +54,27 @@ export const GlobalUpgradeInput = Schema.Struct({
   target: Schema.optional(Schema.String),
 })
 
+const HandoffIdentifier = Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/))
+const HandoffEpoch = Schema.String.check(Schema.isMinLength(16), Schema.isMaxLength(128))
+
+const HandoffMatch = Schema.Struct({
+  request: HandoffIdentifier,
+  phase: Schema.Literals(["requested", "accepted"]),
+  revision: Schema.Number.check(Schema.isInt(), Schema.isBetween({ minimum: 0, maximum: 1_000_000 })),
+  sourceEpoch: HandoffEpoch,
+  targetEpoch: Schema.optional(HandoffEpoch),
+})
+
+export const GlobalAuthorityHandoffInput = Schema.Union([
+  Schema.Struct({ action: Schema.Literal("request"), request: HandoffIdentifier, targetEpoch: HandoffEpoch }),
+  Schema.Struct({ action: Schema.Literal("abort"), expected: HandoffMatch }),
+])
+
+const GlobalAuthorityHandoffResult = Schema.Struct({
+  success: Schema.Literal(true),
+  phase: Schema.Literals(["accepted", "aborted"]),
+})
+
 const GlobalUpgradeResult = Schema.Union([
   Schema.Struct({
     success: Schema.Literal(true),
@@ -74,6 +95,7 @@ export const GlobalPaths = {
   guiBridgeSync: "/global/gui-bridge/sync",
   guiBridgeUnregister: "/global/gui-bridge/unregister",
   guiBridgeRespond: "/global/gui-bridge/respond",
+  authorityHandoff: "/global/authority-handoff",
 } as const
 
 export const GlobalApi = HttpApi.make("global").add(
@@ -124,6 +146,16 @@ export const GlobalApi = HttpApi.make("global").add(
           identifier: "global.dispose",
           summary: "Dispose instance",
           description: "Clean up and dispose all OpenCode instances, releasing all resources.",
+        }),
+      ),
+      HttpApiEndpoint.post("authorityHandoff", GlobalPaths.authorityHandoff, {
+        payload: GlobalAuthorityHandoffInput,
+        success: GlobalAuthorityHandoffResult,
+        error: [ForbiddenError, ConflictError],
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "global.authority_handoff",
+          summary: "Control internal coordinator authority handoff",
         }),
       ),
       HttpApiEndpoint.post("upgrade", GlobalPaths.upgrade, {

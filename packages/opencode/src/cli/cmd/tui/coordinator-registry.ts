@@ -150,7 +150,10 @@ async function readClientLease(file: string) {
  * same database.
  */
 export class CoordinatorVersionMismatchError extends Error {
-  constructor(readonly manifest: TuiCoordinatorManifest, message: string) {
+  constructor(
+    readonly manifest: TuiCoordinatorManifest,
+    message: string,
+  ) {
     super(message)
     this.name = "CoordinatorVersionMismatchError"
   }
@@ -206,10 +209,9 @@ export async function readActiveCoordinator(
   return undefined
 }
 
-function coordinatorAuthorityError(
-  authority: { state: string; reason?: string } | "progressing",
-) {
-  const reason = authority === "progressing" ? authority : authority.state === "blocked" ? authority.reason : authority.state
+function coordinatorAuthorityError(authority: { state: string; reason?: string } | "progressing") {
+  const reason =
+    authority === "progressing" ? authority : authority.state === "blocked" ? authority.reason : authority.state
   return new Error(`TUI coordinator authority is ${reason}; refusing election or replacement`)
 }
 
@@ -275,14 +277,21 @@ export function compareAndSwapCoordinatorHandoff(
 
     const file = coordinatorHandoffPath(stateRoot, key)
     if (!replacement) {
-      if (!isCoordinatorHandoffRecord(current) || current.targetEpoch === undefined) return false
+      if (!isCoordinatorHandoffRecord(current) || (current.phase !== "requested" && current.phase !== "accepted"))
+        return false
+      const manifest = await readCoordinatorManifestFile(coordinatorManifestPathIn(stateRoot, key)).catch(
+        () => undefined,
+      )
+      if (!manifest || manifest.authorityEpoch !== current.sourceEpoch || manifest.pid !== process.pid) return false
       await fs.rm(file)
       return true
     }
     if (!isCoordinatorHandoffRecord(replacement)) throw new Error("Invalid replacement coordinator handoff record")
     if (!current) {
-      const manifest = await readCoordinatorManifestFile(coordinatorManifestPathIn(stateRoot, key)).catch(() => undefined)
-      if (!manifest || manifest.authorityEpoch !== replacement.sourceEpoch) return false
+      const manifest = await readCoordinatorManifestFile(coordinatorManifestPathIn(stateRoot, key)).catch(
+        () => undefined,
+      )
+      if (!manifest || manifest.authorityEpoch !== replacement.sourceEpoch || manifest.pid !== process.pid) return false
     }
     if (!checkCoordinatorHandoffTransition(isCoordinatorHandoffRecord(current) ? current : undefined, replacement)) {
       throw new Error("Illegal coordinator handoff transition")
@@ -314,6 +323,31 @@ export function compareAndSwapCoordinatorHandoff(
       await fs.rm(temporary, { force: true }).catch(() => {})
     }
     return true
+  })
+}
+
+export function inspectCoordinatorHandoff(key: string, stateRoot = STATE_ROOT) {
+  if (!isCoordinatorKey(key)) throw new Error("Invalid coordinator key")
+  return withCoordinatorAuthorityLock(stateRoot, key, async () => {
+    const handoff = await readCoordinatorHandoff(stateRoot, key).catch((error) => {
+      if (isMissingCoordinatorFile(error)) return undefined
+      throw error
+    })
+    if (handoff !== undefined && !isCoordinatorHandoffRecord(handoff)) throw new Error("Invalid coordinator handoff")
+    return handoff
+  })
+}
+
+export function proveCoordinatorSourceWithoutHandoff(key: string, sourceEpoch: string, stateRoot = STATE_ROOT) {
+  if (!isCoordinatorKey(key)) throw new Error("Invalid coordinator key")
+  return withCoordinatorAuthorityLock(stateRoot, key, async () => {
+    const handoff = await readCoordinatorHandoff(stateRoot, key).catch((error) => {
+      if (isMissingCoordinatorFile(error)) return undefined
+      throw error
+    })
+    if (handoff !== undefined) return false
+    const manifest = await readCoordinatorManifestFile(coordinatorManifestPathIn(stateRoot, key)).catch(() => undefined)
+    return manifest?.authorityEpoch === sourceEpoch && manifest.pid === process.pid
   })
 }
 
@@ -411,12 +445,7 @@ async function preferredCoordinatorDatabase() {
   const active = await discoverActiveGuiCoordinatorDatabase()
   const discovered =
     active || persisted ? undefined : coordinatorDatabaseIdentity((await discoverBackendDatabase()) ?? fallback)
-  const database = selectBackendAuthority(
-    active,
-    persisted,
-    discovered,
-    fallback,
-  )
+  const database = selectBackendAuthority(active, persisted, discovered, fallback)
   if (database !== fallback && database !== persisted) await rememberBackendAuthority(database).catch(() => undefined)
   return database
 }
@@ -482,10 +511,6 @@ async function hasActiveGuiClient(key: string, root: string) {
 async function rememberBackendAuthority(database: string, file = BACKEND_AUTHORITY) {
   await fs.mkdir(path.dirname(file), { recursive: true })
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`
-  await fs.writeFile(
-    tmp,
-    JSON.stringify({ version: 1, database, updatedAt: Date.now() }, null, 2),
-    { mode: 0o600 },
-  )
+  await fs.writeFile(tmp, JSON.stringify({ version: 1, database, updatedAt: Date.now() }, null, 2), { mode: 0o600 })
   await fs.rename(tmp, file)
 }

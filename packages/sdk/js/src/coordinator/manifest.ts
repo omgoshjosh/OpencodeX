@@ -17,15 +17,15 @@ import path from "node:path"
 
 /**
  * Schema number of the manifest file. This intentionally did NOT move when
- * `serverVersion` was added: both readers hard-delete a manifest that fails
- * validation, so an older binary meeting a newer schema number would delete the
- * manifest of a live, healthy coordinator and start a second writer on the same
- * database. Additive optional fields pass every field-typed validator, so new
- * information must arrive that way instead of through a version bump.
+ * `serverVersion` was added. Readers fail closed on validation errors, while
+ * additive optional fields let older binaries retain compatibility with newer
+ * coordinators. New information must arrive that way instead of through a
+ * version bump.
  */
 export const COORDINATOR_MANIFEST_VERSION = 2
 export const COORDINATOR_CLIENT_LEASE_VERSION = 1
-export const COORDINATOR_HANDOFF_VERSION = 1
+export const COORDINATOR_HANDOFF_LEGACY_VERSION = 1
+export const COORDINATOR_HANDOFF_VERSION = 2
 /** Directory under the state root that holds manifests, leases, and startup logs. */
 export const COORDINATOR_DIRECTORY = "tui-coordinators"
 /** Version string used by builds that were not stamped by the release pipeline. */
@@ -53,6 +53,12 @@ export type CoordinatorManifest = {
    * and that absence is what identifies it as legacy.
    */
   serverVersion?: string
+  /** Opaque generation of the process currently holding database authority. */
+  authorityEpoch?: string
+  /** Whether this authority currently accepts new work. */
+  admission?: boolean
+  /** Whether this authority is ready to serve attached clients. */
+  ready?: boolean
 }
 
 export type CoordinatorClientLease = {
@@ -70,8 +76,23 @@ export type CoordinatorClientLease = {
 export type CoordinatorHandoffRecord = {
   version: typeof COORDINATOR_HANDOFF_VERSION
   request: string
+  phase: CoordinatorHandoffPhase
+  revision: number
+  sourceEpoch: string
+  targetEpoch?: string
+  createdAt: string
+  updatedAt: string
+}
+
+export type LegacyCoordinatorHandoffRecord = {
+  version: typeof COORDINATOR_HANDOFF_LEGACY_VERSION
+  request: string
   sourceToken: string
 }
+
+export type CoordinatorHandoffWireRecord = LegacyCoordinatorHandoffRecord | CoordinatorHandoffRecord
+
+export type CoordinatorHandoffPhase = "requested" | "accepted" | "ready" | "committed"
 
 export type CoordinatorCredentials = Pick<CoordinatorManifest, "username" | "password">
 
@@ -79,7 +100,28 @@ export type CoordinatorHealth = {
   healthy: boolean
   version?: string
   active?: boolean
+  authorityEpoch?: string
+  admission?: boolean
+  ready?: boolean
 }
+
+export type CoordinatorAuthorityResolution =
+  | { state: "absent" }
+  | { state: "active"; authorityEpoch: string | undefined }
+  | { state: "handoff"; authorityEpoch: string; handoff: CoordinatorHandoffRecord }
+  | {
+      state: "blocked"
+      reason:
+        | "malformed_handoff"
+        | "legacy_handoff"
+        | "orphaned_handoff"
+        | "incompatible_handoff"
+        | "incompatible_authority"
+        | "invalid_authority"
+        | "unhealthy"
+        | "not_ready"
+        | "admission_closed"
+    }
 
 export type CoordinatorCompatibilityReason =
   | "match"
@@ -176,7 +218,11 @@ export function isCoordinatorManifest(value: unknown): value is CoordinatorManif
     typeof manifest.password === "string" &&
     typeof manifest.token === "string" &&
     typeof manifest.createdAt === "string" &&
-    (manifest.serverVersion === undefined || typeof manifest.serverVersion === "string")
+    (manifest.serverVersion === undefined || typeof manifest.serverVersion === "string") &&
+    (manifest.authorityEpoch === undefined ||
+      (typeof manifest.authorityEpoch === "string" && manifest.authorityEpoch.length > 0)) &&
+    (manifest.admission === undefined || typeof manifest.admission === "boolean") &&
+    (manifest.ready === undefined || typeof manifest.ready === "boolean")
   )
 }
 
@@ -198,19 +244,102 @@ export function isCoordinatorClientLease(value: unknown): value is CoordinatorCl
 }
 
 export function isCoordinatorHandoffRecord(value: unknown): value is CoordinatorHandoffRecord {
-  if (typeof value !== "object" || value === null) return false
+  return normalizeCoordinatorHandoffRecord(value) !== undefined
+}
+
+/** Returns a canonical v2 record. Legacy v1 records remain distinct on purpose. */
+export function normalizeCoordinatorHandoffRecord(value: unknown): CoordinatorHandoffRecord | undefined {
+  if (typeof value !== "object" || value === null) return undefined
+  if ("sourceToken" in value) return undefined
   const record = value as Partial<CoordinatorHandoffRecord>
+  if (record.version !== COORDINATOR_HANDOFF_VERSION) return undefined
+  if (typeof record.request !== "string" || record.request.length === 0) return undefined
+  if (!isCoordinatorHandoffPhase(record.phase)) return undefined
+  if (typeof record.revision !== "number" || !Number.isSafeInteger(record.revision) || record.revision < 0) {
+    return undefined
+  }
+  if (typeof record.sourceEpoch !== "string" || record.sourceEpoch.length === 0) return undefined
+  if (record.targetEpoch !== undefined && (typeof record.targetEpoch !== "string" || record.targetEpoch.length === 0)) {
+    return undefined
+  }
+  if (!isCoordinatorTimestamp(record.createdAt) || !isCoordinatorTimestamp(record.updatedAt)) return undefined
+  if (Date.parse(record.updatedAt) < Date.parse(record.createdAt)) return undefined
+  if (record.phase === "requested" && record.targetEpoch !== undefined) return undefined
+  if (record.phase !== "requested" && record.targetEpoch === undefined) return undefined
+  if (record.revision !== coordinatorHandoffPhaseRevision(record.phase)) return undefined
+  return {
+    version: COORDINATOR_HANDOFF_VERSION,
+    request: record.request,
+    phase: record.phase,
+    revision: record.revision,
+    sourceEpoch: record.sourceEpoch,
+    ...(record.targetEpoch === undefined ? {} : { targetEpoch: record.targetEpoch }),
+    createdAt: record.createdAt,
+    updatedAt: record.updatedAt,
+  }
+}
+
+/** Recognizes additive v1 wire records, but never a v1/v2 hybrid. */
+export function isLegacyCoordinatorHandoffRecord(value: unknown): value is LegacyCoordinatorHandoffRecord {
+  if (typeof value !== "object" || value === null) return false
+  if (
+    "phase" in value ||
+    "revision" in value ||
+    "sourceEpoch" in value ||
+    "targetEpoch" in value ||
+    "createdAt" in value ||
+    "updatedAt" in value
+  ) {
+    return false
+  }
+  const record = value as Partial<LegacyCoordinatorHandoffRecord>
   return (
-    record.version === COORDINATOR_HANDOFF_VERSION &&
+    record.version === COORDINATOR_HANDOFF_LEGACY_VERSION &&
     typeof record.request === "string" &&
-    typeof record.sourceToken === "string"
+    record.request.length > 0 &&
+    typeof record.sourceToken === "string" &&
+    record.sourceToken.length > 0
   )
 }
 
-export function parseCoordinatorHandoffRecord(raw: string): CoordinatorHandoffRecord {
+export function parseCoordinatorHandoffRecord(raw: string): CoordinatorHandoffWireRecord {
   const parsed = JSON.parse(raw) as unknown
-  if (!isCoordinatorHandoffRecord(parsed)) throw new Error("Invalid coordinator handoff record")
-  return parsed
+  const record = normalizeCoordinatorHandoffRecord(parsed)
+  if (record) return record
+  if (isLegacyCoordinatorHandoffRecord(parsed)) return parsed
+  throw new Error("Invalid coordinator handoff record")
+}
+
+/** Enforces the monotonic handoff state machine independently of file locking. */
+export function checkCoordinatorHandoffTransition(
+  current: CoordinatorHandoffRecord | undefined,
+  next: CoordinatorHandoffRecord,
+) {
+  if (!isCoordinatorHandoffRecord(next)) return false
+  if (!current) return next.phase === "requested" && next.revision === 0
+  if (next.request !== current.request || next.sourceEpoch !== current.sourceEpoch) return false
+  if (next.createdAt !== current.createdAt || next.revision !== current.revision + 1) return false
+  if (Date.parse(next.updatedAt) <= Date.parse(current.updatedAt)) return false
+  if (current.targetEpoch !== undefined && next.targetEpoch !== current.targetEpoch) return false
+  if (current.phase === "requested") return next.phase === "accepted" && next.targetEpoch !== undefined
+  if (current.phase === "accepted") return next.phase === "ready"
+  if (current.phase === "ready") return next.phase === "committed"
+  return false
+}
+
+function isCoordinatorHandoffPhase(value: unknown): value is CoordinatorHandoffPhase {
+  return value === "requested" || value === "accepted" || value === "ready" || value === "committed"
+}
+
+function coordinatorHandoffPhaseRevision(phase: CoordinatorHandoffPhase) {
+  if (phase === "requested") return 0
+  if (phase === "accepted") return 1
+  if (phase === "ready") return 2
+  return 3
+}
+
+function isCoordinatorTimestamp(value: unknown): value is string {
+  return typeof value === "string" && Number.isFinite(Date.parse(value))
 }
 
 /** Reads and validates a manifest file, propagating filesystem errors. */
@@ -303,10 +432,20 @@ export async function fetchCoordinatorHealth(
     if (!response.ok) return undefined
     const body: unknown = await response.json()
     if (typeof body !== "object" || body === null) return undefined
+    if ("authorityEpoch" in body && (typeof body.authorityEpoch !== "string" || body.authorityEpoch.length === 0)) {
+      return undefined
+    }
+    if ("admission" in body && typeof body.admission !== "boolean") return undefined
+    if ("ready" in body && typeof body.ready !== "boolean") return undefined
     return {
       healthy: "healthy" in body && body.healthy === true,
       version: "version" in body && typeof body.version === "string" ? body.version : undefined,
       active: "active" in body && typeof body.active === "boolean" ? body.active : undefined,
+      ...("authorityEpoch" in body && typeof body.authorityEpoch === "string"
+        ? { authorityEpoch: body.authorityEpoch }
+        : {}),
+      ...("admission" in body && typeof body.admission === "boolean" ? { admission: body.admission } : {}),
+      ...("ready" in body && typeof body.ready === "boolean" ? { ready: body.ready } : {}),
     }
   } catch {
     return undefined
@@ -320,6 +459,47 @@ export async function isCoordinatorHealthy(
   options?: { timeout?: number; fetch?: typeof globalThis.fetch },
 ) {
   return (await fetchCoordinatorHealth(manifest, options))?.healthy === true
+}
+
+/**
+ * Classifies observed authority state without performing I/O or changing election behavior.
+ * Any handoff that cannot be proven to belong to the observed authority fails closed.
+ */
+export function resolveCoordinatorAuthority(input: {
+  manifest?: CoordinatorManifest
+  health?: CoordinatorHealth
+  handoff?: unknown
+}): CoordinatorAuthorityResolution {
+  if (isLegacyCoordinatorHandoffRecord(input.handoff)) return { state: "blocked", reason: "legacy_handoff" }
+  const handoff = input.handoff === undefined ? undefined : normalizeCoordinatorHandoffRecord(input.handoff)
+  if (input.handoff !== undefined && !handoff) return { state: "blocked", reason: "malformed_handoff" }
+  if (!input.manifest) {
+    if (handoff) return { state: "blocked", reason: "orphaned_handoff" }
+    return { state: "absent" }
+  }
+  if (input.manifest.authorityEpoch === "" || input.health?.authorityEpoch === "") {
+    return { state: "blocked", reason: "invalid_authority" }
+  }
+  if (!input.health?.healthy) return { state: "blocked", reason: "unhealthy" }
+  if (
+    input.manifest.authorityEpoch !== undefined &&
+    input.health.authorityEpoch !== undefined &&
+    input.manifest.authorityEpoch !== input.health.authorityEpoch
+  ) {
+    return { state: "blocked", reason: "incompatible_authority" }
+  }
+  const authorityEpoch = input.health.authorityEpoch ?? input.manifest.authorityEpoch
+  if (handoff) {
+    if (!authorityEpoch || handoff.sourceEpoch !== authorityEpoch) {
+      return { state: "blocked", reason: "incompatible_handoff" }
+    }
+    return { state: "handoff", authorityEpoch, handoff }
+  }
+  if (input.manifest.ready === false || input.health.ready === false) return { state: "blocked", reason: "not_ready" }
+  if (input.manifest.admission === false || input.health.admission === false) {
+    return { state: "blocked", reason: "admission_closed" }
+  }
+  return { state: "active", authorityEpoch }
 }
 
 /**

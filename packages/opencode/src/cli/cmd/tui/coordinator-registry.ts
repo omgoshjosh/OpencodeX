@@ -7,6 +7,7 @@ import { LockProtocol } from "@opencode-ai/core/util/lock-protocol"
 import { ensureRunID, OPENCODE_PROCESS_ROLE, OPENCODE_RUN_ID } from "@opencode-ai/core/util/opencode-process"
 import {
   checkCoordinatorCompatibility,
+  checkCoordinatorHandoffTransition,
   coordinatorClientDir as coordinatorClientDirIn,
   coordinatorDatabaseIdentity as coordinatorDatabaseIdentityOf,
   coordinatorHandoffPath,
@@ -21,7 +22,6 @@ import {
   isCoordinatorProcessAlive,
   isMissingCoordinatorFile,
   readCoordinatorManifestFile,
-  readCoordinatorManifestToken,
   readCoordinatorHandoff,
   removeCoordinatorManifest as removeCoordinatorManifestIn,
   startCoordinatorClientLease as startCoordinatorClientLeaseIn,
@@ -40,7 +40,10 @@ import { discoverBackendDatabase } from "./database-discovery"
 export type TuiCoordinatorManifest = CoordinatorManifest
 export type TuiCoordinatorClientLease = CoordinatorClientLease
 export type TuiCoordinatorHandoffRecord = CoordinatorHandoffRecord
-export type TuiCoordinatorHandoffMatch = Pick<TuiCoordinatorHandoffRecord, "request" | "sourceToken">
+export type TuiCoordinatorHandoffMatch = Pick<
+  TuiCoordinatorHandoffRecord,
+  "request" | "phase" | "revision" | "sourceEpoch" | "targetEpoch"
+>
 
 const STATE_ROOT = Global.Path.state
 const ROOT = coordinatorRoot(STATE_ROOT)
@@ -144,14 +147,18 @@ export class CoordinatorVersionMismatchError extends Error {
   }
 }
 
-export async function readActiveCoordinator(key = coordinatorKey(), database = coordinatorDatabaseIdentity()) {
-  const manifest = await readActiveManifest(key)
+export async function readActiveCoordinator(
+  key = coordinatorKey(),
+  database = coordinatorDatabaseIdentity(),
+  stateRoot = STATE_ROOT,
+) {
+  const manifest = await readActiveManifest(key, stateRoot)
   if (!manifest) return undefined
   if (
     manifest.key !== key ||
     coordinatorDatabaseIdentity(manifest.database) !== coordinatorDatabaseIdentity(database)
   ) {
-    await removeCoordinatorManifest(key, manifest.token)
+    await removeCoordinatorManifestIn(stateRoot, key, manifest.token)
     return undefined
   }
   const health = await fetchCoordinatorHealth(manifest)
@@ -172,7 +179,7 @@ export async function readActiveCoordinator(key = coordinatorKey(), database = c
   if (isCoordinatorProcessAlive(manifest.pid)) {
     throw new Error(`TUI coordinator process ${manifest.pid} is alive but unhealthy; refusing to replace it`)
   }
-  await removeCoordinatorManifest(key, manifest.token)
+  await removeCoordinatorManifestIn(stateRoot, key, manifest.token)
   return undefined
 }
 
@@ -181,16 +188,13 @@ export async function readPreferredCoordinator() {
   return readActiveCoordinator(coordinatorKey(database), database)
 }
 
-async function readActiveManifest(key: string) {
-  const file = coordinatorManifestPath(key)
+export async function readActiveManifest(key: string, stateRoot = STATE_ROOT) {
+  const file = coordinatorManifestPathIn(stateRoot, key)
   try {
     return await readCoordinatorManifestFile(file)
   } catch (error) {
     if (isMissingCoordinatorFile(error)) return undefined
-    const token = await readCoordinatorManifestToken(file)
-    if (!token) throw new Error("Invalid TUI coordinator manifest cannot be removed safely", { cause: error })
-    await removeCoordinatorManifest(key, token)
-    return undefined
+    throw new Error("Invalid TUI coordinator manifest; refusing to replace it", { cause: error })
   }
 }
 
@@ -213,9 +217,9 @@ export function coordinatorStartupLock(key: string) {
 }
 
 /**
- * Atomically changes handoff state only when the current request and source
- * generation are exactly the expected pair. Malformed state is never treated
- * as absence, so it cannot be overwritten or deleted through this API.
+ * Atomically changes handoff state only when its full authority fence is
+ * exactly expected. Malformed and legacy state is never treated as absence, so
+ * it cannot be overwritten or deleted through this API.
  */
 export function compareAndSwapCoordinatorHandoff(
   key: string,
@@ -232,16 +236,25 @@ export function compareAndSwapCoordinatorHandoff(
         throw error
       })
       const matches = expected
-        ? current?.request === expected.request && current.sourceToken === expected.sourceToken
+        ? isCoordinatorHandoffRecord(current) &&
+          current.request === expected.request &&
+          current.phase === expected.phase &&
+          current.sourceEpoch === expected.sourceEpoch &&
+          current.revision === expected.revision &&
+          current.targetEpoch === expected.targetEpoch
         : current === undefined
       if (!matches) return false
 
       const file = coordinatorHandoffPath(stateRoot, key)
       if (!replacement) {
+        if (!isCoordinatorHandoffRecord(current) || current.targetEpoch === undefined) return false
         await fs.rm(file)
         return true
       }
       if (!isCoordinatorHandoffRecord(replacement)) throw new Error("Invalid replacement coordinator handoff record")
+      if (!checkCoordinatorHandoffTransition(isCoordinatorHandoffRecord(current) ? current : undefined, replacement)) {
+        throw new Error("Illegal coordinator handoff transition")
+      }
 
       await fs.mkdir(path.dirname(file), { recursive: true })
       const temporary = `${file}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`
@@ -252,7 +265,12 @@ export function compareAndSwapCoordinatorHandoff(
             {
               version: replacement.version,
               request: replacement.request,
-              sourceToken: replacement.sourceToken,
+              phase: replacement.phase,
+              revision: replacement.revision,
+              sourceEpoch: replacement.sourceEpoch,
+              ...(replacement.targetEpoch === undefined ? {} : { targetEpoch: replacement.targetEpoch }),
+              createdAt: replacement.createdAt,
+              updatedAt: replacement.updatedAt,
             },
             null,
             2,

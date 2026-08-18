@@ -8,7 +8,6 @@ import {
   isCoordinatorProcessAlive,
   isMissingCoordinatorFile,
   readCoordinatorManifestFile,
-  readCoordinatorManifestToken,
   removeCoordinatorManifest as removeCoordinatorManifestIn,
   startCoordinatorClientLease as startCoordinatorClientLeaseIn,
 } from "@opencode-ai/sdk/coordinator"
@@ -191,10 +190,7 @@ async function readActiveManifest(key: string) {
     return await readCoordinatorManifest(key)
   } catch (error) {
     if (isMissingCoordinatorFile(error)) return undefined
-    const token = await readCoordinatorManifestToken(coordinatorManifestPath(key))
-    if (!token) throw new Error("Invalid TUI coordinator manifest cannot be removed safely", { cause: error })
-    await removeCoordinatorManifest(key, token)
-    return undefined
+    throw new Error("Invalid TUI coordinator manifest; refusing to replace it", { cause: error })
   }
 }
 

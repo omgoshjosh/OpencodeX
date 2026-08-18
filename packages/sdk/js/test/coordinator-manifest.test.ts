@@ -3,15 +3,20 @@ import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import {
+  COORDINATOR_HANDOFF_VERSION,
   COORDINATOR_MANIFEST_VERSION,
   checkCoordinatorCompatibility,
   coordinatorClientDir,
   coordinatorDatabaseIdentity,
+  coordinatorHandoffPath,
   coordinatorKey,
   coordinatorManifestPath,
   fetchCoordinatorHealth,
+  isCoordinatorHandoffRecord,
+  isCoordinatorKey,
   isCoordinatorManifest,
   readCoordinatorManifest,
+  readCoordinatorHandoff,
   removeCoordinatorManifest,
   startCoordinatorClientLease,
   writeCoordinatorManifest,
@@ -79,6 +84,54 @@ describe("coordinator manifest validation", () => {
     await fs.mkdir(path.dirname(file), { recursive: true })
     await fs.writeFile(file, "{not json")
     await expect(readCoordinatorManifest(root, "abc123")).rejects.toThrow()
+  })
+})
+
+describe("coordinator handoff record", () => {
+  test("reads a credential-free versioned record from its coordinator-scoped path", async () => {
+    const root = await stateRoot()
+    const record = {
+      version: COORDINATOR_HANDOFF_VERSION,
+      request: "request-1",
+      sourceToken: "source-generation-1",
+    } as const
+    const key = "a".repeat(40)
+    const file = coordinatorHandoffPath(root, key)
+    await fs.mkdir(path.dirname(file), { recursive: true })
+    await fs.writeFile(file, JSON.stringify(record))
+
+    expect(await readCoordinatorHandoff(root, key)).toEqual(record)
+    expect(Object.keys(record)).not.toContain("username")
+    expect(Object.keys(record)).not.toContain("password")
+  })
+
+  test("validates the version and exact field types while allowing additive fields", () => {
+    const record = {
+      version: COORDINATOR_HANDOFF_VERSION,
+      request: "request-1",
+      sourceToken: "source-generation-1",
+    }
+    expect(isCoordinatorHandoffRecord(record)).toBe(true)
+    expect(isCoordinatorHandoffRecord({ ...record, future: true })).toBe(true)
+    expect(isCoordinatorHandoffRecord({ ...record, version: 2 })).toBe(false)
+    expect(isCoordinatorHandoffRecord({ ...record, sourceToken: 1 })).toBe(false)
+  })
+
+  test("requires canonical coordinator keys before deriving handoff paths", () => {
+    expect(isCoordinatorKey("a".repeat(40))).toBe(true)
+    expect(isCoordinatorKey("A".repeat(40))).toBe(false)
+    expect(() => coordinatorHandoffPath("/state", "alias/../key")).toThrow("Invalid coordinator key")
+    expect(() => coordinatorHandoffPath("/state", "../../outside")).toThrow("Invalid coordinator key")
+  })
+
+  test("rejects malformed handoff state", async () => {
+    const root = await stateRoot()
+    const key = "a".repeat(40)
+    const file = coordinatorHandoffPath(root, key)
+    await fs.mkdir(path.dirname(file), { recursive: true })
+    await fs.writeFile(file, "{not json")
+
+    await expect(readCoordinatorHandoff(root, key)).rejects.toThrow()
   })
 })
 

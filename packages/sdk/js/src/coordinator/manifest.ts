@@ -25,6 +25,7 @@ import path from "node:path"
  */
 export const COORDINATOR_MANIFEST_VERSION = 2
 export const COORDINATOR_CLIENT_LEASE_VERSION = 1
+export const COORDINATOR_HANDOFF_VERSION = 1
 /** Directory under the state root that holds manifests, leases, and startup logs. */
 export const COORDINATOR_DIRECTORY = "tui-coordinators"
 /** Version string used by builds that were not stamped by the release pipeline. */
@@ -59,6 +60,17 @@ export type CoordinatorClientLease = {
   key: string
   pid: number
   updatedAt: number
+}
+
+/**
+ * Credential-free coordination state for a future authority handoff. The
+ * opaque pair identifies one request against one generation of the source
+ * coordinator; attach credentials never belong in this file.
+ */
+export type CoordinatorHandoffRecord = {
+  version: typeof COORDINATOR_HANDOFF_VERSION
+  request: string
+  sourceToken: string
 }
 
 export type CoordinatorCredentials = Pick<CoordinatorManifest, "username" | "password">
@@ -98,6 +110,15 @@ export function coordinatorClientDir(stateRoot: string, key: string) {
 
 export function coordinatorStartupLogPath(stateRoot: string, key: string) {
   return path.join(coordinatorRoot(stateRoot), `${key}.startup.log`)
+}
+
+export function isCoordinatorKey(key: string) {
+  return /^[0-9a-f]{40}$/.test(key)
+}
+
+export function coordinatorHandoffPath(stateRoot: string, key: string) {
+  if (!isCoordinatorKey(key)) throw new Error("Invalid coordinator key")
+  return path.join(coordinatorRoot(stateRoot), `${key}.handoff.json`)
 }
 
 /**
@@ -176,6 +197,22 @@ export function isCoordinatorClientLease(value: unknown): value is CoordinatorCl
   )
 }
 
+export function isCoordinatorHandoffRecord(value: unknown): value is CoordinatorHandoffRecord {
+  if (typeof value !== "object" || value === null) return false
+  const record = value as Partial<CoordinatorHandoffRecord>
+  return (
+    record.version === COORDINATOR_HANDOFF_VERSION &&
+    typeof record.request === "string" &&
+    typeof record.sourceToken === "string"
+  )
+}
+
+export function parseCoordinatorHandoffRecord(raw: string): CoordinatorHandoffRecord {
+  const parsed = JSON.parse(raw) as unknown
+  if (!isCoordinatorHandoffRecord(parsed)) throw new Error("Invalid coordinator handoff record")
+  return parsed
+}
+
 /** Reads and validates a manifest file, propagating filesystem errors. */
 export async function readCoordinatorManifestFile(file: string) {
   return parseCoordinatorManifest(await fs.readFile(file, "utf8"))
@@ -183,6 +220,15 @@ export async function readCoordinatorManifestFile(file: string) {
 
 export async function readCoordinatorManifest(stateRoot: string, key: string) {
   return readCoordinatorManifestFile(coordinatorManifestPath(stateRoot, key))
+}
+
+/** Reads and validates a handoff file, propagating missing and malformed state. */
+export async function readCoordinatorHandoffFile(file: string) {
+  return parseCoordinatorHandoffRecord(await fs.readFile(file, "utf8"))
+}
+
+export async function readCoordinatorHandoff(stateRoot: string, key: string) {
+  return readCoordinatorHandoffFile(coordinatorHandoffPath(stateRoot, key))
 }
 
 /**

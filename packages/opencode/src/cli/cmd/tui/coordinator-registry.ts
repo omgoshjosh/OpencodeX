@@ -3,25 +3,31 @@ import { Global } from "@opencode-ai/core/global"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import * as Log from "@opencode-ai/core/util/log"
 import { Flock } from "@opencode-ai/core/util/flock"
+import { LockProtocol } from "@opencode-ai/core/util/lock-protocol"
 import { ensureRunID, OPENCODE_PROCESS_ROLE, OPENCODE_RUN_ID } from "@opencode-ai/core/util/opencode-process"
 import {
   checkCoordinatorCompatibility,
   coordinatorClientDir as coordinatorClientDirIn,
   coordinatorDatabaseIdentity as coordinatorDatabaseIdentityOf,
+  coordinatorHandoffPath,
   coordinatorHeaders as coordinatorHeadersFor,
   coordinatorKey as coordinatorKeyOf,
   coordinatorManifestPath as coordinatorManifestPathIn,
   coordinatorRoot,
   fetchCoordinatorHealth,
   isCoordinatorClientLease,
+  isCoordinatorHandoffRecord,
+  isCoordinatorKey,
   isCoordinatorProcessAlive,
   isMissingCoordinatorFile,
   readCoordinatorManifestFile,
   readCoordinatorManifestToken,
+  readCoordinatorHandoff,
   removeCoordinatorManifest as removeCoordinatorManifestIn,
   startCoordinatorClientLease as startCoordinatorClientLeaseIn,
   writeCoordinatorManifest as writeCoordinatorManifestIn,
   type CoordinatorClientLease,
+  type CoordinatorHandoffRecord,
   type CoordinatorManifest,
 } from "@opencode-ai/sdk/coordinator"
 import { errorMessage } from "@/util/error"
@@ -33,6 +39,8 @@ import { discoverBackendDatabase } from "./database-discovery"
 
 export type TuiCoordinatorManifest = CoordinatorManifest
 export type TuiCoordinatorClientLease = CoordinatorClientLease
+export type TuiCoordinatorHandoffRecord = CoordinatorHandoffRecord
+export type TuiCoordinatorHandoffMatch = Pick<TuiCoordinatorHandoffRecord, "request" | "sourceToken">
 
 const STATE_ROOT = Global.Path.state
 const ROOT = coordinatorRoot(STATE_ROOT)
@@ -202,6 +210,63 @@ export function withCoordinatorStartupLock<T>(key: string, fn: () => Promise<T>)
 
 export function coordinatorStartupLock(key: string) {
   return Flock.effect(`tui-coordinator:${key}`, { timeoutMs: START_TIMEOUT, staleMs: LOCK_STALE_TIMEOUT })
+}
+
+/**
+ * Atomically changes handoff state only when the current request and source
+ * generation are exactly the expected pair. Malformed state is never treated
+ * as absence, so it cannot be overwritten or deleted through this API.
+ */
+export function compareAndSwapCoordinatorHandoff(
+  key: string,
+  expected: TuiCoordinatorHandoffMatch | undefined,
+  replacement: TuiCoordinatorHandoffRecord | undefined,
+  stateRoot = STATE_ROOT,
+) {
+  if (!isCoordinatorKey(key)) throw new Error("Invalid coordinator key")
+  return Flock.withLock(
+    `tui-coordinator-handoff:${key}`,
+    async () => {
+      const current = await readCoordinatorHandoff(stateRoot, key).catch((error) => {
+        if (isMissingCoordinatorFile(error)) return undefined
+        throw error
+      })
+      const matches = expected
+        ? current?.request === expected.request && current.sourceToken === expected.sourceToken
+        : current === undefined
+      if (!matches) return false
+
+      const file = coordinatorHandoffPath(stateRoot, key)
+      if (!replacement) {
+        await fs.rm(file)
+        return true
+      }
+      if (!isCoordinatorHandoffRecord(replacement)) throw new Error("Invalid replacement coordinator handoff record")
+
+      await fs.mkdir(path.dirname(file), { recursive: true })
+      const temporary = `${file}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`
+      try {
+        await fs.writeFile(
+          temporary,
+          JSON.stringify(
+            {
+              version: replacement.version,
+              request: replacement.request,
+              sourceToken: replacement.sourceToken,
+            },
+            null,
+            2,
+          ),
+          { mode: 0o600 },
+        )
+        await fs.rename(temporary, file)
+      } finally {
+        await fs.rm(temporary, { force: true }).catch(() => {})
+      }
+      return true
+    },
+    { dir: LockProtocol.rootDir(stateRoot) },
+  )
 }
 
 export function acquireCoordinatorOwnerLock(key: string) {

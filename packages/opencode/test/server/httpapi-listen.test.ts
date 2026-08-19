@@ -8,6 +8,7 @@ import { GlobalPaths } from "../../src/server/routes/instance/httpapi/groups/glo
 import { withTimeout } from "../../src/util/timeout"
 import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances } from "../fixture/fixture"
+import { ServerAuth } from "../../src/server/auth"
 
 void Log.init({ print: false })
 
@@ -20,6 +21,7 @@ const original = {
 const auth = { username: "opencode", password: "listen-secret" }
 
 afterEach(async () => {
+  ServerAuth.resetForTest()
   Flag.OPENCODE_SERVER_PASSWORD = original.OPENCODE_SERVER_PASSWORD
   Flag.OPENCODE_SERVER_USERNAME = original.OPENCODE_SERVER_USERNAME
   if (original.envPassword === undefined) delete process.env.OPENCODE_SERVER_PASSWORD
@@ -47,6 +49,26 @@ function stop(listener: Awaited<ReturnType<typeof startListener>>, label: string
 }
 
 describe("HttpApi Server.listen", () => {
+  test("uses explicit in-memory auth after scrubbing inherited credentials", async () => {
+    process.env.OPENCODE_SERVER_USERNAME = "must-be-scrubbed"
+    process.env.OPENCODE_SERVER_PASSWORD = "must-be-scrubbed"
+    ServerAuth.initialize(auth)
+    const listener = await Server.listen({ hostname: "127.0.0.1", port: 0 })
+
+    try {
+      expect(process.env.OPENCODE_SERVER_USERNAME).toBeUndefined()
+      expect(process.env.OPENCODE_SERVER_PASSWORD).toBeUndefined()
+      const unauthorized = await fetch(new URL(GlobalPaths.health, listener.url))
+      const authorized = await fetch(new URL(GlobalPaths.health, listener.url), {
+        headers: { authorization: authorization() },
+      })
+      expect(unauthorized.status).toBe(401)
+      expect(authorized.status).toBe(200)
+    } finally {
+      await stop(listener, "timed out cleaning up explicit auth listener")
+    }
+  })
+
   test("propagates and caches scope finalizer failure", async () => {
     const calls: string[] = []
     const stop = await Effect.runPromise(

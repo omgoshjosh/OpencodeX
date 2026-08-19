@@ -186,7 +186,7 @@ describe("coordinator handoff compare-and-swap", () => {
     expect((await fs.stat(coordinatorHandoffPath(tmp.path, key))).mode & 0o777).toBe(0o600)
   })
 
-  test("aborts requested and accepted handoffs only on an exact authority fence", async () => {
+  test("deletes requested but never accepted handoffs on an exact authority fence", async () => {
     await using tmp = await tmpdir()
     const first = record("request-1", "source-1")
     const second = accepted(first)
@@ -218,8 +218,8 @@ describe("coordinator handoff compare-and-swap", () => {
         tmp.path,
       ),
     ).toBe(false)
-    expect(await compareAndSwapCoordinatorHandoff(key, second, undefined, tmp.path)).toBe(true)
-    expect(await Bun.file(coordinatorHandoffPath(tmp.path, key)).exists()).toBe(false)
+    expect(await compareAndSwapCoordinatorHandoff(key, second, undefined, tmp.path)).toBe(false)
+    expect(await readCoordinatorHandoff(tmp.path, key)).toEqual(second)
   })
 
   test("fails closed without changing malformed state", async () => {

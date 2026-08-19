@@ -3,6 +3,7 @@ import { OPENCODE_PROCESS_ROLE } from "@opencode-ai/core/util/opencode-process"
 type Waiter = () => void
 
 const state = {
+  authorityEpoch: undefined as string | undefined,
   admission: true,
   ready: true,
   inflight: 0,
@@ -11,12 +12,23 @@ const state = {
 }
 
 export function enabled() {
-  return process.env[OPENCODE_PROCESS_ROLE] === "coordinator" && !!process.env.OPENCODE_COORDINATOR_AUTHORITY_EPOCH
+  return process.env[OPENCODE_PROCESS_ROLE] === "coordinator" && state.authorityEpoch !== undefined
 }
 
 export function health() {
-  const authorityEpoch = process.env.OPENCODE_COORDINATOR_AUTHORITY_EPOCH
+  const authorityEpoch = state.authorityEpoch
   return authorityEpoch && enabled() ? { authorityEpoch, admission: state.admission, ready: state.ready } : undefined
+}
+
+export function initialize(authorityEpoch?: string) {
+  state.authorityEpoch = authorityEpoch
+  state.admission = true
+  state.ready = true
+  delete process.env.OPENCODE_COORDINATOR_AUTHORITY_EPOCH
+}
+
+export function epoch() {
+  return state.authorityEpoch
 }
 
 export function acquire(url: string) {
@@ -66,6 +78,7 @@ export function serialized<A>(transition: () => Promise<A>) {
 }
 
 export function resetForTest() {
+  state.authorityEpoch = undefined
   state.admission = true
   state.ready = true
   state.inflight = 0

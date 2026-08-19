@@ -10,6 +10,7 @@ describe.serial("coordinator authority admission", () => {
     process.env[OPENCODE_PROCESS_ROLE] = "coordinator"
     process.env.OPENCODE_COORDINATOR_AUTHORITY_EPOCH = "epoch-test"
     CoordinatorAuthority.resetForTest()
+    CoordinatorAuthority.initialize("epoch-test")
   })
 
   afterEach(() => {
@@ -59,5 +60,10 @@ describe.serial("coordinator authority admission", () => {
     process.env[OPENCODE_PROCESS_ROLE] = "worker"
     expect(CoordinatorAuthority.health()).toBeUndefined()
     expect(CoordinatorAuthority.acquire("/session")).toBeFunction()
+  })
+
+  test("stores the epoch in memory and scrubs the inherited variable", () => {
+    expect(CoordinatorAuthority.epoch()).toBe("epoch-test")
+    expect(process.env.OPENCODE_COORDINATOR_AUTHORITY_EPOCH).toBeUndefined()
   })
 })

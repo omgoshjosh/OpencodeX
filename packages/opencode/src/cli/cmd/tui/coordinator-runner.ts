@@ -6,6 +6,8 @@ import * as Log from "@opencode-ai/core/util/log"
 import { Effect } from "effect"
 import { ServerAuth } from "@/server/auth"
 import { Server } from "@/server/server"
+import { CoordinatorAuthority } from "@/server/coordinator-authority"
+import { CoordinatorHandoff } from "@/server/coordinator-handoff"
 import { errorMessage } from "@/util/error"
 import { Filesystem } from "@/util/filesystem"
 import {
@@ -20,6 +22,7 @@ import {
   publishCoordinatorManifest,
   type TuiCoordinatorManifest,
 } from "./coordinator-registry"
+import type { CoordinatorBootstrap } from "./coordinator-bootstrap"
 
 const FIRST_CLIENT_TIMEOUT = 60_000
 const IDLE_SHUTDOWN_TIMEOUT = 5_000
@@ -41,6 +44,14 @@ export type CoordinatorRunnerOptions = {
   startupLock?: boolean
   signal?: AbortSignal
   beforeStart?: Effect.Effect<void, unknown>
+  bootstrap: CoordinatorBootstrap
+}
+
+export function initializeCoordinatorProcess(bootstrap: CoordinatorBootstrap) {
+  ServerAuth.initialize(bootstrap)
+  CoordinatorAuthority.initialize()
+  CoordinatorHandoff.initialize()
+  return bootstrap
 }
 
 export const runCoordinator = Effect.fn("TuiCoordinator.run")(function* (input: CoordinatorRunnerOptions) {
@@ -48,22 +59,27 @@ export const runCoordinator = Effect.fn("TuiCoordinator.run")(function* (input: 
   const database = coordinatorDatabaseIdentity()
   const key = coordinatorKey(database)
   if (input.key && input.key !== key) throw new Error("TUI coordinator key does not match its database")
-  const username = requiredEnv("OPENCODE_TUI_COORDINATOR_USERNAME")
-  const password = requiredEnv("OPENCODE_TUI_COORDINATOR_PASSWORD")
-  const token = requiredEnv("OPENCODE_TUI_COORDINATOR_TOKEN")
 
   process.env[OPENCODE_PROCESS_ROLE] ??= "coordinator"
   ensureRunID()
-  process.env.OPENCODE_SERVER_USERNAME ??= username
-  process.env.OPENCODE_SERVER_PASSWORD ??= password
 
   yield* Effect.try({
     try: () => process.chdir(directory),
     catch: () => new Error(`Failed to change directory to ${directory}`),
   })
 
+  const credentials = initializeCoordinatorProcess(input.bootstrap)
+
   return yield* Effect.acquireUseRelease(
-    startCoordinator({ ...input, directory, database, key, username, password, token }),
+    startCoordinator({
+      ...input,
+      directory,
+      database,
+      key,
+      username: credentials.username,
+      password: credentials.password,
+      token: credentials.token,
+    }),
     (resource) => {
       if (!resource.owned) return Effect.succeed(resource.manifest)
       return waitForShutdown(resource, input.signal).pipe(
@@ -111,7 +127,7 @@ function startCoordinator(
       input.signal?.throwIfAborted()
 
       const authorityEpoch = randomBytes(32).toString("base64url")
-      process.env.OPENCODE_COORDINATOR_AUTHORITY_EPOCH = authorityEpoch
+      CoordinatorAuthority.initialize(authorityEpoch)
       const server = yield* Effect.promise(() =>
         Server.listen({
           hostname: "127.0.0.1",
@@ -402,10 +418,4 @@ async function boundedCoordinatorShutdownStep(action: () => Promise<unknown>, ti
   } finally {
     if (timer) clearTimeout(timer)
   }
-}
-
-function requiredEnv(name: string) {
-  const value = process.env[name]
-  if (!value) throw new Error(`${name} is required`)
-  return value
 }

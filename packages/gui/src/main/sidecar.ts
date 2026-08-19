@@ -27,6 +27,7 @@ import {
   type SidecarLaunch,
 } from "./sidecar-launch.js"
 import { stopOwnedCoordinatorUnderAuthority } from "./sidecar-lifecycle.js"
+import { sidecarChildEnvironment, writeSidecarBootstrap } from "./sidecar-bootstrap.js"
 
 export type SidecarConnection = {
   url: string
@@ -207,7 +208,8 @@ async function activeCoordinator(key: string, database: string) {
 }
 
 function coordinatorAuthorityError(authority: { state: string; reason?: string } | "progressing") {
-  const reason = authority === "progressing" ? authority : authority.state === "blocked" ? authority.reason : authority.state
+  const reason =
+    authority === "progressing" ? authority : authority.state === "blocked" ? authority.reason : authority.state
   return new Error(`OpencodeX coordinator authority is ${reason}; refusing election or replacement`)
 }
 
@@ -231,8 +233,8 @@ async function spawnCoordinator(directory: string, key: string, database: string
   const password = randomBytes(32).toString("base64url")
   const token = randomBytes(32).toString("base64url")
   const started = { ...createSidecarLaunch(directory, key, database), startupLog: coordinatorStartupLogPath(key) }
-  const child = (() => {
-    const startupLog = createStartupLog(started)
+  const startupLog = createStartupLog(started)
+  const child = await (async () => {
     try {
       const spawned = spawn(started.command, started.args, {
         cwd: started.cwd,
@@ -243,23 +245,21 @@ async function spawnCoordinator(directory: string, key: string, database: string
            `windowsHide` keeps the detached child from opening a console
            window. */
         detached: true,
-        stdio: ["ignore", startupLog, startupLog],
-        env: {
-          ...process.env,
+        stdio: ["ignore", startupLog, startupLog, "pipe"],
+        env: sidecarChildEnvironment(process.env, {
           ...selectedDatabaseEnv(started.database),
           OPENCODE_CLI_NAME: "opencodex",
-          OPENCODE_TUI_COORDINATOR_USERNAME: COORDINATOR_USERNAME,
-          OPENCODE_TUI_COORDINATOR_PASSWORD: password,
-          OPENCODE_TUI_COORDINATOR_TOKEN: token,
-          OPENCODE_SERVER_USERNAME: COORDINATOR_USERNAME,
-          OPENCODE_SERVER_PASSWORD: password,
-        },
+          OPENCODE_COORDINATOR_BOOTSTRAP_FD: "3",
+        }),
         windowsHide: true,
       })
       fs.closeSync(startupLog)
+      await writeSidecarBootstrap(spawned, { version: 1, username: COORDINATOR_USERNAME, password, token })
       return spawned
     } catch (error) {
-      fs.closeSync(startupLog)
+      try {
+        fs.closeSync(startupLog)
+      } catch {}
       throw startError(error, started)
     }
   })()

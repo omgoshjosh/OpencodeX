@@ -55,20 +55,20 @@ async function waitForHandoff(stateRoot: string) {
 describe.serial("coordinator handoff transition", () => {
   beforeEach(() => {
     process.env[OPENCODE_PROCESS_ROLE] = "coordinator"
-    process.env.OPENCODE_COORDINATOR_AUTHORITY_EPOCH = sourceEpoch
-    process.env.OPENCODE_COORDINATOR_HANDOFF_CAPABILITY = capability
     delete process.env.OPENCODE_COORDINATOR_HANDOFF_DRAIN_TIMEOUT_MS
     setSystemTime()
     CoordinatorAuthority.resetForTest()
+    CoordinatorAuthority.initialize(sourceEpoch)
+    CoordinatorHandoff.resetForTest()
+    CoordinatorHandoff.initialize({ capability })
   })
 
   afterEach(() => {
     setSystemTime()
     CoordinatorHandoff.overrideForTest()
+    CoordinatorHandoff.resetForTest()
     CoordinatorAuthority.resetForTest()
     delete process.env[OPENCODE_PROCESS_ROLE]
-    delete process.env.OPENCODE_COORDINATOR_AUTHORITY_EPOCH
-    delete process.env.OPENCODE_COORDINATOR_HANDOFF_CAPABILITY
     delete process.env.OPENCODE_COORDINATOR_HANDOFF_DRAIN_TIMEOUT_MS
   })
 
@@ -226,7 +226,7 @@ describe.serial("coordinator handoff transition", () => {
     })
 
     expect(await retry).toEqual({ phase: "accepted" })
-    await expect(racingAbort).rejects.toThrow("changed")
+    await expect(racingAbort).rejects.toThrow("roll forward")
     expect(await readCoordinatorHandoff(tmp.path, key)).toMatchObject({ phase: "accepted", revision: 1 })
     expect(CoordinatorAuthority.health()?.admission).toBe(false)
   })
@@ -236,8 +236,17 @@ describe.serial("coordinator handoff transition", () => {
     expect(CoordinatorHandoff.authorized(capability)).toBe(true)
     expect(CoordinatorHandoff.authorized(`${capability}x`)).toBe(false)
     expect(CoordinatorHandoff.authorized(undefined)).toBe(false)
-    process.env.OPENCODE_COORDINATOR_HANDOFF_CAPABILITY = "short"
+    CoordinatorHandoff.initialize({ capability: "short" })
     expect(CoordinatorHandoff.available()).toBe(false)
     expect(CoordinatorHandoff.authorized("short")).toBe(false)
+  })
+
+  test("requires explicit capability initialization and scrubs inherited capability", () => {
+    process.env.OPENCODE_COORDINATOR_HANDOFF_CAPABILITY = capability
+    CoordinatorHandoff.initialize()
+
+    expect(CoordinatorHandoff.available()).toBe(false)
+    expect(CoordinatorHandoff.authorized(capability)).toBe(false)
+    expect(process.env.OPENCODE_COORDINATOR_HANDOFF_CAPABILITY).toBeUndefined()
   })
 })

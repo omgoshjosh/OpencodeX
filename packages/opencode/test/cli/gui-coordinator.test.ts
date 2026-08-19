@@ -7,6 +7,12 @@ import path from "node:path"
 import { Effect } from "effect"
 import { Database } from "bun:sqlite"
 import { awaitWithTimeout, it, pollWithTimeout } from "../lib/effect"
+import { spawn } from "node:child_process"
+import {
+  COORDINATOR_BOOTSTRAP_FD_ENV,
+  coordinatorChildEnvironment,
+  writeCoordinatorBootstrapToChild,
+} from "../../src/cli/cmd/tui/coordinator-bootstrap"
 
 const root = path.resolve(import.meta.dir, "../..")
 const directEntry = path.join(root, "src", "gui-coordinator.ts")
@@ -38,6 +44,50 @@ type Fixture = {
 }
 
 describe("GUI coordinator direct entry", () => {
+  it.live("requires FD 3 bootstrap for GUI and hidden TUI entries", () =>
+    withFixture((fixture) =>
+      Effect.promise(async () => {
+        const environment = coordinatorChildEnvironment(process.env, {
+          HOME: fixture.home,
+          XDG_DATA_HOME: path.join(fixture.home, "data"),
+          XDG_STATE_HOME: path.join(fixture.home, "state"),
+          OPENCODE_DB: fixture.database,
+          OPENCODE_PROCESS_ROLE: "coordinator",
+        })
+        const entries = [
+          [process.execPath, "run", "--conditions=browser", directEntry, fixture.directory, "--key", fixture.key],
+          [
+            process.execPath,
+            "run",
+            "--conditions=browser",
+            cliEntry,
+            "internal-tui-coordinator",
+            fixture.directory,
+            "--key",
+            fixture.key,
+          ],
+        ]
+        const results = await Promise.all(
+          entries.map(async (command) => {
+            const child = spawn(command[0], command.slice(1), {
+              cwd: root,
+              env: environment,
+              stdio: ["ignore", "ignore", "pipe"],
+            })
+            const stderr = readStream(child.stderr!)
+            const exit = await new Promise<number | null>((resolve) => child.once("exit", resolve))
+            return { exit, stderr: await stderr }
+          }),
+        )
+
+        for (const result of results) {
+          expect(result.exit).not.toBe(0)
+          expect(result.stderr).toContain("Coordinator bootstrap is required")
+        }
+      }),
+    ),
+  )
+
   it.live(
     "publishes authenticated loopback health and removes its manifest on runner abort",
     () =>
@@ -58,7 +108,11 @@ describe("GUI coordinator direct entry", () => {
 
           yield* writeLease(fixture)
           yield* Effect.sync(child.stop)
-          yield* awaitWithTimeout(Effect.promise(() => child.process.exited), "coordinator did not exit on abort", "10 seconds")
+          yield* awaitWithTimeout(
+            Effect.promise(() => child.process.exited),
+            "coordinator did not exit on abort",
+            "10 seconds",
+          )
           yield* waitForManifestRemoval(fixture)
         }),
       ),
@@ -188,7 +242,11 @@ describe("GUI coordinator direct entry", () => {
           expect(response.status).toBe(200)
 
           yield* Effect.sync(() => winner.process.kill())
-          yield* awaitWithTimeout(Effect.promise(() => winner.process.exited), "winning coordinator did not exit", "10 seconds")
+          yield* awaitWithTimeout(
+            Effect.promise(() => winner.process.exited),
+            "winning coordinator did not exit",
+            "10 seconds",
+          )
           yield* Effect.promise(() => fs.rm(fixture.manifest, { force: true }))
         }),
       ),
@@ -259,8 +317,16 @@ describe("GUI coordinator direct entry", () => {
           yield* Effect.sync(() => first.process.kill())
           yield* Effect.sync(() => second.process.kill())
           yield* Effect.all([
-            awaitWithTimeout(Effect.promise(() => first.process.exited), "first coordinator did not exit", "10 seconds"),
-            awaitWithTimeout(Effect.promise(() => second.process.exited), "second coordinator did not exit", "10 seconds"),
+            awaitWithTimeout(
+              Effect.promise(() => first.process.exited),
+              "first coordinator did not exit",
+              "10 seconds",
+            ),
+            awaitWithTimeout(
+              Effect.promise(() => second.process.exited),
+              "second coordinator did not exit",
+              "10 seconds",
+            ),
           ])
           yield* Effect.promise(() => fs.rm(firstFixture.manifest, { force: true }))
           yield* Effect.promise(() => fs.rm(secondFixture.manifest, { force: true }))
@@ -302,7 +368,9 @@ describe("GUI coordinator direct entry", () => {
           }
           const inputs = Object.keys(metadata.inputs).map((file) => file.replaceAll("\\", "/"))
           expect(inputs.some((file) => file.includes("/yargs/"))).toBe(false)
-          expect(inputs.some((file) => file.endsWith("packages/opencode/src/index.ts") || file === "src/index.ts")).toBe(false)
+          expect(
+            inputs.some((file) => file.endsWith("packages/opencode/src/index.ts") || file === "src/index.ts"),
+          ).toBe(false)
           expect(inputs.some((file) => file.includes("/src/cli/cmd/run"))).toBe(false)
           expect(inputs.some((file) => file.includes("/src/cli/cmd/tui/app"))).toBe(false)
           expect(inputs.some((file) => file.includes("parser.worker"))).toBe(false)
@@ -334,20 +402,23 @@ function withFixture<A, E, R>(use: (fixture: Fixture) => Effect.Effect<A, E, R>)
 
 function spawnCoordinator(fixture: Fixture, entry: "direct" | "hidden" | "runner", id: string) {
   return Effect.acquireRelease(
-    Effect.sync(() => {
+    Effect.tryPromise(async () => {
       const username = `coordinator-${id}`
       const password = randomBytes(24).toString("base64url")
+      const token = randomBytes(24).toString("base64url")
       const args =
         entry === "direct"
           ? [directEntry, fixture.directory, "--key", fixture.key]
           : entry === "hidden"
             ? [cliEntry, "internal-tui-coordinator", fixture.directory, "--key", fixture.key]
             : [runnerEntry, fixture.directory, fixture.key]
-      const command = entry === "direct" && directBinary ? [directBinary, ...args.slice(1)] : ["bun", "run", "--conditions=browser", ...args]
-      const process = Bun.spawn(command, {
+      const command =
+        entry === "direct" && directBinary
+          ? [directBinary, ...args.slice(1)]
+          : [process.execPath, "run", "--conditions=browser", ...args]
+      const child = spawn(command[0], command.slice(1), {
         cwd: root,
-        env: {
-          ...globalThis.process.env,
+        env: coordinatorChildEnvironment(globalThis.process.env, {
           HOME: fixture.home,
           XDG_CONFIG_HOME: path.join(fixture.home, "config"),
           XDG_DATA_HOME: path.join(fixture.home, "data"),
@@ -359,26 +430,22 @@ function spawnCoordinator(fixture: Fixture, entry: "direct" | "hidden" | "runner
           OPENCODE_PURE: "1",
           OPENCODE_DISABLE_AUTOUPDATE: "1",
           OPENCODE_DISABLE_MODELS_FETCH: "1",
-          OPENCODE_TUI_COORDINATOR_USERNAME: username,
-          OPENCODE_TUI_COORDINATOR_PASSWORD: password,
-          OPENCODE_TUI_COORDINATOR_TOKEN: randomBytes(24).toString("base64url"),
-          OPENCODE_SERVER_USERNAME: username,
-          OPENCODE_SERVER_PASSWORD: password,
           OPENCODE_RUN_ID: crypto.randomUUID(),
           OPENCODE_PROCESS_ROLE: "coordinator",
           OPENCODE_TUI_COORDINATOR_STARTUP_LOCK_HELD: undefined,
-        },
-        stdin: "pipe",
-        stdout: "ignore",
-        stderr: "pipe",
+          [COORDINATOR_BOOTSTRAP_FD_ENV]: "3",
+        }),
+        stdio: ["pipe", "ignore", "pipe", "pipe"],
       })
-      const stderr = new Response(process.stderr).text()
+      const exited = new Promise<number | null>((resolve) => child.once("exit", resolve))
+      const stderr = readStream(child.stderr!)
+      await writeCoordinatorBootstrapToChild(child, { version: 1, username, password, token })
       return {
-        process,
+        process: Object.assign(child, { exited }),
         stderr,
         stop: () => {
-          process.stdin.write("stop\n")
-          process.stdin.end()
+          child.stdin!.write("stop\n")
+          child.stdin!.end()
         },
       }
     }),
@@ -393,6 +460,12 @@ function spawnCoordinator(fixture: Fixture, entry: "direct" | "hidden" | "runner
   )
 }
 
+async function readStream(stream: NodeJS.ReadableStream) {
+  const chunks: Buffer[] = []
+  for await (const chunk of stream) chunks.push(Buffer.from(chunk))
+  return Buffer.concat(chunks).toString("utf8")
+}
+
 function readManifest(fixture: Fixture) {
   return Effect.tryPromise(() => fs.readFile(fixture.manifest, "utf8")).pipe(
     Effect.map((raw) => JSON.parse(raw) as Manifest),
@@ -400,17 +473,16 @@ function readManifest(fixture: Fixture) {
   )
 }
 
-function waitForManifest(
-  fixture: Fixture,
-  ...children: Array<Effect.Success<ReturnType<typeof spawnCoordinator>>>
-) {
+function waitForManifest(fixture: Fixture, ...children: Array<Effect.Success<ReturnType<typeof spawnCoordinator>>>) {
   return pollWithTimeout(
     Effect.gen(function* () {
       const manifest = yield* readManifest(fixture)
       if (manifest) return manifest
       const failed = children.find((child) => child.process.exitCode !== null)
       if (!failed) return undefined
-      return yield* Effect.fail(new Error(`coordinator exited before publishing a manifest\n${yield* Effect.promise(() => failed.stderr)}`))
+      return yield* Effect.fail(
+        new Error(`coordinator exited before publishing a manifest\n${yield* Effect.promise(() => failed.stderr)}`),
+      )
     }),
     "coordinator did not publish a manifest",
     "30 seconds",
@@ -432,10 +504,7 @@ function writeLease(fixture: Fixture) {
   const file = path.join(fixture.clients, `${process.pid}-${randomBytes(4).toString("hex")}.json`)
   return Effect.promise(async () => {
     await fs.mkdir(fixture.clients, { recursive: true })
-    await fs.writeFile(
-      file,
-      JSON.stringify({ version: 1, key: fixture.key, pid: process.pid, updatedAt: Date.now() }),
-    )
+    await fs.writeFile(file, JSON.stringify({ version: 1, key: fixture.key, pid: process.pid, updatedAt: Date.now() }))
     return file
   })
 }
@@ -470,18 +539,17 @@ function normalizeDirectory(directory: string) {
 
 /*
  * The coordinator publishes the directory it actually chdir'd into, and
- * Filesystem.resolve puts that through realpathSync.native. On Windows that
- * expands 8.3 short names, so os.tmpdir() under an account whose name exceeds
- * eight characters (GitHub's runneradmin -> RUNNER~1) yields a fixture path
- * that never string-matches the manifest. Compare on the coordinator's footing.
+ * Filesystem.resolve puts that through realpathSync.native. This resolves
+ * macOS /var aliases and Windows 8.3 short names, so compare on the
+ * coordinator's footing.
  */
 function realDirectory(directory: string) {
   const resolved = path.resolve(directory)
-  if (process.platform !== "win32") return resolved
   try {
-    return realpathSync.native(resolved).toLowerCase()
+    const real = realpathSync.native(resolved)
+    return process.platform === "win32" ? real.toLowerCase() : real
   } catch {
-    return resolved.toLowerCase()
+    return process.platform === "win32" ? resolved.toLowerCase() : resolved
   }
 }
 

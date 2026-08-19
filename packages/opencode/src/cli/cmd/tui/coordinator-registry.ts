@@ -6,11 +6,8 @@ import { Flock } from "@opencode-ai/core/util/flock"
 import { LockProtocol } from "@opencode-ai/core/util/lock-protocol"
 import { ensureRunID, OPENCODE_PROCESS_ROLE, OPENCODE_RUN_ID } from "@opencode-ai/core/util/opencode-process"
 import {
-  activateCoordinatorHandoffTarget as activateCoordinatorHandoffTargetIn,
   checkCoordinatorCompatibility,
   checkCoordinatorHandoffTransition,
-  cleanupCommittedCoordinatorHandoff as cleanupCommittedCoordinatorHandoffIn,
-  commitCoordinatorHandoffTarget as commitCoordinatorHandoffTargetIn,
   coordinatorClientDir as coordinatorClientDirIn,
   coordinatorDatabaseIdentity as coordinatorDatabaseIdentityOf,
   coordinatorHandoffPath,
@@ -40,6 +37,11 @@ import { spawn } from "child_process"
 import fs from "fs/promises"
 import path from "path"
 import { discoverBackendDatabase } from "./database-discovery"
+import {
+  COORDINATOR_BOOTSTRAP_FD_ENV,
+  coordinatorChildEnvironment,
+  writeCoordinatorBootstrapToChild,
+} from "./coordinator-bootstrap"
 
 export type TuiCoordinatorManifest = CoordinatorManifest
 export type TuiCoordinatorClientLease = CoordinatorClientLease
@@ -80,30 +82,6 @@ export function coordinatorHeaders(manifest: TuiCoordinatorManifest) {
 
 export function publishCoordinatorManifest(manifest: TuiCoordinatorManifest) {
   return publishCoordinatorManifestIn(STATE_ROOT, manifest, undefined)
-}
-
-export function activateCoordinatorHandoffTarget(input: {
-  sourceManifest: TuiCoordinatorManifest
-  targetManifest: TuiCoordinatorManifest
-  accepted: TuiCoordinatorHandoffRecord
-  ready: TuiCoordinatorHandoffRecord
-}) {
-  return activateCoordinatorHandoffTargetIn({ stateRoot: STATE_ROOT, ...input })
-}
-
-export function commitCoordinatorHandoffTarget(input: {
-  targetManifest: TuiCoordinatorManifest
-  ready: TuiCoordinatorHandoffRecord
-  committed: TuiCoordinatorHandoffRecord
-}) {
-  return commitCoordinatorHandoffTargetIn({ stateRoot: STATE_ROOT, ...input })
-}
-
-export function cleanupCommittedCoordinatorHandoff(input: {
-  targetManifest: TuiCoordinatorManifest
-  committed: TuiCoordinatorHandoffRecord
-}) {
-  return cleanupCommittedCoordinatorHandoffIn({ stateRoot: STATE_ROOT, ...input })
 }
 
 export async function removeCoordinatorManifest(key: string, manifest: TuiCoordinatorManifest) {
@@ -304,8 +282,7 @@ export function compareAndSwapCoordinatorHandoff(
 
     const file = coordinatorHandoffPath(stateRoot, key)
     if (!replacement) {
-      if (!isCoordinatorHandoffRecord(current) || (current.phase !== "requested" && current.phase !== "accepted"))
-        return false
+      if (!isCoordinatorHandoffRecord(current) || current.phase !== "requested") return false
       const manifest = await readCoordinatorManifestFile(coordinatorManifestPathIn(stateRoot, key)).catch(
         () => undefined,
       )
@@ -391,7 +368,7 @@ function createSecret() {
   return randomBytes(32).toString("base64url")
 }
 
-function spawnCoordinator(directory: string, key: string, database: string) {
+async function spawnCoordinator(directory: string, key: string, database: string) {
   const password = createSecret()
   const token = createSecret()
   const command = cliCommand()
@@ -403,21 +380,17 @@ function spawnCoordinator(directory: string, key: string, database: string) {
        gracefully even while other clients still hold leases. `windowsHide`
        keeps the detached child from opening a console window. */
     detached: true,
-    stdio: "ignore",
+    stdio: ["ignore", "ignore", "ignore", "pipe"],
     windowsHide: true,
-    env: {
-      ...process.env,
+    env: coordinatorChildEnvironment(process.env, {
       [OPENCODE_PROCESS_ROLE]: "coordinator",
       [OPENCODE_RUN_ID]: ensureRunID(),
       [COORDINATOR_STARTUP_LOCK_HELD]: "1",
-      OPENCODE_TUI_COORDINATOR_USERNAME: USERNAME,
-      OPENCODE_TUI_COORDINATOR_PASSWORD: password,
-      OPENCODE_TUI_COORDINATOR_TOKEN: token,
-      OPENCODE_SERVER_USERNAME: USERNAME,
-      OPENCODE_SERVER_PASSWORD: password,
+      [COORDINATOR_BOOTSTRAP_FD_ENV]: "3",
       OPENCODE_DB: database,
-    },
+    }),
   })
+  await writeCoordinatorBootstrapToChild(child, { version: 1, username: USERNAME, password, token })
   child.unref()
 }
 
@@ -442,7 +415,7 @@ export async function resolveLocalCoordinator(directory: string) {
   return await withCoordinatorStartupLock(key, async () => {
     const existing = await readActiveCoordinator(key, database)
     if (existing) return existing
-    spawnCoordinator(directory, key, database)
+    await spawnCoordinator(directory, key, database)
     return await waitForCoordinator(key, database)
   })
 }

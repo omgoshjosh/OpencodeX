@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test"
 import { Option, Redacted } from "effect"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { ServerAuth } from "../../src/server/auth"
+import { spawnSync } from "node:child_process"
 
 const original = {
   OPENCODE_SERVER_PASSWORD: Flag.OPENCODE_SERVER_PASSWORD,
@@ -9,6 +10,7 @@ const original = {
 }
 
 afterEach(() => {
+  ServerAuth.resetForTest()
   Flag.OPENCODE_SERVER_PASSWORD = original.OPENCODE_SERVER_PASSWORD
   Flag.OPENCODE_SERVER_USERNAME = original.OPENCODE_SERVER_USERNAME
 })
@@ -55,5 +57,40 @@ describe("ServerAuth", () => {
     expect(ServerAuth.required(config)).toBe(true)
     expect(ServerAuth.authorized({ username: "alice", password: Redacted.make("secret") }, config)).toBe(true)
     expect(ServerAuth.authorized({ username: "opencode", password: Redacted.make("secret") }, config)).toBe(false)
+  })
+
+  test("stores credentials in memory and scrubs child inheritance", () => {
+    process.env.OPENCODE_SERVER_USERNAME = "inherited-user"
+    process.env.OPENCODE_SERVER_PASSWORD = "inherited-password"
+    process.env.OPENCODE_TUI_COORDINATOR_USERNAME = "coordinator-user"
+    process.env.OPENCODE_TUI_COORDINATOR_PASSWORD = "coordinator-password"
+    process.env.OPENCODE_TUI_COORDINATOR_TOKEN = "coordinator-token"
+
+    ServerAuth.initialize({ username: "memory-user", password: "memory-password" })
+    const child = spawnSync(process.execPath, ["-e", "console.log(JSON.stringify(process.env))"], {
+      env: process.env,
+      encoding: "utf8",
+    })
+    const inherited = JSON.parse(child.stdout) as Record<string, string>
+    expect(inherited.OPENCODE_SERVER_USERNAME).toBeUndefined()
+    expect(inherited.OPENCODE_SERVER_PASSWORD).toBeUndefined()
+    expect(inherited.OPENCODE_TUI_COORDINATOR_USERNAME).toBeUndefined()
+    expect(inherited.OPENCODE_TUI_COORDINATOR_PASSWORD).toBeUndefined()
+    expect(inherited.OPENCODE_TUI_COORDINATOR_TOKEN).toBeUndefined()
+    expect(ServerAuth.headers()).toEqual({
+      Authorization: `Basic ${Buffer.from("memory-user:memory-password").toString("base64")}`,
+    })
+  })
+
+  test("captures manual environment configuration once and scrubs it", () => {
+    process.env.OPENCODE_SERVER_USERNAME = "manual-user"
+    process.env.OPENCODE_SERVER_PASSWORD = "manual-password"
+
+    expect(ServerAuth.capture()).toEqual({ username: "manual-user", password: Option.some("manual-password") })
+    expect(process.env.OPENCODE_SERVER_USERNAME).toBeUndefined()
+    expect(process.env.OPENCODE_SERVER_PASSWORD).toBeUndefined()
+    expect(ServerAuth.headers()).toEqual({
+      Authorization: `Basic ${Buffer.from("manual-user:manual-password").toString("base64")}`,
+    })
   })
 })

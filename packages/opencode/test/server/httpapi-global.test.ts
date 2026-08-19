@@ -88,9 +88,10 @@ function setupHandoff(stateRoot: string) {
   return Effect.acquireRelease(
     Effect.promise(async () => {
       process.env[OPENCODE_PROCESS_ROLE] = "coordinator"
-      process.env.OPENCODE_COORDINATOR_AUTHORITY_EPOCH = sourceEpoch
-      process.env.OPENCODE_COORDINATOR_HANDOFF_CAPABILITY = capability
       CoordinatorAuthority.resetForTest()
+      CoordinatorAuthority.initialize(sourceEpoch)
+      CoordinatorHandoff.resetForTest()
+      CoordinatorHandoff.initialize({ capability })
       CoordinatorHandoff.overrideForTest({ key: handoffKey, stateRoot })
       const file = coordinatorManifestPath(stateRoot, handoffKey)
       await fs.mkdir(path.dirname(file), { recursive: true })
@@ -117,10 +118,9 @@ function setupHandoff(stateRoot: string) {
     () =>
       Effect.sync(() => {
         CoordinatorHandoff.overrideForTest()
+        CoordinatorHandoff.resetForTest()
         CoordinatorAuthority.resetForTest()
         delete process.env[OPENCODE_PROCESS_ROLE]
-        delete process.env.OPENCODE_COORDINATOR_AUTHORITY_EPOCH
-        delete process.env.OPENCODE_COORDINATOR_HANDOFF_CAPABILITY
         setSystemTime()
       }),
   )
@@ -278,9 +278,8 @@ describe.serial("global HttpApi", () => {
           targetEpoch,
         },
       })
-      expect(aborted.status).toBe(200)
-      expect(yield* aborted.json).toEqual({ success: true, phase: "aborted" })
-      expect(CoordinatorAuthority.health()?.admission).toBe(true)
+      expect(aborted.status).toBe(409)
+      expect(CoordinatorAuthority.health()?.admission).toBe(false)
     }),
   )
 
@@ -301,6 +300,23 @@ describe.serial("global HttpApi", () => {
       expect(missingCapability.status).toBe(403)
       expect(wrongCapability.status).toBe(403)
       expect(CoordinatorAuthority.health()?.admission).toBe(true)
+    }),
+  )
+
+  itSecret.live("keeps handoff control disabled without explicit capability initialization", () =>
+    Effect.gen(function* () {
+      const tmp = yield* tempdir()
+      yield* setupHandoff(tmp.path)
+      CoordinatorHandoff.initialize()
+
+      const response = yield* handoffRequest({ action: "request", request: requestID(), targetEpoch })
+
+      expect(response.status).toBe(403)
+      expect(CoordinatorHandoff.available()).toBe(false)
+      expect(CoordinatorAuthority.health()).toMatchObject({ admission: true, ready: true })
+      expect(
+        yield* Effect.promise(() => readCoordinatorHandoff(tmp.path, handoffKey).catch(() => undefined)),
+      ).toBeUndefined()
     }),
   )
 

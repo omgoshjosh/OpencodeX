@@ -15,19 +15,29 @@ const CAPABILITY_ENV = "OPENCODE_COORDINATOR_HANDOFF_CAPABILITY"
 const TIMEOUT_ENV = "OPENCODE_COORDINATOR_HANDOFF_DRAIN_TIMEOUT_MS"
 const DEFAULT_TIMEOUT_MS = 5_000
 const testOverride: { key?: string; stateRoot?: string } = {}
+let capability: string | undefined
 
 export class TransitionConflict extends Error {}
 export class TransitionUnavailable extends Error {}
 
 export function authorized(capability: string | undefined) {
-  const secret = process.env[CAPABILITY_ENV]
+  const secret = getCapability()
   if (!secret || secret.length < 32 || secret.length > 256 || !capability || capability.length > 256) return false
   return timingSafeEqual(digest(secret), digest(capability))
 }
 
 export function available() {
-  const secret = process.env[CAPABILITY_ENV]
+  const secret = getCapability()
   return secret !== undefined && secret.length >= 32 && secret.length <= 256
+}
+
+export function initialize(input?: { capability?: string }) {
+  capability = input?.capability
+  delete process.env[CAPABILITY_ENV]
+}
+
+function getCapability() {
+  return capability
 }
 
 export function request(input: { request: string; targetEpoch: string; signal?: AbortSignal }) {
@@ -88,10 +98,10 @@ export function abort(input: { expected: TuiCoordinatorHandoffMatch; signal?: Ab
     const sourceEpoch = requireSourceEpoch()
     const key = testOverride.key ?? coordinatorKey()
     const current = await inspectCoordinatorHandoff(key, testOverride.stateRoot)
+    if (current?.phase === "accepted") throw new TransitionConflict("Accepted coordinator handoff must roll forward")
     if (!current || !matches(current, input.expected) || current.sourceEpoch !== sourceEpoch)
       throw new TransitionConflict("Coordinator handoff changed")
-    if (current.phase !== "requested" && current.phase !== "accepted")
-      throw new TransitionConflict("Coordinator handoff cannot be aborted")
+    if (current.phase !== "requested") throw new TransitionConflict("Accepted coordinator handoff must roll forward")
     void CoordinatorAuthority.close()
     const deleted = await compareAndSwapCoordinatorHandoff(key, input.expected, undefined, testOverride.stateRoot)
     if (!deleted) throw new TransitionConflict("Coordinator handoff changed")
@@ -155,7 +165,7 @@ function waitForDrain(signal?: AbortSignal) {
 }
 
 function requireSourceEpoch() {
-  const epoch = process.env.OPENCODE_COORDINATOR_AUTHORITY_EPOCH
+  const epoch = CoordinatorAuthority.epoch()
   if (!CoordinatorAuthority.enabled() || !epoch) throw new TransitionUnavailable("Coordinator handoff is unavailable")
   return epoch
 }
@@ -171,6 +181,10 @@ export function strictlyLaterTimestamp(previous: string, now = Date.now()) {
 export function overrideForTest(input?: { key: string; stateRoot: string }) {
   testOverride.key = input?.key
   testOverride.stateRoot = input?.stateRoot
+}
+
+export function resetForTest() {
+  capability = undefined
 }
 
 export * as CoordinatorHandoff from "./coordinator-handoff"

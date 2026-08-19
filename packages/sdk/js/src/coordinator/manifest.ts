@@ -153,6 +153,10 @@ export type CoordinatorAuthorityObservation =
   | { state: "progressing" }
 
 export type CoordinatorManifestFence = Pick<CoordinatorManifest, "token" | "authorityEpoch">
+export type CoordinatorSourceManifestFence = Pick<
+  CoordinatorManifest,
+  "version" | "key" | "pid" | "createdAt" | "serverVersion" | "authorityEpoch"
+>
 export type CoordinatorHandoffFence = Pick<
   CoordinatorHandoffRecord,
   "request" | "phase" | "revision" | "sourceEpoch" | "targetEpoch"
@@ -297,6 +301,33 @@ export function sameCoordinatorManifest(left: unknown, right: unknown): left is 
     left.authorityEpoch === right.authorityEpoch &&
     left.admission === right.admission &&
     left.ready === right.ready
+  )
+}
+
+/** Exact equality over the non-secret source fields safe to persist in supervisor intent. */
+export function coordinatorSourceManifestFence(manifest: CoordinatorManifest): CoordinatorSourceManifestFence {
+  return {
+    version: manifest.version,
+    key: manifest.key,
+    pid: manifest.pid,
+    createdAt: manifest.createdAt,
+    ...(manifest.serverVersion === undefined ? {} : { serverVersion: manifest.serverVersion }),
+    ...(manifest.authorityEpoch === undefined ? {} : { authorityEpoch: manifest.authorityEpoch }),
+  }
+}
+
+export function sameCoordinatorSourceManifestFence(
+  manifest: CoordinatorManifest,
+  fence: CoordinatorSourceManifestFence,
+) {
+  const actual = coordinatorSourceManifestFence(manifest)
+  return (
+    actual.version === fence.version &&
+    actual.key === fence.key &&
+    actual.pid === fence.pid &&
+    actual.createdAt === fence.createdAt &&
+    actual.serverVersion === fence.serverVersion &&
+    actual.authorityEpoch === fence.authorityEpoch
   )
 }
 
@@ -1167,3 +1198,6 @@ export function startCoordinatorClientLease(input: {
     },
   }
 }
+
+export * from "./supervisor-intent.js"
+export * from "./supervisor-recovery.js"

@@ -2834,6 +2834,11 @@ export type OpencodeXSwarmCreateInput = {
   }
 }
 
+export type ValidationError = {
+  _tag: "ValidationError"
+  message: string
+}
+
 export type OpencodeXSwarmUpdateInput = {
   title?: string
   roles?: Array<OpencodeXSwarmRoleInput>
@@ -8480,9 +8485,9 @@ export type OpencodexSwarmCreateData = {
 
 export type OpencodexSwarmCreateErrors = {
   /**
-   * BadRequest | InvalidRequestError
+   * BadRequest | ValidationError | InvalidRequestError
    */
-  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  400: EffectHttpApiErrorBadRequest | ValidationError | InvalidRequestError
   /**
    * ProjectNotFoundError
    */
@@ -8511,9 +8516,9 @@ export type OpencodexSwarmDeleteData = {
 
 export type OpencodexSwarmDeleteErrors = {
   /**
-   * BadRequest | InvalidRequestError
+   * BadRequest | ValidationError | InvalidRequestError
    */
-  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  400: EffectHttpApiErrorBadRequest | ValidationError | InvalidRequestError
   /**
    * NotFoundError
    */
@@ -8542,9 +8547,9 @@ export type OpencodexSwarmGetData = {
 
 export type OpencodexSwarmGetErrors = {
   /**
-   * BadRequest | InvalidRequestError
+   * BadRequest | ValidationError | InvalidRequestError
    */
-  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  400: EffectHttpApiErrorBadRequest | ValidationError | InvalidRequestError
   /**
    * NotFoundError
    */
@@ -8573,9 +8578,9 @@ export type OpencodexSwarmUpdateData = {
 
 export type OpencodexSwarmUpdateErrors = {
   /**
-   * BadRequest | InvalidRequestError
+   * BadRequest | ValidationError | InvalidRequestError
    */
-  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  400: EffectHttpApiErrorBadRequest | ValidationError | InvalidRequestError
   /**
    * NotFoundError
    */
@@ -8604,9 +8609,9 @@ export type OpencodexSwarmCancelData = {
 
 export type OpencodexSwarmCancelErrors = {
   /**
-   * BadRequest | InvalidRequestError
+   * BadRequest | ValidationError | InvalidRequestError
    */
-  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  400: EffectHttpApiErrorBadRequest | ValidationError | InvalidRequestError
   /**
    * NotFoundError
    */
@@ -8635,9 +8640,9 @@ export type OpencodexSwarmRoleAddData = {
 
 export type OpencodexSwarmRoleAddErrors = {
   /**
-   * BadRequest | InvalidRequestError
+   * BadRequest | ValidationError | InvalidRequestError
    */
-  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  400: EffectHttpApiErrorBadRequest | ValidationError | InvalidRequestError
   /**
    * NotFoundError
    */
@@ -8667,9 +8672,9 @@ export type OpencodexSwarmRoleUpdateData = {
 
 export type OpencodexSwarmRoleUpdateErrors = {
   /**
-   * BadRequest | InvalidRequestError
+   * BadRequest | ValidationError | InvalidRequestError
    */
-  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  400: EffectHttpApiErrorBadRequest | ValidationError | InvalidRequestError
   /**
    * NotFoundError
    */

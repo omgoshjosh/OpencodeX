@@ -13,6 +13,7 @@ function fakeQuery() {
     resumeID: undefined as string | undefined,
     interrupts: 0,
     aborted: false,
+    promptEnded: false,
     handlers: undefined as (() => Handlers | undefined) | undefined,
   }
   const create: CreateQuery<Handlers> = async (input) => {
@@ -20,6 +21,7 @@ function fakeQuery() {
     state.handlers = input.handlers
     void (async () => {
       for await (const message of input.prompt) state.prompts.push(message)
+      state.promptEnded = true
     })()
     return {
       events: stream.iterable,
@@ -147,6 +149,33 @@ describe("claude channel", () => {
     expect(state.prompts.map((message) => message.message.content)).toEqual(["one", "two"])
   })
 
+  test("closes streaming input after a native image message", async () => {
+    const { create, state } = fakeQuery()
+    const channel = new Channel<Handlers>("s1", create)
+    const message = {
+      type: "user",
+      message: {
+        role: "user",
+        content: [
+          { type: "text", text: "describe it" },
+          {
+            type: "image",
+            source: { type: "base64", media_type: "image/png", data: "aGVsbG8=" },
+          },
+        ],
+      },
+      parent_tool_use_id: null,
+    } as SDKUserMessage
+
+    channel.turn([message], { name: "image" }, { closeInput: true })
+    await settled()
+
+    expect(state.prompts).toEqual([message])
+    expect(state.promptEnded).toBe(true)
+    expect(channel.retiring).toBe(true)
+    expect(() => channel.turn([user("too soon")], { name: "next" })).toThrow("retiring")
+  })
+
   test("ends the turn's events when the underlying query dies", async () => {
     const { create, emit, endStream } = fakeQuery()
     const channel = new Channel<Handlers>("s1", create)
@@ -243,6 +272,19 @@ describe("channel registry", () => {
     expect(channel1.dead).toBe(true)
     const channel2 = await registry.acquire("session", "config-a", fakeQuery().create, { resumeID: "conv-2" })
     expect(channel2).not.toBe(channel1)
+  })
+
+  test("replaces a retiring image channel even before its query exits", async () => {
+    const registry = createChannelRegistry<Handlers>()
+    const first = fakeQuery()
+    const channel1 = await registry.acquire("session", "config-a", first.create)
+    channel1.turn([user("image")], { name: "image" }, { closeInput: true })
+
+    const channel2 = await registry.acquire("session", "config-a", fakeQuery().create, { resumeID: "conv-3" })
+
+    expect(channel2).not.toBe(channel1)
+    expect(channel1.dead).toBe(true)
+    expect(first.state.aborted).toBe(true)
   })
 
   test("closeAll tears every channel down", async () => {

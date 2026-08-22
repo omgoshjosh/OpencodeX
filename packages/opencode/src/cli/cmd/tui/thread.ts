@@ -55,9 +55,15 @@ export function resolveThreadDirectory(project?: string, envPWD = process.env.PW
   return Filesystem.resolve(cwd)
 }
 
-export async function initializeTuiTransport<T>(initialize: () => Promise<T>, cleanup: () => Promise<void>) {
+export async function initializeTuiTransport<T>(
+  initialize: () => Promise<T>,
+  cleanup: () => Promise<void>,
+  afterInitialize?: () => void,
+) {
   try {
-    return await initialize()
+    const result = await initialize()
+    afterInitialize?.()
+    return result
   } catch (error) {
     Log.Default.warn("tui stopping: transport initialization failed", { error: errorMessage(error) })
     await cleanup()
@@ -263,17 +269,22 @@ export const TuiThreadCommand = cmd({
               return [tui, server]
             }
 
-            setTimeout(() => {
-              client.call("checkUpgrade", { directory: cwd }).catch(() => {})
-            }, 1000).unref?.()
+            // Do not start instance-backed maintenance until the authority is
+            // listening. On slower Windows runners, this timer used to race
+            // server()'s own database bootstrap and corrupt its transaction
+            // state ("cannot rollback - no transaction is active").
+            const server = await initializeTuiTransport(
+              () => client.call("server", network),
+              () => stop(),
+              () => {
+                setTimeout(() => {
+                  client.call("checkUpgrade", { directory: cwd }).catch(() => {})
+                }, 1000).unref?.()
+              },
+            )
 
             return {
-              url: (
-                await initializeTuiTransport(
-                  () => client.call("server", network),
-                  () => stop(),
-                )
-              ).url,
+              url: server.url,
               headers: { authorization: `Basic ${Buffer.from(`${username}:${password}`).toString("base64")}` },
             }
           })()

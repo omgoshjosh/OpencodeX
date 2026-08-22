@@ -107,6 +107,8 @@ export class Channel<H> {
   dead = false
 
   private readonly interruptGraceMs: number
+  /** Input reached EOF (for native images); finish this query, never reuse it. */
+  retiring = false
 
   constructor(
     readonly key: string,
@@ -177,8 +179,9 @@ export class Channel<H> {
    * the caller stops consuming (the driver breaks once the mapper reports the
    * turn finished) or the underlying query dies.
    */
-  turn(messages: SDKUserMessage[], handlers: H) {
+  turn(messages: SDKUserMessage[], handlers: H, options?: { closeInput?: boolean }) {
     if (this.dead) throw new Error("The Claude channel is closed.")
+    if (this.retiring) throw new Error("The Claude channel is retiring.")
     if (this.sink) throw new Error("A turn is already active on this Claude channel.")
     this.handlers = handlers
 
@@ -199,6 +202,14 @@ export class Channel<H> {
     this.sink = sink
 
     for (const message of messages) this.input.push(message)
+    // Claude CLI 2.1.228 only preserves native image blocks when the
+    // streaming-input source reaches EOF after the message. Text turns keep
+    // the channel open; image turns close it and the next turn resumes on a
+    // fresh channel.
+    if (options?.closeInput) {
+      this.retiring = true
+      this.input.end()
+    }
 
     const detach = () => {
       if (this.sink === sink) {
@@ -306,7 +317,8 @@ export function createChannelRegistry<H>() {
     ): Promise<Channel<H>> {
       const acquire = async () => {
         const existing = channels.get(sessionKey)
-        if (existing && !existing.channel.dead && existing.config === config) return existing.channel
+        if (existing && !existing.channel.dead && !existing.channel.retiring && existing.config === config)
+          return existing.channel
         if (existing) {
           channels.delete(sessionKey)
           await existing.channel.close().catch(() => undefined)

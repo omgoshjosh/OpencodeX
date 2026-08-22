@@ -305,7 +305,9 @@ export function createSdkTransport(): ClaudeTransport {
         options.resumeID ? { resumeID: options.resumeID } : undefined,
       )
       if (cancelled || options.signal?.aborted) return
-      active = channel.turn([userMessage(prompt)], turnHandlers(options))
+      active = channel.turn([userMessage(prompt)], turnHandlers(options), {
+        closeInput: typeof prompt !== "string",
+      })
       if (cancelled) {
         // The interrupt raced the turn start: unwind what was just attached.
         await active.interrupt()

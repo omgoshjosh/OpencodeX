@@ -32,3 +32,24 @@ test("successful TUI transport initialization leaves cleanup to the normal lifec
   expect(result).toEqual({ url: "http://127.0.0.1:4096" })
   expect(releases).toBe(0)
 })
+
+test("starts post-initialization work only after transport startup settles", async () => {
+  const events: string[] = []
+  const result = await initializeTuiTransport(
+    async () => {
+      events.push("server-start")
+      await Promise.resolve()
+      events.push("server-ready")
+      return { url: "http://127.0.0.1:1" }
+    },
+    async () => {
+      events.push("cleanup")
+    },
+    () => {
+      events.push("maintenance")
+    },
+  )
+
+  expect(result.url).toBe("http://127.0.0.1:1")
+  expect(events).toEqual(["server-start", "server-ready", "maintenance"])
+})

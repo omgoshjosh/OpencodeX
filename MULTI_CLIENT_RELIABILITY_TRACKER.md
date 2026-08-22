@@ -92,7 +92,7 @@ Allow desktop GUI to use the canonical backend without spawning a loopback coord
 Acceptance criteria:
 
 - GUI accepts an explicit canonical URL and credentials.
-- Main-process authorization and renderer CSP allow only that configured origin plus existing loopback development origins.
+- Before opening a renderer window, the packaged Electron main process configures its default session to inject a `Content-Security-Policy` response header that allows only that configured origin plus existing loopback development origins. The static renderer HTML intentionally has no broad CSP meta tag.
 - Remote mode does not spawn or acquire a local coordinator.
 - Connection errors identify the configured backend and preserve retryable state.
 - Local sidecar mode remains available for standalone use.

@@ -17,15 +17,14 @@ import { GlobalUpgradeInput } from "../groups/global"
 import { makeGuiBridgeHandlers } from "./gui-bridge"
 import { Database } from "@opencode-ai/core/database/database"
 import { OpencodeXJobTable, OpencodeXSwarmTable } from "@opencode-ai/core/opencodex/sql"
-import {
-  SessionCommandTable,
-  SessionExecutionTable,
-  SessionInteractionTable,
-} from "@opencode-ai/core/session/sql"
-import { and, eq, gt, inArray, notInArray, or } from "drizzle-orm"
+import { SessionCommandTable, SessionExecutionTable, SessionInteractionTable } from "@opencode-ai/core/session/sql"
+import { and, eq, gt, inArray, or } from "drizzle-orm"
 import { ensureProcessMetadata } from "@opencode-ai/core/util/opencode-process"
 
 const log = Log.create({ service: "server" })
+
+/** Only work that is executing or actively draining should block redeploy. */
+export const ACTIVE_SWARM_STATUSES = ["queued", "running", "cancelling"] as const
 
 function eventData(data: unknown): Sse.Event {
   return {
@@ -103,10 +102,7 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
             .where(
               or(
                 eq(SessionExecutionTable.state, "queued"),
-                and(
-                  eq(SessionExecutionTable.state, "running"),
-                  gt(SessionExecutionTable.lease_expires_at, now),
-                ),
+                and(eq(SessionExecutionTable.state, "running"), gt(SessionExecutionTable.lease_expires_at, now)),
               ),
             )
             .limit(1)
@@ -132,10 +128,15 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
           db
             .select({ id: OpencodeXSwarmTable.id })
             .from(OpencodeXSwarmTable)
-            .where(notInArray(OpencodeXSwarmTable.status, ["completed", "partially_failed", "failed", "cancelled"]))
+            .where(inArray(OpencodeXSwarmTable.status, ACTIVE_SWARM_STATUSES))
             .limit(1)
             .get(),
-        ].map((query) => query.pipe(Effect.map((row) => row !== undefined), Effect.orDie)),
+        ].map((query) =>
+          query.pipe(
+            Effect.map((row) => row !== undefined),
+            Effect.orDie,
+          ),
+        ),
         { concurrency: "unbounded" },
       )
       return {

@@ -1,5 +1,5 @@
 import { NodeHttpServer } from "@effect/platform-node"
-import { describe, expect } from "bun:test"
+import { describe, expect, test } from "bun:test"
 import { Context, Deferred, Effect, Fiber, Layer, Option } from "effect"
 import { HttpBody, HttpClient, HttpClientRequest, HttpRouter } from "effect/unstable/http"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
@@ -8,6 +8,7 @@ import { Config } from "../../src/config/config"
 import { Installation } from "../../src/installation"
 import { EventV2Bridge } from "../../src/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
+import { OpencodeXSwarmTable } from "@opencode-ai/core/opencodex/sql"
 import { GuiBridge } from "../../src/opencodex/gui-bridge"
 import { SessionID } from "../../src/session/schema"
 import { ServerAuth } from "../../src/server/auth"
@@ -18,6 +19,7 @@ import { globalHandlers } from "../../src/server/routes/instance/httpapi/handler
 import { authorizationLayer } from "../../src/server/routes/instance/httpapi/middleware/authorization"
 import { schemaErrorLayer } from "../../src/server/routes/instance/httpapi/middleware/schema-error"
 import { testEffect } from "../lib/effect"
+import { eq } from "drizzle-orm"
 
 const guiBridgeLayer = GuiBridge.layer.pipe(Layer.provideMerge(EventV2Bridge.defaultLayer))
 
@@ -43,11 +45,51 @@ const apiLayer = HttpRouter.serve(
   ),
   Layer.provide(ServerAuth.Config.layer({ password: Option.none(), username: "opencode" })),
   Layer.provideMerge(guiBridgeLayer),
-  Layer.provide(Database.defaultLayer),
+  Layer.provideMerge(Database.defaultLayer),
 )
 const it = testEffect(apiLayer)
 
 describe("global HttpApi", () => {
+  it.live("only executing swarm rows block idle-gated redeploy", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const id = "swm_health_activity_test"
+      const now = Date.now()
+      yield* database.db
+        .insert(OpencodeXSwarmTable)
+        .values({
+          id,
+          title: "health",
+          prompt: "",
+          status: "planned",
+          source: "manual",
+          time_created: now,
+          time_updated: now,
+        })
+        .run()
+      yield* Effect.addFinalizer(() =>
+        database.db.delete(OpencodeXSwarmTable).where(eq(OpencodeXSwarmTable.id, id)).run().pipe(Effect.orDie),
+      )
+
+      const health = () => HttpClient.get(GlobalPaths.health).pipe(Effect.flatMap((response) => response.json))
+      expect(yield* health()).toMatchObject({ active: false })
+
+      yield* database.db
+        .update(OpencodeXSwarmTable)
+        .set({ status: "running" })
+        .where(eq(OpencodeXSwarmTable.id, id))
+        .run()
+      expect(yield* health()).toMatchObject({ active: true })
+
+      yield* database.db
+        .update(OpencodeXSwarmTable)
+        .set({ status: "blocked" })
+        .where(eq(OpencodeXSwarmTable.id, id))
+        .run()
+      expect(yield* health()).toMatchObject({ active: false })
+    }),
+  )
+
   it.live("upgrades to latest when the request body is omitted", () =>
     Effect.gen(function* () {
       const response = yield* HttpClient.post(GlobalPaths.upgrade)
@@ -92,12 +134,14 @@ describe("global HttpApi", () => {
         return Deferred.succeed(requestID, GuiBridge.RequestID.make(event.data.requestID)).pipe(Effect.asVoid)
       })
       yield* Effect.addFinalizer(() => unsubscribe)
-      const pending = yield* bridge.request({
-        directory: scopes[73].directory,
-        sessionID: SessionID.make("ses_gui_global_http_test"),
-        operation: "browser.state",
-        input: {},
-      }).pipe(Effect.forkScoped)
+      const pending = yield* bridge
+        .request({
+          directory: scopes[73].directory,
+          sessionID: SessionID.make("ses_gui_global_http_test"),
+          operation: "browser.state",
+          input: {},
+        })
+        .pipe(Effect.forkScoped)
       const id = yield* Deferred.await(requestID)
 
       const responded = yield* HttpClientRequest.post(GlobalPaths.guiBridgeRespond).pipe(

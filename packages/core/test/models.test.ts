@@ -1,5 +1,5 @@
 import { describe, expect, beforeAll, beforeEach, afterAll } from "bun:test"
-import { Effect, Layer, Ref } from "effect"
+import { Effect, Layer, Ref, Schema } from "effect"
 import { HttpClient, HttpClientResponse } from "effect/unstable/http"
 import { AppFileSystem } from "@opencode-ai/core/filesystem"
 import { Flag } from "@opencode-ai/core/flag/flag"
@@ -176,7 +176,7 @@ describe("ModelsDev Service", () => {
       const mtimeMs = Date.now() - 1000
       const first = JSON.stringify(fixture)
       const second = first.replace("Acme One", "Zinc One")
-      const updated = JSON.parse(second) as Record<string, ModelsDev.Provider>
+      const updated = Schema.decodeUnknownSync(ModelsDev.Catalog)(JSON.parse(second))
       expect(second.length).toBe(first.length)
       yield* writeCacheText(first, mtimeMs)
       const state = yield* Ref.make(initialState)

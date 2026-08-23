@@ -107,6 +107,9 @@ export const Provider = Schema.Struct({
 
 export type Provider = Schema.Schema.Type<typeof Provider>
 
+export const Catalog = Schema.Record(Schema.String, Provider)
+export type Catalog = Schema.Schema.Type<typeof Catalog>
+
 export const Event = {
   Refreshed: EventV2.define({
     type: "models-dev.refreshed",
@@ -170,7 +173,7 @@ export const layer = Layer.effect(
       const bytes = yield* fs.readFile(catalogPath)
       return yield* Effect.try({
         try: () => ({
-          value: JSON.parse(new TextDecoder().decode(bytes)) as Record<string, Provider>,
+          value: Schema.decodeUnknownSync(Catalog)(JSON.parse(new TextDecoder().decode(bytes))),
           version: Hash.fast(Buffer.from(bytes)),
         }),
         catch: (cause) => new Error("Failed to parse models catalog", { cause }),
@@ -209,7 +212,7 @@ export const layer = Layer.effect(
           return yield* fetchAndWrite()
         }),
       )
-      return JSON.parse(text) as Record<string, Provider>
+      return Schema.decodeUnknownSync(Catalog)(JSON.parse(text))
     }).pipe(Effect.withSpan("ModelsDev.populate"), Effect.orDie)
 
     const [cachedGet, invalidate] = yield* Effect.cachedInvalidateWithTTL(populate, Duration.infinity)

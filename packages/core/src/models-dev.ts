@@ -1,5 +1,6 @@
 import path from "path"
-import { Context, Duration, Effect, Layer, Option, Ref, Schedule, Schema } from "effect"
+import { randomUUID } from "crypto"
+import { Context, Duration, Effect, Layer, Option, Ref, Schedule, Schema, Semaphore } from "effect"
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/unstable/http"
 import { Global } from "./global"
 import { Flag } from "./flag/flag"
@@ -146,15 +147,8 @@ export const layer = Layer.effect(
     const ttl = Duration.minutes(5)
     const lockKey = `models-dev:${filepath}`
 
-    const diskVersion = fs.stat(catalogPath).pipe(
-      Effect.catch(() => Effect.succeed(undefined)),
-      Effect.map((stat) => {
-        if (!stat) return undefined
-        const mtime = Option.getOrElse(stat.mtime, () => new Date(0)).getTime()
-        return `${mtime}:${Number(stat.size)}`
-      }),
-    )
     const loadedVersion = yield* Ref.make<string | undefined>(undefined)
+    const refreshLock = Semaphore.makeUnsafe(1)
 
     const fresh = Effect.fnUntraced(function* () {
       const stat = yield* fs.stat(filepath).pipe(Effect.catch(() => Effect.succeed(undefined)))
@@ -172,12 +166,22 @@ export const layer = Layer.effect(
       )
     })
 
+    const readCatalog = Effect.fn("ModelsDev.readCatalog")(function* () {
+      const bytes = yield* fs.readFile(catalogPath)
+      return yield* Effect.try({
+        try: () => ({
+          value: JSON.parse(new TextDecoder().decode(bytes)) as Record<string, Provider>,
+          version: Hash.fast(Buffer.from(bytes)),
+        }),
+        catch: (cause) => new Error("Failed to parse models catalog", { cause }),
+      })
+    })
+
     const loadFromDisk = Effect.gen(function* () {
-      const version = yield* diskVersion
-      const value = yield* fs.readJson(catalogPath).pipe(Effect.catch(() => Effect.succeed(undefined)))
-      if (!value) return undefined
-      yield* Ref.set(loadedVersion, version)
-      return value as Record<string, Provider>
+      const catalog = yield* readCatalog().pipe(Effect.catch(() => Effect.succeed(undefined)))
+      if (!catalog) return undefined
+      yield* Ref.set(loadedVersion, catalog.version)
+      return catalog.value
     })
 
     const loadSnapshot = Effect.sync(() =>
@@ -186,7 +190,9 @@ export const layer = Layer.effect(
 
     const fetchAndWrite = Effect.fn("ModelsDev.fetchAndWrite")(function* () {
       const text = yield* fetchApi()
-      yield* fs.writeWithDirs(filepath, text)
+      const tempPath = `${filepath}.${randomUUID()}.tmp`
+      yield* fs.writeWithDirs(tempPath, text)
+      yield* fs.rename(tempPath, filepath).pipe(Effect.ensuring(fs.remove(tempPath).pipe(Effect.ignore)))
       return text
     })
 
@@ -208,15 +214,19 @@ export const layer = Layer.effect(
 
     const [cachedGet, invalidate] = yield* Effect.cachedInvalidateWithTTL(populate, Duration.infinity)
 
-    const get = Effect.fn("ModelsDev.get")(function* () {
-      const cached = yield* cachedGet
-      const version = yield* diskVersion
-      if (!version || version === (yield* Ref.get(loadedVersion))) return cached
-      yield* invalidate
-      const next = yield* cachedGet
-      yield* events.publish(Event.Refreshed, {})
-      return next
-    })
+    const get = Effect.fn("ModelsDev.get")(() =>
+      refreshLock.withPermit(
+        Effect.gen(function* () {
+          const cached = yield* cachedGet
+          const catalog = yield* readCatalog().pipe(Effect.catch(() => Effect.succeed(undefined)))
+          if (!catalog || catalog.version === (yield* Ref.get(loadedVersion))) return cached
+          yield* invalidate
+          const next = yield* cachedGet
+          yield* events.publish(Event.Refreshed, {})
+          return next
+        }),
+      ),
+    )
 
     const refresh = Effect.fn("ModelsDev.refresh")(function* (force = false) {
       if (!force && (yield* fresh())) return

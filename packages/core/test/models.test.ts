@@ -91,22 +91,25 @@ const buildLayer = (state: Ref.Ref<MockState>) =>
   // and Effect.provide uses a process-global MemoMap by default — without fresh,
   // every test would reuse the cachedInvalidateWithTTL state from the first run.
   Layer.fresh(ModelsDev.layer).pipe(
+    Layer.provideMerge(EventV2.defaultLayer),
     Layer.provide(Layer.succeed(HttpClient.HttpClient, makeMockClient(state))),
     Layer.provide(AppFileSystem.defaultLayer),
-    Layer.provide(EventV2.defaultLayer),
   )
 
 const writeCache = (data: object, mtimeMs?: number) =>
+  writeCacheText(JSON.stringify(data), mtimeMs)
+
+const writeCacheText = (text: string, mtimeMs?: number) =>
   Effect.promise(async () => {
     await mkdir(Global.Path.cache, { recursive: true })
-    await writeFile(cacheFile, JSON.stringify(data))
+    await writeFile(cacheFile, text)
     if (mtimeMs !== undefined) {
       const t = mtimeMs / 1000
       await utimes(cacheFile, t, t)
     }
   })
 
-const provided = <A, E>(state: Ref.Ref<MockState>, eff: Effect.Effect<A, E, ModelsDev.Service>) =>
+const provided = <A, E>(state: Ref.Ref<MockState>, eff: Effect.Effect<A, E, ModelsDev.Service | EventV2.Service>) =>
   eff.pipe(Effect.provide(buildLayer(state)))
 
 beforeEach(async () => {
@@ -168,24 +171,59 @@ describe("ModelsDev Service", () => {
     }),
   )
 
-  it.live("get() reloads cache files updated by another process", () =>
+  it.live("get() reloads identical-length cache files with a coarse mtime exactly once", () =>
     Effect.gen(function* () {
-      yield* writeCache(fixture)
+      const mtimeMs = Date.now() - 1000
+      const first = JSON.stringify(fixture)
+      const second = first.replace("Acme One", "Zinc One")
+      const updated = JSON.parse(second) as Record<string, ModelsDev.Provider>
+      expect(second.length).toBe(first.length)
+      yield* writeCacheText(first, mtimeMs)
       const state = yield* Ref.make(initialState)
-      const first = yield* provided(
+      const result = yield* provided(
         state,
         Effect.gen(function* () {
           const svc = yield* ModelsDev.Service
+          const events = yield* EventV2.Service
+          const received: string[] = []
+          yield* events.listen((event) =>
+            Effect.sync(() => {
+              if (event.type === ModelsDev.Event.Refreshed.type) received.push(event.type)
+            }),
+          )
           const a = yield* svc.get()
-          // Another OpenCode process can update the shared catalog while this
-          // process keeps running.
-          yield* writeCache(fixture2)
+          yield* writeCacheText(second, mtimeMs)
           const b = yield* svc.get()
-          return { a, b }
+          const c = yield* svc.get()
+          return { a, b, c, received }
         }),
       )
-      expect(first.a).toEqual(fixture)
-      expect(first.b).toEqual(fixture2)
+      expect(result.a).toEqual(fixture)
+      expect(result.b).toEqual(updated)
+      expect(result.c).toEqual(updated)
+      expect(result.received).toEqual([ModelsDev.Event.Refreshed.type])
+    }),
+  )
+
+  it.live("get() retains the last complete catalog during a partial external write", () =>
+    Effect.gen(function* () {
+      yield* writeCache(fixture)
+      const state = yield* Ref.make(initialState)
+      const result = yield* provided(
+        state,
+        Effect.gen(function* () {
+          const svc = yield* ModelsDev.Service
+          const initial = yield* svc.get()
+          yield* writeCacheText('{"partial":')
+          const duringWrite = yield* svc.get()
+          yield* writeCache(fixture2)
+          const updated = yield* svc.get()
+          return { initial, duringWrite, updated }
+        }),
+      )
+      expect(result.initial).toEqual(fixture)
+      expect(result.duringWrite).toEqual(fixture)
+      expect(result.updated).toEqual(fixture2)
     }),
   )
 

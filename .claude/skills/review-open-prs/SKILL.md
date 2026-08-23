@@ -22,7 +22,10 @@ ecgreen/OpencodeX."
 
 - Only `ecgreen/OpencodeX`. Do not rely on a checkout remote or `gh` default;
   every GitHub call needs `--repo ecgreen/OpencodeX`.
-- Only `--comment` and `--request-changes` reviews. Never `--approve`.
+- Local `/review-open-prs` is read-only: select, dispatch draft analysis, and
+  monitor the GitHub workflow. It never posts. Only the repository workflow's
+  dependent `post` job has `pull-requests: write`, and it posts `COMMENT`
+  reviews only.
 - Never merge, close, label, push, or modify a PR branch.
 - Never modify the working tree, switch branches, or create a worktree. All
   locks and normal/dry-run body files live in OS/session temporary storage.
@@ -187,12 +190,12 @@ marker was written.
 
 ### 3. Verify what was posted
 
-While holding the cycle lock, the orchestrator alone owns this sequence for
+The GitHub workflow's single dependent `post` job owns this sequence for
 each draft: reselect the PR; compare `action=review`, head SHA, and `nextPass`
 with the dispatched decision; post the draft with `gh pr review`; then verify
 the selected marker in GitHub. If selection differs, mark it `skipped (changed
 during review)` and do not post. No subagent or separate automated worker is
-permitted to issue `gh pr review`; this sequence is the only automated posting
+permitted to issue a review API POST; this sequence is the only automated posting
 path and it always performs the fresh check first.
 
 For each subagent that reported `"posted": true`, confirm _this cycle's_ review

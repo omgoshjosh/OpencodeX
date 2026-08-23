@@ -5,7 +5,7 @@ import {
   flattenPages,
   mapConcurrent,
   REVIEW_REPO,
-  REVIEWER_LOGIN,
+  normalizeCheckStatus,
   type CheckRun,
   type PullRequestSnapshot,
 } from "./pr-review-select.js"
@@ -16,6 +16,7 @@ type GhRollupEntry = {
   name?: string
   context?: string
   status?: string
+  state?: string
 }
 
 type GhPullRequest = {
@@ -24,30 +25,11 @@ type GhPullRequest = {
   author: { login: string } | null
   isDraft: boolean
   headRefOid: string
-  reviews: { authorLogin: string; body: string; submittedAt: string }[]
-  comments: { authorLogin: string; createdAt: string }[]
   statusCheckRollup: GhRollupEntry[] | null
   headCommittedAt: string
 }
 
 type GhListPullRequest = { number: number }
-
-type GhReview = { user: { login: string } | null; body: string | null; submitted_at: string | null }
-type GhComment = { user: { login: string } | null; created_at: string | null }
-
-// If the authenticated `gh` account ever drifts from REVIEWER_LOGIN, every
-// marker posted from here on becomes invisible to the next pass's identity
-// check on GitHub review authorship, reproducing the unbounded re-review bug
-// this selection module otherwise guards against. Fail loudly before listing
-// anything.
-const authenticatedLogin = (await $`gh api user --jq .login`.text()).trim()
-if (authenticatedLogin !== REVIEWER_LOGIN) {
-  console.error(
-    `error: gh is authenticated as "${authenticatedLogin}", but reviews are posted as "${REVIEWER_LOGIN}". ` +
-      "Re-authenticate gh as the correct account before running this again.",
-  )
-  process.exit(1)
-}
 
 const PR_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
@@ -62,7 +44,7 @@ const CHECK_QUERY = `query($owner: String!, $name: String!, $number: Int!, $afte
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       statusCheckRollup { contexts(first: 100, after: $after) {
-        nodes { ... on CheckRun { name status } ... on StatusContext { context } }
+        nodes { ... on CheckRun { name status } ... on StatusContext { context state } }
         pageInfo { hasNextPage endCursor }
       } }
     }
@@ -88,10 +70,7 @@ const decisions = pulls.map((pull) => {
   const rollup = pull.statusCheckRollup ?? []
   const checks: CheckRun[] = rollup.map((entry) => ({
     name: entry.name ?? entry.context ?? "unnamed check",
-    // A StatusContext has no `status` field. Defaulting to COMPLETED is safe
-    // here because this repo's CI is GitHub Actions only — no classic status
-    // integration exists that would set and hold a real PENDING state.
-    status: entry.status ?? "COMPLETED",
+    status: normalizeCheckStatus(entry.status, entry.state),
   }))
 
   const snapshot: PullRequestSnapshot = {
@@ -101,8 +80,6 @@ const decisions = pulls.map((pull) => {
     isDraft: pull.isDraft,
     headRefOid: pull.headRefOid,
     headCommittedAt: pull.headCommittedAt,
-    reviews: pull.reviews,
-    comments: pull.comments,
     checks,
   }
 
@@ -134,17 +111,9 @@ async function loadPullRequest(number: number): Promise<GhPullRequest> {
   if (!record(commit) || !record(commit.commit) || typeof commit.commit.committedDate !== "string")
     throw new Error(`gh api graphql returned no head commit timestamp for #${number}`)
   const rollup = await loadCheckContexts(number)
-  const reviews = await paginated<GhReview>(`repos/${REVIEW_REPO}/pulls/${number}/reviews?per_page=100`, isReview)
-  const comments = await paginated<GhComment>(`repos/${REVIEW_REPO}/issues/${number}/comments?per_page=100`, isComment)
   const value = {
     ...pull,
     headCommittedAt: commit.commit.committedDate,
-    reviews: reviews.map((entry) => ({
-      authorLogin: entry.user?.login ?? "",
-      body: entry.body ?? "",
-      submittedAt: entry.submitted_at ?? "",
-    })),
-    comments: comments.map((entry) => ({ authorLogin: entry.user?.login ?? "", createdAt: entry.created_at ?? "" })),
     statusCheckRollup: rollup,
   }
   if (!isGhPullRequest(value)) throw new Error(`gh api returned an invalid pull request for #${number}`)
@@ -190,24 +159,11 @@ function isListPullRequest(value: unknown): value is GhListPullRequest {
   return record(value) && typeof value.number === "number"
 }
 
-function isReview(value: unknown): value is GhReview {
-  if (!record(value)) return false
-  if (value.user !== null && (!record(value.user) || typeof value.user.login !== "string")) return false
-  return (
-    (value.body === null || typeof value.body === "string") &&
-    (value.submitted_at === null || typeof value.submitted_at === "string")
-  )
-}
-
-function isComment(value: unknown): value is GhComment {
-  if (!record(value)) return false
-  if (value.user !== null && (!record(value.user) || typeof value.user.login !== "string")) return false
-  return value.created_at === null || typeof value.created_at === "string"
-}
-
 function isCheck(value: unknown) {
   if (!record(value)) return false
-  return [value.name, value.context, value.status].every((entry) => entry === undefined || typeof entry === "string")
+  return [value.name, value.context, value.status, value.state].every(
+    (entry) => entry === undefined || typeof entry === "string",
+  )
 }
 
 function record(value: unknown): value is Record<string, unknown> {

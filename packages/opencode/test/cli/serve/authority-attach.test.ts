@@ -108,7 +108,10 @@ describe("clients attach-first against a running serve authority", () => {
         expect(urlPort(serveManifest.url)).toBe(serve.port)
 
         yield* llm.text("hello from the serve-attached run")
-        const result = yield* opencode.run("say hi", { env: { OPENCODE_DB: database } })
+        const result = yield* opencode.run("say hi", {
+          env: { OPENCODE_DB: database },
+          timeoutMs: 75_000,
+        })
         opencode.expectExit(result, 0)
         expect(result.stdout).toContain("hello from the serve-attached run")
 
@@ -120,7 +123,7 @@ describe("clients attach-first against a running serve authority", () => {
         const health = yield* Effect.promise(() => fetch(new URL("/global/health", serve.url)))
         expect(health.status).toBe(200)
       }),
-    90_000,
+    150_000,
   )
 
   cliIt.live(

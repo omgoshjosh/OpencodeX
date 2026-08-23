@@ -1,5 +1,4 @@
 export const REVIEW_REPO = "ecgreen/OpencodeX"
-export const REVIEWER_LOGIN = "ecgreen"
 export const NO_CI_GRACE_MS = 20 * 60 * 1000
 
 export type CheckRun = { name: string; status: string }
@@ -10,8 +9,6 @@ export type PullRequestSnapshot = {
   isDraft: boolean
   headRefOid: string
   headCommittedAt: string
-  reviews: { authorLogin: string; body: string; submittedAt: string }[]
-  comments: { authorLogin: string; createdAt: string }[]
   checks: CheckRun[]
 }
 export type Decision = {
@@ -37,9 +34,17 @@ export function decidePullRequest(pr: PullRequestSnapshot, now: Date): Decision 
       ci: "present" as const,
     }
   const ci = pr.checks.length ? "present" : "absent"
-  if (ci === "absent" && now.getTime() - new Date(pr.headCommittedAt).getTime() < NO_CI_GRACE_MS)
+  const committedAt = new Date(pr.headCommittedAt).getTime()
+  if (!Number.isFinite(committedAt))
+    return { ...base, action: "defer" as const, reason: "invalid head commit timestamp", ci }
+  if (ci === "absent" && now.getTime() - committedAt < NO_CI_GRACE_MS)
     return { ...base, action: "defer" as const, reason: "CI not yet registered", ci }
   return { ...base, action: "review" as const, reason: "eligible", ci }
+}
+
+export function normalizeCheckStatus(status?: string, state?: string): string {
+  if (status) return status
+  return state === "PENDING" ? "IN_PROGRESS" : "COMPLETED"
 }
 
 export function flattenPages<T>(pages: readonly (readonly T[])[]): T[] {

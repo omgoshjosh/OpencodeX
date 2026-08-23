@@ -131,12 +131,11 @@ bun test test/pr-review-select.test.ts
 
 1. Query `gh api user --jq .login` and exit before listing PRs unless it equals
    `REVIEWER_LOGIN`.
-2. List open PRs with an explicit `--repo` and only the fields needed to
-   construct `PullRequestSnapshot`.
-3. Request GitHub CLI's maximum 1,000 PRs and fail when that ceiling is
-   reached; otherwise older PRs could be silently truncated. Add explicit
-   pagination before enabling automated review for a repository with that many
-   open PRs.
+2. Explicitly paginate open PRs, reviews, and comments with `--repo`, and
+   request only the final head-commit timestamp needed to construct each
+   `PullRequestSnapshot`.
+3. Reject malformed pagination data; never silently truncate PR or review
+   history.
 4. Normalize check runs to `name` and `status`. Conclusions are evidence for
    the rubric, not input to the gate chain.
 5. Pass each snapshot and a shared current time to `decidePullRequest`, then

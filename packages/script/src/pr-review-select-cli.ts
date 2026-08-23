@@ -2,6 +2,7 @@
 import { $ } from "bun"
 import {
   decidePullRequest,
+  flattenPages,
   REVIEW_REPO,
   REVIEWER_LOGIN,
   type CheckRun,
@@ -22,11 +23,16 @@ type GhPullRequest = {
   author: { login: string } | null
   isDraft: boolean
   headRefOid: string
-  commits: { committedDate: string }[]
-  reviews: { author: { login: string } | null; body: string | null; submittedAt: string }[]
-  comments: { author: { login: string } | null; createdAt: string }[]
+  reviews: { authorLogin: string; body: string; submittedAt: string }[]
+  comments: { authorLogin: string; createdAt: string }[]
   statusCheckRollup: GhRollupEntry[] | null
+  headCommittedAt: string
 }
+
+type GhListPullRequest = { number: number }
+
+type GhReview = { user: { login: string } | null; body: string | null; submitted_at: string | null }
+type GhComment = { user: { login: string } | null; created_at: string | null }
 
 // If the authenticated `gh` account ever drifts from REVIEWER_LOGIN, every
 // marker posted from here on becomes invisible to the next pass's identity
@@ -42,25 +48,24 @@ if (authenticatedLogin !== REVIEWER_LOGIN) {
   process.exit(1)
 }
 
-const FIELDS = "number,title,author,isDraft,headRefOid,commits,reviews,comments,statusCheckRollup"
+const PR_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      number title isDraft headRefOid author { login }
+      commits(last: 1) { nodes { commit { committedDate } } }
+      statusCheckRollup { contexts(first: 100) { nodes {
+        ... on CheckRun { name status }
+        ... on StatusContext { context }
+      } } }
+    }
+  }
+}`
 
-// `gh pr list` supports at most 1,000 results. The selector must never quietly
-// review only a prefix of the repository, so reaching this ceiling fails the
-// cycle and requires an explicit pagination implementation before it can run.
-const PR_LIMIT = 1000
-
-const listed: unknown =
-  await $`gh pr list --repo ${REVIEW_REPO} --state open --limit ${PR_LIMIT} --json ${FIELDS}`.json()
-if (!Array.isArray(listed)) throw new Error("gh pr list returned an invalid response")
-const pulls = listed.filter(isGhPullRequest)
-if (pulls.length !== listed.length) throw new Error("gh pr list returned an invalid pull request")
-
-if (pulls.length >= PR_LIMIT) {
-  throw new Error(
-    `gh pr list reached its ${PR_LIMIT}-PR ceiling; refusing to omit open PRs. ` +
-      "Add paginated selection before running automated reviews for this repository.",
-  )
-}
+const listed = await paginated<GhListPullRequest>(
+  `repos/${REVIEW_REPO}/pulls?state=open&per_page=100`,
+  isListPullRequest,
+)
+const pulls = await Promise.all(listed.map((pull) => loadPullRequest(pull.number)))
 
 const now = new Date()
 const decisions = pulls.map((pull) => {
@@ -79,16 +84,9 @@ const decisions = pulls.map((pull) => {
     authorLogin: pull.author?.login ?? "",
     isDraft: pull.isDraft,
     headRefOid: pull.headRefOid,
-    headCommittedAt: pull.commits.at(-1)?.committedDate ?? new Date(0).toISOString(),
-    reviews: pull.reviews.map((entry) => ({
-      authorLogin: entry.author?.login ?? "",
-      body: entry.body ?? "",
-      submittedAt: entry.submittedAt,
-    })),
-    comments: pull.comments.map((entry) => ({
-      authorLogin: entry.author?.login ?? "",
-      createdAt: entry.createdAt,
-    })),
+    headCommittedAt: pull.headCommittedAt,
+    reviews: pull.reviews,
+    comments: pull.comments,
     checks,
   }
 
@@ -102,29 +100,68 @@ function isGhPullRequest(value: unknown): value is GhPullRequest {
   if (typeof value.number !== "number" || typeof value.title !== "string") return false
   if (typeof value.isDraft !== "boolean" || typeof value.headRefOid !== "string") return false
   if (value.author !== null && (!record(value.author) || typeof value.author.login !== "string")) return false
-  if (!Array.isArray(value.commits) || !value.commits.every(isCommit)) return false
-  if (!Array.isArray(value.reviews) || !value.reviews.every(isReview)) return false
-  if (!Array.isArray(value.comments) || !value.comments.every(isComment)) return false
+  if (typeof value.headCommittedAt !== "string") return false
   return (
     value.statusCheckRollup === null ||
     (Array.isArray(value.statusCheckRollup) && value.statusCheckRollup.every(isCheck))
   )
 }
 
-function isCommit(value: unknown) {
-  return record(value) && typeof value.committedDate === "string"
+async function loadPullRequest(number: number): Promise<GhPullRequest> {
+  const raw: unknown =
+    await $`gh api graphql -f query=${PR_QUERY} -F owner=ecgreen -F name=OpencodeX -F number=${number}`.json()
+  const pull =
+    record(raw) && record(raw.data) && record(raw.data.repository) ? raw.data.repository.pullRequest : undefined
+  if (!record(pull) || !record(pull.commits) || !Array.isArray(pull.commits.nodes))
+    throw new Error(`gh api graphql returned an invalid pull request for #${number}`)
+  const commit = pull.commits.nodes.at(-1)
+  if (!record(commit) || !record(commit.commit) || typeof commit.commit.committedDate !== "string")
+    throw new Error(`gh api graphql returned no head commit timestamp for #${number}`)
+  const rollup =
+    record(pull.statusCheckRollup) && record(pull.statusCheckRollup.contexts)
+      ? pull.statusCheckRollup.contexts.nodes
+      : null
+  const reviews = await paginated<GhReview>(`repos/${REVIEW_REPO}/pulls/${number}/reviews?per_page=100`, isReview)
+  const comments = await paginated<GhComment>(`repos/${REVIEW_REPO}/issues/${number}/comments?per_page=100`, isComment)
+  const value = {
+    ...pull,
+    headCommittedAt: commit.commit.committedDate,
+    reviews: reviews.map((entry) => ({
+      authorLogin: entry.user?.login ?? "",
+      body: entry.body ?? "",
+      submittedAt: entry.submitted_at ?? "",
+    })),
+    comments: comments.map((entry) => ({ authorLogin: entry.user?.login ?? "", createdAt: entry.created_at ?? "" })),
+    statusCheckRollup: rollup,
+  }
+  if (!isGhPullRequest(value)) throw new Error(`gh api returned an invalid pull request for #${number}`)
+  return value
 }
 
-function isReview(value: unknown) {
-  if (!record(value)) return false
-  if (value.author !== null && (!record(value.author) || typeof value.author.login !== "string")) return false
-  return (value.body === null || typeof value.body === "string") && typeof value.submittedAt === "string"
+async function paginated<T>(path: string, validate: (value: unknown) => value is T): Promise<T[]> {
+  const pages: unknown = await $`gh api --paginate --slurp ${path}`.json()
+  if (!Array.isArray(pages) || !pages.every((page) => Array.isArray(page) && page.every(validate)))
+    throw new Error(`gh api returned invalid paginated data for ${path}`)
+  return flattenPages(pages)
 }
 
-function isComment(value: unknown) {
+function isListPullRequest(value: unknown): value is GhListPullRequest {
+  return record(value) && typeof value.number === "number"
+}
+
+function isReview(value: unknown): value is GhReview {
   if (!record(value)) return false
-  if (value.author !== null && (!record(value.author) || typeof value.author.login !== "string")) return false
-  return typeof value.createdAt === "string"
+  if (value.user !== null && (!record(value.user) || typeof value.user.login !== "string")) return false
+  return (
+    (value.body === null || typeof value.body === "string") &&
+    (value.submitted_at === null || typeof value.submitted_at === "string")
+  )
+}
+
+function isComment(value: unknown): value is GhComment {
+  if (!record(value)) return false
+  if (value.user !== null && (!record(value.user) || typeof value.user.login !== "string")) return false
+  return value.created_at === null || typeof value.created_at === "string"
 }
 
 function isCheck(value: unknown) {

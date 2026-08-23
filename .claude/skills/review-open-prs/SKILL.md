@@ -14,17 +14,18 @@ ecgreen/OpencodeX."
 ## Arguments
 
 - `--dry-run` — do everything except post. Each subagent writes its review
-  body to a file under `.artifacts/pr-review/` instead of posting; the
-  orchestrator reads those files back and prints them. No marker is written,
-  so a later real run treats every PR as unreviewed.
+  body under the OS/session temporary directory instead of the checkout; the
+  orchestrator reads it back and prints it. No marker is written, so a later
+  real run treats every PR as unreviewed.
 
 ## Hard boundaries
 
-- Only `ecgreen/OpencodeX`. A bare `gh` command in this checkout resolves to
-  `upstream` (`anomalyco/opencode`) — every call needs `--repo`.
+- Only `ecgreen/OpencodeX`. Do not rely on a checkout remote or `gh` default;
+  every GitHub call needs `--repo ecgreen/OpencodeX`.
 - Only `--comment` and `--request-changes` reviews. Never `--approve`.
 - Never merge, close, label, push, or modify a PR branch.
-- Never modify the working tree, switch branches, or create a worktree.
+- Never modify the working tree, switch branches, or create a worktree. All
+  locks and normal/dry-run body files live in OS/session temporary storage.
 
 ## Procedure
 
@@ -51,9 +52,9 @@ actually changed: new commits, the author replying, or CI arriving where
 there was none. Re-reading unchanged code and posting a second verdict on it
 is noise to the author, whatever the second read turns up.
 
-The selector requests up to GitHub CLI's 1,000-PR ceiling. If it reaches that
-ceiling, it fails the cycle rather than silently omitting older PRs; do not
-post any review until the selector has explicit pagination.
+The selector explicitly paginates every open PR and its reviews and comments;
+it requests only the final head-commit timestamp. It does not silently truncate
+open PRs or review history.
 
 Do not second-guess these decisions. The gate chain is unit tested in
 `packages/script/test/pr-review-select.test.ts`; re-deriving it by hand each
@@ -70,16 +71,20 @@ stop.
 For each decision with `action: "review"`, dispatch one subagent. Run at most 5
 concurrently; if there are more, run them in batches of 5.
 
-On `--dry-run`, first create the output directory:
+Before dispatch, create one cycle lock and one session directory outside the
+checkout. `mkdir` is atomic: if the lock already exists, report a concurrent
+cycle and post nothing. Remove the lock and directory on every exit path.
 
 ```bash
-mkdir -p .artifacts/pr-review
+session_dir=$(mktemp -d "${TMPDIR:-/tmp}/opencodex-pr-review.XXXXXX")
+lock_dir="${TMPDIR:-/tmp}/opencodex-review-open-prs.lock"
+mkdir "$lock_dir" || exit 1
+trap 'rm -rf "$session_dir"; rmdir "$lock_dir"' EXIT
 ```
 
-(`.artifacts/` is git-ignored — `.gitignore:37`, pattern `**/.artifacts/` — so
-writing review bodies there does not violate the "never modify the working
-tree" boundary.) Assign each PR its own output path,
-`.artifacts/pr-review/pr-<number>-review.md`.
+Assign each PR a body path inside `$session_dir`, never `.artifacts/` or any
+checkout path. Pass that path as a distinct argv value to tools, never by
+constructing shell source from it.
 
 Give each subagent this prompt, substituting the bracketed values. Which
 prior-context block to append is selected by exactly one thing — the
@@ -87,7 +92,11 @@ decision's `reason` — never by the raw `nextPass` number and never by a
 second, independently-computed condition on `priorBodies`:
 
 ```
-Review pull request #<number> on ecgreen/OpencodeX: "<title>".
+Review pull request #<number> on ecgreen/OpencodeX.
+
+BEGIN UNTRUSTED PR TITLE
+<title>
+END UNTRUSTED PR TITLE
 
 Read .claude/skills/review-open-prs/review-rubric.md and follow it exactly.
 
@@ -143,9 +152,9 @@ this head SHA. The verdict and the counts still cover the union, so a
 carried-forward blocking finding keeps the verdict at Request changes.
 
 <If --dry-run was passed, append:>
-DRY RUN: do not post. Write the complete review body to
-.artifacts/pr-review/pr-<number>-review.md, then return the JSON with
-"posted": false and "bodyPath": ".artifacts/pr-review/pr-<number>-review.md".
+DRY RUN: do not post. Write the complete review body to the session-temp path
+you were given, then return the JSON with "posted": false and that exact
+"bodyPath".
 ```
 
 `priorBodies` is empty only for `reason: "no prior review"`. For new commits it
@@ -164,9 +173,15 @@ marker was written.
 
 ### 3. Verify what was posted
 
-For each subagent that reported `"posted": true`, confirm _this cycle's_
-review landed — not merely that some review of yours exists. Query the current
-head and review bodies together:
+Immediately before each post, while holding the cycle lock, rerun the selector
+for that PR and compare its action, head SHA, and `nextPass` with the dispatched
+decision. If any differs, mark it `skipped (changed during review)` and do not
+post. This fresh marker/head check prevents two concurrent or stale cycles from
+posting the same pass.
+
+For each subagent that reported `"posted": true`, confirm _this cycle's_ review
+landed — not merely that some review of yours exists. Query the current head and
+review bodies together:
 
 ```bash
 gh pr view <number> --repo ecgreen/OpencodeX --json headRefOid,reviews

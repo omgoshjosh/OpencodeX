@@ -477,11 +477,12 @@ function normalizeDirectory(directory: string) {
  */
 function realDirectory(directory: string) {
   const resolved = path.resolve(directory)
-  if (process.platform !== "win32") return resolved
+  if (process.platform !== "win32" && process.platform !== "darwin") return resolved
   try {
-    return realpathSync.native(resolved).toLowerCase()
+    const real = realpathSync.native(resolved)
+    return process.platform === "win32" ? real.toLowerCase() : real
   } catch {
-    return resolved.toLowerCase()
+    return process.platform === "win32" ? resolved.toLowerCase() : resolved
   }
 }
 

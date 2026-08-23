@@ -9,7 +9,7 @@ The initial OpencodeX repository is a snapshot import without a Git merge-base. 
 1. `git fetch upstream --tags`, run `bun run upstream:status vX.Y.Z --markdown`, then run `bun run upstream:rehearse vX.Y.Z`. The report groups backend, storage, SDK/API, providers, dependencies, upstream front ends, pruned paths, and shared seams; the rehearsal measures the real merge/conflict surface without changing the worktree.
 2. Create `chore/upstream-vX.Y.Z` from `main`.
 3. Merge the exact tag commit with `git merge --no-ff vX.Y.Z` (add `--allow-unrelated-histories` only for the first lineage PR).
-4. Accept upstream-owned backend changes, preserve fork-owned paths, remove anything in `permanentlyPrunedPaths`, and manually review every shared seam. Run `bun run surface:audit` until clean.
+4. Accept upstream-owned backend changes only when their complete dependency closure fits the retained architecture. Preserve fork-owned paths, remove anything in `permanentlyPrunedPaths`, and manually review every shared seam. Do not partially adopt an upstream package split: record rejected architecture slices in the divergence ledger and port compatible behavior separately. Run `bun run surface:audit` until clean.
 5. Treat upstream TUI/Desktop changes as a behavior-port checklist. Port useful behavior into OpencodeX clients without restoring upstream front ends.
 6. Reconcile `package.json`, `bun.lock`, catalog entries, and patches. Run `bun install`, then verify `bun install --frozen-lockfile`.
 7. From `packages/sdk/js`, run `bun script/build.ts`; generated output must have no unexplained diff.
@@ -46,6 +46,16 @@ Deleted, upstream-owned (do not restore on merge):
 | ~76% of `packages/ui/src` — all of `theme/`, `hooks/`, `storybook/`, `styles/tailwind/`, the icon/favicon/image asset sets, most of `components/`, `v2/`, `i18n/`, `context/` | Upstream web-frontend residue. `packages/ui` survives only as the Solid components the GUI still imports (`file`, `markdown`, `code-block`, `popover`, `logo`, `session-diff`, `tool-output-preview`, `context/marked`, four `v2/components/*-v2`) plus the five notification `.mp3`s the TUI imports. Anything outside that set is intentionally gone; re-adding a file here needs a live importer. |
 | `packages/{containers,identity,extensions,effect-sqlite-node}`, `script/{publish.ts,release,generate.ts}`, `packages/plugin/src/example*.ts` | Vestigial upstream packages and scripts. Also in `permanentlyPrunedPaths`. |
 | `packages/opencode/script/publish.ts`, `packages/plugin/script/publish.ts`, `packages/sdk/js/script/publish.ts` | Upstream's release pipeline: Docker push to `ghcr.io/anomalyco/opencode`, AUR PKGBUILDs, a Homebrew tap, and `npm publish` to the `@opencode-ai` scope this fork does not own. The fork releases via `.github/workflows/release-cli.yml` + `script/build.ts` only. Also in `permanentlyPrunedPaths`. |
+
+### 2026-08 — first-lineage sync to v1.18.21
+
+The v1.18.21 release moves core runtime, schema, protocol, server, TUI, SDK-next,
+and web/desktop behavior into a mutually dependent package split. Partial adoption
+does not typecheck against OpencodeX's retained Effect services and durable
+session model. The first-lineage merge therefore establishes Git ancestry,
+permanently prunes those new workspaces in `upstream/policy.json`, and ports only
+independently compatible server behavior. Future behavior ports remain explicit
+follow-up work; the rejected package split must not be restored implicitly.
 
 Moved or split (a merge conflict here means upstream edited the *old* path — port the change into the new one):
 

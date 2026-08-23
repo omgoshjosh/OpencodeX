@@ -41,6 +41,11 @@ describe("getWorkspaceRouteSessionID", () => {
     expect(getWorkspaceRouteSessionID(url)).toBe(SessionID.make("ses_xyz"))
   })
 
+  test("extracts session ID from experimental background path", () => {
+    const url = new URL("http://localhost/experimental/session/ses_background/background")
+    expect(getWorkspaceRouteSessionID(url)).toBe(SessionID.make("ses_background"))
+  })
+
   test("returns null for /session/status", () => {
     const url = new URL("http://localhost/session/status")
     expect(getWorkspaceRouteSessionID(url)).toBeNull()
@@ -68,10 +73,11 @@ describe("workspaceProxyURL", () => {
     expect(result.pathname).toBe("/base/session/abc")
   })
 
-  test("preserves query params from request but removes workspace", () => {
-    const url = new URL("http://localhost/config?workspace=ws_123&keep=yes")
+  test("preserves remote query params but removes host routing context", () => {
+    const url = new URL("http://localhost/config?workspace=ws_123&directory=F%3A%5Crepo&keep=yes")
     const result = workspaceProxyURL("http://remote:8080/base", url)
     expect(result.searchParams.get("workspace")).toBeNull()
+    expect(result.searchParams.get("directory")).toBeNull()
     expect(result.searchParams.get("keep")).toBe("yes")
   })
 

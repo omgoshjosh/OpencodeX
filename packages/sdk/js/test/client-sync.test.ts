@@ -3074,7 +3074,19 @@ describe("client state sync", () => {
       capabilities: async () => {
         loads += 1
         if (loads === 1) await new Promise<void>((resolve) => (release = resolve))
-        return capabilities(`capabilities-${loads}`)
+        return {
+          ...capabilities(`capabilities-${loads}`),
+          providers:
+            loads === 1
+              ? []
+              : [
+                  {
+                    id: "opencode",
+                    name: "opencode",
+                    models: { "x-preview-f-free": { id: "x-preview-f-free", name: "Ox Alpha Free" } },
+                  } as ClientCapabilitiesSnapshot["providers"][number],
+                ],
+        }
       },
       events: async ({ signal }) =>
         (async function* () {
@@ -3101,6 +3113,18 @@ describe("client state sync", () => {
     await Bun.sleep(0)
     expect(loads).toBe(3)
     expect(controller.getState().capabilities?.revision).toBe("capabilities-3")
+
+    controller.applyEvent({ id: "models-dev-refreshed", type: "models-dev.refreshed", properties: {} })
+    await Bun.sleep(0)
+    expect(loads).toBe(4)
+    expect(controller.getState().capabilities?.revision).toBe("capabilities-4")
+    expect(
+      controller
+        .getState()
+        .capabilities?.providers.some(
+          (item) => item.id === "opencode" && item.models["x-preview-f-free"]?.name === "Ox Alpha Free",
+        ),
+    ).toBe(true)
     controller.stop()
   })
 })

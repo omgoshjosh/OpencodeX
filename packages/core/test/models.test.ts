@@ -205,6 +205,34 @@ describe("ModelsDev Service", () => {
     }),
   )
 
+  it.live("get() shares one reload and refresh event across concurrent callers after a catalog update", () =>
+    Effect.gen(function* () {
+      yield* writeCache(fixture)
+      const state = yield* Ref.make(initialState)
+      const result = yield* provided(
+        state,
+        Effect.gen(function* () {
+          const svc = yield* ModelsDev.Service
+          const events = yield* EventV2.Service
+          const received: string[] = []
+          yield* events.listen((event) =>
+            Effect.sync(() => {
+              if (event.type === ModelsDev.Event.Refreshed.type) received.push(event.type)
+            }),
+          )
+          yield* svc.get()
+          yield* writeCache(fixture2)
+          const catalogs = yield* Effect.all([svc.get(), svc.get(), svc.get(), svc.get(), svc.get()], {
+            concurrency: "unbounded",
+          })
+          return { catalogs, received }
+        }),
+      )
+      for (const catalog of result.catalogs) expect(catalog).toEqual(fixture2)
+      expect(result.received).toEqual([ModelsDev.Event.Refreshed.type])
+    }),
+  )
+
   it.live("get() retains the last complete catalog during a partial external write", () =>
     Effect.gen(function* () {
       yield* writeCache(fixture)

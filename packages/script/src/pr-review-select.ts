@@ -58,6 +58,7 @@ export type PriorReview = Marker & {
 export type Decision = {
   number: number
   title: string
+  headRefOid: string
   action: DecisionAction
   reason: string
   ci: CiPresence
@@ -83,7 +84,12 @@ export function parseMarker(body: string): Marker | undefined {
 // GitHub timestamps are all Z-suffixed ISO 8601 of identical width, so string
 // comparison is chronological and avoids a Date allocation per comment.
 export function decidePullRequest(pr: PullRequestSnapshot, now: Date): Decision {
-  const base = { number: pr.number, title: pr.title, selfAuthored: pr.authorLogin === REVIEWER_LOGIN }
+  const base = {
+    number: pr.number,
+    title: pr.title,
+    headRefOid: pr.headRefOid,
+    selfAuthored: pr.authorLogin === REVIEWER_LOGIN,
+  }
 
   const markedReviews: PriorReview[] = pr.reviews
     .flatMap((record) => {
@@ -182,4 +188,38 @@ export function decidePullRequest(pr: PullRequestSnapshot, now: Date): Decision 
     nextPass: priorPass,
     priorBodies,
   }
+}
+
+// A selection is only a snapshot. Re-evaluating immediately before posting
+// closes the window where a concurrent cycle, an author reply, or a new head
+// could turn the selected pass into a duplicate review.
+export function canPostDecision(selected: Decision, current: PullRequestSnapshot, now: Date): boolean {
+  const fresh = decidePullRequest(current, now)
+  return (
+    fresh.action === "review" &&
+    fresh.number === selected.number &&
+    fresh.headRefOid === selected.headRefOid &&
+    fresh.nextPass === selected.nextPass
+  )
+}
+
+// This value is passed as one argv element to `git show`; it is never embedded
+// in a shell program. Rejecting traversal and NUL also keeps the requested
+// context inside the reviewed repository tree.
+export function gitObjectPath(headRefOid: string, path: string): string {
+  if (!/^[0-9a-f]{40}$/.test(headRefOid)) throw new Error("invalid pull request head SHA")
+  if (
+    !path ||
+    path.includes("\0") ||
+    path.startsWith("/") ||
+    path.split("/").some((part) => part === "." || part === "..")
+  )
+    throw new Error("invalid pull request path")
+  return `${headRefOid}:${path}`
+}
+
+// REST pagination is represented as pages so callers cannot accidentally lose
+// a final page by assuming GitHub's default page size covers all history.
+export function flattenPages<T>(pages: readonly (readonly T[])[]): T[] {
+  return pages.flatMap((page) => page)
 }

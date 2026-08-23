@@ -30,9 +30,9 @@ work landed after the last review.
 
 ## Non-Goals
 
-- Running the test suite, typecheck, or build locally. CI already runs `static`,
-  `unit` on Linux and Windows, `cli-subprocess` on both, `gui-e2e`, and
-  `packaged-gui`; reading those results is the CI check.
+- Running the test suite, typecheck, or build locally. The reviewer reads only
+  checks present in the selected PR's CI rollup; it does not infer that GUI or
+  platform checks ran when the rollup does not report them.
 - Approving or merging PRs. The skill never submits `APPROVE`.
 - Reviewing upstream (`anomalyco/opencode`) PRs.
 - Inline (line-anchored) PR comments. Deferred; see Future Work.
@@ -40,10 +40,8 @@ work landed after the last review.
 
 ## Context
 
-- `origin` is `https://github.com/ecgreen/OpencodeX.git`; `upstream` is
-  `https://github.com/anomalyco/opencode.git` with push disabled.
-- A bare `gh pr list` in this checkout resolves to **upstream**, returning
-  40,000+ unrelated PRs. Every `gh` invocation in this skill must pass
+- Repository remotes and GitHub CLI defaults are ambient configuration, not a
+  safety boundary. Every `gh` invocation in this skill passes
   `--repo ecgreen/OpencodeX` explicitly. This is the single highest-risk detail
   in the design.
 - Reviews are submitted as `ecgreen`. Most open PRs are authored by
@@ -88,9 +86,9 @@ gh pr list --repo ecgreen/OpencodeX --state open --limit 1000 \
   --json number,title,author,isDraft,headRefOid,commits,reviews,comments,statusCheckRollup
 ```
 
-The adapter first verifies `gh api user --jq .login` is `ecgreen`, and fails
-when the result reaches GitHub CLI's 1,000-PR ceiling. It posts nothing until
-the selector has explicit pagination, so truncation cannot remain silent.
+The adapter first verifies `gh api user --jq .login` is `ecgreen`, then uses
+explicit pagination for open PRs and each PR's review/comment history. It asks
+for only the final head-commit timestamp.
 
 ### Gate chain
 

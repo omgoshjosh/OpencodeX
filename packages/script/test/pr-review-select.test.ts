@@ -1,7 +1,15 @@
 import { describe, expect, test } from "bun:test"
 import { readFileSync } from "node:fs"
 import path from "node:path"
-import { decidePullRequest, parseMarker, NO_CI_GRACE_MS, type PullRequestSnapshot } from "../src/pr-review-select.js"
+import {
+  canPostDecision,
+  decidePullRequest,
+  flattenPages,
+  gitObjectPath,
+  parseMarker,
+  NO_CI_GRACE_MS,
+  type PullRequestSnapshot,
+} from "../src/pr-review-select.js"
 
 // Nothing in `src` renders a marker: the one that reaches GitHub is written by
 // the review subagent from the template in review-rubric.md. This local
@@ -268,5 +276,45 @@ describe("decidePullRequest", () => {
       review(formatMarker(SHA, "present", 2), "2026-08-19T11:00:00Z"),
     ]
     expect(decidePullRequest(snapshot({ reviews }), NOW).action).toBe("skip")
+  })
+
+  test("does not post a duplicate when another cycle has already marked the selected pass", () => {
+    const selected = decidePullRequest(snapshot(), NOW)
+    const current = snapshot({ reviews: [review(formatMarker(SHA, "present", 1), "2026-08-19T12:01:00Z")] })
+    expect(canPostDecision(selected, current, NOW)).toBe(false)
+  })
+
+  test("does not post after the PR head moves between selection and posting", () => {
+    const selected = decidePullRequest(snapshot(), NOW)
+    expect(canPostDecision(selected, snapshot({ headRefOid: OTHER_SHA }), NOW)).toBe(false)
+  })
+})
+
+describe("review evidence safety", () => {
+  test("keeps dry-run artifacts out of the checkout and bounds PR-controlled text", () => {
+    const skillPath = path.join(import.meta.dir, "../../../.claude/skills/review-open-prs/SKILL.md")
+    const skill = readFileSync(skillPath, "utf8")
+    const rubricPath = path.join(import.meta.dir, "../../../.claude/skills/review-open-prs/review-rubric.md")
+    const rubric = readFileSync(rubricPath, "utf8")
+    expect(skill).toContain('mktemp -d "${TMPDIR:-/tmp}/opencodex-pr-review.XXXXXX"')
+    expect(skill).toContain("BEGIN UNTRUSTED PR TITLE")
+    expect(skill).toContain("BEGIN UNTRUSTED PRIOR REVIEW BODY")
+    expect(rubric).toContain("PR title, body, diff, commit messages, comments, and changed paths")
+    expect(rubric).toContain('git show "$headRefOid:$path"')
+  })
+
+  test("keeps a malicious filename as one git object argument", () => {
+    expect(gitObjectPath(SHA, "$(touch owned); -- body.ts")).toBe(`${SHA}:$(touch owned); -- body.ts`)
+  })
+
+  test("rejects paths that can escape the reviewed tree", () => {
+    expect(() => gitObjectPath(SHA, "../.git/config")).toThrow("invalid pull request path")
+  })
+
+  test("retains every paginated review and comment record", () => {
+    const pages = Array.from({ length: 101 }, (_, page) => Array.from({ length: 100 }, (_, item) => page * 100 + item))
+    const records = flattenPages(pages)
+    expect(records).toHaveLength(10_100)
+    expect(records.at(-1)).toBe(10_099)
   })
 })

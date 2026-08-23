@@ -243,9 +243,12 @@ per-cycle OS/session temporary directory provided by the orchestrator, never
 into the repository. Return the body path as a distinct value. Never run
 `gh pr review`, never post a marker, and never report `posted: true`.
 
-The lock-owning orchestrator reselects the PR, checks its head/pass, chooses
-`--request-changes` for Blocking findings or `--comment` otherwise, posts the
-body with an argv-safe `--body-file` value, then verifies the marker.
+The workflow's trusted post job reselects the PR, checks its head/pass, posts a
+comment-only review with the exact `commit_id`, then verifies the returned
+review ID, actor, event, body, marker, and current head. There is an unavoidable
+GET/POST race: a head can move after the pre-post read. The post job detects
+that mismatch after posting and reports failure; it never treats it as success
+and cannot safely retract a real review.
 
 **Unless the dispatch prompt told you the reviewer authored this PR.** GitHub
 rejects `REQUEST_CHANGES` on your own pull request outright:

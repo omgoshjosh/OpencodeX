@@ -70,12 +70,18 @@ const CHECK_QUERY = `query($owner: String!, $name: String!, $number: Int!, $afte
 }`
 
 const PR_CONCURRENCY = 4
+const requestedPr = process.argv[2] === "--pr" ? Number(process.argv[3]) : undefined
+if (process.argv.length > 2 && (requestedPr === undefined || !Number.isInteger(requestedPr) || requestedPr < 1))
+  throw new Error("usage: pr-review:select [--pr <positive-number>]")
 
 const listed = await paginated<GhListPullRequest>(
   `repos/${REVIEW_REPO}/pulls?state=open&per_page=100`,
   isListPullRequest,
 )
-const pulls = await mapConcurrent(listed, PR_CONCURRENCY, (pull) => loadPullRequest(pull.number))
+const selected = requestedPr === undefined ? listed : listed.filter((pull) => pull.number === requestedPr!)
+if (requestedPr !== undefined && selected.length !== 1)
+  throw new Error(`open pull request #${requestedPr} was not found`)
+const pulls = await mapConcurrent(selected, PR_CONCURRENCY, (pull) => loadPullRequest(pull.number))
 
 const now = new Date()
 const decisions = pulls.map((pull) => {

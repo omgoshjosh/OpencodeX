@@ -11,6 +11,7 @@ import {
   NO_CI_GRACE_MS,
   type PullRequestSnapshot,
 } from "../src/pr-review-select.js"
+import { markerFor, postBody, validateDraft, verifyPostedReview } from "../src/pr-review-post.js"
 
 // Nothing in `src` renders a marker: the one that reaches GitHub is written by
 // the review subagent from the template in review-rubric.md. This local
@@ -292,6 +293,50 @@ describe("decidePullRequest", () => {
 })
 
 describe("review evidence safety", () => {
+  test("rejects malformed and marker-injected drafts", () => {
+    expect(() =>
+      validateDraft({
+        number: 1,
+        headRefOid: SHA,
+        ci: "present",
+        pass: 1,
+        body: "<!-- opencodex-pr-review -->",
+        blocking: 0,
+        nonBlocking: 0,
+        nits: 0,
+      }),
+    ).toThrow("must not contain a marker")
+    expect(() =>
+      validateDraft({
+        number: 1,
+        headRefOid: SHA.slice(0, 7),
+        ci: "present",
+        pass: 1,
+        body: "review",
+        blocking: 0,
+        nonBlocking: 0,
+        nits: 0,
+      }),
+    ).toThrow("full head SHA")
+  })
+
+  test("requires returned comment identity, exact commit, body, and current head", () => {
+    const draft = validateDraft({
+      number: 1,
+      headRefOid: SHA,
+      ci: "present",
+      pass: 2,
+      body: "review",
+      blocking: 0,
+      nonBlocking: 0,
+      nits: 0,
+    })
+    const returned = { id: 9, user: { login: "ecgreen" }, event: "COMMENT", commit_id: SHA, body: postBody(draft) }
+    expect(markerFor(draft)).toContain("-v2 sha=" + SHA)
+    expect(() => verifyPostedReview(returned, draft, 9, SHA)).not.toThrow()
+    expect(() => verifyPostedReview(returned, draft, 10, SHA)).toThrow("wrong actor or ID")
+    expect(() => verifyPostedReview(returned, draft, 9, OTHER_SHA)).toThrow("head changed")
+  })
   test("keeps dry-run artifacts out of the checkout and bounds PR-controlled text", () => {
     const skillPath = path.join(import.meta.dir, "../../../.claude/skills/review-open-prs/SKILL.md")
     const skill = readFileSync(skillPath, "utf8")

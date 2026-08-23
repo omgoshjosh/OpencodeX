@@ -79,11 +79,12 @@ the cycle.
 
 ### Input
 
-One call:
+Explicit pagination calls:
 
 ```
-gh pr list --repo ecgreen/OpencodeX --state open --limit 1000 \
-  --json number,title,author,isDraft,headRefOid,commits,reviews,comments,statusCheckRollup
+gh api --paginate --slurp repos/ecgreen/OpencodeX/pulls?state=open\&per_page=100
+gh api --paginate --slurp repos/ecgreen/OpencodeX/pulls/<n>/reviews?per_page=100
+gh api --paginate --slurp repos/ecgreen/OpencodeX/issues/<n>/comments?per_page=100
 ```
 
 The adapter first verifies `gh api user --jq .login` is `ecgreen`, then uses

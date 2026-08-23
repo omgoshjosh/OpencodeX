@@ -223,3 +223,20 @@ export function gitObjectPath(headRefOid: string, path: string): string {
 export function flattenPages<T>(pages: readonly (readonly T[])[]): T[] {
   return pages.flatMap((page) => page)
 }
+
+// Cap fan-out so a repository with many open PRs cannot burst GitHub's API or
+// consume all local subprocess slots before the cycle can make progress.
+export async function mapConcurrent<T, U>(
+  values: readonly T[],
+  limit: number,
+  action: (value: T) => Promise<U>,
+): Promise<U[]> {
+  if (!Number.isInteger(limit) || limit < 1) throw new Error("concurrency limit must be a positive integer")
+  const output = Array<U>(values.length)
+  await Promise.all(
+    Array.from({ length: Math.min(values.length, limit) }, async (_, worker) => {
+      for (let index = worker; index < values.length; index += limit) output[index] = await action(values[index])
+    }),
+  )
+  return output
+}

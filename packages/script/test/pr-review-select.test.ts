@@ -6,6 +6,7 @@ import {
   decidePullRequest,
   flattenPages,
   gitObjectPath,
+  mapConcurrent,
   parseMarker,
   NO_CI_GRACE_MS,
   type PullRequestSnapshot,
@@ -301,6 +302,10 @@ describe("review evidence safety", () => {
     expect(skill).toContain("BEGIN UNTRUSTED PRIOR REVIEW BODY")
     expect(rubric).toContain("PR title, body, diff, commit messages, comments, and changed paths")
     expect(rubric).toContain('git show "$headRefOid:$path"')
+    expect(skill).toContain('shlock -p "$$" -f "$lock_file"')
+    expect(skill).toContain('kill -0 "$owner_pid"')
+    expect(skill).toContain("You are a draft-only reviewer")
+    expect(rubric).toContain("Never run\n`gh pr review`")
   })
 
   test("keeps a malicious filename as one git object argument", () => {
@@ -316,5 +321,42 @@ describe("review evidence safety", () => {
     const records = flattenPages(pages)
     expect(records).toHaveLength(10_100)
     expect(records.at(-1)).toBe(10_099)
+  })
+
+  test("requires every check-context page beyond GitHub's first 100", () => {
+    const cliPath = path.join(import.meta.dir, "../src/pr-review-select-cli.ts")
+    const cli = readFileSync(cliPath, "utf8")
+    expect(cli).toContain("contexts(first: 100, after: $after)")
+    expect(cli).toContain("hasNextPage")
+    expect(cli).toContain("loadCheckContexts(number, contexts.pageInfo.endCursor)")
+  })
+
+  test("keeps at most the configured number of per-PR requests in flight", async () => {
+    let active = 0
+    let peak = 0
+    const values = await mapConcurrent(
+      Array.from({ length: 11 }, (_, index) => index),
+      4,
+      async (value) => {
+        active += 1
+        peak = Math.max(peak, active)
+        await new Promise((resolve) => setTimeout(resolve, 1))
+        active -= 1
+        return value * 2
+      },
+    )
+    expect(peak).toBe(4)
+    expect(values).toEqual(Array.from({ length: 11 }, (_, index) => index * 2))
+  })
+
+  test("documents lock recovery before the owner-only fresh-check post sequence", () => {
+    const skillPath = path.join(import.meta.dir, "../../../.claude/skills/review-open-prs/SKILL.md")
+    const skill = readFileSync(skillPath, "utf8")
+    const staleRecovery = skill.indexOf('kill -0 "$owner_pid"')
+    const freshSelection = skill.indexOf("reselect the PR")
+    const post = skill.indexOf("post the draft with `gh pr review`")
+    expect(staleRecovery).toBeGreaterThan(-1)
+    expect(freshSelection).toBeGreaterThan(staleRecovery)
+    expect(post).toBeGreaterThan(freshSelection)
   })
 })

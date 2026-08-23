@@ -72,14 +72,23 @@ For each decision with `action: "review"`, dispatch one subagent. Run at most 5
 concurrently; if there are more, run them in batches of 5.
 
 Before dispatch, create one cycle lock and one session directory outside the
-checkout. `mkdir` is atomic: if the lock already exists, report a concurrent
-cycle and post nothing. Remove the lock and directory on every exit path.
+checkout. `shlock` atomically records the owner PID. On collision, read only
+the numeric owner PID and use `kill -0` to verify it: a live owner means stop;
+only a verified-dead owner may have its stale lock removed and be retried once.
+Never remove a live owner's lock. Remove the owned lock and session directory
+on every exit path.
 
 ```bash
 session_dir=$(mktemp -d "${TMPDIR:-/tmp}/opencodex-pr-review.XXXXXX")
-lock_dir="${TMPDIR:-/tmp}/opencodex-review-open-prs.lock"
-mkdir "$lock_dir" || exit 1
-trap 'rm -rf "$session_dir"; rmdir "$lock_dir"' EXIT
+lock_file="${TMPDIR:-/tmp}/opencodex-review-open-prs.lock"
+if ! shlock -p "$$" -f "$lock_file"; then
+  owner_pid=$(cat "$lock_file")
+  case "$owner_pid" in (*[!0-9]*|'') exit 1;; esac
+  kill -0 "$owner_pid" 2>/dev/null && exit 1
+  rm -f "$lock_file"
+  shlock -p "$$" -f "$lock_file" || exit 1
+fi
+trap 'rm -rf "$session_dir"; rm -f "$lock_file"' EXIT
 ```
 
 Assign each PR a body path inside `$session_dir`, never `.artifacts/` or any
@@ -103,6 +112,11 @@ Read .claude/skills/review-open-prs/review-rubric.md and follow it exactly.
 Reason this PR is being reviewed: <reason>
 CI presence for the current head: <ci>
 Record pass=<nextPass> in your marker.
+
+You are a draft-only reviewer. Never run `gh pr review`, never post a marker,
+and never claim `posted: true`. Write the proposed review body to your assigned
+session-temp path and return the JSON draft result. Only the lock-owning
+orchestrator may freshly select, post, and verify it.
 
 <If selfAuthored is true, append:>
 You authored this PR. GitHub rejects --request-changes on your own pull
@@ -173,11 +187,13 @@ marker was written.
 
 ### 3. Verify what was posted
 
-Immediately before each post, while holding the cycle lock, rerun the selector
-for that PR and compare its action, head SHA, and `nextPass` with the dispatched
-decision. If any differs, mark it `skipped (changed during review)` and do not
-post. This fresh marker/head check prevents two concurrent or stale cycles from
-posting the same pass.
+While holding the cycle lock, the orchestrator alone owns this sequence for
+each draft: reselect the PR; compare `action=review`, head SHA, and `nextPass`
+with the dispatched decision; post the draft with `gh pr review`; then verify
+the selected marker in GitHub. If selection differs, mark it `skipped (changed
+during review)` and do not post. No subagent or separate automated worker is
+permitted to issue `gh pr review`; this sequence is the only automated posting
+path and it always performs the fresh check first.
 
 For each subagent that reported `"posted": true`, confirm _this cycle's_ review
 landed — not merely that some review of yours exists. Query the current head and

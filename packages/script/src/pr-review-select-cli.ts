@@ -3,6 +3,7 @@ import { $ } from "bun"
 import {
   decidePullRequest,
   flattenPages,
+  mapConcurrent,
   REVIEW_REPO,
   REVIEWER_LOGIN,
   type CheckRun,
@@ -53,19 +54,28 @@ const PR_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
     pullRequest(number: $number) {
       number title isDraft headRefOid author { login }
       commits(last: 1) { nodes { commit { committedDate } } }
-      statusCheckRollup { contexts(first: 100) { nodes {
-        ... on CheckRun { name status }
-        ... on StatusContext { context }
-      } } }
     }
   }
 }`
+
+const CHECK_QUERY = `query($owner: String!, $name: String!, $number: Int!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      statusCheckRollup { contexts(first: 100, after: $after) {
+        nodes { ... on CheckRun { name status } ... on StatusContext { context } }
+        pageInfo { hasNextPage endCursor }
+      } }
+    }
+  }
+}`
+
+const PR_CONCURRENCY = 4
 
 const listed = await paginated<GhListPullRequest>(
   `repos/${REVIEW_REPO}/pulls?state=open&per_page=100`,
   isListPullRequest,
 )
-const pulls = await Promise.all(listed.map((pull) => loadPullRequest(pull.number)))
+const pulls = await mapConcurrent(listed, PR_CONCURRENCY, (pull) => loadPullRequest(pull.number))
 
 const now = new Date()
 const decisions = pulls.map((pull) => {
@@ -117,10 +127,7 @@ async function loadPullRequest(number: number): Promise<GhPullRequest> {
   const commit = pull.commits.nodes.at(-1)
   if (!record(commit) || !record(commit.commit) || typeof commit.commit.committedDate !== "string")
     throw new Error(`gh api graphql returned no head commit timestamp for #${number}`)
-  const rollup =
-    record(pull.statusCheckRollup) && record(pull.statusCheckRollup.contexts)
-      ? pull.statusCheckRollup.contexts.nodes
-      : null
+  const rollup = await loadCheckContexts(number)
   const reviews = await paginated<GhReview>(`repos/${REVIEW_REPO}/pulls/${number}/reviews?per_page=100`, isReview)
   const comments = await paginated<GhComment>(`repos/${REVIEW_REPO}/issues/${number}/comments?per_page=100`, isComment)
   const value = {
@@ -136,6 +143,34 @@ async function loadPullRequest(number: number): Promise<GhPullRequest> {
   }
   if (!isGhPullRequest(value)) throw new Error(`gh api returned an invalid pull request for #${number}`)
   return value
+}
+
+async function loadCheckContexts(number: number, after?: string): Promise<GhRollupEntry[]> {
+  const raw: unknown = after
+    ? await $`gh api graphql -f query=${CHECK_QUERY} -F owner=ecgreen -F name=OpencodeX -F number=${number} -F after=${after}`.json()
+    : await $`gh api graphql -f query=${CHECK_QUERY} -F owner=ecgreen -F name=OpencodeX -F number=${number}`.json()
+  const contexts =
+    record(raw) &&
+    record(raw.data) &&
+    record(raw.data.repository) &&
+    record(raw.data.repository.pullRequest) &&
+    record(raw.data.repository.pullRequest.statusCheckRollup) &&
+    record(raw.data.repository.pullRequest.statusCheckRollup.contexts)
+      ? raw.data.repository.pullRequest.statusCheckRollup.contexts
+      : undefined
+  if (
+    !record(contexts) ||
+    !Array.isArray(contexts.nodes) ||
+    !contexts.nodes.every(isCheck) ||
+    !record(contexts.pageInfo) ||
+    typeof contexts.pageInfo.hasNextPage !== "boolean" ||
+    (contexts.pageInfo.endCursor !== null && typeof contexts.pageInfo.endCursor !== "string")
+  )
+    throw new Error(`gh api graphql returned invalid check contexts for #${number}`)
+  if (!contexts.pageInfo.hasNextPage) return contexts.nodes
+  if (typeof contexts.pageInfo.endCursor !== "string")
+    throw new Error(`gh api graphql returned no next check cursor for #${number}`)
+  return [...contexts.nodes, ...(await loadCheckContexts(number, contexts.pageInfo.endCursor))]
 }
 
 async function paginated<T>(path: string, validate: (value: unknown) => value is T): Promise<T[]> {

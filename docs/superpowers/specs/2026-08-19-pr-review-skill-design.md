@@ -68,8 +68,9 @@ Two components:
 - **Cycle orchestrator** (main session): enumerates PRs, applies the gate chain,
   dispatches subagents, prints the summary table. Holds no PR diffs.
 - **PR review subagent** (one per eligible PR, max 5 concurrent): gathers
-  evidence for a single PR, applies the rubric, posts one review. Gets a clean
-  context so a large diff cannot crowd out the rubric.
+  evidence for a single PR, applies the rubric, and returns a draft only. The
+  lock-owning orchestrator alone performs fresh selection, posting, and marker
+  verification. Clean contexts keep a large diff from crowding out the rubric.
 
 The split exists so the orchestrator's context stays small and constant
 regardless of how many PRs are in flight, and so one PR's failure cannot abort

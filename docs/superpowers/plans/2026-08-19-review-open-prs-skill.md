@@ -200,8 +200,8 @@ The orchestrator must:
 6. For author replies or CI arrival at the same head, likewise append every
    entry in `priorBodies`, oldest first, and identify the trigger.
 7. Never interpolate only `priorBodies[0]` or only `priorReview.body`.
-8. On dry-run, transfer each body through its assigned git-ignored artifact
-   path and post nothing.
+8. Transfer every draft through its assigned OS/session temporary path and post
+   nothing on dry-run.
 9. On a real run, verify that the latest review marker contains the expected
    current SHA and `nextPass`; authorship alone cannot prove this cycle posted.
 10. Print one compact summary table, including errors without retrying them in

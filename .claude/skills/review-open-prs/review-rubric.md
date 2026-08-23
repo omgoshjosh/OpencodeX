@@ -236,19 +236,16 @@ with notes` when there are zero Blocking findings but at least one
   ordinary case; a higher number means the author or CI brought you back to a
   commit already reviewed, and the footer should not claim otherwise.
 
-## Posting
+## Draft Return
 
-On normal and dry runs, write the body only to the per-cycle OS/session
-temporary directory provided by the orchestrator, never into the repository.
-Pass its path as a separate argv value. Then:
+You are draft-only. On normal and dry runs, write the body only to the
+per-cycle OS/session temporary directory provided by the orchestrator, never
+into the repository. Return the body path as a distinct value. Never run
+`gh pr review`, never post a marker, and never report `posted: true`.
 
-```
-gh pr review <n> --repo ecgreen/OpencodeX --request-changes --body-file <path>
-gh pr review <n> --repo ecgreen/OpencodeX --comment --body-file <path>
-```
-
-Use `--request-changes` when there is at least one Blocking finding, otherwise
-`--comment`. Never `--approve`.
+The lock-owning orchestrator reselects the PR, checks its head/pass, chooses
+`--request-changes` for Blocking findings or `--comment` otherwise, posts the
+body with an argv-safe `--body-file` value, then verifies the marker.
 
 **Unless the dispatch prompt told you the reviewer authored this PR.** GitHub
 rejects `REQUEST_CHANGES` on your own pull request outright:
@@ -268,10 +265,19 @@ is selected again next cycle with the same findings, forever.
 
 Return one line of JSON and nothing else. The contract differs by mode:
 
-- **Normal run:** post the review (see Posting), then return:
+- **Every run:** return a draft; the lock-owning orchestrator is the only
+  process that posts after its fresh selection check:
 
   ```json
-  { "number": 25, "verdict": "request_changes", "blocking": 2, "nonBlocking": 3, "nits": 1, "posted": true }
+  {
+    "number": 25,
+    "verdict": "request_changes",
+    "blocking": 2,
+    "nonBlocking": 3,
+    "nits": 1,
+    "posted": false,
+    "bodyPath": "<session-temp>/pr-25-review.md"
+  }
   ```
 
 - **Dry run:** do not post. Write the complete review body to the output path

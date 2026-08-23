@@ -176,7 +176,7 @@ describe("ModelsDev Service", () => {
       const mtimeMs = Date.now() - 1000
       const first = JSON.stringify(fixture)
       const second = first.replace("Acme One", "Zinc One")
-      const updated = Schema.decodeUnknownSync(ModelsDev.Catalog)(JSON.parse(second))
+      const updated = Schema.decodeUnknownSync(Schema.fromJsonString(ModelsDev.Catalog))(second)
       expect(second.length).toBe(first.length)
       yield* writeCacheText(first, mtimeMs)
       const state = yield* Ref.make(initialState)

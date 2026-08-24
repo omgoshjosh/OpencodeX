@@ -1593,6 +1593,15 @@ export const layer = Layer.effect(
           database[providerID] = parsed
         }
 
+        const opencodeGo = database[ProviderV2.ID.make("opencode-go")]
+        if (opencodeGo) {
+          opencodeGo.options = {
+            headerTimeout: 120_000,
+            chunkTimeout: 120_000,
+            ...opencodeGo.options,
+          }
+        }
+
         // load env
         const envs = yield* env.all()
         for (const [id, provider] of Object.entries(database)) {

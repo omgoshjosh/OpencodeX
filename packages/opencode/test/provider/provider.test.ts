@@ -401,6 +401,25 @@ it.instance(
   { config: { provider: { anthropic: { options: { timeout: 60000, headerTimeout: 10000, chunkTimeout: 15000 } } } } },
 )
 
+it.instance("opencode-go bounds response header and stream stalls by default", () =>
+  Effect.gen(function* () {
+    const provider = (yield* list)[ProviderV2.ID.make("opencode-go")]
+    expect(provider.options.headerTimeout).toBe(120_000)
+    expect(provider.options.chunkTimeout).toBe(120_000)
+  }),
+  {
+    config: {
+      provider: {
+        "opencode-go": {
+          name: "OpenCode Go",
+          npm: "@ai-sdk/openai-compatible",
+          models: { "test-model": { name: "Test Model" } },
+        },
+      },
+    },
+  },
+)
+
 it.instance("getModel returns model for valid provider/model", () =>
   Effect.gen(function* () {
     yield* setProcessEnv("ANTHROPIC_API_KEY", "test-api-key")

@@ -1,9 +1,11 @@
 import { Database } from "@opencode-ai/core/database/database"
+import { Global } from "@opencode-ai/core/global"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { Log } from "@opencode-ai/core/util/log"
 import { ensureRunID, OPENCODE_PROCESS_ROLE } from "@opencode-ai/core/util/opencode-process"
 import { Effect, Schema } from "effect"
 import { randomBytes } from "crypto"
+import { reserveCanonicalAuthority } from "@opencode-ai/sdk/coordinator"
 import { ServerAuth } from "@/server/auth"
 import { Server, type Listener } from "@/server/server"
 import { errorMessage } from "@/util/error"
@@ -128,6 +130,11 @@ function startServeAuthority(
 ) {
   const start = Effect.fnUntraced(function* () {
     if (input.signal?.aborted) return yield* Effect.interrupt
+    if (process.env.OPENCODE_CANONICAL_AUTHORITY === "1") {
+      // This durable claim precedes every election step so fallback clients do
+      // not replace a configured serve backend while it is restarting.
+      yield* Effect.promise(() => reserveCanonicalAuthority(Global.Path.state, input.key, input.database))
+    }
     // A live authority (TUI coordinator, GUI sidecar, or another serve) must be
     // left strictly alone: attaching two writers to one database is the exact
     // failure this protocol exists to prevent. Fail loudly instead.
@@ -202,9 +209,10 @@ function startServeAuthority(
           stopped: false,
         }),
         Effect.onError(() =>
-          Effect.all(listeners.map((listener) => Effect.promise(() => listener.stop(true))), { discard: true }).pipe(
-            Effect.ignore,
-          ),
+          Effect.all(
+            listeners.map((listener) => Effect.promise(() => listener.stop(true))),
+            { discard: true },
+          ).pipe(Effect.ignore),
         ),
       )
     })
@@ -226,8 +234,7 @@ export function manifestURLFor(hostname: string, primaryPort: number, companion?
   // resolve to the bracketed IPv6 loopback form `[::1]` (the WHATWG URL
   // hostname setter drops a bare IPv6 address), while 0.0.0.0 and LAN
   // hostnames use the IPv4 127.0.0.1 that their sockets map to.
-  const host =
-    hostname === "::" || hostname === "::1" ? "[::1]" : LOOPBACK_HOSTS.has(hostname) ? hostname : "127.0.0.1"
+  const host = hostname === "::" || hostname === "::1" ? "[::1]" : LOOPBACK_HOSTS.has(hostname) ? hostname : "127.0.0.1"
   return new URL(`http://${host}:${port}`).toString()
 }
 
@@ -306,7 +313,9 @@ function stopServeAuthority(resource: OwnedServeAuthority, reason: string) {
     )
     yield* Effect.tryPromise(() => resource.ownerLock.release()).pipe(
       Effect.catch((error) =>
-        Effect.sync(() => Log.Default.warn("backend authority owner lock release failed", { error: errorMessage(error) })),
+        Effect.sync(() =>
+          Log.Default.warn("backend authority owner lock release failed", { error: errorMessage(error) }),
+        ),
       ),
     )
   })

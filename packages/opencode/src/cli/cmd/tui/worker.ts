@@ -190,6 +190,7 @@ async function startServer(input: {
       port: input.port,
       mdns: input.mdns,
       mdnsDomain: input.mdnsDomain,
+      prefer4096: false,
       cors: input.cors ?? [],
     }
     listeners = needsCompanion

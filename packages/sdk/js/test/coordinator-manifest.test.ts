@@ -4,6 +4,7 @@ import os from "node:os"
 import path from "node:path"
 import {
   COORDINATOR_MANIFEST_VERSION,
+  canonicalAuthorityReservationPath,
   checkCoordinatorCompatibility,
   coordinatorClientDir,
   coordinatorDatabaseIdentity,
@@ -12,9 +13,12 @@ import {
   fetchCoordinatorHealth,
   isCoordinatorHealthForManifest,
   isCoordinatorManifest,
+  isCanonicalAuthorityReserved,
   readCoordinatorManifest,
+  reserveCanonicalAuthority,
   removeCoordinatorManifest,
   startCoordinatorClientLease,
+  startFallbackCoordinator,
   writeCoordinatorManifest,
   type CoordinatorManifest,
 } from "../src/coordinator/manifest"
@@ -83,12 +87,53 @@ describe("coordinator manifest validation", () => {
   })
 })
 
+describe("canonical authority reservation", () => {
+  test("persists across a canonical restart and makes a fallback wait", async () => {
+    const root = await stateRoot()
+    await reserveCanonicalAuthority(root, "abc123", "/data/opencode.db")
+    expect(await isCanonicalAuthorityReserved(root, "abc123")).toBe(true)
+    expect(JSON.parse(await fs.readFile(canonicalAuthorityReservationPath(root, "abc123"), "utf8"))).toMatchObject({
+      version: 1,
+      key: "abc123",
+      database: "/data/opencode.db",
+    })
+    let spawned = false
+    expect(
+      await startFallbackCoordinator({
+        stateRoot: root,
+        key: "abc123",
+        spawn: async () => {
+          spawned = true
+          return "spawned"
+        },
+        wait: async () => "attached-after-restart",
+      }),
+    ).toBe("attached-after-restart")
+    expect(spawned).toBe(false)
+  })
+
+  test("fails closed for malformed reservations and preserves unreserved fallback", async () => {
+    const root = await stateRoot()
+    const file = canonicalAuthorityReservationPath(root, "abc123")
+    await fs.mkdir(path.dirname(file), { recursive: true })
+    await fs.writeFile(file, "{")
+    expect(await isCanonicalAuthorityReserved(root, "abc123")).toBe(true)
+    expect(await isCanonicalAuthorityReserved(root, "unreserved")).toBe(false)
+    expect(
+      await startFallbackCoordinator({
+        stateRoot: root,
+        key: "unreserved",
+        spawn: async () => "spawned",
+        wait: async () => "waited",
+      }),
+    ).toBe("spawned")
+  })
+})
+
 describe("coordinator key derivation", () => {
   test("is the sha1 of the resolved database identity", () => {
     const absolute = path.resolve("/data/opencode.db")
-    expect(coordinatorDatabaseIdentity(absolute)).toBe(
-      process.platform === "win32" ? absolute.toLowerCase() : absolute,
-    )
+    expect(coordinatorDatabaseIdentity(absolute)).toBe(process.platform === "win32" ? absolute.toLowerCase() : absolute)
     expect(coordinatorKey(absolute)).toMatch(/^[0-9a-f]{40}$/)
     expect(coordinatorKey(absolute)).toBe(coordinatorKey(absolute.toUpperCase() === absolute ? absolute : absolute))
   })
@@ -182,9 +227,7 @@ describe("compatibility policy", () => {
   })
 
   test("a legacy manifest is not rescued by a local client", () => {
-    expect(
-      checkCoordinatorCompatibility({ manifest: {}, clientVersion: "local", skip: false }).reason,
-    ).toBe("legacy")
+    expect(checkCoordinatorCompatibility({ manifest: {}, clientVersion: "local", skip: false }).reason).toBe("legacy")
   })
 
   test("cross-checks the manifest against the live health version", () => {
@@ -209,9 +252,10 @@ describe("compatibility policy", () => {
   })
 
   test("the skip escape bypasses every refusal", () => {
-    expect(
-      checkCoordinatorCompatibility({ manifest: {}, clientVersion: "1.2.3", skip: true }),
-    ).toEqual({ compatible: true, reason: "skipped" })
+    expect(checkCoordinatorCompatibility({ manifest: {}, clientVersion: "1.2.3", skip: true })).toEqual({
+      compatible: true,
+      reason: "skipped",
+    })
     expect(
       checkCoordinatorCompatibility({
         manifest: { serverVersion: "9.9.9" },
@@ -226,9 +270,7 @@ describe("compatibility policy", () => {
     const previous = process.env.OPENCODEX_SKIP_VERSION_CHECK
     try {
       process.env.OPENCODEX_SKIP_VERSION_CHECK = "1"
-      expect(
-        checkCoordinatorCompatibility({ manifest: {}, clientVersion: "1.2.3" }).reason,
-      ).toBe("skipped")
+      expect(checkCoordinatorCompatibility({ manifest: {}, clientVersion: "1.2.3" }).reason).toBe("skipped")
       delete process.env.OPENCODEX_SKIP_VERSION_CHECK
       expect(checkCoordinatorCompatibility({ manifest: {}, clientVersion: "1.2.3" }).reason).toBe("legacy")
     } finally {

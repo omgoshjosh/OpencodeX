@@ -92,6 +92,11 @@ export const runServeAuthority = Effect.fn("ServeAuthority.run")(function* (inpu
     password,
     allowInsecureLan: process.env.OPENCODE_SERVER_ALLOW_INSECURE_LAN,
   })
+  if (process.env.OPENCODE_CANONICAL_AUTHORITY === "1") {
+    // Persist before any startup/election lock. A fallback that later enters
+    // serialized startup sees this durable claim and waits for serve to return.
+    yield* Effect.promise(() => reserveCanonicalAuthority(Global.Path.state, key, database))
+  }
   const token = randomBytes(24).toString("base64url")
 
   process.env[OPENCODE_PROCESS_ROLE] = "main"
@@ -130,11 +135,6 @@ function startServeAuthority(
 ) {
   const start = Effect.fnUntraced(function* () {
     if (input.signal?.aborted) return yield* Effect.interrupt
-    if (process.env.OPENCODE_CANONICAL_AUTHORITY === "1") {
-      // This durable claim precedes every election step so fallback clients do
-      // not replace a configured serve backend while it is restarting.
-      yield* Effect.promise(() => reserveCanonicalAuthority(Global.Path.state, input.key, input.database))
-    }
     // A live authority (TUI coordinator, GUI sidecar, or another serve) must be
     // left strictly alone: attaching two writers to one database is the exact
     // failure this protocol exists to prevent. Fail loudly instead.

@@ -112,6 +112,30 @@ describe("canonical authority reservation", () => {
     expect(spawned).toBe(false)
   })
 
+  test("preempts a fallback contender released into serialized startup", async () => {
+    const root = await stateRoot()
+    const contender = Promise.withResolvers<void>()
+    let spawned = false
+    const fallback = contender.promise.then(() =>
+      startFallbackCoordinator({
+        stateRoot: root,
+        key: "abc123",
+        spawn: async () => {
+          spawned = true
+          return "spawned"
+        },
+        wait: async () => "attached-to-canonical",
+      }),
+    )
+
+    // Canonical serve reserves before the fallback is released from startup
+    // serialization, so the fallback cannot win the authority election.
+    await reserveCanonicalAuthority(root, "abc123", "/data/opencode.db")
+    contender.resolve()
+    expect(await fallback).toBe("attached-to-canonical")
+    expect(spawned).toBe(false)
+  })
+
   test("fails closed for malformed reservations and preserves unreserved fallback", async () => {
     const root = await stateRoot()
     const file = canonicalAuthorityReservationPath(root, "abc123")

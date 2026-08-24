@@ -1,4 +1,4 @@
-import { Context, Deferred, Effect, Layer, Schema, Scope } from "effect"
+import { Cause, Context, Deferred, Effect, Exit, Layer, Schema } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import { SessionID, MessageID } from "@/session/schema"
 import * as Log from "@opencode-ai/core/util/log"
@@ -161,7 +161,6 @@ export const layer = Layer.effect(
   Effect.gen(function* () {
     const events = yield* EventV2Bridge.Service
     const { db } = yield* Database.Service
-    const scope = yield* Scope.Scope
 
     const rejectPending = Effect.fn("Question.rejectPending")(function* (requestID: QuestionID, sessionID: SessionID) {
       const now = Date.now()
@@ -190,6 +189,67 @@ export const layer = Layer.effect(
           .pipe(Effect.orDie),
       )
       if (committed) yield* events.broadcast(committed)
+    })
+
+    const recoverObservation = Effect.fn("Question.recoverObservation")(function* (
+      requestID: QuestionID,
+      sessionID: SessionID,
+      deferred: Deferred.Deferred<ReadonlyArray<Answer>, RejectedError>,
+    ) {
+      for (;;) {
+        const exit = yield* events
+          .barrier(
+            db
+              .transaction(
+                (transaction) =>
+                  Effect.gen(function* () {
+                    const row = yield* transaction
+                      .select({ state: SessionInteractionTable.state, response: SessionInteractionTable.response_json })
+                      .from(SessionInteractionTable)
+                      .where(
+                        and(
+                          eq(SessionInteractionTable.id, encodeQuestionID(requestID)),
+                          eq(SessionInteractionTable.kind, "question"),
+                        ),
+                      )
+                      .get()
+                    if (row?.state === "replied") return { reply: decodeReply(row.response), event: undefined }
+                    if (!row || row.state === "rejected") return { reply: undefined, event: undefined }
+                    const now = Date.now()
+                    const updated = yield* transaction
+                      .update(SessionInteractionTable)
+                      .set({ state: "rejected", responded_at: now, time_updated: now })
+                      .where(
+                        and(
+                          eq(SessionInteractionTable.id, encodeQuestionID(requestID)),
+                          eq(SessionInteractionTable.state, "pending"),
+                        ),
+                      )
+                      .returning({ id: SessionInteractionTable.id })
+                      .get()
+                    return {
+                      reply: undefined,
+                      event: updated ? yield* events.commit(Event.Rejected, { sessionID, requestID }) : undefined,
+                    }
+                  }),
+                { behavior: "immediate" },
+              )
+              .pipe(Effect.orDie),
+          )
+          .pipe(Effect.exit)
+        if (Exit.isFailure(exit)) {
+          if (Cause.hasInterruptsOnly(exit.cause)) return yield* Effect.failCause(exit.cause)
+          yield* Effect.sleep("50 millis")
+          continue
+        }
+        if (exit.value.event) yield* events.broadcast(exit.value.event)
+        if (exit.value.reply?._tag === "Some") {
+          yield* Deferred.succeed(deferred, exit.value.reply.value.answers).pipe(Effect.asVoid)
+          return undefined
+        }
+        yield* Deferred.fail(deferred, new RejectedError()).pipe(Effect.asVoid)
+        return undefined
+      }
     })
 
     const state = yield* InstanceState.make<State>(
@@ -276,7 +336,14 @@ export const layer = Layer.effect(
         )
         if (!asked) return yield* new RejectedError()
         yield* events.broadcast(asked)
-        yield* observe(id, deferred).pipe(Effect.forkIn(scope))
+        yield* observe(id, deferred).pipe(
+          Effect.catchCause((cause) =>
+            Cause.hasInterruptsOnly(cause)
+              ? Effect.failCause(cause)
+              : recoverObservation(id, info.sessionID, deferred),
+          ),
+          Effect.raceFirst(Deferred.await(deferred)),
+        )
         return yield* Deferred.await(deferred)
       }).pipe(
         Effect.onInterrupt(() => rejectPending(id, info.sessionID)),

@@ -1,12 +1,18 @@
 import { afterEach, expect } from "bun:test"
-import { Cause, Effect, Exit, Fiber, Layer, Queue } from "effect"
+import { Cause, Context, Effect, Exit, Fiber, Layer, Queue } from "effect"
 import { Question } from "../../src/question"
 import { InstanceRef } from "../../src/effect/instance-ref"
 import { InstanceStore } from "../../src/project/instance-store"
 import { QuestionID } from "../../src/question/schema"
-import { disposeAllInstances, provideInstance, TestInstance, testInstanceStoreLayer, tmpdirScoped } from "../fixture/fixture"
+import {
+  disposeAllInstances,
+  provideInstance,
+  TestInstance,
+  testInstanceStoreLayer,
+  tmpdirScoped,
+} from "../fixture/fixture"
 import { SessionID } from "../../src/session/schema"
-import { testEffect } from "../lib/effect"
+import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { EventV2Bridge } from "../../src/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
@@ -164,9 +170,180 @@ it.instance(
         answers: [["Option 1"]],
       })
 
+      const { db } = yield* Database.Service
+      expect(
+        yield* db
+          .select({ state: SessionInteractionTable.state })
+          .from(SessionInteractionTable)
+          .where(eq(SessionInteractionTable.id, String(requestID)))
+          .get()
+          .pipe(Effect.orDie),
+      ).toEqual({ state: "replied" })
       expect(yield* Fiber.join(fiber)).toEqual([["Option 1"]])
     }),
   { git: true },
+)
+
+it.instance("ask - fails when durable observation cannot read the persisted question", () =>
+  Effect.gen(function* () {
+    const database = yield* Database.Service
+    const events = yield* EventV2Bridge.Service
+    const recoveryAttempted = yield* Queue.unbounded<void>()
+    let failObservation = false
+    let failRecovery = false
+    const db = new Proxy(database.db, {
+      get(target, property) {
+        if (property === "select" && failObservation) {
+          return () => ({
+            from: () => ({
+              where: () => ({
+                get: () => Effect.die(new Error("database unavailable")),
+              }),
+            }),
+          })
+        }
+        if (property === "transaction" && failRecovery) {
+          return () =>
+            Effect.gen(function* () {
+              yield* Queue.offer(recoveryAttempted, undefined)
+              return yield* Effect.die(new Error("database still unavailable"))
+            })
+        }
+        const value = Reflect.get(target, property, target)
+        return typeof value === "function" ? value.bind(target) : value
+      },
+    })
+    const context = yield* Layer.build(
+      Layer.fresh(
+        Question.layer.pipe(
+          Layer.provide(Layer.succeed(Database.Service, { db })),
+          Layer.provide(Layer.succeed(EventV2Bridge.Service, events)),
+        ),
+      ),
+    )
+    const question = Context.get(context, Question.Service)
+    const asked = yield* Queue.unbounded<void>()
+    const off = yield* events.listen((event) => {
+      if (event.type === Question.Event.Asked.type) Queue.offerUnsafe(asked, undefined)
+      return Effect.void
+    })
+    yield* Effect.addFinalizer(() => off)
+
+    const fiber = yield* question
+      .ask({
+        sessionID: SessionID.make("ses_observer_failure"),
+        questions: [
+          {
+            question: "Can durable observation fail?",
+            header: "Failure",
+            options: [{ label: "Yes", description: "Yes" }],
+          },
+        ],
+      })
+      .pipe(Effect.forkScoped)
+    yield* Queue.take(asked)
+    failObservation = true
+    failRecovery = true
+    yield* Queue.take(recoveryAttempted)
+    failRecovery = false
+
+    const exit = yield* awaitWithTimeout(Fiber.await(fiber), "ask remained pending after observation failed")
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(Question.RejectedError)
+    failObservation = false
+    expect(
+      yield* database.db
+        .select({ state: SessionInteractionTable.state })
+        .from(SessionInteractionTable)
+        .where(eq(SessionInteractionTable.session_id, SessionID.make("ses_observer_failure")))
+        .get()
+        .pipe(Effect.orDie),
+    ).toEqual({ state: "rejected" })
+    expect(yield* question.list()).toEqual([])
+  }),
+)
+
+it.instance("ask - preserves a reply committed while durable observation fails", () =>
+  Effect.gen(function* () {
+    const database = yield* Database.Service
+    const events = yield* EventV2Bridge.Service
+    const failedRead = yield* Queue.unbounded<void>()
+    const releaseRead = yield* Queue.unbounded<void>()
+    let failObservation = false
+    const db = new Proxy(database.db, {
+      get(target, property) {
+        if (property === "select") {
+          return (fields?: unknown) => {
+            if (failObservation && fields !== undefined) {
+              return {
+                from: () => ({
+                  where: () => ({
+                    get: () =>
+                      Effect.gen(function* () {
+                        yield* Queue.offer(failedRead, undefined)
+                        yield* Queue.take(releaseRead)
+                        return yield* Effect.die(new Error("database unavailable"))
+                      }),
+                  }),
+                }),
+              }
+            }
+            return Reflect.apply(Reflect.get(target, property, target), target, fields === undefined ? [] : [fields])
+          }
+        }
+        const value = Reflect.get(target, property, target)
+        return typeof value === "function" ? value.bind(target) : value
+      },
+    })
+    const context = yield* Layer.build(
+      Layer.fresh(
+        Question.layer.pipe(
+          Layer.provide(Layer.succeed(Database.Service, { db })),
+          Layer.provide(Layer.succeed(EventV2Bridge.Service, events)),
+        ),
+      ),
+    )
+    const question = Context.get(context, Question.Service)
+    const asked = yield* Queue.unbounded<void>()
+    const off = yield* events.listen((event) => {
+      if (event.type === Question.Event.Asked.type) Queue.offerUnsafe(asked, undefined)
+      return Effect.void
+    })
+    yield* Effect.addFinalizer(() => off)
+
+    const fiber = yield* question
+      .ask({
+        sessionID: SessionID.make("ses_observer_reply_race"),
+        questions: [
+          {
+            question: "Can a committed reply win?",
+            header: "Race",
+            options: [{ label: "Yes", description: "Yes" }],
+          },
+        ],
+      })
+      .pipe(Effect.forkScoped)
+    yield* Queue.take(asked)
+    const [pending] = yield* question.list()
+    failObservation = true
+    yield* Queue.take(failedRead)
+    const replyFiber = yield* question.reply({ requestID: pending.id, answers: [["Yes"]] }).pipe(Effect.forkScoped)
+    yield* pollWithTimeout(
+      database.db
+        .select({ state: SessionInteractionTable.state })
+        .from(SessionInteractionTable)
+        .where(eq(SessionInteractionTable.session_id, SessionID.make("ses_observer_reply_race")))
+        .get()
+        .pipe(Effect.map((row) => (row?.state === "replied" ? true : undefined))),
+      "reply did not commit while observation was failing",
+    )
+    yield* Queue.offer(releaseRead, undefined)
+    yield* Fiber.join(replyFiber)
+
+    expect(yield* awaitWithTimeout(Fiber.join(fiber), "ask lost a committed reply during observation failure")).toEqual([
+      ["Yes"],
+    ])
+  }),
 )
 
 it.instance(

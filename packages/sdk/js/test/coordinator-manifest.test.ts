@@ -112,26 +112,30 @@ describe("canonical authority reservation", () => {
     expect(spawned).toBe(false)
   })
 
-  test("preempts a fallback contender released into serialized startup", async () => {
+  test("rechecks canonical intent before a fallback spawns", async () => {
     const root = await stateRoot()
-    const contender = Promise.withResolvers<void>()
+    const enteredGrace = Promise.withResolvers<void>()
+    const releaseGrace = Promise.withResolvers<void>()
     let spawned = false
-    const fallback = contender.promise.then(() =>
-      startFallbackCoordinator({
-        stateRoot: root,
-        key: "abc123",
-        spawn: async () => {
-          spawned = true
-          return "spawned"
-        },
-        wait: async () => "attached-to-canonical",
-      }),
-    )
+    const fallback = startFallbackCoordinator({
+      stateRoot: root,
+      key: "abc123",
+      grace: () => {
+        enteredGrace.resolve()
+        return releaseGrace.promise
+      },
+      spawn: async () => {
+        spawned = true
+        return "spawned"
+      },
+      wait: async () => "attached-to-canonical",
+    })
 
-    // Canonical serve reserves before the fallback is released from startup
-    // serialization, so the fallback cannot win the authority election.
+    // The first check saw no reservation. Canonical serve publishes during the
+    // grace, then the mandatory pre-spawn check must select attach instead.
+    await enteredGrace.promise
     await reserveCanonicalAuthority(root, "abc123", "/data/opencode.db")
-    contender.resolve()
+    releaseGrace.resolve()
     expect(await fallback).toBe("attached-to-canonical")
     expect(spawned).toBe(false)
   })
@@ -147,6 +151,7 @@ describe("canonical authority reservation", () => {
       await startFallbackCoordinator({
         stateRoot: root,
         key: "unreserved",
+        grace: async () => {},
         spawn: async () => "spawned",
         wait: async () => "waited",
       }),

@@ -26,6 +26,7 @@ import path from "node:path"
 export const COORDINATOR_MANIFEST_VERSION = 2
 export const COORDINATOR_CLIENT_LEASE_VERSION = 1
 export const CANONICAL_AUTHORITY_RESERVATION_VERSION = 1
+export const CANONICAL_AUTHORITY_INTENT_GRACE_MS = 100
 /** Directory under the state root that holds manifests, leases, and startup logs. */
 export const COORDINATOR_DIRECTORY = "tui-coordinators"
 /** Version string used by builds that were not stamped by the release pipeline. */
@@ -228,9 +229,19 @@ export async function startFallbackCoordinator<T>(input: {
   key: string
   spawn: () => Promise<T>
   wait: () => Promise<T>
+  /** Test hook; production uses the bounded canonical intent grace below. */
+  grace?: () => Promise<void>
 }) {
   if (await isCanonicalAuthorityReserved(input.stateRoot, input.key)) return input.wait()
+  await (input.grace?.() ?? canonicalAuthorityIntentGrace())
+  // A canonical serve can publish after the initial check while this fallback
+  // holds startup serialization, so read again immediately before spawning.
+  if (await isCanonicalAuthorityReserved(input.stateRoot, input.key)) return input.wait()
   return input.spawn()
+}
+
+function canonicalAuthorityIntentGrace() {
+  return new Promise<void>((resolve) => setTimeout(resolve, CANONICAL_AUTHORITY_INTENT_GRACE_MS))
 }
 
 export function isCoordinatorClientLease(value: unknown): value is CoordinatorClientLease {

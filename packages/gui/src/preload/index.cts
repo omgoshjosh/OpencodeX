@@ -1,5 +1,6 @@
 import { contextBridge, ipcRenderer, webUtils } from "electron"
 import type {
+  ClaudeAuthStatus,
   ClaudeCodeStatus,
   TerminalCreateInput,
   TerminalLaunchProfile,
@@ -7,7 +8,7 @@ import type {
 } from "../shared/terminal.js"
 import type { GuiConnectionResult } from "../shared/connection.js"
 
-export type { ClaudeCodeStatus, TerminalCreateInput, TerminalLaunchProfile, TerminalResult }
+export type { ClaudeAuthStatus, ClaudeCodeStatus, TerminalCreateInput, TerminalLaunchProfile, TerminalResult }
 export type { GuiConnectionResult }
 
 export type BrowserState = {
@@ -86,6 +87,7 @@ contextBridge.exposeInMainWorld("opencodex", {
   installationID: () => invoke<string>("opencodex:installation-id"),
   claude: {
     status: () => invoke<ClaudeCodeStatus>("opencodex:claude:status"),
+    authStatus: () => invoke<ClaudeAuthStatus>("opencodex:claude:auth-status"),
   },
   folder: (defaultPath?: string) => invoke<string | undefined>("opencodex:folder", defaultPath),
   folders: (defaultPath?: string) => invoke<string[] | undefined>("opencodex:folders", defaultPath),

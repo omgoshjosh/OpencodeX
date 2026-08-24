@@ -7,6 +7,7 @@ import { Permission } from "@/permission"
 import { Question } from "@/question"
 import { Session } from "@/session/session"
 import { Todo } from "@/session/todo"
+import { classifyClaudeError } from "./claude-auth-error"
 import { ClaudeDriverMetadata } from "./claude-driver-metadata"
 import { ClaudeDelegate } from "./claude-delegate"
 import { ClaudeHandoff } from "./claude-handoff"
@@ -340,7 +341,7 @@ export function makeLayer(options: LayerOptions = {}) {
                 launched: true,
                 modelID: live.modelID,
                 billed: live.billed,
-                ...(live.authFailed ? { authState: "needs-login" as const } : { authState: "ready" as const }),
+                ...(live.authFailure ? { authState: "needs-login" as const } : { authState: "ready" as const }),
                 ...(live.tasks.size > 0 ? { tasks: [...live.tasks].map(([id, task]) => ({ id, ...task })) } : {}),
               }),
             })
@@ -362,11 +363,15 @@ export function makeLayer(options: LayerOptions = {}) {
           void iterator.return?.().catch(() => undefined)
         })
         let deliveryFailed = false
+        // SDK auth failures reject the iterator rather than emitting a result
+        // event, so retain their text for the auth classifier below.
+        let deliveryFailure: string | undefined
         const consume = Effect.gen(function* () {
           while (true) {
             const result = yield* Effect.promise(() => nextClaudeEvent(iterator))
             if ("failure" in result) {
               deliveryFailed = true
+              deliveryFailure = result.failure instanceof Error ? result.failure.message : String(result.failure)
               break
             }
             const next = result.next
@@ -408,11 +413,14 @@ export function makeLayer(options: LayerOptions = {}) {
         )
 
         if (deliveryFailed || !live.finished) {
+          const authFailure = deliveryFailure ? classifyClaudeError(deliveryFailure) : undefined
+          if (authFailure) live.authFailure = authFailure
+          const reported = authFailure?.message ?? DELIVERY_FAILURE
           return yield* Effect.uninterruptible(
             Effect.gen(function* () {
               yield* interruptTurn
-              yield* finalize("delivery-failed", DELIVERY_FAILURE)
-              if (sidechain) yield* interpretSidechainActions(sidechain.finalizeAll(DELIVERY_FAILURE))
+              yield* finalize("delivery-failed", reported)
+              if (sidechain) yield* interpretSidechainActions(sidechain.finalizeAll(reported))
               yield* saveConversation()
               return yield* readTurn(input.sessionID, live.messageID)
             }),

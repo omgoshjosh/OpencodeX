@@ -2,6 +2,7 @@ import type {
   BrowserSnapshot,
   BrowserCapture,
   BrowserState,
+  ClaudeAuthStatus,
   ClaudeCodeStatus,
   ContextPath,
   GuiConnectionResult,
@@ -21,6 +22,7 @@ declare global {
       installationID(): Promise<string>
       claude: {
         status(): Promise<ClaudeCodeStatus>
+        authStatus(): Promise<ClaudeAuthStatus>
       }
       folder(defaultPath?: string): Promise<string | undefined>
       folders?(defaultPath?: string): Promise<string[] | undefined>

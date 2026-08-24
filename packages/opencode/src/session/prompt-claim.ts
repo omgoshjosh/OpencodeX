@@ -1,5 +1,5 @@
 import { and, eq, inArray, isNull, lt, or } from "drizzle-orm"
-import { Cause, Context, Effect, Exit, Fiber, Schedule, Scope } from "effect"
+import { Cause, Context, Deferred, Effect, Exit, Fiber, Schedule, Scope } from "effect"
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
 import { Database } from "@opencode-ai/core/database/database"
 import { NamedError } from "@opencode-ai/core/util/error"
@@ -9,7 +9,10 @@ import { InstanceState } from "@/effect/instance-state"
 import { SessionID } from "./schema"
 import type { LoopInput } from "./prompt-schema"
 import { SessionPromptRecovery } from "./prompt-recovery"
+import { ensureRunID } from "@opencode-ai/core/util/opencode-process"
+import { SessionExecutionOwner } from "./execution-owner"
 import * as Session from "./session"
+import type { DeploymentDrainError } from "@/server/deployment-drain"
 
 export interface Deps {
   readonly database: Context.Service.Shape<typeof Database.Service>
@@ -18,6 +21,7 @@ export interface Deps {
   readonly loop: (input: LoopInput) => Effect.Effect<SessionLegacy.WithParts>
   readonly commandLeaseMillis?: number
   readonly clock?: () => number
+  readonly admit?: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E | DeploymentDrainError, R>
 }
 
 /**
@@ -30,13 +34,14 @@ export function make(deps: Deps) {
   return Effect.gen(function* () {
     const { database, events, scope, loop } = deps
     const { db } = database
-    const commandOwner = `local:${process.pid}:prompt:${crypto.randomUUID()}`
+    const processRunID = ensureRunID()
+    const commandOwner = `local:${process.pid}:${processRunID}:prompt:${crypto.randomUUID()}`
     const commandLeaseMillis = deps.commandLeaseMillis ?? 30_000
     const clock = deps.clock ?? Date.now
 
     const claimCommandTurn = Effect.fn("SessionPrompt.claimCommandTurn")(function* (commandID: string) {
       const now = clock()
-      return yield* db
+      const claim = db
         .transaction(
           (transaction) =>
             Effect.gen(function* () {
@@ -48,7 +53,17 @@ export function make(deps: Deps) {
               if (!current || ["succeeded", "failed", "cancelled"].includes(current.status)) {
                 return { state: "done" as const }
               }
-              if (current.status === "running" && current.lease_expires_at && current.lease_expires_at > now) {
+              const reclaimDeadOwner =
+                current.status === "running" &&
+                !!current.owner_id &&
+                /^local:\d+:[^:]+:prompt:/.test(current.owner_id) &&
+                !SessionExecutionOwner.alive(current.owner_id, processRunID)
+              if (
+                current.status === "running" &&
+                current.lease_expires_at &&
+                current.lease_expires_at > now &&
+                !reclaimDeadOwner
+              ) {
                 return { state: "occupied" as const }
               }
               const active = yield* transaction
@@ -94,7 +109,12 @@ export function make(deps: Deps) {
                     eq(SessionCommandTable.status, current.status),
                     eq(SessionCommandTable.claim_generation, current.claim_generation),
                     current.status === "running"
-                      ? or(isNull(SessionCommandTable.lease_expires_at), lt(SessionCommandTable.lease_expires_at, now))
+                      ? reclaimDeadOwner
+                        ? undefined
+                        : or(
+                            isNull(SessionCommandTable.lease_expires_at),
+                            lt(SessionCommandTable.lease_expires_at, now),
+                          )
                       : undefined,
                   ),
                 )
@@ -106,6 +126,14 @@ export function make(deps: Deps) {
           { behavior: "immediate" },
         )
         .pipe(Effect.orDie)
+      if (!deps.admit) return yield* claim
+      return yield* deps.admit(claim).pipe(
+        Effect.catchIf(
+          (error): error is DeploymentDrainError =>
+            error instanceof Error && "_tag" in error && error._tag === "DeploymentDrainError",
+          () => Effect.succeed({ state: "draining" as const }),
+        ),
+      )
     })
 
     const waitForExecutionTurn = Effect.fn("SessionPrompt.waitForExecutionTurn")(function* (
@@ -141,18 +169,24 @@ export function make(deps: Deps) {
     type ExecuteCommand = (commandID: string) => Effect.Effect<void>
     const executeCommand: ExecuteCommand = Effect.fn("SessionPrompt.executeCommand")(function* (commandID: string) {
       let claimed = yield* claimCommandTurn(commandID)
-      while (claimed.state === "waiting" || claimed.state === "occupied" || claimed.state === "blocked") {
+      while (
+        claimed.state === "waiting" ||
+        claimed.state === "occupied" ||
+        claimed.state === "blocked" ||
+        claimed.state === "draining"
+      ) {
         if (claimed.state === "blocked") yield* executeCommand(claimed.commandID)
         yield* Effect.sleep("200 millis")
         claimed = yield* claimCommandTurn(commandID)
       }
       if (claimed.state !== "ready") return
       const command = claimed.command
+      const ownershipLost = yield* Deferred.make<void>()
       const heartbeat = yield* Effect.sleep(Math.floor(commandLeaseMillis / 3)).pipe(
         Effect.andThen(
-          Effect.suspend(() => {
+          Effect.gen(function* () {
             const now = clock()
-            return db
+            const updated = yield* db
               .update(SessionCommandTable)
               .set({ lease_expires_at: now + commandLeaseMillis, time_updated: now })
               .where(
@@ -163,31 +197,39 @@ export function make(deps: Deps) {
                   eq(SessionCommandTable.claim_generation, command.claim_generation),
                 ),
               )
-              .run()
+              .returning({ id: SessionCommandTable.id })
+              .get()
               .pipe(Effect.orDie)
+            if (updated) return
+            yield* Deferred.succeed(ownershipLost, undefined)
+            return yield* Effect.interrupt
           }),
         ),
         Effect.repeat(Schedule.forever),
         Effect.forkIn(scope),
       )
-      const exit = yield* Effect.gen(function* () {
-        if (!(yield* waitForExecutionTurn(commandID, command.session_id))) return
-        const admitted = yield* db
-          .select({ id: SessionCommandTable.id })
-          .from(SessionCommandTable)
-          .where(
-            and(
-              eq(SessionCommandTable.id, commandID),
-              eq(SessionCommandTable.status, "running"),
-              eq(SessionCommandTable.owner_id, commandOwner),
-              eq(SessionCommandTable.claim_generation, command.claim_generation),
-            ),
-          )
-          .get()
-          .pipe(Effect.orDie)
-        if (!admitted) return
-        return yield* loop({ sessionID: command.session_id, messageID: command.message_id })
-      }).pipe(Effect.exit, Effect.ensuring(Fiber.interrupt(heartbeat)))
+      const exit = yield* Effect.raceFirst(
+        Effect.gen(function* () {
+          if (!(yield* waitForExecutionTurn(commandID, command.session_id))) return
+          const admitted = yield* db
+            .select({ id: SessionCommandTable.id })
+            .from(SessionCommandTable)
+            .where(
+              and(
+                eq(SessionCommandTable.id, commandID),
+                eq(SessionCommandTable.status, "running"),
+                eq(SessionCommandTable.owner_id, commandOwner),
+                eq(SessionCommandTable.claim_generation, command.claim_generation),
+              ),
+            )
+            .get()
+            .pipe(Effect.orDie)
+          if (!admitted) return
+          return yield* loop({ sessionID: command.session_id, messageID: command.message_id })
+        }),
+        Deferred.await(ownershipLost).pipe(Effect.andThen(Effect.interrupt)),
+      ).pipe(Effect.exit, Effect.ensuring(Fiber.interrupt(heartbeat)))
+      if (yield* Deferred.isDone(ownershipLost)) return
       const completedAt = clock()
       const error = Exit.isFailure(exit)
         ? Cause.pretty(exit.cause)

@@ -2,6 +2,7 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { errorMessage } from "@/util/error"
 import { Cause, Context, Effect, Exit, Fiber, Layer, Option, Queue, Schedule, Scope } from "effect"
 import { OpencodeXJob } from "./job"
+import { DeploymentDrain, type DeploymentDrainError } from "@/server/deployment-drain"
 
 export type Executor = (
   job: OpencodeXJob.Info,
@@ -191,27 +192,35 @@ export function layer(options: Options = {}) {
         yield* Effect.forEach(
           queued.slice(0, capacity),
           (job) =>
-            Effect.gen(function* () {
-              const handler = executors.get(job.kind)
-              if (!handler) return
-              const owner = `local:${process.pid}:dispatcher:${job.id}`
-              const claimed = yield* jobs.claim({ jobID: job.id, owner, leaseMs }).pipe(Effect.option)
-              if (Option.isNone(claimed)) return
-              const controller = new AbortController()
-              const current = { controller, owner, handler }
-              active.set(job.id, current)
-              yield* execute(claimed.value, handler, owner, controller).pipe(
-                Effect.onInterrupt(() => release(job.id, current).pipe(Effect.ignore)),
-                Effect.catchCause((cause) => Effect.logError("job execution fiber failed", { jobID: job.id, cause })),
-                Effect.ensuring(
-                  Effect.sync(() => {
-                    active.delete(job.id)
-                    Queue.offerUnsafe(wakeups, undefined)
-                  }),
-                ),
-                Effect.forkIn(scope, { startImmediately: true }),
-              )
-            }),
+            DeploymentDrain.admitExecution(
+              Effect.gen(function* () {
+                const handler = executors.get(job.kind)
+                if (!handler) return
+                const owner = `local:${process.pid}:dispatcher:${job.id}`
+                const claimed = yield* jobs.claim({ jobID: job.id, owner, leaseMs }).pipe(Effect.option)
+                if (Option.isNone(claimed)) return
+                const controller = new AbortController()
+                const current = { controller, owner, handler }
+                active.set(job.id, current)
+                yield* execute(claimed.value, handler, owner, controller).pipe(
+                  Effect.onInterrupt(() => release(job.id, current).pipe(Effect.ignore)),
+                  Effect.ensuring(
+                    Effect.sync(() => {
+                      active.delete(job.id)
+                      Queue.offerUnsafe(wakeups, undefined)
+                    }),
+                  ),
+                )
+              }),
+            ).pipe(
+              Effect.catchIf(
+                (error): error is DeploymentDrainError =>
+                  error instanceof Error && "_tag" in error && error._tag === "DeploymentDrainError",
+                () => Effect.void,
+              ),
+              Effect.catchCause((cause) => Effect.logError("job execution fiber failed", { jobID: job.id, cause })),
+              Effect.forkIn(scope, { startImmediately: true }),
+            ),
           { concurrency: 1, discard: true },
         )
       })

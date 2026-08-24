@@ -2,13 +2,15 @@ import { expect } from "bun:test"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { OpencodeXJobDispatcher } from "@/opencodex/job-dispatcher"
 import { OpencodeXJob } from "@/opencodex/job"
+import { DeploymentDrain } from "@/server/deployment-drain"
 import { Deferred, Effect, Layer } from "effect"
-import { testEffect } from "../lib/effect"
+import { awaitWithTimeout, testEffect } from "../lib/effect"
 
 const it = testEffect(
   OpencodeXJobDispatcher.layer({ leaseMs: 90, heartbeatMs: 20, recoveryMs: 10_000 }).pipe(
     Layer.provideMerge(OpencodeXJob.defaultLayer),
     Layer.provideMerge(EventV2Bridge.defaultLayer),
+    Layer.provideMerge(DeploymentDrain.defaultLayer),
   ),
 )
 
@@ -65,6 +67,61 @@ it.live("does not claim work until its durable graph is ready", () =>
     yield* jobs.update({ id: created.id, metadata: { dispatchReady: true } })
     yield* waitForStatus(jobs, created.id, "succeeded")
     expect(executions).toBe(1)
+  }),
+)
+
+it.live("does not claim queued work while draining and resumes after cancel", () =>
+  Effect.gen(function* () {
+    const jobs = yield* OpencodeXJob.Service
+    const events = yield* EventV2Bridge.Service
+    const drain = yield* DeploymentDrain.Service
+    const considered = Promise.withResolvers<void>()
+    const started = yield* Deferred.make<void>()
+    const settled = yield* Deferred.make<OpencodeXJob.Info>()
+    yield* Effect.addFinalizer(() => Effect.sync(DeploymentDrain.resetForTest))
+    yield* drain.begin(drain.runID)
+
+    yield* Effect.gen(function* () {
+      const dispatcher = yield* OpencodeXJobDispatcher.Service
+      yield* dispatcher.register(
+        "test.drain-gate",
+        () => Deferred.succeed(started, undefined).pipe(Effect.as({ started: true })),
+        (job) => Effect.succeed(Deferred.succeed(settled, job).pipe(Effect.asVoid)),
+      )
+      const created = yield* jobs.create({ kind: "test.drain-gate", idempotencyKey: "dispatcher-drain-gate" })
+
+      yield* awaitWithTimeout(
+        Effect.promise(() => considered.promise),
+        "dispatcher did not reach drain admission",
+      )
+      expect(yield* Deferred.isDone(started)).toBe(false)
+      expect(yield* jobs.get(created.id)).toMatchObject({ status: "queued", attempt: 0 })
+
+      yield* drain.cancel(drain.runID)
+      yield* dispatcher.wake()
+      yield* awaitWithTimeout(Deferred.await(started), "dispatcher did not resume after drain cancellation")
+      expect(yield* awaitWithTimeout(Deferred.await(settled), "resumed job did not settle")).toMatchObject({
+        id: created.id,
+        status: "succeeded",
+        attempt: 1,
+      })
+    }).pipe(
+      Effect.provide(
+        OpencodeXJobDispatcher.layer({
+          leaseMs: 90,
+          heartbeatMs: 20,
+          recoveryMs: 10_000,
+          accepts: (job) => {
+            if (job.kind === "test.drain-gate") considered.resolve()
+            return true
+          },
+        }).pipe(
+          Layer.provide(Layer.succeed(OpencodeXJob.Service, jobs)),
+          Layer.provide(Layer.succeed(EventV2Bridge.Service, events)),
+        ),
+      ),
+      Effect.scoped,
+    )
   }),
 )
 

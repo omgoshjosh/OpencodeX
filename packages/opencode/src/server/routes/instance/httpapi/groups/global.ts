@@ -6,7 +6,7 @@ import "@/server/event"
 import { Schema } from "effect"
 import { HttpApi, HttpApiEndpoint, HttpApiError, HttpApiGroup, HttpApiSchema, OpenApi } from "effect/unstable/httpapi"
 import { described } from "./metadata"
-import { ConflictError, ForbiddenError, InvalidRequestError } from "../errors"
+import { ConflictError, ForbiddenError, InvalidRequestError, ServiceUnavailableError } from "../errors"
 
 const GlobalHealth = Schema.Struct({
   healthy: Schema.Literal(true),
@@ -17,6 +17,28 @@ const GlobalHealth = Schema.Struct({
   databaseID: Schema.String,
   coordinatorKey: Schema.String,
   eventBusID: Schema.String,
+  accepting: Schema.Boolean,
+  draining: Schema.Boolean,
+})
+
+const DrainInput = Schema.Struct({ expectedRunID: Schema.String })
+const DrainStatus = Schema.Struct({
+  runID: Schema.String,
+  accepting: Schema.Boolean,
+  draining: Schema.Boolean,
+  inFlightAdmissions: Schema.Number,
+  queuedCommands: Schema.Number,
+  runningCommands: Schema.Number,
+  liveRunningExecutions: Schema.Number,
+  activeJobs: Schema.Number,
+  activeSwarms: Schema.Number,
+  activeGoals: Schema.Number,
+  ready: Schema.Boolean,
+})
+const ReplayReceipt = Schema.Struct({
+  runID: Schema.String,
+  directories: Schema.Array(Schema.String),
+  commandCount: Schema.Number,
 })
 
 const SyncEventSchemas = EventV2.registry
@@ -76,6 +98,10 @@ export const GlobalPaths = {
   guiBridgeSync: "/global/gui-bridge/sync",
   guiBridgeUnregister: "/global/gui-bridge/unregister",
   guiBridgeRespond: "/global/gui-bridge/respond",
+  drainBegin: "/global/drain/begin",
+  drainStatus: "/global/drain",
+  drainCancel: "/global/drain/cancel",
+  drainReplay: "/global/drain/replay",
 } as const
 
 export const GlobalApi = HttpApi.make("global").add(
@@ -99,6 +125,24 @@ export const GlobalApi = HttpApi.make("global").add(
           description: "Subscribe to global events from the OpenCode system using server-sent events.",
         }),
       ),
+      HttpApiEndpoint.get("drainStatus", GlobalPaths.drainStatus, {
+        success: described(DrainStatus, "Deployment drain status"),
+      }),
+      HttpApiEndpoint.post("drainBegin", GlobalPaths.drainBegin, {
+        payload: DrainInput,
+        success: described(DrainStatus, "Deployment drain receipt"),
+        error: ConflictError,
+      }),
+      HttpApiEndpoint.post("drainCancel", GlobalPaths.drainCancel, {
+        payload: DrainInput,
+        success: described(DrainStatus, "Deployment drain receipt"),
+        error: ConflictError,
+      }),
+      HttpApiEndpoint.post("drainReplay", GlobalPaths.drainReplay, {
+        payload: DrainInput,
+        success: described(ReplayReceipt, "Deployment replay receipt"),
+        error: [ConflictError, ServiceUnavailableError],
+      }),
       HttpApiEndpoint.get("configGet", GlobalPaths.config, {
         success: described(Config.Info, "Get global config info"),
       }).annotateMerge(

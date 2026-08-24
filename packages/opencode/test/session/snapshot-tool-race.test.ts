@@ -22,6 +22,7 @@ import path from "path"
 import { Session } from "@/session/session"
 import { LLM } from "../../src/session/llm"
 import { SessionPrompt } from "../../src/session/prompt"
+import { DeploymentDrain } from "@/server/deployment-drain"
 import { SessionRevert } from "../../src/session/revert"
 import { SessionSummary } from "../../src/session/summary"
 import { MessageV2 } from "../../src/session/message-v2"
@@ -177,6 +178,7 @@ function makeHttp() {
     TestLLMServer.layer,
     SessionSummary.defaultLayer,
     SessionPrompt.layer.pipe(
+      Layer.provide(DeploymentDrain.defaultLayer),
       Layer.provide(OpencodeXClaudeDriver.defaultLayer),
       Layer.provide(SessionRevert.defaultLayer),
       Layer.provide(Skill.defaultLayer),

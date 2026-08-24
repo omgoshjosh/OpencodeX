@@ -45,6 +45,7 @@ import { SessionRevert } from "@/session/revert"
 import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
 import { SessionSummary } from "@/session/summary"
+import { DeploymentDrain } from "@/server/deployment-drain"
 import { Todo } from "@/session/todo"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
@@ -107,6 +108,8 @@ const cors = (corsOptions?: CorsOptions) =>
 const authOnlyRouterLayer = authorizationRouterMiddleware.layer.pipe(Layer.provide(ServerAuth.Config.defaultLayer))
 const httpApiAuthLayer = authorizationLayer.pipe(Layer.provide(ServerAuth.Config.defaultLayer))
 const workspaceRoutingLive = workspaceRoutingLayer.pipe(Layer.provide(Socket.layerWebSocketConstructorGlobal))
+const deploymentDrainLive = DeploymentDrain.defaultLayer
+const sessionPromptLive = SessionPrompt.sharedDrainLayer.pipe(Layer.provide(deploymentDrainLive))
 const rootApiRoutes = HttpApiBuilder.layer(RootHttpApi).pipe(
   Layer.provide([controlHandlers, globalHandlers]),
   Layer.provide(schemaErrorLayer),
@@ -168,6 +171,7 @@ export function createRoutes(
       fenceLayer.pipe(Layer.provide(Database.defaultLayer)),
       cors(corsOptions),
       Database.defaultLayer,
+      deploymentDrainLive,
       EffectFlock.defaultLayer,
       Agent.defaultLayer,
       Auth.defaultLayer,
@@ -202,7 +206,7 @@ export function createRoutes(
       RuntimeFlags.defaultLayer,
       Session.defaultLayer,
       SessionCompaction.defaultLayer,
-      SessionPrompt.defaultLayer,
+      sessionPromptLive,
       SessionRevert.defaultLayer,
       SessionRunState.defaultLayer,
       SessionStatus.defaultLayer,

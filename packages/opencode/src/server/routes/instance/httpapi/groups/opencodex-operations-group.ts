@@ -5,7 +5,13 @@ import { OpencodeXTerminalSession } from "@/opencodex/terminal-session"
 import { OpencodeXView } from "@/opencodex/view"
 import { Schema } from "effect"
 import { HttpApiEndpoint, HttpApiError, OpenApi } from "effect/unstable/httpapi"
-import { ApiNotFoundError, ApiValidationError, ConflictError, ProjectNotFoundError } from "../errors"
+import {
+  ApiNotFoundError,
+  ApiValidationError,
+  ConflictError,
+  ProjectNotFoundError,
+  ServiceUnavailableError,
+} from "../errors"
 import { Authorization } from "../middleware/authorization"
 import { InstanceContextMiddleware } from "../middleware/instance-context"
 import { WorkspaceRoutingMiddleware } from "../middleware/workspace-routing"
@@ -29,7 +35,7 @@ export const opencodexGroup = opencodexWorkbenchGroup
     HttpApiEndpoint.post("createJob", `${OPENCODEX_ROOT}/job`, {
       payload: OpencodeXJob.CreateInput,
       success: described(OpencodeXJob.Info, "Created OpencodeX job"),
-      error: HttpApiError.BadRequest,
+      error: [HttpApiError.BadRequest, ServiceUnavailableError],
     }).annotateMerge(OpenApi.annotations({ identifier: "opencodex.job.create", summary: "Create OpencodeX job" })),
     HttpApiEndpoint.get("getJob", `${OPENCODEX_ROOT}/job/:jobID`, {
       params: { jobID: Schema.String },
@@ -51,7 +57,7 @@ export const opencodexGroup = opencodexWorkbenchGroup
       params: { jobID: Schema.String },
       payload: ClaimJobPayload,
       success: described(OpencodeXJob.Info, "Claimed OpencodeX job"),
-      error: [HttpApiError.BadRequest, ApiNotFoundError],
+      error: [HttpApiError.BadRequest, ApiNotFoundError, ServiceUnavailableError],
     }).annotateMerge(
       OpenApi.annotations({ identifier: "opencodex.job.claim", summary: "Claim an OpencodeX job lease" }),
     ),
@@ -59,7 +65,7 @@ export const opencodexGroup = opencodexWorkbenchGroup
       params: { jobID: Schema.String },
       payload: StartJobPayload,
       success: described(OpencodeXJob.Info, "Running OpencodeX job"),
-      error: [HttpApiError.BadRequest, ApiNotFoundError],
+      error: [HttpApiError.BadRequest, ApiNotFoundError, ServiceUnavailableError],
     }).annotateMerge(
       OpenApi.annotations({ identifier: "opencodex.job.start", summary: "Start a claimed OpencodeX job" }),
     ),
@@ -67,7 +73,7 @@ export const opencodexGroup = opencodexWorkbenchGroup
       params: { jobID: Schema.String },
       payload: ClaimJobPayload,
       success: described(OpencodeXJob.Info, "Renewed OpencodeX job lease"),
-      error: [HttpApiError.BadRequest, ApiNotFoundError],
+      error: [HttpApiError.BadRequest, ApiNotFoundError, ServiceUnavailableError],
     }).annotateMerge(
       OpenApi.annotations({ identifier: "opencodex.job.renew", summary: "Renew an OpencodeX job lease" }),
     ),
@@ -75,7 +81,7 @@ export const opencodexGroup = opencodexWorkbenchGroup
       params: { jobID: Schema.String },
       payload: CompleteJobPayload,
       success: described(OpencodeXJob.Info, "Succeeded OpencodeX job"),
-      error: [HttpApiError.BadRequest, ApiNotFoundError],
+      error: [HttpApiError.BadRequest, ApiNotFoundError, ServiceUnavailableError],
     }).annotateMerge(
       OpenApi.annotations({ identifier: "opencodex.job.succeed", summary: "Complete an OpencodeX job successfully" }),
     ),
@@ -83,7 +89,7 @@ export const opencodexGroup = opencodexWorkbenchGroup
       params: { jobID: Schema.String },
       payload: FailJobPayload,
       success: described(OpencodeXJob.Info, "Failed OpencodeX job"),
-      error: [HttpApiError.BadRequest, ApiNotFoundError],
+      error: [HttpApiError.BadRequest, ApiNotFoundError, ServiceUnavailableError],
     }).annotateMerge(
       OpenApi.annotations({
         identifier: "opencodex.job.fail",
@@ -93,7 +99,7 @@ export const opencodexGroup = opencodexWorkbenchGroup
     HttpApiEndpoint.post("retryJob", `${OPENCODEX_ROOT}/job/:jobID/retry`, {
       params: { jobID: Schema.String },
       success: described(OpencodeXJob.Info, "Requeued OpencodeX job"),
-      error: [HttpApiError.BadRequest, ApiNotFoundError],
+      error: [HttpApiError.BadRequest, ApiNotFoundError, ServiceUnavailableError],
     }).annotateMerge(
       OpenApi.annotations({
         identifier: "opencodex.job.retry",
@@ -107,7 +113,7 @@ export const opencodexGroup = opencodexWorkbenchGroup
     HttpApiEndpoint.post("createSwarm", `${OPENCODEX_ROOT}/swarm`, {
       payload: OpencodeXSwarm.CreateInput,
       success: described(OpencodeXSwarm.Info, "Created OpencodeX swarm"),
-      error: [HttpApiError.BadRequest, ApiValidationError, ProjectNotFoundError],
+      error: [HttpApiError.BadRequest, ApiValidationError, ProjectNotFoundError, ServiceUnavailableError],
     }).annotateMerge(OpenApi.annotations({ identifier: "opencodex.swarm.create", summary: "Create OpencodeX swarm" })),
     HttpApiEndpoint.get("getSwarm", `${OPENCODEX_ROOT}/swarm/:swarmID`, {
       params: { swarmID: Schema.String },
@@ -183,13 +189,13 @@ export const opencodexGroup = opencodexWorkbenchGroup
     HttpApiEndpoint.post("startGoal", `${OPENCODEX_ROOT}/goal/:goalID/start`, {
       params: { goalID: Schema.String },
       success: described(OpencodeXGoal.Info, "Running OpencodeX goal"),
-      error: [HttpApiError.BadRequest, ApiNotFoundError],
+      error: [HttpApiError.BadRequest, ApiNotFoundError, ServiceUnavailableError],
     }).annotateMerge(OpenApi.annotations({ identifier: "opencodex.goal.start", summary: "Start an OpencodeX goal" })),
     HttpApiEndpoint.post("approveGoalNode", `${OPENCODEX_ROOT}/goal/:goalID/node/:nodeID/approve`, {
       params: { goalID: Schema.String, nodeID: Schema.String },
       payload: ApproveGoalNodePayload,
       success: described(OpencodeXGoal.Info, "Resolved OpencodeX goal gate"),
-      error: [HttpApiError.BadRequest, ApiNotFoundError],
+      error: [HttpApiError.BadRequest, ApiNotFoundError, ServiceUnavailableError],
     }).annotateMerge(
       OpenApi.annotations({ identifier: "opencodex.goal.node.approve", summary: "Approve or reject a goal gate" }),
     ),

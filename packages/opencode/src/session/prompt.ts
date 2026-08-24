@@ -2,6 +2,7 @@ import { SessionLegacy } from "@opencode-ai/core/session/legacy"
 import { SessionID, MessageID, PartID } from "./schema"
 import { MessageV2 } from "./message-v2"
 import { SessionRevert } from "./revert"
+import { DeploymentDrain } from "@/server/deployment-drain"
 import * as Session from "./session"
 import { Agent } from "../agent/agent"
 import { Provider } from "@/provider/provider"
@@ -197,9 +198,9 @@ export const layer = Layer.effect(
         cancel: (sessionID: SessionID) => cancel(sessionID),
         resolvePromptParts: (template: string) => resolvePromptParts(template),
         resolveModel: (model) =>
-          provider.getModel(model.providerID, model.modelID).pipe(
-            Effect.catchIf(Provider.ModelNotFoundError.isInstance, () => Effect.succeed(undefined)),
-          ),
+          provider
+            .getModel(model.providerID, model.modelID)
+            .pipe(Effect.catchIf(Provider.ModelNotFoundError.isInstance, () => Effect.succeed(undefined))),
         prompt: (input: PromptInput) => prompt(input).pipe(Effect.catch(Effect.die)),
         loop: (input: LoopInput) => loop(input),
       } satisfies TaskPromptOps
@@ -742,9 +743,9 @@ export const layer = Layer.effect(
       sessions,
       skills,
       resolveModel: (model) =>
-        provider.getModel(ProviderV2.ID.make(model.providerID), ProviderV2.ModelID.make(model.modelID)).pipe(
-          Effect.catchIf(Provider.ModelNotFoundError.isInstance, () => Effect.succeed(undefined)),
-        ),
+        provider
+          .getModel(ProviderV2.ID.make(model.providerID), ProviderV2.ModelID.make(model.modelID))
+          .pipe(Effect.catchIf(Provider.ModelNotFoundError.isInstance, () => Effect.succeed(undefined))),
       prompt: (input) => prompt(input),
       loop: (input) => loop(input),
     })
@@ -761,10 +762,12 @@ export const layer = Layer.effect(
       },
     )
 
+    const drain = yield* DeploymentDrain.Service
     const { wakeSession, recover } = yield* PromptClaim.make({
       database,
       events,
       scope,
+      admit: drain.admit,
       loop: (input) => loop(input),
     })
 
@@ -1005,7 +1008,7 @@ export const layer = Layer.effect(
   }),
 )
 
-export const defaultLayer = Layer.suspend(() =>
+export const sharedDrainLayer = Layer.suspend(() =>
   layer
     .pipe(
       Layer.provide(SessionRunState.defaultLayer),
@@ -1048,5 +1051,7 @@ export const defaultLayer = Layer.suspend(() =>
       ),
     ),
 )
+
+export const defaultLayer = sharedDrainLayer.pipe(Layer.provide(DeploymentDrain.defaultLayer))
 
 export * as SessionPrompt from "./prompt"

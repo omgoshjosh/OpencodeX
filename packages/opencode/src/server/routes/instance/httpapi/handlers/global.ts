@@ -20,6 +20,9 @@ import { OpencodeXJobTable, OpencodeXSwarmTable } from "@opencode-ai/core/openco
 import { SessionCommandTable, SessionExecutionTable, SessionInteractionTable } from "@opencode-ai/core/session/sql"
 import { and, eq, gt, inArray, or } from "drizzle-orm"
 import { ensureProcessMetadata } from "@opencode-ai/core/util/opencode-process"
+import { DeploymentDrain, type DeploymentDrainError } from "@/server/deployment-drain"
+import { InstanceStore } from "@/project/instance-store"
+import { ConflictError, ServiceUnavailableError } from "../errors"
 
 const log = Log.create({ service: "server" })
 
@@ -89,6 +92,8 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
     const bridge = yield* EffectBridge.make()
     const guiBridge = yield* makeGuiBridgeHandlers()
     const { db } = yield* Database.Service
+    const drain = yield* DeploymentDrain.Service
+    const store = yield* InstanceStore.Service
     const processMetadata = ensureProcessMetadata("main")
     const databaseID = Bun.hash(Database.path()).toString(36)
 
@@ -148,12 +153,29 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
         databaseID,
         coordinatorKey: coordinatorKey(Database.path()),
         eventBusID: GlobalBusID,
+        accepting: !drain.isDraining(),
+        draining: drain.isDraining(),
       }
     })
 
     const event = Effect.fn("GlobalHttpApi.event")(function* () {
       return eventResponse()
     })
+
+    const runIDError = <A>(effect: Effect.Effect<A, DeploymentDrainError>) =>
+      effect.pipe(Effect.mapError((error) => new ConflictError({ message: error.message, resource: "runID" })))
+    const replayError = <A>(effect: Effect.Effect<A, DeploymentDrainError>) =>
+      effect.pipe(
+        Effect.mapError((error) =>
+          error.kind === "unavailable"
+            ? new ServiceUnavailableError({ message: error.message, service: "deployment-drain" })
+            : new ConflictError({ message: error.message, resource: "runID" }),
+        ),
+      )
+    const drainStatus = Effect.fn("GlobalHttpApi.drainStatus")(function* () { return yield* drain.status() })
+    const drainBegin = Effect.fn("GlobalHttpApi.drainBegin")(function* (ctx: { payload: { expectedRunID: string } }) { return yield* runIDError(drain.begin(ctx.payload.expectedRunID)) })
+    const drainCancel = Effect.fn("GlobalHttpApi.drainCancel")(function* (ctx: { payload: { expectedRunID: string } }) { return yield* runIDError(drain.cancel(ctx.payload.expectedRunID)) })
+    const drainReplay = Effect.fn("GlobalHttpApi.drainReplay")(function* (ctx: { payload: { expectedRunID: string } }) { return yield* replayError(drain.replay(ctx.payload.expectedRunID, store)) })
 
     const configGet = Effect.fn("GlobalHttpApi.configGet")(function* () {
       return yield* config.getGlobal()
@@ -224,6 +246,10 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
     return handlers
       .handle("health", health)
       .handleRaw("event", event)
+      .handle("drainStatus", drainStatus)
+      .handle("drainBegin", drainBegin)
+      .handle("drainCancel", drainCancel)
+      .handle("drainReplay", drainReplay)
       .handle("configGet", configGet)
       .handle("configUpdate", configUpdate)
       .handle("dispose", dispose)

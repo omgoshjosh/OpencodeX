@@ -6,8 +6,9 @@ import { OpencodeXView } from "@/opencodex/view"
 import { Project } from "@/project/project"
 import { Effect } from "effect"
 import { HttpApiError } from "effect/unstable/httpapi"
-import { ApiValidationError, ConflictError, notFound, ProjectNotFoundError } from "../errors"
+import { ApiValidationError, ConflictError, notFound, ProjectNotFoundError, ServiceUnavailableError } from "../errors"
 import { UpdateJobPayload, UpdateTerminalSessionPayload, UpdateViewPayload } from "../groups/opencodex"
+import { DeploymentDrain, type DeploymentDrainError } from "@/server/deployment-drain"
 
 export const makeOpencodeXOperationsHandlers = Effect.fn("OpencodeXHttpApi.makeOperationsHandlers")(function* () {
   const goals = yield* OpencodeXGoal.Service
@@ -15,6 +16,23 @@ export const makeOpencodeXOperationsHandlers = Effect.fn("OpencodeXHttpApi.makeO
   const swarms = yield* OpencodeXSwarm.Service
   const terminalSessions = yield* OpencodeXTerminalSession.Service
   const views = yield* OpencodeXView.Service
+  const drain = yield* DeploymentDrain.Service
+  const admit = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+    drain.admit(effect).pipe(
+      Effect.catchIf(
+        (error): error is DeploymentDrainError =>
+          error instanceof Error && "_tag" in error && error._tag === "DeploymentDrainError",
+        (error) => Effect.fail(new ServiceUnavailableError({ message: error.message, service: "deployment-drain" })),
+      ),
+    )
+  const finish = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+    drain.finish(effect).pipe(
+      Effect.catchIf(
+        (error): error is DeploymentDrainError =>
+          error instanceof Error && "_tag" in error && error._tag === "DeploymentDrainError",
+        (error) => Effect.fail(new ServiceUnavailableError({ message: error.message, service: "deployment-drain" })),
+      ),
+    )
 
   const requireMutableJob = Effect.fn("OpencodeXHttpApi.requireMutableJob")(function* (jobID: string) {
     const job = yield* mapJobErrors(jobs.get(jobID))
@@ -35,7 +53,7 @@ export const makeOpencodeXOperationsHandlers = Effect.fn("OpencodeXHttpApi.makeO
     ) {
       return yield* new HttpApiError.BadRequest({})
     }
-    return yield* jobs.create(ctx.payload)
+    return yield* admit(jobs.create(ctx.payload))
   })
   const getJob = Effect.fn("OpencodeXHttpApi.getJob")(function* (ctx: { params: { jobID: string } }) {
     return yield* mapJobErrors(jobs.get(ctx.params.jobID))
@@ -56,39 +74,39 @@ export const makeOpencodeXOperationsHandlers = Effect.fn("OpencodeXHttpApi.makeO
     payload: Omit<OpencodeXJob.ClaimInput, "jobID">
   }) {
     yield* requireMutableJob(ctx.params.jobID)
-    return yield* mapJobErrors(jobs.claim({ ...ctx.payload, jobID: ctx.params.jobID }))
+    return yield* admit(mapJobErrors(jobs.claim({ ...ctx.payload, jobID: ctx.params.jobID })))
   })
   const startJob = Effect.fn("OpencodeXHttpApi.startJob")(function* (ctx: {
     params: { jobID: string }
     payload: { owner: string }
   }) {
     yield* requireMutableJob(ctx.params.jobID)
-    return yield* mapJobErrors(jobs.start(ctx.params.jobID, ctx.payload.owner))
+    return yield* admit(mapJobErrors(jobs.start(ctx.params.jobID, ctx.payload.owner)))
   })
   const renewJob = Effect.fn("OpencodeXHttpApi.renewJob")(function* (ctx: {
     params: { jobID: string }
     payload: Omit<OpencodeXJob.ClaimInput, "jobID">
   }) {
     yield* requireMutableJob(ctx.params.jobID)
-    return yield* mapJobErrors(jobs.renew({ ...ctx.payload, jobID: ctx.params.jobID }))
+    return yield* admit(mapJobErrors(jobs.renew({ ...ctx.payload, jobID: ctx.params.jobID })))
   })
   const succeedJob = Effect.fn("OpencodeXHttpApi.succeedJob")(function* (ctx: {
     params: { jobID: string }
     payload: Omit<OpencodeXJob.CompleteInput, "jobID">
   }) {
     yield* requireMutableJob(ctx.params.jobID)
-    return yield* mapJobErrors(jobs.succeed({ ...ctx.payload, jobID: ctx.params.jobID }))
+    return yield* finish(mapJobErrors(jobs.succeed({ ...ctx.payload, jobID: ctx.params.jobID })))
   })
   const failJob = Effect.fn("OpencodeXHttpApi.failJob")(function* (ctx: {
     params: { jobID: string }
     payload: Omit<OpencodeXJob.FailInput, "jobID">
   }) {
     yield* requireMutableJob(ctx.params.jobID)
-    return yield* mapJobErrors(jobs.fail({ ...ctx.payload, jobID: ctx.params.jobID }))
+    return yield* finish(mapJobErrors(jobs.fail({ ...ctx.payload, jobID: ctx.params.jobID })))
   })
   const retryJob = Effect.fn("OpencodeXHttpApi.retryJob")(function* (ctx: { params: { jobID: string } }) {
     yield* requireMutableJob(ctx.params.jobID)
-    return yield* mapJobErrors(jobs.retry(ctx.params.jobID))
+    return yield* admit(mapJobErrors(jobs.retry(ctx.params.jobID)))
   })
 
   const listSwarms = Effect.fn("OpencodeXHttpApi.listSwarms")(function* () {
@@ -97,7 +115,7 @@ export const makeOpencodeXOperationsHandlers = Effect.fn("OpencodeXHttpApi.makeO
   const createSwarm = Effect.fn("OpencodeXHttpApi.createSwarm")(function* (ctx: {
     payload: OpencodeXSwarm.CreateInput
   }) {
-    return yield* mapSwarmCreateErrors(swarms.create(ctx.payload))
+    return yield* admit(mapSwarmCreateErrors(swarms.create(ctx.payload)))
   })
   const getSwarm = Effect.fn("OpencodeXHttpApi.getSwarm")(function* (ctx: { params: { swarmID: string } }) {
     return yield* mapSwarmErrors(swarms.get(ctx.params.swarmID))
@@ -158,13 +176,14 @@ export const makeOpencodeXOperationsHandlers = Effect.fn("OpencodeXHttpApi.makeO
     return yield* mapGoalErrors(goals.updatePlan(ctx.params.goalID, ctx.payload))
   })
   const startGoal = Effect.fn("OpencodeXHttpApi.startGoal")(function* (ctx: { params: { goalID: string } }) {
-    return yield* mapGoalErrors(goals.start(ctx.params.goalID))
+    return yield* admit(mapGoalErrors(goals.start(ctx.params.goalID)))
   })
   const approveGoalNode = Effect.fn("OpencodeXHttpApi.approveGoalNode")(function* (ctx: {
     params: { goalID: string; nodeID: string }
     payload: { approved: boolean }
   }) {
-    return yield* mapGoalErrors(goals.approve(ctx.params.goalID, ctx.params.nodeID, ctx.payload.approved))
+    const effect = mapGoalErrors(goals.approve(ctx.params.goalID, ctx.params.nodeID, ctx.payload.approved))
+    return yield* ctx.payload.approved ? admit(effect) : effect
   })
   const cancelGoal = Effect.fn("OpencodeXHttpApi.cancelGoal")(function* (ctx: { params: { goalID: string } }) {
     return yield* mapGoalErrors(goals.cancel(ctx.params.goalID))

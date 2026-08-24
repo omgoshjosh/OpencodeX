@@ -67,6 +67,7 @@ import { reply, TestLLMServer } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { OpencodeXProject } from "@/opencodex/project"
+import { DeploymentDrain } from "@/server/deployment-drain"
 import { OpencodeXProjectTable, OpencodeXSwarmRoleTable, OpencodeXSwarmTable } from "@opencode-ai/core/opencodex/sql"
 
 void Log.init({ print: false })
@@ -287,6 +288,7 @@ function makePrompt(input?: {
     Layer.provide(RuntimeFlags.layer({})),
     Layer.provideMerge(deps),
     Layer.provide(summary),
+    Layer.provide(DeploymentDrain.defaultLayer),
   )
 }
 
@@ -298,7 +300,7 @@ function makeHttpNoLLMServer(input?: { processor?: "blocking" }) {
   return makePrompt(input)
 }
 
-const it = testEffect(makeHttp())
+const it = testEffect(Layer.mergeAll(DeploymentDrain.defaultLayer, makeHttp()))
 const noLLMServer = testEffect(makeHttpNoLLMServer())
 const raceNoLLMServer = testEffect(makeHttpNoLLMServer({ processor: "blocking" }))
 const unix = process.platform !== "win32" ? it.instance : it.instance.skip
@@ -316,6 +318,29 @@ const racingRunState = Layer.succeed(
   }),
 )
 const cancelRaceIt = testEffect(makePrompt({ runState: racingRunState }))
+
+it.instance("keeps promptAsync queued until a deployment drain is cancelled", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const drain = yield* DeploymentDrain.Service
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const { db } = yield* Database.Service
+    const chat = yield* sessions.create({})
+    yield* drain.begin(drain.runID)
+    yield* prompt.promptAsync({ sessionID: chat.id, model: ref, parts: [{ type: "text", text: "queue during drain" }] })
+    const command = yield* db
+      .select({ status: SessionCommandTable.status })
+      .from(SessionCommandTable)
+      .where(eq(SessionCommandTable.session_id, chat.id))
+      .get()
+      .pipe(Effect.orDie)
+    expect(command?.status).toBe("queued")
+    expect(yield* llm.hits).toHaveLength(0)
+    yield* drain.cancel(drain.runID)
+    yield* llm.wait(1)
+  }),
+)
 
 // Config that registers a custom "test" provider with a "test-model" model
 // so provider model lookup succeeds inside the loop.
@@ -1040,6 +1065,76 @@ it.instance("command heartbeat extends its lease from the current clock", () =>
 
     expect(initial.lease).toBe(1_090)
     expect(extended.lease).toBe(2_090)
+  }),
+)
+
+it.instance("command execution stops when its heartbeat loses ownership", () =>
+  Effect.gen(function* () {
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const database = yield* Database.Service
+    const events = yield* EventV2Bridge.Service
+    const scope = yield* Effect.scope
+    const chat = yield* sessions.create({})
+    const message = yield* prompt.prompt({
+      sessionID: chat.id,
+      model: ref,
+      noReply: true,
+      parts: [{ type: "text", text: "ownership loss" }],
+    })
+    const session = yield* database.db
+      .select()
+      .from(SessionTable)
+      .where(eq(SessionTable.id, chat.id))
+      .get()
+      .pipe(Effect.orDie)
+    if (!session) return yield* Effect.die(new Error("missing session row"))
+    const entered = yield* Deferred.make<void>()
+    const stopped = yield* Deferred.make<void>()
+    const claim = yield* PromptClaim.make({
+      database,
+      events,
+      scope,
+      commandLeaseMillis: 90,
+      loop: () =>
+        Deferred.succeed(entered, undefined).pipe(
+          Effect.andThen(Effect.never),
+          Effect.ensuring(Deferred.succeed(stopped, undefined)),
+        ),
+    })
+    yield* database.db
+      .insert(SessionCommandTable)
+      .values({
+        id: "sec_ownership_loss",
+        session_id: chat.id,
+        message_id: message.info.id,
+        project_id: session.project_id,
+        directory: session.directory,
+        status: "queued",
+        time_created: Date.now(),
+        time_updated: Date.now(),
+      })
+      .run()
+      .pipe(Effect.orDie)
+
+    yield* claim.launchCommand("sec_ownership_loss")
+    yield* awaitWithTimeout(Deferred.await(entered), "command did not start")
+    yield* database.db
+      .update(SessionCommandTable)
+      .set({ owner_id: "remote:new-owner" })
+      .where(eq(SessionCommandTable.id, "sec_ownership_loss"))
+      .run()
+      .pipe(Effect.orDie)
+    yield* awaitWithTimeout(Deferred.await(stopped), "ownership loss did not stop command execution")
+
+    expect(
+      yield* database.db
+        .select({ status: SessionCommandTable.status, owner: SessionCommandTable.owner_id })
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.id, "sec_ownership_loss"))
+        .get()
+        .pipe(Effect.orDie),
+    ).toEqual({ status: "running", owner: "remote:new-owner" })
   }),
 )
 

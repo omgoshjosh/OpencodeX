@@ -1,9 +1,13 @@
 import { expect } from "bun:test"
 import { OpencodeXJob } from "@/opencodex/job"
-import { Effect } from "effect"
+import { Database } from "@opencode-ai/core/database/database"
+import { OpencodeXJobTable } from "@opencode-ai/core/opencodex/sql"
+import { eq } from "drizzle-orm"
+import { Effect, Layer } from "effect"
 import { testEffect } from "../lib/effect"
 
 const it = testEffect(OpencodeXJob.defaultLayer)
+const dbIt = testEffect(Layer.mergeAll(Database.defaultLayer, OpencodeXJob.defaultLayer))
 
 it.live("submits idempotently and runs the legal lifecycle", () =>
   Effect.gen(function* () {
@@ -96,10 +100,10 @@ it.live("interrupts work with an expired lease and permits a bounded retry", () 
       idempotencyKey: "job-recovery",
       maxAttempts: 2,
     })
-    yield* jobs.claim({ jobID: created.id, owner: "runner-a", leaseMs: 1 })
+    yield* jobs.claim({ jobID: created.id, owner: "runner-a", leaseMs: 30_000 })
     yield* jobs.start(created.id, "runner-a")
 
-    const recovered = yield* jobs.recover(Date.now() + 10_000)
+    const recovered = yield* jobs.recover(Date.now() + 60_000)
     expect(recovered.find((job) => job.id === created.id)?.status).toBe("interrupted")
 
     const queued = yield* jobs.retry(created.id)
@@ -212,12 +216,35 @@ it.live("acknowledges cancellation while recovering an abandoned lease", () =>
   Effect.gen(function* () {
     const jobs = yield* OpencodeXJob.Service
     const created = yield* jobs.create({ kind: "test", idempotencyKey: "job-cancel-recovery" })
-    yield* jobs.claim({ jobID: created.id, owner: "local:999999:old", leaseMs: 1 })
+    yield* jobs.claim({ jobID: created.id, owner: "local:999999:old", leaseMs: 30_000 })
     yield* jobs.start(created.id, "local:999999:old")
     yield* jobs.cancel(created.id)
 
-    const recovered = yield* jobs.recover(Date.now() + 10_000)
+    const recovered = yield* jobs.recover(Date.now() + 60_000)
     expect(recovered.find((job) => job.id === created.id)?.status).toBe("cancelled")
     expect((yield* jobs.get(created.id)).statusReason).toBe("Cancellation acknowledged during startup recovery")
+  }),
+)
+
+dbIt.live("rejects renewal and settlement after a lease expires", () =>
+  Effect.gen(function* () {
+    const jobs = yield* OpencodeXJob.Service
+    const { db } = yield* Database.Service
+    const created = yield* jobs.create({ kind: "test.expired-owner" })
+    yield* jobs.claim({ jobID: created.id, owner: "stale-owner", leaseMs: 30_000 })
+    yield* jobs.start(created.id, "stale-owner")
+    yield* db
+      .update(OpencodeXJobTable)
+      .set({ lease_expires_at: Date.now() - 1 })
+      .where(eq(OpencodeXJobTable.id, created.id))
+      .run()
+      .pipe(Effect.orDie)
+
+    expect(
+      (yield* jobs.renew({ jobID: created.id, owner: "stale-owner", leaseMs: 30_000 }).pipe(Effect.flip))._tag,
+    ).toBe("OpencodeX.Job.TransitionError")
+    expect(
+      (yield* jobs.succeed({ jobID: created.id, owner: "stale-owner" }).pipe(Effect.flip))._tag,
+    ).toBe("OpencodeX.Job.TransitionError")
   }),
 )

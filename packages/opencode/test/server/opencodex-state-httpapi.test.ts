@@ -22,6 +22,7 @@ import { testEffect } from "../lib/effect"
 import { httpApiLayer } from "./httpapi-layer"
 import { makeReader as makeSessionCardReader, MAX_RETAINED_IDS } from "../../src/opencodex/session-card"
 import { AUTHORITY_EPOCH } from "../../src/opencodex/state-epoch"
+import { DeploymentDrain } from "../../src/server/deployment-drain"
 
 const noopBootstrap = Layer.succeed(InstanceBootstrap.Service, InstanceBootstrap.Service.of({ run: Effect.void }))
 const it = testEffect(
@@ -30,6 +31,7 @@ const it = testEffect(
     CrossSpawnSpawner.defaultLayer,
     InstanceStore.defaultLayer.pipe(Layer.provide(noopBootstrap)),
     Database.defaultLayer,
+    DeploymentDrain.defaultLayer,
     httpApiLayer,
   ),
 )
@@ -75,6 +77,46 @@ afterEach(async () => {
 })
 
 describe("OpencodeX state HTTP API", () => {
+  it.live("rejects new jobs during drain while cancellation stays available", () =>
+    Effect.gen(function* () {
+      const directory = yield* tmpdirScoped({ git: true, config: { formatter: false, lsp: false } })
+      const server = yield* HttpServer.HttpServer
+      const drain = yield* DeploymentDrain.Service
+      const request = (path: string, init: RequestInit = {}) => {
+        const headers = new Headers(init.headers)
+        headers.set("x-opencode-directory", directory)
+        if (init.body) headers.set("content-type", "application/json")
+        return fetch(new URL(path, HttpServer.formatAddress(server.address)), { ...init, headers })
+      }
+      const created = record(
+        yield* Effect.promise(() =>
+          request("/experimental/opencodex/job", {
+            method: "POST",
+            body: JSON.stringify({ kind: "test.drain" }),
+          }).then((response) => response.json()),
+        ),
+      )
+      yield* drain.begin(drain.runID)
+      yield* Effect.addFinalizer(() => drain.cancel(drain.runID).pipe(Effect.ignore))
+
+      expect(
+        yield* Effect.promise(() =>
+          request("/experimental/opencodex/job", {
+            method: "POST",
+            body: JSON.stringify({ kind: "test.rejected" }),
+          }).then((response) => response.status),
+        ),
+      ).toBe(503)
+      expect(
+        yield* Effect.promise(() =>
+          request(`/experimental/opencodex/job/${String(created.id)}/cancel`, { method: "POST" }).then(
+            (response) => response.status,
+          ),
+        ),
+      ).toBe(200)
+    }),
+  )
+
   it.live("rejects stale reviewed-file replacements while merging timestamps", () =>
     Effect.gen(function* () {
       const directory = yield* tmpdirScoped({ git: true, config: { formatter: false, lsp: false } })
@@ -119,9 +161,7 @@ describe("OpencodeX state HTTP API", () => {
       )
       expect(responses.map((response) => response.status).toSorted((a, b) => a - b)).toEqual([200, 200, 409])
       const snapshot = record(
-        yield* Effect.promise(() =>
-          request("/experimental/opencodex/state").then((response) => response.json()),
-        ),
+        yield* Effect.promise(() => request("/experimental/opencodex/state").then((response) => response.json())),
       )
       const state = record(record(record(record(snapshot).payloads).catalog).sessionUiState)[sessionID]
       expect(record(state).seenAt).toBe(10)
@@ -553,9 +593,9 @@ describe("OpencodeX state HTTP API", () => {
       )
       yield* Effect.addFinalizer(() => Effect.sync(() => headerController.abort()))
       expect(record(yield* Effect.promise(() => headerReplay.next())).type).toBe("ready")
-      expect(
-        record(record(yield* Effect.promise(() => headerReplay.next())).event).cursor,
-      ).toBe(record(replayedEvents[0]).cursor)
+      expect(record(record(yield* Effect.promise(() => headerReplay.next())).event).cursor).toBe(
+        record(replayedEvents[0]).cursor,
+      )
       headerController.abort()
 
       const resetController = new AbortController()
@@ -655,7 +695,9 @@ describe("OpencodeX state HTTP API", () => {
         .get()
         .pipe(Effect.orDie)
       if (!source) return yield* Effect.die("pagination fixture session was not persisted")
-      const ids = Array.from({ length: 5_001 }, (_, index) => SessionID.make(`ses_card_${String(index).padStart(5, "0")}`))
+      const ids = Array.from({ length: 5_001 }, (_, index) =>
+        SessionID.make(`ses_card_${String(index).padStart(5, "0")}`),
+      )
       yield* Effect.forEach(
         Array.from({ length: Math.ceil(ids.length / 200) }, (_, index) => ids.slice(index * 200, (index + 1) * 200)),
         (chunk) =>
@@ -701,24 +743,22 @@ describe("OpencodeX state HTTP API", () => {
       expect(recent.items.map((item) => item.id)).not.toContain(retainedUnseenID)
       expect(unseenReviewIDs).toContain(retainedUnseenID)
       const bounded = yield* cardReader.initial(ids)
-      const expectedInitialIDs = new Set([
-        ...ids.slice(0, MAX_RETAINED_IDS),
-        ...recent.items.map((item) => item.id),
-      ])
+      const expectedInitialIDs = new Set([...ids.slice(0, MAX_RETAINED_IDS), ...recent.items.map((item) => item.id)])
       expect(bounded.items).toHaveLength(expectedInitialIDs.size)
       expect(new Set(bounded.items.map((item) => item.id))).toEqual(expectedInitialIDs)
 
       const root = record(
-        yield* Effect.promise(() =>
-          request("/experimental/opencodex/state").then((response) => response.json()),
-        ),
+        yield* Effect.promise(() => request("/experimental/opencodex/state").then((response) => response.json())),
       )
       const initialCards = record(record(record(root.payloads).catalog).sessionCards)
       expect(Array.isArray(initialCards.items) ? initialCards.items.length : 0).toBe(MAX_RETAINED_IDS + 1)
       expect(initialCards.hasMore).toBe(true)
 
       const pagination = yield* Effect.promise(async () => {
-        const collect = async (cursor?: string, pageIDs: string[] = []): Promise<{ pageIDs: string[]; terminal: Record<string, unknown> }> => {
+        const collect = async (
+          cursor?: string,
+          pageIDs: string[] = [],
+        ): Promise<{ pageIDs: string[]; terminal: Record<string, unknown> }> => {
           const page = record(
             await request(
               `/experimental/opencodex/state/session-card?limit=200${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`,
@@ -770,9 +810,7 @@ describe("OpencodeX state HTTP API", () => {
         .run()
         .pipe(Effect.orDie)
       const associated = record(
-        yield* Effect.promise(() =>
-          request("/experimental/opencodex/state").then((response) => response.json()),
-        ),
+        yield* Effect.promise(() => request("/experimental/opencodex/state").then((response) => response.json())),
       )
       const project = (record(record(associated.payloads).catalog).projects as unknown[])
         .map(record)
@@ -796,15 +834,26 @@ describe("OpencodeX state HTTP API", () => {
         yield* Effect.promise(() => request("/experimental/opencodex/state").then((response) => response.json())),
       )
       const catalog = record(record(withView.payloads).catalog)
-      expect((catalog.views as unknown[]).map(record).find((item) => item.id === createdView.id)?.sessionIDs).toContain(oldID)
+      expect((catalog.views as unknown[]).map(record).find((item) => item.id === createdView.id)?.sessionIDs).toContain(
+        oldID,
+      )
 
-      yield* db.update(SessionTable).set({ time_archived: 2_000 }).where(eq(SessionTable.id, oldID)).run().pipe(Effect.orDie)
+      yield* db
+        .update(SessionTable)
+        .set({ time_archived: 2_000 })
+        .where(eq(SessionTable.id, oldID))
+        .run()
+        .pipe(Effect.orDie)
       const archived = record(
         yield* Effect.promise(() => request("/experimental/opencodex/state").then((response) => response.json())),
       )
       const archivedCatalog = record(record(archived.payloads).catalog)
-      expect((archivedCatalog.projects as unknown[]).map(record).find((item) => item.id === overlay.id)?.sessionIDs).not.toContain(oldID)
-      expect((archivedCatalog.views as unknown[]).map(record).find((item) => item.id === createdView.id)?.sessionIDs).not.toContain(oldID)
+      expect(
+        (archivedCatalog.projects as unknown[]).map(record).find((item) => item.id === overlay.id)?.sessionIDs,
+      ).not.toContain(oldID)
+      expect(
+        (archivedCatalog.views as unknown[]).map(record).find((item) => item.id === createdView.id)?.sessionIDs,
+      ).not.toContain(oldID)
       const archivedExact = record(
         yield* Effect.promise(() =>
           request(`/experimental/opencodex/state/session-card?ids=${encodeURIComponent(oldID)}`).then((response) =>
@@ -813,8 +862,22 @@ describe("OpencodeX state HTTP API", () => {
         ),
       )
       expect(archivedExact.missing).toEqual([oldID])
-      expect(yield* db.select().from(OpencodeXProjectSessionTable).where(eq(OpencodeXProjectSessionTable.session_id, oldID)).get().pipe(Effect.orDie)).toBeDefined()
-      expect(yield* db.select().from(OpencodeXViewSessionTable).where(eq(OpencodeXViewSessionTable.session_id, oldID)).get().pipe(Effect.orDie)).toBeDefined()
+      expect(
+        yield* db
+          .select()
+          .from(OpencodeXProjectSessionTable)
+          .where(eq(OpencodeXProjectSessionTable.session_id, oldID))
+          .get()
+          .pipe(Effect.orDie),
+      ).toBeDefined()
+      expect(
+        yield* db
+          .select()
+          .from(OpencodeXViewSessionTable)
+          .where(eq(OpencodeXViewSessionTable.session_id, oldID))
+          .get()
+          .pipe(Effect.orDie),
+      ).toBeDefined()
 
       yield* db
         .update(SessionTable)
@@ -826,16 +889,24 @@ describe("OpencodeX state HTTP API", () => {
         yield* Effect.promise(() => request("/experimental/opencodex/state").then((response) => response.json())),
       )
       const swarmCatalog = record(record(swarm.payloads).catalog)
-      expect((swarmCatalog.projects as unknown[]).map(record).find((item) => item.id === overlay.id)?.sessionIDs).not.toContain(oldID)
-      expect((swarmCatalog.views as unknown[]).map(record).find((item) => item.id === createdView.id)?.sessionIDs).not.toContain(oldID)
+      expect(
+        (swarmCatalog.projects as unknown[]).map(record).find((item) => item.id === overlay.id)?.sessionIDs,
+      ).not.toContain(oldID)
+      expect(
+        (swarmCatalog.views as unknown[]).map(record).find((item) => item.id === createdView.id)?.sessionIDs,
+      ).not.toContain(oldID)
 
       yield* db.update(SessionTable).set({ metadata: null }).where(eq(SessionTable.id, oldID)).run().pipe(Effect.orDie)
       const restored = record(
         yield* Effect.promise(() => request("/experimental/opencodex/state").then((response) => response.json())),
       )
       const restoredCatalog = record(record(restored.payloads).catalog)
-      expect((restoredCatalog.projects as unknown[]).map(record).find((item) => item.id === overlay.id)?.sessionIDs).toContain(oldID)
-      expect((restoredCatalog.views as unknown[]).map(record).find((item) => item.id === createdView.id)?.sessionIDs).toContain(oldID)
+      expect(
+        (restoredCatalog.projects as unknown[]).map(record).find((item) => item.id === overlay.id)?.sessionIDs,
+      ).toContain(oldID)
+      expect(
+        (restoredCatalog.views as unknown[]).map(record).find((item) => item.id === createdView.id)?.sessionIDs,
+      ).toContain(oldID)
     }),
   )
 })

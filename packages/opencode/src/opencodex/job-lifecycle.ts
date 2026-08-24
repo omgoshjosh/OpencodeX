@@ -2,7 +2,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
 import { OpencodeXJobTable } from "@opencode-ai/core/opencodex/sql"
 import { Effect } from "effect"
-import { and, eq, inArray, isNotNull, isNull, lt, or } from "drizzle-orm"
+import { and, eq, gt, inArray, isNotNull, isNull, lt, or } from "drizzle-orm"
 import { hydrate } from "./job-model"
 import {
   Event,
@@ -47,17 +47,25 @@ export function createJobLifecycle(
   })
 
   const start = Effect.fn("OpencodeXJob.start")(function* (jobID: string, owner: string) {
+    const now = Date.now()
     return yield* store.transition({
       job: yield* store.get(jobID),
       target: "running",
       owner,
-      values: { started_at: Date.now() },
+      condition: gt(OpencodeXJobTable.lease_expires_at, now),
+      values: { started_at: now },
     })
   })
 
   const renew = Effect.fn("OpencodeXJob.renew")(function* (input: ClaimInput) {
     const current = yield* store.get(input.jobID)
-    if (!["claimed", "running"].includes(current.status) || current.leaseOwner !== input.owner) {
+    const now = Date.now()
+    if (
+      !["claimed", "running"].includes(current.status) ||
+      current.leaseOwner !== input.owner ||
+      !current.leaseExpiresAt ||
+      current.leaseExpiresAt <= now
+    ) {
       return yield* new TransitionError({
         jobID: current.id,
         status: current.status,
@@ -67,12 +75,13 @@ export function createJobLifecycle(
     }
     const row = yield* db
       .update(OpencodeXJobTable)
-      .set({ lease_expires_at: Date.now() + input.leaseMs, time_updated: Date.now() })
+      .set({ lease_expires_at: now + input.leaseMs, time_updated: now })
       .where(
         and(
           eq(OpencodeXJobTable.id, current.id),
           eq(OpencodeXJobTable.status, current.status),
           eq(OpencodeXJobTable.lease_owner, input.owner),
+          gt(OpencodeXJobTable.lease_expires_at, now),
         ),
       )
       .returning()
@@ -92,6 +101,15 @@ export function createJobLifecycle(
     settlement?: TransactionalSettlement,
   ) {
     const current = yield* store.get(input.jobID)
+    const now = Date.now()
+    if (!current.leaseExpiresAt || current.leaseExpiresAt <= now) {
+      return yield* new TransitionError({
+        jobID: current.id,
+        status: current.status,
+        target: input.outcome.status,
+        message: "An expired job lease cannot be settled",
+      })
+    }
     if (current.cancelRequestedAt) {
       if (input.outcome.status === "cancelled") {
         return yield* store.transition({
@@ -99,9 +117,12 @@ export function createJobLifecycle(
           target: "cancelled",
           owner: input.owner,
           settlement,
-          condition: isNotNull(OpencodeXJobTable.cancel_requested_at),
+          condition: and(
+            isNotNull(OpencodeXJobTable.cancel_requested_at),
+            gt(OpencodeXJobTable.lease_expires_at, now),
+          ),
           values: {
-            completed_at: Date.now(),
+            completed_at: now,
             lease_owner: null,
             lease_expires_at: null,
             status_reason: "Cancellation acknowledged after executor termination",
@@ -128,9 +149,9 @@ export function createJobLifecycle(
       target: input.outcome.status,
       owner: input.owner,
       settlement,
-      condition: isNull(OpencodeXJobTable.cancel_requested_at),
+      condition: and(isNull(OpencodeXJobTable.cancel_requested_at), gt(OpencodeXJobTable.lease_expires_at, now)),
       values: {
-        completed_at: Date.now(),
+        completed_at: now,
         lease_owner: null,
         lease_expires_at: null,
         result_json: input.outcome.status === "succeeded" ? input.outcome.result : undefined,

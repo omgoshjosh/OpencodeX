@@ -13,6 +13,7 @@ import { Context, Effect, Layer, Schedule, Scope } from "effect"
 import { GOAL_NODE_JOB_KIND, GoalDispatch } from "./goal-dispatch"
 import { GoalExecution, goalExecutionLayer } from "./goal-execution"
 import { OpencodeXGoal } from "./goal"
+import { DeploymentDrain } from "@/server/deployment-drain"
 
 /**
  * Where planning meets running. The goal service can be built anywhere - it
@@ -45,7 +46,7 @@ export const layer = Layer.effect(
     // starts them. The cadence itself lives on each goal.
     const scope = yield* Scope.Scope
     yield* Effect.sleep(SCHEDULE_TICK_MS).pipe(
-      Effect.andThen(dispatch.sweepSchedules().pipe(Effect.ignore)),
+      Effect.andThen(DeploymentDrain.admitExecution(dispatch.sweepSchedules()).pipe(Effect.ignore)),
       Effect.repeat(Schedule.forever),
       Effect.forkIn(scope),
     )

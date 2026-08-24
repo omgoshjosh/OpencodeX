@@ -18,6 +18,8 @@ import { controlHandlers } from "../../src/server/routes/instance/httpapi/handle
 import { globalHandlers } from "../../src/server/routes/instance/httpapi/handlers/global"
 import { authorizationLayer } from "../../src/server/routes/instance/httpapi/middleware/authorization"
 import { schemaErrorLayer } from "../../src/server/routes/instance/httpapi/middleware/schema-error"
+import { DeploymentDrain } from "../../src/server/deployment-drain"
+import { InstanceStore } from "../../src/project/instance-store"
 import { testEffect } from "../lib/effect"
 import { eq } from "drizzle-orm"
 
@@ -25,7 +27,7 @@ const guiBridgeLayer = GuiBridge.layer.pipe(Layer.provideMerge(EventV2Bridge.def
 
 const apiLayer = HttpRouter.serve(
   HttpApiBuilder.layer(RootHttpApi).pipe(
-    Layer.provide([controlHandlers, globalHandlers]),
+    Layer.provide([controlHandlers, globalHandlers.pipe(Layer.provide(DeploymentDrain.defaultLayer))]),
     Layer.provide([authorizationLayer, schemaErrorLayer]),
     // Raw HttpApi routes expose an opaque handler context at the request boundary.
     // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion
@@ -45,11 +47,29 @@ const apiLayer = HttpRouter.serve(
   ),
   Layer.provide(ServerAuth.Config.layer({ password: Option.none(), username: "opencode" })),
   Layer.provideMerge(guiBridgeLayer),
+  Layer.provide(DeploymentDrain.defaultLayer),
+  Layer.provide(Layer.mock(InstanceStore.Service)({ load: () => Effect.die("unused") })),
   Layer.provideMerge(Database.defaultLayer),
 )
 const it = testEffect(apiLayer)
 
 describe("global HttpApi", () => {
+  it.live("begins idempotently and fences drain requests by run ID", () =>
+    Effect.gen(function* () {
+      const health = yield* HttpClient.get(GlobalPaths.health).pipe(Effect.flatMap((response) => response.json))
+      if (!health || typeof health !== "object" || !("runID" in health) || typeof health.runID !== "string") {
+        return yield* Effect.die("missing health run ID")
+      }
+      const request = (path: string, expectedRunID: string) =>
+        HttpClientRequest.post(path).pipe(HttpClientRequest.bodyJsonUnsafe({ expectedRunID }), HttpClient.execute)
+      expect((yield* request(GlobalPaths.drainBegin, "wrong-run")).status).toBe(409)
+      expect(yield* (yield* request(GlobalPaths.drainBegin, health.runID)).json).toMatchObject({ draining: true, accepting: false })
+      expect(yield* (yield* request(GlobalPaths.drainBegin, health.runID)).json).toMatchObject({ draining: true })
+      expect(yield* (yield* HttpClient.get(GlobalPaths.drainStatus)).json).toMatchObject({ draining: true })
+      expect(yield* (yield* request(GlobalPaths.drainCancel, health.runID)).json).toMatchObject({ draining: false, accepting: true })
+    }),
+  )
+
   it.live("only executing swarm rows block idle-gated redeploy", () =>
     Effect.gen(function* () {
       const database = yield* Database.Service

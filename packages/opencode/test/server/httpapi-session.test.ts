@@ -24,7 +24,7 @@ import { Session } from "@/session/session"
 import { MessageID, PartID, SessionID, type SessionID as SessionIDType } from "../../src/session/schema"
 import { MessageV2 } from "../../src/session/message-v2"
 import { Database } from "@opencode-ai/core/database/database"
-import { SessionTable } from "@opencode-ai/core/session/sql"
+import { SessionCommandTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import * as DateTime from "effect/DateTime"
@@ -35,6 +35,7 @@ import { disposeAllInstances, provideInstanceEffect, TestInstance, tmpdirScoped 
 import { TestLLMServer } from "../lib/llm-server"
 import { testProviderConfig } from "../lib/test-provider"
 import { testEffect } from "../lib/effect"
+import { DeploymentDrain } from "@/server/deployment-drain"
 
 void Log.init({ print: false })
 
@@ -65,6 +66,7 @@ const it = testEffect(
     instanceStoreLayer,
     Project.defaultLayer,
     Session.defaultLayer,
+    DeploymentDrain.defaultLayer,
     workspaceLayer,
     Database.defaultLayer,
     httpApiLayer,
@@ -189,6 +191,50 @@ afterEach(async () => {
 })
 
 describe("session HttpApi", () => {
+  it.instance(
+    "returns 503 for direct execution mutations during drain while promptAsync stays queued",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const drain = yield* DeploymentDrain.Service
+        const { db } = yield* Database.Service
+        const session = yield* createSession({ title: "drain fence" })
+        const headers = { "x-opencode-directory": test.directory, "content-type": "application/json" }
+        const post = (route: string, body: unknown) =>
+          request(pathFor(route, { sessionID: session.id }), {
+            method: "POST",
+            headers,
+            body: JSON.stringify(body),
+          })
+
+        yield* drain.begin(drain.runID)
+        yield* Effect.addFinalizer(() => drain.cancel(drain.runID).pipe(Effect.ignore))
+
+        const direct = yield* Effect.all([
+          post(SessionPaths.init, { providerID: "test", modelID: "test", messageID: MessageID.ascending() }),
+          post(SessionPaths.summarize, { providerID: "test", modelID: "test" }),
+          post(SessionPaths.prompt, { noReply: true, parts: [{ type: "text", text: "direct prompt" }] }),
+          post(SessionPaths.command, { command: "test", arguments: "" }),
+          post(SessionPaths.shell, { agent: "build", command: "pwd" }),
+        ])
+        expect(direct.map((response) => response.status)).toEqual([503, 503, 503, 503, 503])
+
+        const queued = yield* post(SessionPaths.promptAsync, {
+          parts: [{ type: "text", text: "queued prompt" }],
+        })
+        expect(queued.status).toBe(204)
+        expect(
+          yield* db
+            .select({ status: SessionCommandTable.status })
+            .from(SessionCommandTable)
+            .where(eq(SessionCommandTable.session_id, session.id))
+            .get()
+            .pipe(Effect.orDie),
+        ).toEqual({ status: "queued" })
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+  )
+
   it.effect("maps busy sessions to public session busy errors", () =>
     Effect.gen(function* () {
       const sessionID = SessionID.descending()
@@ -372,7 +418,6 @@ describe("session HttpApi", () => {
       })
     }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(CrossSpawnSpawner.defaultLayer)),
   )
-
 
   it.instance(
     "serves sessions with migrated summary diffs missing file details",

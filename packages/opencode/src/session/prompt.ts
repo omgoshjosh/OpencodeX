@@ -196,6 +196,10 @@ export const layer = Layer.effect(
       return {
         cancel: (sessionID: SessionID) => cancel(sessionID),
         resolvePromptParts: (template: string) => resolvePromptParts(template),
+        resolveModel: (model) =>
+          provider.getModel(model.providerID, model.modelID).pipe(
+            Effect.catchIf(Provider.ModelNotFoundError.isInstance, () => Effect.succeed(undefined)),
+          ),
         prompt: (input: PromptInput) => prompt(input).pipe(Effect.catch(Effect.die)),
         loop: (input: LoopInput) => loop(input),
       } satisfies TaskPromptOps
@@ -737,6 +741,10 @@ export const layer = Layer.effect(
       database,
       sessions,
       skills,
+      resolveModel: (model) =>
+        provider.getModel(ProviderV2.ID.make(model.providerID), ProviderV2.ModelID.make(model.modelID)).pipe(
+          Effect.catchIf(Provider.ModelNotFoundError.isInstance, () => Effect.succeed(undefined)),
+        ),
       prompt: (input) => prompt(input),
       loop: (input) => loop(input),
     })

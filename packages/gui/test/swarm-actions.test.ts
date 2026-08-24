@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import type { OpencodeXSwarm, Session } from "@opencode-ai/sdk/v2/client"
+import type { OpencodeXSwarm, Provider, Session } from "@opencode-ai/sdk/v2/client"
 import {
   defaultSwarmRoles,
   nextSwarmRolePreset,
@@ -16,6 +16,7 @@ import {
   moveSwarmRoleFallback,
   removeSwarmRoleFallback,
   setSwarmRoleFallback,
+  swarmRoleFallbackCatalogIssue,
 } from "../src/renderer/src/lib/swarm-role-fallbacks"
 
 describe("GUI swarm action helpers", () => {
@@ -117,6 +118,24 @@ describe("GUI swarm action helpers", () => {
     expect(canSelectSwarmRoleModel(role, { providerID: "openai", modelID: "gpt-5" }, "primary")).toBe(false)
     expect(canSelectSwarmRoleModel(role, { providerID: "google", modelID: "gemini-3" }, "new")).toBe(true)
     expect(canSelectSwarmRoleModel(role, { providerID: "openai", modelID: "gpt-5" }, 0)).toBe(true)
+  })
+
+  test("reports live catalog drift for saved fallback models", () => {
+    const provider = {
+      id: "anthropic",
+      name: "Anthropic",
+      models: { claude: { variants: { high: {} } } },
+    } as unknown as Provider
+    expect(swarmRoleFallbackCatalogIssue({ providerID: "missing", modelID: "model" }, [provider], ["missing"]))
+      .toBe("Provider is unavailable.")
+    expect(swarmRoleFallbackCatalogIssue({ providerID: "anthropic", modelID: "missing" }, [provider], ["anthropic"]))
+      .toBe("Model is unavailable.")
+    expect(swarmRoleFallbackCatalogIssue({ providerID: "anthropic", modelID: "claude", variant: "low" }, [provider], ["anthropic"]))
+      .toBe("Variant low is unavailable.")
+    expect(swarmRoleFallbackCatalogIssue({ providerID: "anthropic", modelID: "claude", variant: "high" }, [provider], []))
+      .toBe("Anthropic is not connected.")
+    expect(swarmRoleFallbackCatalogIssue({ providerID: "anthropic", modelID: "claude", variant: "high" }, [provider], ["anthropic"]))
+      .toBeUndefined()
   })
 
   test("a swarm is working when any session on it is busy", () => {

@@ -25,7 +25,7 @@ import * as Session from "./session"
 import { prepareImages } from "./swarm-attachments"
 import { SessionStatus } from "./status"
 import { hydrateFallbackModels } from "@/opencodex/swarm-model"
-import { shouldAdvanceModelFallback } from "./model-fallback"
+import { availableModelAttempts, shouldAdvanceModelFallback } from "./model-fallback"
 
 const log = Log.create({ service: "session.prompt-swarm" })
 
@@ -47,6 +47,9 @@ export interface Deps {
   readonly database: Context.Service.Shape<typeof Database.Service>
   readonly sessions: Context.Service.Shape<typeof Session.Service>
   readonly skills: Context.Service.Shape<typeof Skill.Service>
+  readonly resolveModel: (
+    model: { providerID: string; modelID: string; variant?: string },
+  ) => Effect.Effect<{ variants?: Record<string, unknown> } | undefined>
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionLegacy.WithParts, Image.Error>
   readonly loop: (input: { sessionID: SessionID; messageID?: MessageID }) => Effect.Effect<SessionLegacy.WithParts>
 }
@@ -283,7 +286,7 @@ export function make(deps: Deps) {
       const text = [roleSkill?.content.trim(), role.instructions?.trim(), input.prompt.trim()]
         .filter(Boolean)
         .join("\n\n")
-      const models = [
+      const models = yield* availableModelAttempts([
         { providerID: role.provider_id!, modelID: role.model_id!, variant: role.variant ?? undefined },
         ...(role.skill === "orchestrator" || role.name.trim().toLowerCase() === "orchestrator"
           ? []
@@ -291,7 +294,7 @@ export function make(deps: Deps) {
               providerID: role.provider_id!,
               modelID: role.model_id!,
             })),
-      ]
+      ], deps.resolveModel)
       const userMessageID = MessageID.ascending()
       const primary = models[0]
       const initial = yield* prompt({

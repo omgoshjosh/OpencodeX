@@ -97,6 +97,19 @@ describe("swarm role model fallback", () => {
     expect(userMessages()).toBe(1)
   })
 
+  test("starts with the first live route when the saved primary left the catalog", async () => {
+    const { runSwarmRole, models, loops } = harness({
+      skills: {},
+      unavailableModels: ["anthropic/claude-sonnet-5"],
+      promptResults: [success("fallback worked")],
+    })
+    expect(await Effect.runPromise(
+      run(runSwarmRole, { roles: [role({ name: "Specialist", skill: null, instructions: "", fallbacks: true })] }),
+    )).toEqual({ ok: true, text: "fallback worked" })
+    expect(models).toEqual(["openai/gpt-5"])
+    expect(loops()).toBe(0)
+  })
+
   test("stops on partial text and returns the primary failure", async () => {
     const partial = failure("quota_exceeded")
     partial.parts = [{ type: "text", text: "partial", synthetic: false }] as never
@@ -476,6 +489,7 @@ function harness(input: {
   parentParts?: Array<Record<string, unknown>>
   onUpdatePart?: () => void
   onPrompt?: () => void
+  unavailableModels?: string[]
 }) {
   const prompts: string[] = []
   const models: string[] = []
@@ -527,6 +541,12 @@ function harness(input: {
             : undefined,
         ),
     } as never,
+    resolveModel: (model: { providerID: string; modelID: string }) =>
+      Effect.succeed(
+        input.unavailableModels?.includes(`${model.providerID}/${model.modelID}`)
+          ? undefined
+          : { variants: { low: {}, medium: {}, high: {} } },
+      ),
     prompt: (promptInput: { messageID?: string; model?: { providerID: string; modelID: string }; parts: Array<{ type: string; text?: string }> }) => {
       input.onPrompt?.()
       if (promptInput.model) models.push(`${promptInput.model.providerID}/${promptInput.model.modelID}`)

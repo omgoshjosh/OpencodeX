@@ -1,6 +1,11 @@
 import type { OpencodeXSwarmFallbackModel, OpencodeXSwarmRoleInput, Provider } from "@opencode-ai/sdk/v2/client"
 import { For, Show, createMemo } from "solid-js"
-import { canAddSwarmRoleFallback, moveSwarmRoleFallback, removeSwarmRoleFallback } from "../lib/swarm-role-fallbacks"
+import {
+  canAddSwarmRoleFallback,
+  moveSwarmRoleFallback,
+  removeSwarmRoleFallback,
+  swarmRoleFallbackCatalogIssue,
+} from "../lib/swarm-role-fallbacks"
 import { Button, IconButton, Select } from "./ui"
 
 export function SwarmRoleFallbackModels(props: {
@@ -67,8 +72,10 @@ export function SwarmRoleFallbackModels(props: {
                   <IconButton appearance="ghost" size="compact" icon="arrowDown" label={`Move fallback ${index() + 1} down`} disabled={index() === fallbacks().length - 1} onClick={() => props.update(moveSwarmRoleFallback(fallbacks(), index(), 1))} />
                   <IconButton appearance="ghost" tone="danger" size="compact" icon="trash" label={`Remove fallback ${index() + 1}`} onClick={() => props.update(removeSwarmRoleFallback(fallbacks(), index()))} />
                 </div>
-                <Show when={!props.connectedProviderIDs.includes(fallback.providerID)}>
-                  <small class="swarm-model-warning">{summary(fallback).provider} is not connected.</small>
+                <Show when={swarmRoleFallbackCatalogIssue(fallback, props.providers, props.connectedProviderIDs)}>
+                  <small class="swarm-model-warning">
+                    {swarmRoleFallbackCatalogIssue(fallback, props.providers, props.connectedProviderIDs)}
+                  </small>
                 </Show>
               </div>
             )}

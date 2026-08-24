@@ -1,4 +1,32 @@
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
+import { Effect } from "effect"
+
+type ModelFallbackRoute = {
+  providerID: string
+  modelID: string
+  variant?: string
+}
+
+export function availableModelAttempts<T extends ModelFallbackRoute, E, R>(
+  models: readonly T[],
+  resolve: (model: T) => Effect.Effect<{ variants?: Record<string, unknown> } | undefined, E, R>,
+) {
+  if (models.length < 2) return Effect.succeed(models.slice())
+  return Effect.forEach(models, (model) =>
+    resolve(model).pipe(
+      Effect.map((info) =>
+        info && (!model.variant || model.variant === "default" || info.variants?.[model.variant]) ? model : undefined,
+      ),
+    ),
+  ).pipe(
+    Effect.map((resolved) => {
+      const available = resolved.filter((model): model is T => model !== undefined)
+      // Preserve the primary route when the entire chain is stale so the
+      // ordinary prompt path still reports its actionable model error.
+      return available.length > 0 ? available : models.slice(0, 1)
+    }),
+  )
+}
 
 const exhaustionCodes = new Set([
   "insufficient_quota",

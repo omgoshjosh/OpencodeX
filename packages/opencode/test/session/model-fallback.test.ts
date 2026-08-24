@@ -1,6 +1,27 @@
 import { describe, expect, test } from "bun:test"
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
-import { isModelFallbackError, shouldAdvanceModelFallback } from "../../src/session/model-fallback"
+import { Effect } from "effect"
+import { availableModelAttempts, isModelFallbackError, shouldAdvanceModelFallback } from "../../src/session/model-fallback"
+
+describe("model fallback catalog preflight", () => {
+  test("skips stale routes and variants while preserving configured order", async () => {
+    const models = [
+      { providerID: "missing", modelID: "primary" },
+      { providerID: "valid", modelID: "first" },
+      { providerID: "valid", modelID: "second", variant: "retired" },
+      { providerID: "valid", modelID: "third", variant: "high" },
+    ]
+    const available = await Effect.runPromise(availableModelAttempts(models, (model) =>
+      Effect.succeed(model.providerID === "missing" ? undefined : { variants: { high: {} } }),
+    ))
+    expect(available).toEqual([models[1], models[3]])
+  })
+
+  test("keeps the primary route when the entire saved chain is stale", async () => {
+    const models = [{ providerID: "missing", modelID: "primary" }, { providerID: "missing", modelID: "fallback" }]
+    expect(await Effect.runPromise(availableModelAttempts(models, () => Effect.succeed(undefined)))).toEqual([models[0]])
+  })
+})
 
 describe("model fallback error classification", () => {
   test.each([

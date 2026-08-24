@@ -798,6 +798,31 @@ describe("tool.task", () => {
       expect(fallbackResult.metadata.model).toMatchObject({ providerID: "openai", modelID: "gpt-5" })
       expect((yield* sessions.messages({ sessionID: fallbackResult.metadata.sessionId })).filter((message) => message.info.role === "user")).toHaveLength(1)
 
+      const liveAttempts: SessionPrompt.PromptInput[] = []
+      const liveResult = yield* def.execute(
+        { description: "build module E", prompt: "do the work", subagent_type: "general", swarm_role: "Senior Engineer" },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          directory: chat.directory,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: {
+            promptOps: {
+              ...stubOps({ onPrompt: (input) => liveAttempts.push(input) }),
+              resolveModel: (attempt: { providerID: ProviderV2.ID; modelID: ProviderV2.ModelID }) => Effect.succeed(
+                attempt.modelID === "claude-fable-5" ? undefined : { variants: {} },
+              ),
+            },
+          },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+      expect(liveAttempts.map((input) => `${input.model?.providerID}/${input.model?.modelID}`)).toEqual(["openai/gpt-5"])
+      expect(liveResult.metadata.model).toMatchObject({ providerID: "openai", modelID: "gpt-5" })
+
       let blockedLoops = 0
       const blocked = yield* def.execute(
         { description: "build module safety", prompt: "do the work", subagent_type: "general", swarm_role: "Senior Engineer" },

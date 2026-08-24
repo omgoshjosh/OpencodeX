@@ -28,7 +28,7 @@ import { OpencodeXSwarmRoleTable } from "@opencode-ai/core/opencodex/sql"
 import { SwarmBriefing } from "@/opencodex/swarm-briefing"
 import { isSwarmProvider } from "@/provider/swarm-provider"
 import { hydrateFallbackModels } from "@/opencodex/swarm-model"
-import { shouldAdvanceModelFallback } from "@/session/model-fallback"
+import { availableModelAttempts, shouldAdvanceModelFallback } from "@/session/model-fallback"
 
 const log = Log.create({ service: "tool.task" })
 
@@ -37,6 +37,9 @@ export interface TaskPromptOps {
   resolvePromptParts(template: string): Effect.Effect<SessionPrompt.PromptInput["parts"]>
   prompt(input: SessionPrompt.PromptInput): Effect.Effect<SessionLegacy.WithParts>
   loop(input: SessionPrompt.LoopInput): Effect.Effect<SessionLegacy.WithParts>
+  resolveModel?: (
+    model: { providerID: ProviderV2.ID; modelID: ProviderV2.ModelID; variant?: string },
+  ) => Effect.Effect<{ variants?: Record<string, unknown> } | undefined>
 }
 
 const id = "task"
@@ -431,13 +434,18 @@ export const TaskTool = Tool.define(
         const configuredModels = swarmRoleModels(swarmRole).map((entry) =>
           isSwarmProvider(entry.providerID) ? { ...model, variant: undefined } : entry,
         )
-        const models =
+        const configuredAttempts =
           configuredModels.length > 0 &&
           (!override ||
             (override.providerID === configuredModels[0].providerID &&
               override.modelID === configuredModels[0].modelID))
             ? configuredModels
             : [{ ...model, variant: undefined }]
+        const ops = ctx.extra?.promptOps as TaskPromptOps
+        if (!ops) return yield* Effect.fail(new Error("TaskTool requires promptOps in ctx.extra"))
+        const models = ops.resolveModel
+          ? yield* availableModelAttempts(configuredAttempts, ops.resolveModel)
+          : configuredAttempts
         const metadata = {
           parentSessionId: ctx.sessionID,
           sessionId: nextSession.id,
@@ -455,9 +463,6 @@ export const TaskTool = Tool.define(
           },
           { durable: true },
         )
-
-        const ops = ctx.extra?.promptOps as TaskPromptOps
-        if (!ops) return yield* Effect.fail(new Error("TaskTool requires promptOps in ctx.extra"))
 
         const runTask = Effect.fn("TaskTool.runTask")(function* () {
           const parts = yield* ops.resolvePromptParts(params.prompt)

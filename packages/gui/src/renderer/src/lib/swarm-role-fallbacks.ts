@@ -1,4 +1,4 @@
-import type { OpencodeXSwarmFallbackModel, OpencodeXSwarmRoleInput } from "@opencode-ai/sdk/v2/client"
+import type { OpencodeXSwarmFallbackModel, OpencodeXSwarmRoleInput, Provider } from "@opencode-ai/sdk/v2/client"
 
 export const MAX_SWARM_ROLE_FALLBACKS = 4
 
@@ -22,6 +22,21 @@ export function canSelectSwarmRoleModel(
     ...(role.fallbackModels ?? []).filter((_, index) => index !== target),
   ]
   return !used.some((item) => swarmRoleModelKey(item) === swarmRoleModelKey(model))
+}
+
+export function swarmRoleFallbackCatalogIssue(
+  fallback: OpencodeXSwarmFallbackModel,
+  providers: readonly Provider[],
+  connectedProviderIDs: readonly string[],
+) {
+  const provider = providers.find((item) => item.id === fallback.providerID)
+  if (!provider) return "Provider is unavailable."
+  const model = provider.models[fallback.modelID]
+  if (!model) return "Model is unavailable."
+  if (fallback.variant && fallback.variant !== "default" && !model.variants?.[fallback.variant]) {
+    return `Variant ${fallback.variant} is unavailable.`
+  }
+  if (!connectedProviderIDs.includes(fallback.providerID)) return `${provider.name} is not connected.`
 }
 
 export function setSwarmRoleFallback(

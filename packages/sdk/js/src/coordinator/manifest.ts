@@ -25,6 +25,7 @@ import path from "node:path"
  */
 export const COORDINATOR_MANIFEST_VERSION = 2
 export const COORDINATOR_CLIENT_LEASE_VERSION = 1
+export const CANONICAL_AUTHORITY_RESERVATION_VERSION = 1
 /** Directory under the state root that holds manifests, leases, and startup logs. */
 export const COORDINATOR_DIRECTORY = "tui-coordinators"
 /** Version string used by builds that were not stamped by the release pipeline. */
@@ -61,6 +62,14 @@ export type CoordinatorClientLease = {
   updatedAt: number
 }
 
+/** A durable claim that a configured `serve` process is this database's authority. */
+export type CanonicalAuthorityReservation = {
+  version: typeof CANONICAL_AUTHORITY_RESERVATION_VERSION
+  key: string
+  database: string
+  createdAt: string
+}
+
 export type CoordinatorCredentials = Pick<CoordinatorManifest, "username" | "password">
 
 export type CoordinatorHealth = {
@@ -70,13 +79,7 @@ export type CoordinatorHealth = {
   coordinatorKey?: string
 }
 
-export type CoordinatorCompatibilityReason =
-  | "match"
-  | "skipped"
-  | "local"
-  | "legacy"
-  | "mismatch"
-  | "health_mismatch"
+export type CoordinatorCompatibilityReason = "match" | "skipped" | "local" | "legacy" | "mismatch" | "health_mismatch"
 
 export type CoordinatorCompatibility = {
   compatible: boolean
@@ -91,6 +94,10 @@ export function coordinatorRoot(stateRoot: string) {
 
 export function coordinatorManifestPath(stateRoot: string, key: string) {
   return path.join(coordinatorRoot(stateRoot), `${key}.json`)
+}
+
+export function canonicalAuthorityReservationPath(stateRoot: string, key: string) {
+  return path.join(coordinatorRoot(stateRoot), `${key}.canonical.json`)
 }
 
 export function coordinatorClientDir(stateRoot: string, key: string) {
@@ -164,6 +171,66 @@ export function parseCoordinatorManifest(raw: string): CoordinatorManifest {
   const parsed = JSON.parse(raw) as unknown
   if (!isCoordinatorManifest(parsed)) throw new Error("Invalid coordinator manifest")
   return parsed
+}
+
+export function isCanonicalAuthorityReservation(value: unknown): value is CanonicalAuthorityReservation {
+  if (typeof value !== "object" || value === null) return false
+  const reservation = value as Partial<CanonicalAuthorityReservation>
+  return (
+    reservation.version === CANONICAL_AUTHORITY_RESERVATION_VERSION &&
+    typeof reservation.key === "string" &&
+    typeof reservation.database === "string" &&
+    typeof reservation.createdAt === "string"
+  )
+}
+
+/**
+ * Writes the canonical claim before authority election. It is deliberately not
+ * removed on shutdown: fallbacks must keep waiting while the configured serve
+ * backend restarts, and corrupt state is treated as a claim rather than ignored.
+ */
+export async function reserveCanonicalAuthority(stateRoot: string, key: string, database: string) {
+  const root = coordinatorRoot(stateRoot)
+  await fs.mkdir(root, { recursive: true })
+  const file = canonicalAuthorityReservationPath(stateRoot, key)
+  const temporary = `${file}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`
+  try {
+    await fs.writeFile(
+      temporary,
+      JSON.stringify({
+        version: CANONICAL_AUTHORITY_RESERVATION_VERSION,
+        key,
+        database,
+        createdAt: new Date().toISOString(),
+      } satisfies CanonicalAuthorityReservation),
+      { mode: 0o600 },
+    )
+    await fs.rename(temporary, file)
+  } finally {
+    await fs.rm(temporary, { force: true }).catch(() => {})
+  }
+}
+
+/** Missing is the only state that permits a fallback coordinator to spawn. */
+export async function isCanonicalAuthorityReserved(stateRoot: string, key: string) {
+  try {
+    const raw = await fs.readFile(canonicalAuthorityReservationPath(stateRoot, key), "utf8")
+    JSON.parse(raw) as unknown
+    return true
+  } catch (error) {
+    return !isMissingCoordinatorFile(error)
+  }
+}
+
+/** Runs `wait` rather than `spawn` whenever a canonical serve claim exists. */
+export async function startFallbackCoordinator<T>(input: {
+  stateRoot: string
+  key: string
+  spawn: () => Promise<T>
+  wait: () => Promise<T>
+}) {
+  if (await isCanonicalAuthorityReserved(input.stateRoot, input.key)) return input.wait()
+  return input.spawn()
 }
 
 export function isCoordinatorClientLease(value: unknown): value is CoordinatorClientLease {
@@ -383,29 +450,31 @@ export function startCoordinatorClientLease(input: {
   let writing = Promise.resolve()
 
   const write = () => {
-    const next = writing.catch(() => {}).then(async () => {
-      if (disposed) return
-      await fs.mkdir(dir, { recursive: true })
-      if (disposed) return
-      const temporary = `${file}.${randomBytes(4).toString("hex")}.tmp`
-      try {
-        await fs.writeFile(
-          temporary,
-          JSON.stringify({
-            version: COORDINATOR_CLIENT_LEASE_VERSION,
-            key: input.key,
-            pid,
-            updatedAt: Date.now(),
-          } satisfies CoordinatorClientLease),
-          { mode: 0o600 },
-        )
+    const next = writing
+      .catch(() => {})
+      .then(async () => {
         if (disposed) return
-        await fs.rename(temporary, file)
-        if (disposed) await fs.rm(file, { force: true })
-      } finally {
-        await fs.rm(temporary, { force: true }).catch(() => {})
-      }
-    })
+        await fs.mkdir(dir, { recursive: true })
+        if (disposed) return
+        const temporary = `${file}.${randomBytes(4).toString("hex")}.tmp`
+        try {
+          await fs.writeFile(
+            temporary,
+            JSON.stringify({
+              version: COORDINATOR_CLIENT_LEASE_VERSION,
+              key: input.key,
+              pid,
+              updatedAt: Date.now(),
+            } satisfies CoordinatorClientLease),
+            { mode: 0o600 },
+          )
+          if (disposed) return
+          await fs.rename(temporary, file)
+          if (disposed) await fs.rm(file, { force: true })
+        } finally {
+          await fs.rm(temporary, { force: true }).catch(() => {})
+        }
+      })
     writing = next
     return next
   }

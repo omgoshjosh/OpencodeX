@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { Database } from "bun:sqlite"
 import fs from "fs/promises"
 import path from "path"
+import { startFallbackCoordinator } from "@opencode-ai/sdk/coordinator"
 import {
   coordinatorDatabaseIdentity,
   coordinatorClientDir,
@@ -14,6 +15,25 @@ import { discoverBackendDatabase } from "../../src/cli/cmd/tui/database-discover
 import { tmpdir } from "../fixture/fixture"
 
 describe("local coordinator database selection", () => {
+  test("does not spawn a TUI fallback while canonical authority is reserved", async () => {
+    await using tmp = await tmpdir()
+    const key = "canonical-authority"
+    await Bun.write(path.join(tmp.path, "tui-coordinators", `${key}.canonical.json`), "{")
+    let spawned = false
+    expect(
+      await startFallbackCoordinator({
+        stateRoot: tmp.path,
+        key,
+        spawn: async () => {
+          spawned = true
+          return "spawned"
+        },
+        wait: async () => "attached",
+      }),
+    ).toBe("attached")
+    expect(spawned).toBe(false)
+  })
+
   test("uses the GUI authority database across installation channels", async () => {
     await using tmp = await tmpdir()
     const database = path.join(tmp.path, "gui.db")
@@ -40,28 +60,34 @@ describe("local coordinator database selection", () => {
     const key = "gui-authority"
     const clients = path.join(tmp.path, `${key}.clients`)
     await Bun.write(database, "")
-    await Bun.write(path.join(clients, `${process.pid}.gui.json`), JSON.stringify({
-      version: 1,
-      key,
-      pid: process.pid,
-      updatedAt: Date.now(),
-    }))
+    await Bun.write(
+      path.join(clients, `${process.pid}.gui.json`),
+      JSON.stringify({
+        version: 1,
+        key,
+        pid: process.pid,
+        updatedAt: Date.now(),
+      }),
+    )
     const server = Bun.serve({
       port: 0,
       fetch: () => Response.json({ healthy: true, coordinatorKey: key }),
     })
-    await Bun.write(path.join(tmp.path, `${key}.json`), JSON.stringify({
-      version: 2,
-      key,
-      directory: tmp.path,
-      database,
-      pid: process.pid,
-      url: server.url.href,
-      username: "gui",
-      password: "secret",
-      token: "token",
-      createdAt: new Date().toISOString(),
-    }))
+    await Bun.write(
+      path.join(tmp.path, `${key}.json`),
+      JSON.stringify({
+        version: 2,
+        key,
+        directory: tmp.path,
+        database,
+        pid: process.pid,
+        url: server.url.href,
+        username: "gui",
+        password: "secret",
+        token: "token",
+        createdAt: new Date().toISOString(),
+      }),
+    )
 
     try {
       expect(await discoverActiveGuiCoordinatorDatabase(tmp.path)).toBe(coordinatorDatabaseIdentity(database))
@@ -75,28 +101,34 @@ describe("local coordinator database selection", () => {
     const database = path.join(tmp.path, "gui.db")
     const key = "gui-authority"
     await Bun.write(database, "")
-    await Bun.write(path.join(tmp.path, `${key}.clients`, `${process.pid}.gui.json`), JSON.stringify({
-      version: 1,
-      key,
-      pid: process.pid,
-      updatedAt: Date.now(),
-    }))
+    await Bun.write(
+      path.join(tmp.path, `${key}.clients`, `${process.pid}.gui.json`),
+      JSON.stringify({
+        version: 1,
+        key,
+        pid: process.pid,
+        updatedAt: Date.now(),
+      }),
+    )
     const server = Bun.serve({
       port: 0,
       fetch: () => Response.json({ healthy: true, coordinatorKey: "other-authority" }),
     })
-    await Bun.write(path.join(tmp.path, `${key}.json`), JSON.stringify({
-      version: 2,
-      key,
-      directory: tmp.path,
-      database,
-      pid: process.pid,
-      url: server.url.href,
-      username: "gui",
-      password: "secret",
-      token: "token",
-      createdAt: new Date().toISOString(),
-    }))
+    await Bun.write(
+      path.join(tmp.path, `${key}.json`),
+      JSON.stringify({
+        version: 2,
+        key,
+        directory: tmp.path,
+        database,
+        pid: process.pid,
+        url: server.url.href,
+        username: "gui",
+        password: "secret",
+        token: "token",
+        createdAt: new Date().toISOString(),
+      }),
+    )
 
     try {
       expect(await discoverActiveGuiCoordinatorDatabase(tmp.path)).toBeUndefined()
@@ -113,9 +145,7 @@ describe("local coordinator database selection", () => {
     await Bun.write(file, "{")
 
     try {
-      expect(await readActiveCoordinatorClientLeases(key)).toEqual([
-        expect.objectContaining({ key, pid: process.pid }),
-      ])
+      expect(await readActiveCoordinatorClientLeases(key)).toEqual([expect.objectContaining({ key, pid: process.pid })])
       expect(await Bun.file(file).exists()).toBe(true)
     } finally {
       await fs.rm(clients, { force: true, recursive: true })

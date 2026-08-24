@@ -111,6 +111,7 @@ function startCoordinator(
           hostname: "127.0.0.1",
           port: 0,
           mdns: false,
+          prefer4096: false,
           cors: [],
         }),
       )

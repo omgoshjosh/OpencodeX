@@ -21,6 +21,7 @@ import {
   readCoordinatorManifestToken,
   removeCoordinatorManifest as removeCoordinatorManifestIn,
   startCoordinatorClientLease as startCoordinatorClientLeaseIn,
+  startFallbackCoordinator,
   writeCoordinatorManifest as writeCoordinatorManifestIn,
   type CoordinatorClientLease,
   type CoordinatorManifest,
@@ -131,7 +132,10 @@ async function readClientLease(file: string) {
  * same database.
  */
 export class CoordinatorVersionMismatchError extends Error {
-  constructor(readonly manifest: TuiCoordinatorManifest, message: string) {
+  constructor(
+    readonly manifest: TuiCoordinatorManifest,
+    message: string,
+  ) {
     super(message)
     this.name = "CoordinatorVersionMismatchError"
   }
@@ -305,8 +309,15 @@ export async function resolveLocalCoordinator(directory: string) {
   return await withCoordinatorStartupLock(key, async () => {
     const existing = await readActiveCoordinator(key, database)
     if (existing) return existing
-    spawnCoordinator(directory, key, database)
-    return await waitForCoordinator(key, database)
+    return startFallbackCoordinator({
+      stateRoot: STATE_ROOT,
+      key,
+      wait: () => waitForCoordinator(key, database),
+      spawn: async () => {
+        spawnCoordinator(directory, key, database)
+        return waitForCoordinator(key, database)
+      },
+    })
   })
 }
 
@@ -335,12 +346,7 @@ export async function preferredCoordinatorDatabase() {
   const active = await discoverActiveGuiCoordinatorDatabase()
   const discovered =
     active || persisted ? undefined : coordinatorDatabaseIdentity((await discoverBackendDatabase()) ?? fallback)
-  const database = selectBackendAuthority(
-    active,
-    persisted,
-    discovered,
-    fallback,
-  )
+  const database = selectBackendAuthority(active, persisted, discovered, fallback)
   if (database !== fallback && database !== persisted) await rememberBackendAuthority(database).catch(() => undefined)
   return database
 }
@@ -401,10 +407,6 @@ async function hasActiveGuiClient(key: string, root: string) {
 async function rememberBackendAuthority(database: string, file = BACKEND_AUTHORITY) {
   await fs.mkdir(path.dirname(file), { recursive: true })
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`
-  await fs.writeFile(
-    tmp,
-    JSON.stringify({ version: 1, database, updatedAt: Date.now() }, null, 2),
-    { mode: 0o600 },
-  )
+  await fs.writeFile(tmp, JSON.stringify({ version: 1, database, updatedAt: Date.now() }, null, 2), { mode: 0o600 })
   await fs.rename(tmp, file)
 }

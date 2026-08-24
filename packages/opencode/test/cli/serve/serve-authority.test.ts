@@ -14,17 +14,15 @@ import os from "node:os"
 import path from "node:path"
 import {
   checkCoordinatorCompatibility,
+  canonicalAuthorityReservationPath,
   coordinatorHeaders,
   fetchCoordinatorHealth,
   isCoordinatorManifest,
+  isCanonicalAuthorityReserved,
   parseCoordinatorManifest,
 } from "@opencode-ai/sdk/coordinator"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
-import {
-  manifestURLFor,
-  ServeAuthorityNetworkError,
-  validateServeAuthorityNetwork,
-} from "@/cli/cmd/serve-authority"
+import { manifestURLFor, ServeAuthorityNetworkError, validateServeAuthorityNetwork } from "@/cli/cmd/serve-authority"
 import { cliIt } from "../../lib/cli-process"
 
 const HealthIdentity = Schema.Struct({
@@ -42,7 +40,7 @@ function coordinatorRoot(home: string) {
 
 async function readServeManifest(home: string) {
   const root = coordinatorRoot(home)
-  const files = (await fs.readdir(root)).filter((file) => file.endsWith(".json"))
+  const files = (await fs.readdir(root)).filter((file) => file.endsWith(".json") && !file.endsWith(".canonical.json"))
   expect(files.length, `expected one manifest in ${root}, got ${files.join(", ")}`).toBe(1)
   return parseCoordinatorManifest(await fs.readFile(path.join(root, files[0]), "utf8"))
 }
@@ -67,6 +65,7 @@ describe("opencode serve authority (subprocess)", () => {
             OPENCODE_RUN_ID: "serve-authority-wildcard",
             OPENCODE_SERVER_PASSWORD: "serve-test-password",
             OPENCODE_SERVER_ALLOW_INSECURE_LAN: "1",
+            OPENCODE_CANONICAL_AUTHORITY: "1",
           },
         })
         const manifest = yield* Effect.promise(() => readServeManifest(home))
@@ -113,14 +112,24 @@ describe("opencode serve authority (subprocess)", () => {
         yield* Effect.sync(() => first.kill())
         yield* Effect.promise(() => first.exited)
         const survived = yield* Effect.promise(() =>
-          fs
-            .access(path.join(coordinatorRoot(home), `${manifest.key}.json`))
-            .then(
-              () => true as const,
-              () => false as const,
-            ),
+          fs.access(path.join(coordinatorRoot(home), `${manifest.key}.json`)).then(
+            () => true as const,
+            () => false as const,
+          ),
         )
         if (process.platform !== "win32") expect(survived).toBe(false)
+        expect(
+          yield* Effect.promise(() =>
+            isCanonicalAuthorityReserved(path.join(home, ".local/state/opencode"), manifest.key),
+          ),
+        ).toBe(true)
+        expect(
+          yield* Effect.promise(() =>
+            Bun.file(
+              canonicalAuthorityReservationPath(path.join(home, ".local/state/opencode"), manifest.key),
+            ).exists(),
+          ),
+        ).toBe(true)
 
         // Handoff: a successor on the same database takes over cleanly.
         yield* opencode.serve({
@@ -213,10 +222,7 @@ describe("opencode serve authority (subprocess)", () => {
         // the file survives, so no live authority is actually serving.
         const stale = { ...original, pid: 9_999_999 }
         yield* Effect.promise(() =>
-          fs.writeFile(
-            path.join(coordinatorRoot(home), `${original.key}.json`),
-            JSON.stringify(stale),
-          ),
+          fs.writeFile(path.join(coordinatorRoot(home), `${original.key}.json`), JSON.stringify(stale)),
         )
 
         yield* opencode.serve()

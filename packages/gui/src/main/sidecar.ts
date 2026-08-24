@@ -12,6 +12,7 @@ import {
   readCoordinatorManifestToken,
   removeCoordinatorManifest as removeCoordinatorManifestIn,
   startCoordinatorClientLease as startCoordinatorClientLeaseIn,
+  startFallbackCoordinator,
 } from "@opencode-ai/sdk/coordinator"
 import {
   COORDINATOR_STATE_ROOT,
@@ -109,8 +110,7 @@ export function startSidecar(signal?: AbortSignal) {
         throw startupStoppedError()
       }
       state.lease = lease
-      if (state.child?.process.pid === manifest.pid && process.env.OPENCODEX_GUI_SMOKE !== "1")
-        state.child = undefined
+      if (state.child?.process.pid === manifest.pid && process.env.OPENCODEX_GUI_SMOKE !== "1") state.child = undefined
       const connection = connectionFromManifest(manifest, directory)
       state.connection = connection
       coordinatorMismatchApproval.clear()
@@ -159,8 +159,17 @@ async function coordinatorConnection(directory: string, signal: AbortSignal) {
   const existing = await activeCoordinator(key, database)
   throwIfStartupStopped(signal)
   if (existing) return existing
-  throwIfStartupStopped(signal)
-  return spawnCoordinator(directory, key, database, signal)
+  // `state.startup` serializes GUI startup; a durable canonical claim means a
+  // restarted serve backend, not permission for this fallback to take over.
+  return startFallbackCoordinator({
+    stateRoot: COORDINATOR_STATE_ROOT,
+    key,
+    wait: () => waitForReservedCoordinator(directory, key, database, signal),
+    spawn: async () => {
+      throwIfStartupStopped(signal)
+      return spawnCoordinator(directory, key, database, signal)
+    },
+  })
 }
 
 function connectionFromManifest(manifest: CoordinatorManifest, directory: string) {
@@ -315,7 +324,9 @@ async function waitForCoordinator(directory: string, child: ChildProcess, starte
     failure = startError(error, started)
   })
   child.once("exit", (code, signal) => {
-    failure = new Error(`OpencodeX coordinator exited before startup (${signal ?? code ?? "unknown"})${startupLogDetails(started)}`)
+    failure = new Error(
+      `OpencodeX coordinator exited before startup (${signal ?? code ?? "unknown"})${startupLogDetails(started)}`,
+    )
   })
   while (Date.now() - startedAt < START_TIMEOUT) {
     throwIfStartupStopped(signal)
@@ -326,6 +337,18 @@ async function waitForCoordinator(directory: string, child: ChildProcess, starte
     await startupDelay(signal)
   }
   throw new Error(`Timed out waiting for OpencodeX coordinator to start${startupLogDetails(started)}`)
+}
+
+async function waitForReservedCoordinator(directory: string, key: string, database: string, signal: AbortSignal) {
+  const startedAt = Date.now()
+  while (Date.now() - startedAt < START_TIMEOUT) {
+    throwIfStartupStopped(signal)
+    const manifest = await activeCoordinator(key, database)
+    throwIfStartupStopped(signal)
+    if (manifest) return manifest
+    await startupDelay(signal)
+  }
+  throw new Error(`Timed out waiting for canonical OpencodeX coordinator for ${directory}`)
 }
 
 function throwIfStartupStopped(signal: AbortSignal) {

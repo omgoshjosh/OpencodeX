@@ -2003,7 +2003,8 @@ export const layer = Layer.effect(
       // Rewrites the ids in place instead of recursing so the rest of the
       // resolution (local-provider refresh, suggestions) applies to the target.
       if (isSwarmProvider(providerID)) {
-        if (!s.providers[SWARM_PROVIDER_ID]?.models[modelID]) yield* refreshSwarmProvider(s)
+        // Route edits must affect the next turn without requiring a provider-list read.
+        yield* refreshSwarmProvider(s)
         const route = swarmModelRoute(s.providers[SWARM_PROVIDER_ID]?.models[modelID])
         if (!route || isSwarmProvider(route.providerID)) {
           return yield* new ModelNotFoundError({ providerID, modelID })

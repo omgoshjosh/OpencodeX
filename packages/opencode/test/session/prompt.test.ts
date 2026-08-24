@@ -3353,6 +3353,16 @@ it.instance("swarm models run in-session on the orchestrator's model with a team
       .get()
       .pipe(Effect.orDie)
     expect(stored?.model).toMatchObject({ providerID: "swarm", id: "swm_test" })
+
+    yield* db
+      .update(OpencodeXSwarmRoleTable)
+      .set({ model_id: "changed-model" })
+      .where(eq(OpencodeXSwarmRoleTable.id, "swr_orch"))
+      .run()
+    const error = yield* provider
+      .getModel(ProviderV2.ID.make("swarm"), ProviderV2.ModelID.make("swm_test"))
+      .pipe(Effect.flip)
+    expect(error).toMatchObject({ providerID: "test", modelID: "changed-model" })
   }),
 )
 

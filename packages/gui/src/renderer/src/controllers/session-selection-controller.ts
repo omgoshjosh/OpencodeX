@@ -2,11 +2,7 @@ import { createEffect, createMemo, createSignal, untrack } from "solid-js"
 import type { createAuthoritativeStateController } from "./authoritative-state-controller"
 import type { createNavigationController } from "./navigation-controller"
 import type { createSessionState } from "./session-state"
-import {
-  emptySessionOrderState,
-  reconcileSessionOrderState,
-  tuiSidebarSessions,
-} from "../lib/app-session-lists"
+import { emptySessionOrderState, reconcileSessionOrderState, tuiSidebarSessions } from "../lib/app-session-lists"
 import { firstAvailableModel, parseModelValue, sessionModelDefaults } from "../lib/model-selection"
 import { projectNameForID, projectNameForSession } from "../lib/project-name"
 import {
@@ -110,17 +106,18 @@ export function createSessionSelectionController(input: {
     const route = input.navigation.route()
     const ready = authoritativeReady()
     if (route.name !== "session" || !input.authoritative.client()) return
-    untrack(() =>
-      void syncColdLinkedSession({
-        ready,
-        sessionID: route.sessionID,
-        ensureSessionCards: input.authoritative.ensureSessionCards,
-        syncSession: input.authoritative.syncSession,
-        isCurrent: () => {
-          const current = input.navigation.route()
-          return current.name === "session" && current.sessionID === route.sessionID
-        },
-      }).catch((cause) => console.error(cause)),
+    untrack(
+      () =>
+        void syncColdLinkedSession({
+          ready,
+          sessionID: route.sessionID,
+          ensureSessionCards: input.authoritative.ensureSessionCards,
+          syncSession: input.authoritative.syncSession,
+          isCurrent: () => {
+            const current = input.navigation.route()
+            return current.name === "session" && current.sessionID === route.sessionID
+          },
+        }).catch((cause) => console.error(cause)),
     )
   })
 
@@ -149,7 +146,8 @@ export function createSessionSelectionController(input: {
   createEffect(() => {
     if (input.state.selectedModel()) return
     const providers = input.authoritative.snapshot()?.providers ?? []
-    const model = input.state.recentModels().find((item) => modelAvailable(item, providers)) ?? firstAvailableModel(providers)
+    const model =
+      input.state.recentModels().find((item) => modelAvailable(item, providers)) ?? firstAvailableModel(providers)
     if (model) input.state.setSelectedModel(model)
   })
 

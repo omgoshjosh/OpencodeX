@@ -155,10 +155,7 @@ export function layer(options: Options = {}) {
           return
         }
         if (job.cancelRequestedAt) {
-          yield* jobs.settle(
-            { jobID, owner: current.owner, outcome: { status: "cancelled" } },
-            current.handler.settled,
-          )
+          yield* jobs.settle({ jobID, owner: current.owner, outcome: { status: "cancelled" } }, current.handler.settled)
           return
         }
         const failed = yield* jobs.fail({

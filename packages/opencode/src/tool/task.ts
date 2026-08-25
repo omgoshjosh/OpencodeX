@@ -37,9 +37,11 @@ export interface TaskPromptOps {
   resolvePromptParts(template: string): Effect.Effect<SessionPrompt.PromptInput["parts"]>
   prompt(input: SessionPrompt.PromptInput): Effect.Effect<SessionLegacy.WithParts>
   loop(input: SessionPrompt.LoopInput): Effect.Effect<SessionLegacy.WithParts>
-  resolveModel?: (
-    model: { providerID: ProviderV2.ID; modelID: ProviderV2.ModelID; variant?: string },
-  ) => Effect.Effect<{ variants?: Record<string, unknown> } | undefined>
+  resolveModel?: (model: {
+    providerID: ProviderV2.ID
+    modelID: ProviderV2.ModelID
+    variant?: string
+  }) => Effect.Effect<{ variants?: Record<string, unknown> } | undefined>
 }
 
 const id = "task"

@@ -19,7 +19,7 @@
   color: var(--ds-text);
   font-size: 16px;
   font-weight: 600;
-  letter-spacing: -.01em;
+  letter-spacing: -0.01em;
   line-height: 1.4;
 }
 
@@ -31,9 +31,9 @@
   justify-items: start;
   gap: var(--ds-space-2);
   padding: var(--ds-space-2) var(--ds-space-3);
-  border-left: 2px solid color-mix(in srgb,var(--ds-info) 45%,transparent);
+  border-left: 2px solid color-mix(in srgb, var(--ds-info) 45%, transparent);
   border-radius: 0 var(--ds-radius-control) var(--ds-radius-control) 0;
-  background: color-mix(in srgb,var(--ds-info) 4%,transparent);
+  background: color-mix(in srgb, var(--ds-info) 4%, transparent);
   color: var(--ds-text-muted);
   font-size: 12.5px;
 }
@@ -65,6 +65,7 @@
 }
 
 .question-option {
+  --question-option-hover-shadow: 0 2px 8px color-mix(in srgb, var(--ds-canvas) 40%, transparent);
   height: auto;
   min-height: 48px;
   align-items: center;
@@ -73,11 +74,15 @@
   padding: var(--ds-space-2) var(--ds-space-3);
   border: 1px solid var(--ds-border-subtle);
   border-radius: var(--ds-radius-control);
-  background: color-mix(in srgb,var(--ds-surface) 60%,transparent);
+  background: color-mix(in srgb, var(--ds-surface) 60%, transparent);
   text-align: left;
   white-space: normal;
-  transition: border-color var(--ds-motion-hover) ease, background var(--ds-motion-hover) ease, transform var(--ds-motion-hover) ease, box-shadow var(--ds-motion-hover) ease;
-  animation: question-option-in .28s cubic-bezier(.16,1,.3,1) both;
+  transition:
+    border-color var(--ds-motion-hover) ease,
+    background var(--ds-motion-hover) ease,
+    transform var(--ds-motion-hover) ease,
+    box-shadow var(--ds-motion-hover) ease;
+  animation: question-option-in 0.28s cubic-bezier(0.16, 1, 0.3, 1) both;
   animation-delay: calc(var(--option-index, 0) * 20ms);
 }
 
@@ -85,16 +90,16 @@
   border-color: var(--ds-border-strong);
   background: var(--ds-surface-raised);
   transform: translateY(-1px);
-  box-shadow: 0 2px 8px color-mix(in srgb,var(--ds-canvas) 40%,transparent);
+  box-shadow: var(--question-option-hover-shadow);
 }
 
 .question-option.is-selected {
   border-color: var(--ds-control-accent);
-  background: color-mix(in srgb,var(--ds-control-accent) 8%,transparent);
+  background: color-mix(in srgb, var(--ds-control-accent) 8%, transparent);
 }
 
 .question-option.is-pulsing {
-  animation: question-option-pulse .2s ease;
+  animation: question-option-pulse 0.2s ease;
 }
 
 .question-option-check {
@@ -104,7 +109,9 @@
   flex: none;
   border: 1.5px solid var(--ds-border);
   border-radius: 50%;
-  transition: border-color var(--ds-motion-hover) ease, background var(--ds-motion-hover) ease;
+  transition:
+    border-color var(--ds-motion-hover) ease,
+    background var(--ds-motion-hover) ease;
 }
 
 .question-option.is-selected .question-option-check {
@@ -118,7 +125,7 @@
   justify-content: flex-end;
 }
 
-.question-option>kbd {
+.question-option > kbd {
   display: inline-grid;
   flex: none;
   width: 22px;
@@ -134,15 +141,18 @@
   font-weight: 600;
   line-height: 1;
   text-align: center;
-  transition: border-color var(--ds-motion-hover) ease, color var(--ds-motion-hover) ease, background var(--ds-motion-hover) ease;
+  transition:
+    border-color var(--ds-motion-hover) ease,
+    color var(--ds-motion-hover) ease,
+    background var(--ds-motion-hover) ease;
 }
 
-.question-option:hover:not(:disabled)>kbd {
+.question-option:hover:not(:disabled) > kbd {
   border-color: var(--ds-border-strong);
   color: var(--ds-text);
 }
 
-.question-option.is-selected>kbd {
+.question-option.is-selected > kbd {
   border-color: var(--ds-control-accent);
   color: var(--ds-control-accent-text);
   background: var(--ds-control-accent);
@@ -185,9 +195,9 @@
 
 .safety-diff-dialog {
   display: grid;
-  grid-template-rows: auto minmax(0,1fr);
-  width: min(1080px,calc(100vw - 48px));
-  max-height: min(820px,calc(100vh - 48px));
+  grid-template-rows: auto minmax(0, 1fr);
+  width: min(1080px, calc(100vw - 48px));
+  max-height: min(820px, calc(100vh - 48px));
   overflow: hidden;
   border: 1px solid var(--ds-border);
   border-radius: var(--ds-radius-overlay);
@@ -196,7 +206,7 @@
   box-shadow: var(--ds-shadow-overlay);
 }
 
-.safety-diff-dialog>header {
+.safety-diff-dialog > header {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
@@ -241,7 +251,7 @@
 
 @keyframes question-option-pulse {
   0% {
-    box-shadow: 0 0 0 0 color-mix(in srgb,var(--ds-control-accent) 45%,transparent);
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--ds-control-accent) 45%, transparent);
   }
   100% {
     box-shadow: 0 0 0 6px transparent;
@@ -251,7 +261,7 @@
 @keyframes safety-dock-in {
   from {
     opacity: 0;
-    transform: translateY(14px) scale(.985);
+    transform: translateY(14px) scale(0.985);
   }
   to {
     opacity: 1;
@@ -263,16 +273,20 @@
    reader's eyes are on the transcript. Settles into the resting shadow. */
 @keyframes safety-card-attention {
   from {
-    box-shadow: 0 0 0 6px color-mix(in srgb,var(--ui-tone) 25%,transparent),var(--ds-shadow-overlay);
+    box-shadow:
+      0 0 0 6px color-mix(in srgb, var(--ui-tone) 25%, transparent),
+      var(--ds-shadow-overlay);
   }
   to {
-    box-shadow: 0 0 0 0 transparent,var(--ds-shadow-overlay);
+    box-shadow:
+      0 0 0 0 transparent,
+      var(--ds-shadow-overlay);
   }
 }
 
-@media (max-width:720px) {
+@media (max-width: 720px) {
   .safety-card {
-    max-height: min(68vh,560px);
+    max-height: min(68vh, 560px);
   }
 
   .safety-card-header,
@@ -295,9 +309,9 @@
     min-width: 42px;
   }
 
-  .permission-summary>div,
+  .permission-summary > div,
   .permission-patterns {
-    grid-template-columns: minmax(0,1fr);
+    grid-template-columns: minmax(0, 1fr);
     gap: var(--ds-space-1);
   }
 

@@ -49,6 +49,7 @@ export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const background = yield* BackgroundJob.Service
+    const sessions = yield* Session.Service
     const status = yield* SessionStatus.Service
     const { db } = yield* Database.Service
     const processRunID = ensureRunID()
@@ -367,6 +368,37 @@ export const layer = Layer.effect(
         )
         .pipe(Effect.orDie)
 
+      // `cancel` settles commands durably even when their owner has already
+      // died, so repair their unfinished tool parts at this same boundary.
+      const cancelled = yield* db
+        .select({
+          id: SessionCommandTable.id,
+          messageID: SessionCommandTable.message_id,
+          generation: SessionCommandTable.claim_generation,
+        })
+        .from(SessionCommandTable)
+        .where(
+          and(
+            eq(SessionCommandTable.session_id, sessionID),
+            eq(SessionCommandTable.status, "cancelled"),
+            eq(SessionCommandTable.completed_at, now),
+          ),
+        )
+        .all()
+        .pipe(Effect.orDie)
+      yield* Effect.forEach(
+        cancelled,
+        (command) =>
+          sessions.reconcileToolParts({
+            sessionID,
+            messageID: command.messageID,
+            commandID: command.id,
+            generation: command.generation,
+            reason: "command cancelled before tool completion",
+          }),
+        { concurrency: 1, discard: true },
+      )
+
       const data = yield* InstanceState.get(state)
       const existing = data.runners.get(sessionID)
       if (
@@ -492,6 +524,7 @@ export const layer = Layer.effect(
 export const defaultLayer = layer.pipe(
   Layer.provide(BackgroundJob.defaultLayer),
   Layer.provide(Database.defaultLayer),
+  Layer.provide(Session.defaultLayer),
   Layer.provide(SessionStatus.defaultLayer),
 )
 

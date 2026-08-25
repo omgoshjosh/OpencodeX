@@ -6,7 +6,7 @@ import { NamedError } from "@opencode-ai/core/util/error"
 import { SessionCommandTable, SessionExecutionTable } from "@opencode-ai/core/session/sql"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { InstanceState } from "@/effect/instance-state"
-import { SessionID } from "./schema"
+import { MessageID, SessionID } from "./schema"
 import type { LoopInput } from "./prompt-schema"
 import { SessionPromptRecovery } from "./prompt-recovery"
 import { ensureRunID } from "@opencode-ai/core/util/opencode-process"
@@ -19,6 +19,13 @@ export interface Deps {
   readonly events: Context.Service.Shape<typeof EventV2Bridge.Service>
   readonly scope: Scope.Scope
   readonly loop: (input: LoopInput) => Effect.Effect<SessionLegacy.WithParts>
+  readonly reconcileToolParts?: (input: {
+    sessionID: SessionID
+    messageID: MessageID
+    commandID: string
+    generation: number
+    reason: string
+  }) => Effect.Effect<number>
   readonly commandLeaseMillis?: number
   readonly clock?: () => number
   readonly admit?: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E | DeploymentDrainError, R>
@@ -225,6 +232,19 @@ export function make(deps: Deps) {
             .get()
             .pipe(Effect.orDie)
           if (!admitted) return
+          // A recovered command starts a new claim generation. Before it can
+          // execute, durably close any unfinished parts from the old owner.
+          // The owner/generation admission above prevents stale runners from
+          // reconciling a newer generation's live execution.
+          if (deps.reconcileToolParts) {
+            yield* deps.reconcileToolParts({
+              sessionID: command.session_id,
+              messageID: command.message_id,
+              commandID,
+              generation: command.claim_generation,
+              reason: "command claim resumed or settled before tool completion",
+            })
+          }
           return yield* loop({ sessionID: command.session_id, messageID: command.message_id })
         }),
         Deferred.await(ownershipLost).pipe(Effect.andThen(Effect.interrupt)),
@@ -238,6 +258,29 @@ export function make(deps: Deps) {
             exit.value.info.error.name !== "MessageAbortedError"
           ? JSON.stringify(exit.value.info.error)
           : undefined
+      const owned = yield* db
+        .select({ id: SessionCommandTable.id })
+        .from(SessionCommandTable)
+        .where(
+          and(
+            eq(SessionCommandTable.id, commandID),
+            eq(SessionCommandTable.status, "running"),
+            eq(SessionCommandTable.owner_id, commandOwner),
+            eq(SessionCommandTable.claim_generation, command.claim_generation),
+          ),
+        )
+        .get()
+        .pipe(Effect.orDie)
+      if (!owned) return
+      if (deps.reconcileToolParts) {
+        yield* deps.reconcileToolParts({
+          sessionID: command.session_id,
+          messageID: command.message_id,
+          commandID,
+          generation: command.claim_generation,
+          reason: error ? "command failed before tool completion" : "command settled before tool completion",
+        })
+      }
       if (!error) {
         yield* db
           .update(SessionCommandTable)

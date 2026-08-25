@@ -551,6 +551,14 @@ export interface Interface {
     field: string
     delta: string
   }) => Effect.Effect<void>
+  /** Durably settles only unfinished tool parts belonging to a command turn. */
+  readonly reconcileToolParts: (input: {
+    sessionID: SessionID
+    messageID: MessageID
+    commandID: string
+    generation: number
+    reason: string
+  }) => Effect.Effect<number>
   /** Finds the first message matching the predicate, searching newest-first. */
   readonly findMessage: (
     sessionID: SessionID,
@@ -845,6 +853,60 @@ export const layer: Layer.Layer<
         yield* events.publish(SessionLegacy.Event.PartUpdated, data, { location })
         return part
       }).pipe(Effect.withSpan("Session.updatePart"))
+
+    const reconcileToolParts: Interface["reconcileToolParts"] = Effect.fn("Session.reconcileToolParts")(function* (input) {
+      const allMessages = yield* messages({ sessionID: input.sessionID }).pipe(Effect.orDie)
+      const turn = new Set<MessageID>([input.messageID])
+      let changed = true
+      while (changed) {
+        changed = false
+        for (const message of allMessages) {
+          if (
+            message.info.role !== "assistant" ||
+            !message.info.parentID ||
+            !turn.has(message.info.parentID) ||
+            turn.has(message.info.id)
+          )
+            continue
+          turn.add(message.info.id)
+          changed = true
+        }
+      }
+      const orphaned = allMessages.flatMap((message) =>
+        !turn.has(message.info.id)
+          ? []
+          : message.parts.filter(
+              (part): part is SessionLegacy.ToolPart =>
+                part.type === "tool" && (part.state.status === "pending" || part.state.status === "running"),
+            ),
+      )
+      const end = Date.now()
+      yield* Effect.forEach(
+        orphaned,
+        (part) =>
+          updatePart({
+            ...part,
+            state: {
+              status: "error",
+              input: part.state.input,
+              error: "Tool execution interrupted before turn settlement",
+              metadata: {
+                ...("metadata" in part.state ? part.state.metadata : {}),
+                interrupted: true,
+                reconciledAt: end,
+                reconciliation: {
+                  commandID: input.commandID,
+                  generation: input.generation,
+                  reason: input.reason,
+                },
+              },
+              time: { start: part.state.status === "running" ? part.state.time.start : end, end },
+            },
+          } satisfies SessionLegacy.ToolPart),
+        { concurrency: 1, discard: true },
+      )
+      return orphaned.length
+    })
 
     const getPart: Interface["getPart"] = Effect.fn("Session.getPart")(function* (input) {
       const row = yield* db
@@ -1231,6 +1293,7 @@ export const layer: Layer.Layer<
       updatePart,
       getPart,
       updatePartDelta,
+      reconcileToolParts,
       findMessage,
     })
   }),

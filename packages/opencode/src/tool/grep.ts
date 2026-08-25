@@ -8,7 +8,7 @@ import { assertExternalDirectoryEffect } from "./external-directory"
 import DESCRIPTION from "./grep.txt"
 import * as Tool from "./tool"
 import { Reference } from "@/reference/reference"
-import { assertScanRoot, SCAN_TIMEOUT } from "./scan-bounds"
+import { assertScanRoot, SCAN_TIMEOUT_MS } from "./scan-bounds"
 
 const MAX_LINE_LENGTH = 2000
 
@@ -74,22 +74,16 @@ export const GrepTool = Tool.define(
           })
 
           const limit = 100
-          const result = yield* rg
-            .search({
-              cwd,
-              pattern: params.pattern,
-              glob: params.include ? [params.include] : undefined,
-              file,
-              limit,
-              signal: ctx.abort,
-            })
-            .pipe(
-              Effect.timeoutFail({
-                duration: SCAN_TIMEOUT,
-                onTimeout: () => new Error(`Grep scan timed out after ${SCAN_TIMEOUT}. Use a more specific path or pattern.`),
-              }),
-            )
-          if (result.items.length === 0) return empty
+          const result = yield* rg.search({
+            cwd,
+            pattern: params.pattern,
+            glob: params.include ? [params.include] : undefined,
+            file,
+            limit,
+            timeout: SCAN_TIMEOUT_MS,
+            signal: ctx.abort,
+          })
+          if (result.items.length === 0 && !result.truncated) return empty
 
           const rows = result.items.map((item) => ({
             path: AppFileSystem.resolve(
@@ -123,12 +117,25 @@ export const GrepTool = Tool.define(
 
           matches.sort((a, b) => b.mtime - a.mtime)
 
-          const truncated = matches.length > limit
-          const final = truncated ? matches.slice(0, limit) : matches
-          if (final.length === 0) return empty
+          const truncated = result.truncated || matches.length > limit
+          const final = matches.slice(0, limit)
+          if (final.length === 0) {
+            return {
+              title: params.pattern,
+              metadata: {
+                matches: 0,
+                truncated: true,
+                truncation: result.truncation,
+                bytes: result.bytes,
+              },
+              output: `(Results truncated by ${result.truncation}. Consider using a more specific path or pattern.)`,
+            }
+          }
 
           const total = matches.length
-          const output = [`Found ${total} matches${truncated ? ` (showing first ${limit})` : ""}`]
+          const output = [
+            `Found ${truncated ? "at least " : ""}${total} matches${truncated ? ` (showing first ${limit})` : ""}`,
+          ]
 
           let current = ""
           for (const match of final) {
@@ -145,7 +152,7 @@ export const GrepTool = Tool.define(
           if (truncated) {
             output.push("")
             output.push(
-              `(Results truncated: showing ${limit} of ${total} matches (${total - limit} hidden). Consider using a more specific path or pattern.)`,
+              `(Results truncated by ${result.truncation ?? "output limit"}. Consider using a more specific path or pattern.)`,
             )
           }
 
@@ -159,6 +166,8 @@ export const GrepTool = Tool.define(
             metadata: {
               matches: total,
               truncated,
+              truncation: result.truncation,
+              bytes: result.bytes,
             },
             output: output.join("\n"),
           }

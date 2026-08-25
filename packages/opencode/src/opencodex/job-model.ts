@@ -6,8 +6,8 @@ const decodeMetadata = Schema.decodeUnknownOption(Schema.fromJsonString(Metadata
 const decodeFailure = Schema.decodeUnknownOption(Failure)
 
 export const transitions: Record<Status, Status[]> = {
-  queued: ["claimed", "cancelled"],
-  claimed: ["queued", "running", "cancelled", "interrupted"],
+  queued: ["claimed", "failed", "cancelled"],
+  claimed: ["queued", "running", "failed", "cancelled", "interrupted"],
   running: ["succeeded", "failed", "cancelled", "interrupted"],
   succeeded: [],
   failed: ["queued", "cancelled"],

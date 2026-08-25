@@ -72,6 +72,10 @@ export function layer(options: Options = {}) {
       ) {
         const latest = yield* jobs.get(job.id).pipe(Effect.option)
         if (Option.isNone(latest) || latest.value.status === "cancelled") return
+        if (latest.value.timeoutAt && latest.value.timeoutAt <= Date.now()) {
+          yield* jobs.expire(job.id, handler.settled).pipe(Effect.ignore)
+          return
+        }
         if (latest.value.cancelRequestedAt) {
           yield* settleOutcome(job.id, owner, { status: "cancelled" }, handler.settled)
           return
@@ -146,11 +150,12 @@ export function layer(options: Options = {}) {
       ) {
         current.controller.abort("Job dispatcher stopped")
         const job = yield* jobs.get(jobID)
+        if (job.timeoutAt && job.timeoutAt <= Date.now()) {
+          yield* jobs.expire(jobID, current.handler.settled).pipe(Effect.ignore)
+          return
+        }
         if (job.cancelRequestedAt) {
-          yield* jobs.settle(
-            { jobID, owner: current.owner, outcome: { status: "cancelled" } },
-            current.handler.settled,
-          )
+          yield* jobs.settle({ jobID, owner: current.owner, outcome: { status: "cancelled" } }, current.handler.settled)
           return
         }
         const failed = yield* jobs.fail({
@@ -168,11 +173,17 @@ export function layer(options: Options = {}) {
         // because the gating checks below read parent status, and a parent can
         // sit in any state.
         const all = yield* jobs.list({ statuses: ["queued"] })
-        const parentIDs = [...new Set(all.flatMap((job) => (job.parentJobID ? [job.parentJobID] : [])))]
-        const parents = yield* jobs.getMany(parentIDs)
-        const byID = new Map([...all, ...parents].map((job) => [job.id, job]))
         yield* Effect.forEach(
-          all.filter((job) => {
+          all.filter((job) => job.timeoutAt !== undefined && job.timeoutAt <= Date.now()),
+          (job) => jobs.expire(job.id, executors.get(job.kind)?.settled).pipe(Effect.ignore),
+          { concurrency: 1, discard: true },
+        )
+        const ready = all.filter((job) => !job.timeoutAt || job.timeoutAt > Date.now())
+        const parentIDs = [...new Set(ready.flatMap((job) => (job.parentJobID ? [job.parentJobID] : [])))]
+        const parents = yield* jobs.getMany(parentIDs)
+        const byID = new Map([...ready, ...parents].map((job) => [job.id, job]))
+        yield* Effect.forEach(
+          ready.filter((job) => {
             if (job.status !== "queued" || !job.parentJobID) return false
             const parent = byID.get(job.parentJobID)
             return parent !== undefined && ["failed", "cancelled", "interrupted"].includes(parent.status)
@@ -180,7 +191,7 @@ export function layer(options: Options = {}) {
           (job) => jobs.cancel(job.id, executors.get(job.kind)?.settled).pipe(Effect.ignore),
           { concurrency: 1, discard: true },
         )
-        const queued = all.filter(
+        const queued = ready.filter(
           (job) =>
             job.status === "queued" &&
             !active.has(job.id) &&

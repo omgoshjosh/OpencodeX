@@ -25,6 +25,7 @@ export const layer = Layer.effect(
       fail: lifecycle.fail,
       settle: lifecycle.settle,
       retry: lifecycle.retry,
+      expire: lifecycle.expire,
       cancel: lifecycle.cancel,
       acknowledgeCancel: lifecycle.acknowledgeCancel,
       recover: lifecycle.recover,

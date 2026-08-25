@@ -2,7 +2,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
 import { OpencodeXJobTable } from "@opencode-ai/core/opencodex/sql"
 import { Effect } from "effect"
-import { and, eq, gt, inArray, isNotNull, isNull, lt, or } from "drizzle-orm"
+import { and, eq, gt, inArray, isNotNull, isNull, lt, lte, or } from "drizzle-orm"
 import { hydrate } from "./job-model"
 import {
   Event,
@@ -15,13 +15,18 @@ import {
 } from "./job-schema"
 import type { JobStore } from "./job-store"
 
-export function createJobLifecycle(
-  db: Database.Interface["db"],
-  events: EventV2.Interface,
-  store: JobStore,
-) {
+export function createJobLifecycle(db: Database.Interface["db"], events: EventV2.Interface, store: JobStore) {
   const claim = Effect.fn("OpencodeXJob.claim")(function* (input: ClaimInput) {
     const current = yield* store.get(input.jobID)
+    if (current.timeoutAt && current.timeoutAt <= Date.now()) {
+      yield* expire(current.id)
+      return yield* new TransitionError({
+        jobID: current.id,
+        status: current.status,
+        target: "claimed",
+        message: "Job deadline has expired",
+      })
+    }
     if (current.attempt >= current.maxAttempts) {
       return yield* new TransitionError({
         jobID: current.id,
@@ -117,10 +122,7 @@ export function createJobLifecycle(
           target: "cancelled",
           owner: input.owner,
           settlement,
-          condition: and(
-            isNotNull(OpencodeXJobTable.cancel_requested_at),
-            gt(OpencodeXJobTable.lease_expires_at, now),
-          ),
+          condition: and(isNotNull(OpencodeXJobTable.cancel_requested_at), gt(OpencodeXJobTable.lease_expires_at, now)),
           values: {
             completed_at: now,
             lease_owner: null,
@@ -162,15 +164,31 @@ export function createJobLifecycle(
   })
 
   const succeed = Effect.fn("OpencodeXJob.succeed")(function* (input: CompleteInput) {
-    return yield* settle({ jobID: input.jobID, owner: input.owner, outcome: { status: "succeeded", result: input.result } })
+    return yield* settle({
+      jobID: input.jobID,
+      owner: input.owner,
+      outcome: { status: "succeeded", result: input.result },
+    })
   })
 
   const fail = Effect.fn("OpencodeXJob.fail")(function* (input: FailInput) {
-    return yield* settle({ jobID: input.jobID, owner: input.owner, outcome: { status: "failed", failure: input.failure } })
+    return yield* settle({
+      jobID: input.jobID,
+      owner: input.owner,
+      outcome: { status: "failed", failure: input.failure },
+    })
   })
 
   const retry = Effect.fn("OpencodeXJob.retry")(function* (jobID: string) {
     const current = yield* store.get(jobID)
+    if (current.timeoutAt && current.timeoutAt <= Date.now()) {
+      return yield* new TransitionError({
+        jobID: current.id,
+        status: current.status,
+        target: "queued",
+        message: "An expired job cannot be retried",
+      })
+    }
     if (current.attempt >= current.maxAttempts) {
       return yield* new TransitionError({
         jobID: current.id,
@@ -192,6 +210,34 @@ export function createJobLifecycle(
         failure_json: null,
         status_reason: null,
         cancel_requested_at: null,
+      },
+    })
+  })
+
+  const expire = Effect.fn("OpencodeXJob.expire")(function* (jobID: string, settlement?: TransactionalSettlement) {
+    const current = yield* store.get(jobID)
+    if (["succeeded", "failed", "cancelled"].includes(current.status)) return current
+    const now = Date.now()
+    if (!current.timeoutAt || current.timeoutAt > now) {
+      return yield* new TransitionError({
+        jobID: current.id,
+        status: current.status,
+        target: "failed",
+        message: "Job deadline has not expired",
+      })
+    }
+    return yield* store.transition({
+      job: current,
+      target: "failed",
+      owner: current.leaseOwner,
+      settlement,
+      condition: lte(OpencodeXJobTable.timeout_at, now),
+      values: {
+        completed_at: now,
+        lease_owner: null,
+        lease_expires_at: null,
+        failure_json: { code: "JOB_TIMEOUT", message: "Job deadline expired" },
+        status_reason: "Job deadline expired",
       },
     })
   })
@@ -220,29 +266,31 @@ export function createJobLifecycle(
     }
     if (current.cancelRequestedAt) return current
     const committed = yield* events.barrier(
-      db.transaction(
-        (transaction) =>
-          Effect.gen(function* () {
-            const row = yield* transaction
-              .update(OpencodeXJobTable)
-              .set({ cancel_requested_at: now, status_reason: "Cancellation requested", time_updated: now })
-              .where(
-                and(
-                  eq(OpencodeXJobTable.id, current.id),
-                  eq(OpencodeXJobTable.status, current.status),
-                  eq(OpencodeXJobTable.attempt, current.attempt),
-                  isNull(OpencodeXJobTable.cancel_requested_at),
-                ),
-              )
-              .returning()
-              .get()
-            if (!row) return undefined
-            const result = hydrate(row)
-            const event = yield* events.commit(Event.Transitioned, { jobID: result.id, status: result.status })
-            return { result, event }
-          }),
-        { behavior: "immediate" },
-      ).pipe(Effect.orDie),
+      db
+        .transaction(
+          (transaction) =>
+            Effect.gen(function* () {
+              const row = yield* transaction
+                .update(OpencodeXJobTable)
+                .set({ cancel_requested_at: now, status_reason: "Cancellation requested", time_updated: now })
+                .where(
+                  and(
+                    eq(OpencodeXJobTable.id, current.id),
+                    eq(OpencodeXJobTable.status, current.status),
+                    eq(OpencodeXJobTable.attempt, current.attempt),
+                    isNull(OpencodeXJobTable.cancel_requested_at),
+                  ),
+                )
+                .returning()
+                .get()
+              if (!row) return undefined
+              const result = hydrate(row)
+              const event = yield* events.commit(Event.Transitioned, { jobID: result.id, status: result.status })
+              return { result, event }
+            }),
+          { behavior: "immediate" },
+        )
+        .pipe(Effect.orDie),
     )
     if (!committed) {
       return yield* new TransitionError({
@@ -280,7 +328,7 @@ export function createJobLifecycle(
       .where(
         and(
           inArray(OpencodeXJobTable.status, ["claimed", "running"]),
-          or(lt(OpencodeXJobTable.lease_expires_at, now), lt(OpencodeXJobTable.timeout_at, now)),
+          or(lt(OpencodeXJobTable.lease_expires_at, now), lte(OpencodeXJobTable.timeout_at, now)),
         ),
       )
       .all()
@@ -289,14 +337,18 @@ export function createJobLifecycle(
       rows,
       (row) => {
         const job = hydrate(row)
+        if (job.timeoutAt && job.timeoutAt <= now)
+          return expire(job.id, settlement?.(job)).pipe(
+            Effect.catchTag("OpencodeX.Job.TransitionError", () => Effect.succeed(job)),
+            Effect.catchTag("OpencodeX.Job.NotFoundError", () => Effect.succeed(job)),
+          )
         return store
           .transition({
             job,
             target: row.cancel_requested_at ? "cancelled" : "interrupted",
             owner: row.lease_owner ?? undefined,
-            settlement:
-              row.cancel_requested_at || row.attempt >= row.max_attempts ? settlement?.(job) : undefined,
-            condition: or(lt(OpencodeXJobTable.lease_expires_at, now), lt(OpencodeXJobTable.timeout_at, now)),
+            settlement: row.cancel_requested_at || row.attempt >= row.max_attempts ? settlement?.(job) : undefined,
+            condition: or(lt(OpencodeXJobTable.lease_expires_at, now), lte(OpencodeXJobTable.timeout_at, now)),
             values: {
               completed_at: now,
               lease_owner: null,
@@ -312,5 +364,5 @@ export function createJobLifecycle(
     )
   })
 
-  return { claim, start, renew, settle, succeed, fail, retry, cancel, acknowledgeCancel, recover }
+  return { claim, start, renew, settle, succeed, fail, retry, expire, cancel, acknowledgeCancel, recover }
 }

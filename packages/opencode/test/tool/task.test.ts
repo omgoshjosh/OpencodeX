@@ -184,12 +184,13 @@ function persistPromptResult(
     yield* sessions.updateMessage(user)
     yield* Effect.forEach(
       input.parts.filter((part): part is SessionLegacy.TextPartInput => part.type === "text"),
-      (part) => sessions.updatePart({
-        ...part,
-        id: PartID.ascending(),
-        messageID: user.id,
-        sessionID: user.sessionID,
-      }),
+      (part) =>
+        sessions.updatePart({
+          ...part,
+          id: PartID.ascending(),
+          messageID: user.id,
+          sessionID: user.sessionID,
+        }),
       { discard: true },
     )
     return yield* persistAssistantResult(sessions, result)
@@ -200,10 +201,12 @@ function persistAssistantResult(
   sessions: Pick<Session.Interface, "updateMessage" | "updatePart">,
   result: SessionLegacy.WithParts,
 ) {
-  return sessions.updateMessage(result.info).pipe(
-    Effect.andThen(Effect.forEach(result.parts, (part) => sessions.updatePart(part), { discard: true })),
-    Effect.as(result),
-  )
+  return sessions
+    .updateMessage(result.info)
+    .pipe(
+      Effect.andThen(Effect.forEach(result.parts, (part) => sessions.updatePart(part), { discard: true })),
+      Effect.as(result),
+    )
 }
 
 describe("tool.task", () => {
@@ -673,7 +676,9 @@ describe("tool.task", () => {
       yield* database.db
         .insert(ProjectTable)
         .values({ id: ProjectV2.ID.make("prj_task_test"), worktree: "/tmp", sandboxes: [] })
-      yield* database.db.insert(OpencodeXProjectTable).values({ id: "opx_task_test", project_id: ProjectV2.ID.make("prj_task_test") })
+      yield* database.db
+        .insert(OpencodeXProjectTable)
+        .values({ id: "opx_task_test", project_id: ProjectV2.ID.make("prj_task_test") })
       yield* database.db.insert(OpencodeXSwarmTable).values({
         id: "swm_task_test",
         opencodex_project_id: "opx_task_test",
@@ -683,7 +688,14 @@ describe("tool.task", () => {
         source: "manual",
       })
       yield* database.db.insert(OpencodeXSwarmRoleTable).values([
-        { id: "role_orch", swarm_id: "swm_task_test", name: "Orchestrator", status: "running", instructions: "", sort_order: 0 },
+        {
+          id: "role_orch",
+          swarm_id: "swm_task_test",
+          name: "Orchestrator",
+          status: "running",
+          instructions: "",
+          sort_order: 0,
+        },
         {
           id: "role_eng",
           swarm_id: "swm_task_test",
@@ -771,8 +783,14 @@ describe("tool.task", () => {
                 }),
               loop: (input: SessionPrompt.LoopInput) =>
                 Effect.gen(function* () {
-                  const turn = yield* sessions.messageWithChildren({ sessionID: input.sessionID, messageID: input.messageID! })
-                  const user = turn.find((message): message is SessionLegacy.WithParts & { info: SessionLegacy.User } => message.info.role === "user")!
+                  const turn = yield* sessions.messageWithChildren({
+                    sessionID: input.sessionID,
+                    messageID: input.messageID!,
+                  })
+                  const user = turn.find(
+                    (message): message is SessionLegacy.WithParts & { info: SessionLegacy.User } =>
+                      message.info.role === "user",
+                  )!
                   const nextInput = {
                     sessionID: input.sessionID,
                     messageID: user.info.id,
@@ -796,11 +814,20 @@ describe("tool.task", () => {
       ])
       expect(fallbackResult.output).toContain("fallback done")
       expect(fallbackResult.metadata.model).toMatchObject({ providerID: "openai", modelID: "gpt-5" })
-      expect((yield* sessions.messages({ sessionID: fallbackResult.metadata.sessionId })).filter((message) => message.info.role === "user")).toHaveLength(1)
+      expect(
+        (yield* sessions.messages({ sessionID: fallbackResult.metadata.sessionId })).filter(
+          (message) => message.info.role === "user",
+        ),
+      ).toHaveLength(1)
 
       const liveAttempts: SessionPrompt.PromptInput[] = []
       const liveResult = yield* def.execute(
-        { description: "build module E", prompt: "do the work", subagent_type: "general", swarm_role: "Senior Engineer" },
+        {
+          description: "build module E",
+          prompt: "do the work",
+          subagent_type: "general",
+          swarm_role: "Senior Engineer",
+        },
         {
           sessionID: chat.id,
           messageID: assistant.id,
@@ -810,9 +837,8 @@ describe("tool.task", () => {
           extra: {
             promptOps: {
               ...stubOps({ onPrompt: (input) => liveAttempts.push(input) }),
-              resolveModel: (attempt: { providerID: ProviderV2.ID; modelID: ProviderV2.ModelID }) => Effect.succeed(
-                attempt.modelID === "claude-fable-5" ? undefined : { variants: {} },
-              ),
+              resolveModel: (attempt: { providerID: ProviderV2.ID; modelID: ProviderV2.ModelID }) =>
+                Effect.succeed(attempt.modelID === "claude-fable-5" ? undefined : { variants: {} }),
             },
           },
           messages: [],
@@ -820,12 +846,19 @@ describe("tool.task", () => {
           ask: () => Effect.void,
         },
       )
-      expect(liveAttempts.map((input) => `${input.model?.providerID}/${input.model?.modelID}`)).toEqual(["openai/gpt-5"])
+      expect(liveAttempts.map((input) => `${input.model?.providerID}/${input.model?.modelID}`)).toEqual([
+        "openai/gpt-5",
+      ])
       expect(liveResult.metadata.model).toMatchObject({ providerID: "openai", modelID: "gpt-5" })
 
       let blockedLoops = 0
       const blocked = yield* def.execute(
-        { description: "build module safety", prompt: "do the work", subagent_type: "general", swarm_role: "Senior Engineer" },
+        {
+          description: "build module safety",
+          prompt: "do the work",
+          subagent_type: "general",
+          swarm_role: "Senior Engineer",
+        },
         {
           sessionID: chat.id,
           messageID: assistant.id,
@@ -853,7 +886,11 @@ describe("tool.task", () => {
       )
       expect(blocked.output).toContain("failed")
       expect(blockedLoops).toBe(0)
-      expect((yield* sessions.messages({ sessionID: blocked.metadata.sessionId })).filter((message) => message.info.role === "user")).toHaveLength(1)
+      expect(
+        (yield* sessions.messages({ sessionID: blocked.metadata.sessionId })).filter(
+          (message) => message.info.role === "user",
+        ),
+      ).toHaveLength(1)
 
       const overrides: SessionPrompt.PromptInput[] = []
       yield* def.execute(
@@ -1174,7 +1211,7 @@ describe("tool.task", () => {
     }),
   )
 
-  background.instance("background task completion does not wait for the parent async prompt", () =>
+  background.instance("background task remains running until its notification is durably persisted", () =>
     Effect.gen(function* () {
       const jobs = yield* BackgroundJob.Service
       const { chat, assistant } = yield* seed()
@@ -1208,8 +1245,9 @@ describe("tool.task", () => {
       )
 
       const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 1_000 })
-      expect(waited.timedOut).toBe(false)
-      expect(waited.info?.status).toBe("completed")
+      expect(waited.timedOut).toBe(true)
+      expect(waited.info?.status).toBe("running")
+      yield* jobs.cancel(result.metadata.sessionId)
     }),
   )
 
@@ -1465,13 +1503,9 @@ describe("tool.task", () => {
         )
 
       const first = yield* exec()
-      const firstRecord = delegationRecord(
-        (yield* sessions.get(SessionID.make(first.metadata.sessionId))).metadata,
-      )
+      const firstRecord = delegationRecord((yield* sessions.get(SessionID.make(first.metadata.sessionId))).metadata)
       const second = yield* exec(first.metadata.sessionId)
-      const secondRecord = delegationRecord(
-        (yield* sessions.get(SessionID.make(second.metadata.sessionId))).metadata,
-      )
+      const secondRecord = delegationRecord((yield* sessions.get(SessionID.make(second.metadata.sessionId))).metadata)
 
       expect(second.metadata.sessionId).toBe(first.metadata.sessionId)
       expect(firstRecord).toMatchObject({ attempt: 1, phase: "settled", outcome: "completed" })
@@ -1662,18 +1696,7 @@ describe("tool.task", () => {
 
       const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 1_000 })
       expect(waited.info?.status).toBe("completed")
-      // The notification prompt is forked; poll briefly for its delivery mark.
-      const record = yield* Effect.promise(async () => {
-        for (let i = 0; i < 50; i++) {
-          const child = await Effect.runPromise(
-            sessions.get(SessionID.make(result.metadata.sessionId)).pipe(Effect.orDie),
-          )
-          const current = delegationRecord(child.metadata)
-          if (current?.deliveryOutcome === "delivered") return current
-          await new Promise((resolve) => setTimeout(resolve, 20))
-        }
-        return undefined
-      })
+      const record = delegationRecord((yield* sessions.get(SessionID.make(result.metadata.sessionId))).metadata)
       expect(record).toMatchObject({ outcome: "completed", deliveryOutcome: "delivered" })
     }),
   )

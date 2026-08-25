@@ -1,6 +1,7 @@
 import type { PermissionRequest, QuestionAnswer, QuestionRequest } from "@opencode-ai/sdk/v2/client"
 import { Show, createEffect, createMemo, createSignal, onCleanup } from "solid-js"
 import { buildSafetyQueue, latestAssistantContext, moveSafetyQueueIndex, safetyQueueGroup } from "../lib/safety-present"
+import { questionSourceLabel } from "../lib/session-actions"
 import { permissionToolPart } from "../lib/tool-display"
 import type { MessageBundle } from "../lib/session-api"
 import { SessionPermissionCard } from "./session-permission-card"
@@ -9,6 +10,7 @@ import { SessionQuestionCard } from "./session-question-card"
 type QuestionDraft = { answers: QuestionAnswer[]; custom: string[] }
 
 export function SessionSafetyDock(props: {
+  sessionID?: string
   permissions: PermissionRequest[]
   questions: QuestionRequest[]
   messages: MessageBundle[]
@@ -104,6 +106,7 @@ export function SessionSafetyDock(props: {
               reply={props.replyQuestion}
               reject={props.rejectQuestion}
               context={context()}
+              source={props.sessionID ? questionSourceLabel(item.request, props.sessionID) : undefined}
             />
           )
         }}

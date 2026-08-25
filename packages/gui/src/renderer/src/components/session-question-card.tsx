@@ -27,6 +27,7 @@ export function SessionQuestionCard(props: {
   reply: (request: QuestionRequest, answers: QuestionAnswer[]) => void
   reject: (request: QuestionRequest) => void
   context?: { text?: string; plan?: string }
+  source?: string
 }) {
   const titleID = `question-title-${createUniqueId()}`
   const [confirmOpen, setConfirmOpen] = createSignal(false)
@@ -138,6 +139,9 @@ export function SessionQuestionCard(props: {
       />
 
       <div class="safety-card-body question-card-body">
+        <Show when={props.source}>
+          <p class="question-source">{props.source}</p>
+        </Show>
         <Show when={props.context?.text || props.context?.plan}>
           <div class="question-context">
             <Show when={props.context?.text}>

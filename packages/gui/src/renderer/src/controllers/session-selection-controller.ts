@@ -18,6 +18,7 @@ import {
 import { shouldShowSelectedSessionLoading } from "../lib/session-hydration-policy"
 import type { GuiSnapshot } from "../lib/session-api"
 import { EMPTY_SESSION_DATA } from "./authoritative-state-controller"
+import { questionsForSessionAttention } from "../lib/session-actions"
 
 export function createSessionSelectionController(input: {
   authoritative: ReturnType<typeof createAuthoritativeStateController>
@@ -75,7 +76,11 @@ export function createSessionSelectionController(input: {
   const selectedQuestions = createMemo(() => {
     const session = selectedSession()
     return session
-      ? (input.authoritative.snapshot()?.questions.filter((request) => request.sessionID === session.id) ?? [])
+      ? questionsForSessionAttention(
+          input.authoritative.snapshot()?.sessions ?? [],
+          session.id,
+          input.authoritative.snapshot()?.questions ?? [],
+        )
       : []
   })
   const visibleSessions = createMemo(() => tuiSidebarSessions(input.authoritative.snapshot(), orderState()))

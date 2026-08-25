@@ -414,6 +414,86 @@ it.instance("coalesces stream activity into one latest timestamp update", () =>
   }),
 )
 
+it.instance("flushes pending activity before terminal idle and cancels its delayed update", () =>
+  Effect.gen(function* () {
+    const graph = yield* buildRunGraph()
+    const release = yield* Latch.make()
+    const fiber = yield* graph.run
+      .ensureRunning(sessionID, Effect.succeed(output), release.await.pipe(Effect.as(output)))
+      .pipe(Effect.forkScoped)
+    const { db } = yield* Database.Service
+    const generation = yield* pollWithTimeout(
+      db
+        .select({ generation: SessionExecutionTable.generation })
+        .from(SessionExecutionTable)
+        .where(eq(SessionExecutionTable.session_id, sessionID))
+        .get()
+        .pipe(Effect.orDie, Effect.map((row) => (row ? row.generation : undefined))),
+      "execution generation never claimed",
+    )
+    const updates = yield* Ref.make({ busy: 0, lastActivityAt: 0 })
+    const events = yield* EventV2Bridge.Service
+    const unsubscribe = yield* events.listen((event) => {
+      if (event.type !== SessionStatus.Event.Status.type) return Effect.void
+      const data = event.data as typeof SessionStatus.Event.Status.data.Type
+      if (data.sessionID !== sessionID || data.status.type !== "busy") return Effect.void
+      const lastActivityAt = data.status.lastActivityAt
+      return Ref.update(updates, (current) => ({
+        busy: current.busy + 1,
+        lastActivityAt: lastActivityAt ?? current.lastActivityAt,
+      }))
+    })
+    yield* Effect.addFinalizer(() => unsubscribe)
+    const observedAt = Date.now()
+    yield* graph.status.activity(sessionID).pipe(
+      Effect.provideService(SessionStatus.ExecutionGeneration, { sessionID, generation }),
+    )
+    yield* release.open
+    yield* Fiber.join(fiber)
+    yield* pollWithTimeout(
+      Ref.get(updates).pipe(Effect.map((current) => (current.lastActivityAt >= observedAt ? current : undefined))),
+      "pending activity was not flushed before idle",
+    )
+    yield* Effect.sleep(300)
+    expect(yield* Ref.get(updates)).toMatchObject({ busy: 1, lastActivityAt: expect.any(Number) })
+    expect(yield* graph.status.get(sessionID)).toEqual({ type: "idle" })
+  }),
+)
+
+it.instance("does not emit a stale busy update when activity timer flushes before idle", () =>
+  Effect.gen(function* () {
+    const graph = yield* buildRunGraph()
+    const release = yield* Latch.make()
+    const fiber = yield* graph.run
+      .ensureRunning(sessionID, Effect.succeed(output), release.await.pipe(Effect.as(output)))
+      .pipe(Effect.forkScoped)
+    const { db } = yield* Database.Service
+    const generation = yield* pollWithTimeout(
+      db
+        .select({ generation: SessionExecutionTable.generation })
+        .from(SessionExecutionTable)
+        .where(eq(SessionExecutionTable.session_id, sessionID))
+        .get()
+        .pipe(Effect.orDie, Effect.map((row) => (row ? row.generation : undefined))),
+      "execution generation never claimed",
+    )
+    const observedAt = Date.now()
+    yield* graph.status.activity(sessionID).pipe(
+      Effect.provideService(SessionStatus.ExecutionGeneration, { sessionID, generation }),
+    )
+    yield* pollWithTimeout(
+      graph.status.get(sessionID).pipe(
+        Effect.map((status) => (status.type === "busy" && (status.lastActivityAt ?? 0) >= observedAt ? true : undefined)),
+      ),
+      "activity timer never flushed",
+    )
+    yield* release.open
+    yield* Fiber.join(fiber)
+    yield* Effect.sleep(300)
+    expect(yield* graph.status.get(sessionID)).toEqual({ type: "idle" })
+  }),
+)
+
 it.instance("does not clear a stale-looking status while its lease owner is live", () =>
   Effect.gen(function* () {
     const graph = yield* buildRunGraph()

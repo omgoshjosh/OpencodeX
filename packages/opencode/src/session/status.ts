@@ -73,6 +73,7 @@ export interface Interface {
   readonly set: (sessionID: SessionID, status: Info) => Effect.Effect<void>
   readonly setForGeneration: (sessionID: SessionID, generation: number, status: Info) => Effect.Effect<boolean>
   readonly activity: (sessionID: SessionID) => Effect.Effect<boolean>
+  readonly flushActivity: (sessionID: SessionID, generation?: number) => Effect.Effect<boolean>
   readonly toolStart: (sessionID: SessionID, title: string) => Effect.Effect<boolean>
   readonly toolEnd: (sessionID: SessionID) => Effect.Effect<boolean>
   readonly setPendingWake: (
@@ -109,7 +110,9 @@ export const layer = Layer.effect(
     const { db } = yield* Database.Service
     const scope = yield* Scope.Scope
     const processRunID = ensureRunID()
-    const activityPending = yield* InstanceState.make(() => Effect.sync(() => new Map<SessionID, { at: number }>()))
+    const activityPending = yield* InstanceState.make(() =>
+      Effect.sync(() => new Map<SessionID, { at: number }>()),
+    )
 
     // `sessionID` scopes the scan to one row. Reads take that path so a status
     // lookup stays an indexed point query instead of two full table scans in an
@@ -283,6 +286,7 @@ export const layer = Layer.effect(
       generation: number,
       status: Info,
     ) {
+      if (status.type === "idle") yield* flushActivity(sessionID, generation)
       return yield* write(sessionID, status, generation)
     })
 
@@ -292,6 +296,7 @@ export const layer = Layer.effect(
         yield* setForGeneration(sessionID, generation.generation, status)
         return
       }
+      if (status.type === "idle") yield* flushActivity(sessionID)
       yield* write(sessionID, status)
     })
 
@@ -307,6 +312,22 @@ export const layer = Layer.effect(
       )
     })
 
+    const flushActivity = Effect.fn("SessionStatus.flushActivity")(function* (sessionID: SessionID, generation?: number) {
+      const pending = yield* InstanceState.get(activityPending)
+      const current = pending.get(sessionID)
+      if (!current) return false
+      const flushed = yield* write(
+        sessionID,
+        (status) =>
+          status?.type === "busy"
+            ? { ...status, lastActivityAt: Math.max(status.lastActivityAt ?? 0, current.at) }
+            : undefined,
+        generation,
+      )
+      if (pending.get(sessionID) === current) pending.delete(sessionID)
+      return flushed
+    })
+
     const activity = Effect.fn("SessionStatus.activity")(function* (sessionID: SessionID) {
       const pending = yield* InstanceState.get(activityPending)
       const now = Date.now()
@@ -318,14 +339,7 @@ export const layer = Layer.effect(
       pending.set(sessionID, { at: now })
       yield* Effect.gen(function* () {
         yield* Effect.sleep(ACTIVITY_FLUSH_MILLIS)
-        const at = pending.get(sessionID)?.at
-        pending.delete(sessionID)
-        if (at === undefined) return
-        yield* patchCurrentGeneration(sessionID, (current) =>
-          current.type === "busy"
-            ? { ...current, lastActivityAt: Math.max(current.lastActivityAt ?? 0, at) }
-            : undefined,
-        )
+        yield* flushActivity(sessionID, (yield* ExecutionGeneration)?.generation)
       }).pipe(Effect.forkIn(scope))
       return false
     })
@@ -374,7 +388,7 @@ export const layer = Layer.effect(
       Effect.forkScoped,
     )
 
-    return Service.of({ get, list, set, setForGeneration, activity, toolStart, toolEnd, setPendingWake })
+    return Service.of({ get, list, set, setForGeneration, activity, flushActivity, toolStart, toolEnd, setPendingWake })
   }),
 )
 

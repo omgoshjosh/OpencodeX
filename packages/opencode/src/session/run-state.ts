@@ -123,6 +123,7 @@ export const layer = Layer.effect(
       lease: Lease,
       interrupted: boolean,
     ) {
+      yield* status.flushActivity(sessionID, lease.generation)
       const now = Date.now()
       const released = yield* db
         .transaction(

@@ -11,7 +11,7 @@ import { deriveSubagentSessionPermission } from "../agent/subagent-permissions"
 import type { SessionPrompt } from "../session/prompt"
 import { Config } from "@/config/config"
 import { ProviderV2 } from "@opencode-ai/core/provider"
-import { Cause, Deferred, Effect, Exit, Schema, Scope } from "effect"
+import { Cause, Deferred, Effect, Exit, Schema } from "effect"
 import { asc, eq } from "drizzle-orm"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import {
@@ -37,9 +37,11 @@ export interface TaskPromptOps {
   resolvePromptParts(template: string): Effect.Effect<SessionPrompt.PromptInput["parts"]>
   prompt(input: SessionPrompt.PromptInput): Effect.Effect<SessionLegacy.WithParts>
   loop(input: SessionPrompt.LoopInput): Effect.Effect<SessionLegacy.WithParts>
-  resolveModel?: (
-    model: { providerID: ProviderV2.ID; modelID: ProviderV2.ModelID; variant?: string },
-  ) => Effect.Effect<{ variants?: Record<string, unknown> } | undefined>
+  resolveModel?: (model: {
+    providerID: ProviderV2.ID
+    modelID: ProviderV2.ModelID
+    variant?: string
+  }) => Effect.Effect<{ variants?: Record<string, unknown> } | undefined>
 }
 
 const id = "task"
@@ -213,7 +215,6 @@ export const TaskTool = Tool.define(
     const background = yield* BackgroundJob.Service
     const config = yield* Config.Service
     const sessions = yield* Session.Service
-    const scope = yield* Scope.Scope
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
 
@@ -568,9 +569,9 @@ export const TaskTool = Tool.define(
               ],
             })
             .pipe(
-              // The notification's durable persistence is what "delivered"
-              // means for a background delegation; anything short of that must
-              // not read as the parent having received the result.
+              // A completed background job must also have durably delivered
+              // its report. Keeping this in the job fiber lets disposal cancel
+              // it and leaves the delegation record honest while it is pending.
               Effect.matchCauseEffect({
                 onSuccess: () =>
                   sessions
@@ -579,9 +580,8 @@ export const TaskTool = Tool.define(
                 onFailure: () =>
                   sessions
                     .stampDelegationDelivery({ sessionID: nextSession.id, runID, outcome: "failed" })
-                    .pipe(Effect.ignore),
+                    .pipe(Effect.andThen(Effect.fail(new Error("Background notification was not persisted")))),
               }),
-              Effect.forkIn(scope, { startImmediately: true }),
             )
         })
 

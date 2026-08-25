@@ -154,18 +154,24 @@ it.live("enforces persisted timeouts and leaves no running lease", () =>
     const jobs = yield* OpencodeXJob.Service
     const dispatcher = yield* OpencodeXJobDispatcher.Service
     let aborted = false
-    yield* dispatcher.register("test.timeout", (_job, signal) => waitForAbort(signal, () => (aborted = true)))
+    let executions = 0
+    yield* dispatcher.register("test.timeout", (_job, signal) => {
+      executions += 1
+      return waitForAbort(signal, () => (aborted = true))
+    })
 
     const created = yield* jobs.create({
       kind: "test.timeout",
       idempotencyKey: "dispatcher-timeout",
+      maxAttempts: 2,
       timeoutAt: Date.now() + 30,
     })
     const failed = yield* waitForStatus(jobs, created.id, "failed")
 
     expect(aborted).toBe(true)
-    expect(failed.failure).toMatchObject({ code: "JOB_EXECUTION_FAILED", message: "Job timed out" })
+    expect(failed.failure).toMatchObject({ code: "JOB_TIMEOUT", message: "Job deadline expired" })
     expect(failed.leaseOwner).toBeUndefined()
+    expect(executions).toBe(1)
     expect(dispatcher.running()).toEqual([])
   }),
 )

@@ -4,6 +4,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { OpencodeXJobTable } from "@opencode-ai/core/opencodex/sql"
 import { eq } from "drizzle-orm"
 import { Effect, Layer } from "effect"
+import { DEFAULT_TIMEOUT_MS } from "@/opencodex/job-store"
 import { testEffect } from "../lib/effect"
 
 const it = testEffect(OpencodeXJob.defaultLayer)
@@ -38,6 +39,19 @@ it.live("submits idempotently and runs the legal lifecycle", () =>
     expect(succeeded.status).toBe("succeeded")
     expect(succeeded.result).toEqual({ answer: 42 })
     expect(succeeded.leaseOwner).toBeUndefined()
+  }),
+)
+
+it.live("persists a bounded default deadline unless the caller supplies one", () =>
+  Effect.gen(function* () {
+    const jobs = yield* OpencodeXJob.Service
+    const before = Date.now()
+    const defaulted = yield* jobs.create({ kind: "test.default-deadline" })
+    const explicit = yield* jobs.create({ kind: "test.explicit-deadline", timeoutAt: before + DEFAULT_TIMEOUT_MS * 2 })
+
+    expect(defaulted.timeoutAt).toBeGreaterThanOrEqual(before + DEFAULT_TIMEOUT_MS)
+    expect(defaulted.timeoutAt).toBeLessThanOrEqual(Date.now() + DEFAULT_TIMEOUT_MS)
+    expect(explicit.timeoutAt).toBe(before + DEFAULT_TIMEOUT_MS * 2)
   }),
 )
 
@@ -121,6 +135,28 @@ it.live("interrupts work with an expired lease and permits a bounded retry", () 
   }),
 )
 
+it.live("persists an expired deadline as terminal and never requeues it", () =>
+  Effect.gen(function* () {
+    const jobs = yield* OpencodeXJob.Service
+    const created = yield* jobs.create({
+      kind: "test.expired-deadline",
+      maxAttempts: 2,
+      timeoutAt: Date.now() - 1,
+    })
+
+    const expired = yield* jobs.expire(created.id)
+    expect(expired).toMatchObject({
+      status: "failed",
+      failure: { code: "JOB_TIMEOUT", message: "Job deadline expired" },
+      leaseOwner: undefined,
+    })
+    expect((yield* jobs.retry(created.id).pipe(Effect.flip))._tag).toBe("OpencodeX.Job.TransitionError")
+    expect((yield* jobs.claim({ jobID: created.id, owner: "runner", leaseMs: 30_000 }).pipe(Effect.flip))._tag).toBe(
+      "OpencodeX.Job.TransitionError",
+    )
+  }),
+)
+
 it.live("does not recover a fresh lease owned by another process", () =>
   Effect.gen(function* () {
     const jobs = yield* OpencodeXJob.Service
@@ -143,8 +179,9 @@ it.live("runs terminal settlement while recovering an exhausted lease", () =>
     yield* jobs.start(created.id, "expired-owner")
     let settled: OpencodeXJob.Info | undefined
 
-    const recovered = yield* jobs.recover(Date.now() + 60_000, () => (job) =>
-      Effect.succeed(Effect.sync(() => (settled = job)).pipe(Effect.asVoid)),
+    const recovered = yield* jobs.recover(
+      Date.now() + 60_000,
+      () => (job) => Effect.succeed(Effect.sync(() => (settled = job)).pipe(Effect.asVoid)),
     )
 
     expect(recovered.find((job) => job.id === created.id)?.status).toBe("interrupted")
@@ -243,8 +280,8 @@ dbIt.live("rejects renewal and settlement after a lease expires", () =>
     expect(
       (yield* jobs.renew({ jobID: created.id, owner: "stale-owner", leaseMs: 30_000 }).pipe(Effect.flip))._tag,
     ).toBe("OpencodeX.Job.TransitionError")
-    expect(
-      (yield* jobs.succeed({ jobID: created.id, owner: "stale-owner" }).pipe(Effect.flip))._tag,
-    ).toBe("OpencodeX.Job.TransitionError")
+    expect((yield* jobs.succeed({ jobID: created.id, owner: "stale-owner" }).pipe(Effect.flip))._tag).toBe(
+      "OpencodeX.Job.TransitionError",
+    )
   }),
 )

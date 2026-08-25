@@ -372,6 +372,48 @@ it.instance("publishes activity, tools, and pending wakes for the owning generat
   }),
 )
 
+it.instance("coalesces stream activity into one latest timestamp update", () =>
+  Effect.gen(function* () {
+    const graph = yield* buildRunGraph()
+    const release = yield* Latch.make()
+    const fiber = yield* graph.run
+      .ensureRunning(sessionID, Effect.succeed(output), release.await.pipe(Effect.as(output)))
+      .pipe(Effect.forkScoped)
+    const { db } = yield* Database.Service
+    const generation = yield* pollWithTimeout(
+      db
+        .select({ generation: SessionExecutionTable.generation })
+        .from(SessionExecutionTable)
+        .where(eq(SessionExecutionTable.session_id, sessionID))
+        .get()
+        .pipe(Effect.orDie, Effect.map((row) => (row ? row.generation : undefined))),
+      "execution generation never claimed",
+    )
+    const events = yield* EventV2Bridge.Service
+    const updates = yield* Ref.make(0)
+    const unsubscribe = yield* events.listen((event) =>
+      event.type === SessionStatus.Event.Status.type &&
+      (event.data as typeof SessionStatus.Event.Status.data.Type).sessionID === sessionID
+        ? Ref.update(updates, (count) => count + 1)
+        : Effect.void,
+    )
+    yield* Effect.addFinalizer(() => unsubscribe)
+    const observedAt = Date.now()
+    const generationContext = { sessionID, generation }
+    yield* graph.status.activity(sessionID).pipe(Effect.provideService(SessionStatus.ExecutionGeneration, generationContext))
+    yield* graph.status.activity(sessionID).pipe(Effect.provideService(SessionStatus.ExecutionGeneration, generationContext))
+    yield* graph.status.activity(sessionID).pipe(Effect.provideService(SessionStatus.ExecutionGeneration, generationContext))
+    yield* Effect.sleep(300)
+
+    expect(yield* Ref.get(updates)).toBe(1)
+    const busy = yield* graph.status.get(sessionID)
+    if (busy.type !== "busy") throw new Error("session stopped before activity flush")
+    expect(busy.lastActivityAt).toBeGreaterThanOrEqual(observedAt)
+    yield* release.open
+    yield* Fiber.join(fiber)
+  }),
+)
+
 it.instance("does not clear a stale-looking status while its lease owner is live", () =>
   Effect.gen(function* () {
     const graph = yield* buildRunGraph()

@@ -1339,6 +1339,18 @@ export type GlobalEvent = {
     | SyncEventOpencodexSessionStateUpdated
 }
 
+export type ConflictError = {
+  _tag: "ConflictError"
+  message: string
+  resource?: string
+}
+
+export type ServiceUnavailableError = {
+  _tag: "ServiceUnavailableError"
+  message: string
+  service?: string
+}
+
 /**
  * Log level
  */
@@ -1755,12 +1767,6 @@ export type Config = {
 export type ForbiddenError = {
   _tag: "ForbiddenError"
   message: string
-}
-
-export type ConflictError = {
-  _tag: "ConflictError"
-  message: string
-  resource?: string
 }
 
 export type Model = {
@@ -4512,6 +4518,8 @@ export type GlobalHealthResponses = {
     databaseID: string
     coordinatorKey: string
     eventBusID: string
+    accepting: boolean
+    draining: boolean
   }
 }
 
@@ -4541,6 +4549,168 @@ export type GlobalEventResponses = {
 }
 
 export type GlobalEventResponse = GlobalEventResponses[keyof GlobalEventResponses]
+
+export type GlobalDrainStatusData = {
+  body?: never
+  path?: never
+  query?: never
+  url: "/global/drain"
+}
+
+export type GlobalDrainStatusErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type GlobalDrainStatusError = GlobalDrainStatusErrors[keyof GlobalDrainStatusErrors]
+
+export type GlobalDrainStatusResponses = {
+  /**
+   * Deployment drain status
+   */
+  200: {
+    runID: string
+    accepting: boolean
+    draining: boolean
+    inFlightAdmissions: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    queuedCommands: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    runningCommands: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    liveRunningExecutions: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    activeJobs: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    activeSwarms: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    activeGoals: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    ready: boolean
+  }
+}
+
+export type GlobalDrainStatusResponse = GlobalDrainStatusResponses[keyof GlobalDrainStatusResponses]
+
+export type GlobalDrainBeginData = {
+  body?: {
+    expectedRunID: string
+  }
+  path?: never
+  query?: never
+  url: "/global/drain/begin"
+}
+
+export type GlobalDrainBeginErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type GlobalDrainBeginError = GlobalDrainBeginErrors[keyof GlobalDrainBeginErrors]
+
+export type GlobalDrainBeginResponses = {
+  /**
+   * Deployment drain receipt
+   */
+  200: {
+    runID: string
+    accepting: boolean
+    draining: boolean
+    inFlightAdmissions: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    queuedCommands: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    runningCommands: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    liveRunningExecutions: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    activeJobs: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    activeSwarms: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    activeGoals: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    ready: boolean
+  }
+}
+
+export type GlobalDrainBeginResponse = GlobalDrainBeginResponses[keyof GlobalDrainBeginResponses]
+
+export type GlobalDrainCancelData = {
+  body?: {
+    expectedRunID: string
+  }
+  path?: never
+  query?: never
+  url: "/global/drain/cancel"
+}
+
+export type GlobalDrainCancelErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type GlobalDrainCancelError = GlobalDrainCancelErrors[keyof GlobalDrainCancelErrors]
+
+export type GlobalDrainCancelResponses = {
+  /**
+   * Deployment drain receipt
+   */
+  200: {
+    runID: string
+    accepting: boolean
+    draining: boolean
+    inFlightAdmissions: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    queuedCommands: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    runningCommands: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    liveRunningExecutions: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    activeJobs: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    activeSwarms: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    activeGoals: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    ready: boolean
+  }
+}
+
+export type GlobalDrainCancelResponse = GlobalDrainCancelResponses[keyof GlobalDrainCancelResponses]
+
+export type GlobalDrainReplayData = {
+  body?: {
+    expectedRunID: string
+  }
+  path?: never
+  query?: never
+  url: "/global/drain/replay"
+}
+
+export type GlobalDrainReplayErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+  /**
+   * ServiceUnavailableError
+   */
+  503: ServiceUnavailableError
+}
+
+export type GlobalDrainReplayError = GlobalDrainReplayErrors[keyof GlobalDrainReplayErrors]
+
+export type GlobalDrainReplayResponses = {
+  /**
+   * Deployment replay receipt
+   */
+  200: {
+    runID: string
+    directories: Array<string>
+    commandCount: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  }
+}
+
+export type GlobalDrainReplayResponse = GlobalDrainReplayResponses[keyof GlobalDrainReplayResponses]
 
 export type GlobalConfigGetData = {
   body?: never
@@ -6595,6 +6765,10 @@ export type OpencodexJobCreateErrors = {
    * BadRequest | InvalidRequestError
    */
   400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * ServiceUnavailableError
+   */
+  503: ServiceUnavailableError
 }
 
 export type OpencodexJobCreateError = OpencodexJobCreateErrors[keyof OpencodexJobCreateErrors]
@@ -8284,6 +8458,10 @@ export type OpencodexJobClaimErrors = {
    * NotFoundError
    */
   404: NotFoundError
+  /**
+   * ServiceUnavailableError
+   */
+  503: ServiceUnavailableError
 }
 
 export type OpencodexJobClaimError = OpencodexJobClaimErrors[keyof OpencodexJobClaimErrors]
@@ -8317,6 +8495,10 @@ export type OpencodexJobStartErrors = {
    * NotFoundError
    */
   404: NotFoundError
+  /**
+   * ServiceUnavailableError
+   */
+  503: ServiceUnavailableError
 }
 
 export type OpencodexJobStartError = OpencodexJobStartErrors[keyof OpencodexJobStartErrors]
@@ -8351,6 +8533,10 @@ export type OpencodexJobRenewErrors = {
    * NotFoundError
    */
   404: NotFoundError
+  /**
+   * ServiceUnavailableError
+   */
+  503: ServiceUnavailableError
 }
 
 export type OpencodexJobRenewError = OpencodexJobRenewErrors[keyof OpencodexJobRenewErrors]
@@ -8387,6 +8573,10 @@ export type OpencodexJobSucceedErrors = {
    * NotFoundError
    */
   404: NotFoundError
+  /**
+   * ServiceUnavailableError
+   */
+  503: ServiceUnavailableError
 }
 
 export type OpencodexJobSucceedError = OpencodexJobSucceedErrors[keyof OpencodexJobSucceedErrors]
@@ -8421,6 +8611,10 @@ export type OpencodexJobFailErrors = {
    * NotFoundError
    */
   404: NotFoundError
+  /**
+   * ServiceUnavailableError
+   */
+  503: ServiceUnavailableError
 }
 
 export type OpencodexJobFailError = OpencodexJobFailErrors[keyof OpencodexJobFailErrors]
@@ -8452,6 +8646,10 @@ export type OpencodexJobRetryErrors = {
    * NotFoundError
    */
   404: NotFoundError
+  /**
+   * ServiceUnavailableError
+   */
+  503: ServiceUnavailableError
 }
 
 export type OpencodexJobRetryError = OpencodexJobRetryErrors[keyof OpencodexJobRetryErrors]
@@ -8506,6 +8704,10 @@ export type OpencodexSwarmCreateErrors = {
    * ProjectNotFoundError
    */
   404: ProjectNotFoundError
+  /**
+   * ServiceUnavailableError
+   */
+  503: ServiceUnavailableError
 }
 
 export type OpencodexSwarmCreateError = OpencodexSwarmCreateErrors[keyof OpencodexSwarmCreateErrors]
@@ -8906,6 +9108,10 @@ export type OpencodexGoalStartErrors = {
    * NotFoundError
    */
   404: NotFoundError
+  /**
+   * ServiceUnavailableError
+   */
+  503: ServiceUnavailableError
 }
 
 export type OpencodexGoalStartError = OpencodexGoalStartErrors[keyof OpencodexGoalStartErrors]
@@ -8940,6 +9146,10 @@ export type OpencodexGoalNodeApproveErrors = {
    * NotFoundError
    */
   404: NotFoundError
+  /**
+   * ServiceUnavailableError
+   */
+  503: ServiceUnavailableError
 }
 
 export type OpencodexGoalNodeApproveError = OpencodexGoalNodeApproveErrors[keyof OpencodexGoalNodeApproveErrors]
@@ -10197,6 +10407,10 @@ export type SessionPromptErrors = {
    * NotFoundError
    */
   404: NotFoundError
+  /**
+   * ServiceUnavailableError
+   */
+  503: ServiceUnavailableError
 }
 
 export type SessionPromptError = SessionPromptErrors[keyof SessionPromptErrors]
@@ -10381,6 +10595,10 @@ export type SessionInitErrors = {
    * NotFoundError
    */
   404: NotFoundError
+  /**
+   * ServiceUnavailableError
+   */
+  503: ServiceUnavailableError
 }
 
 export type SessionInitError = SessionInitErrors[keyof SessionInitErrors]
@@ -10419,6 +10637,10 @@ export type SessionSummarizeErrors = {
    * NotFoundError
    */
   404: NotFoundError
+  /**
+   * ServiceUnavailableError
+   */
+  503: ServiceUnavailableError
 }
 
 export type SessionSummarizeError = SessionSummarizeErrors[keyof SessionSummarizeErrors]
@@ -10519,6 +10741,10 @@ export type SessionCommandErrors = {
    * NotFoundError
    */
   404: NotFoundError
+  /**
+   * ServiceUnavailableError
+   */
+  503: ServiceUnavailableError
 }
 
 export type SessionCommandError = SessionCommandErrors[keyof SessionCommandErrors]
@@ -10569,6 +10795,10 @@ export type SessionShellErrors = {
    * SessionBusyError
    */
   409: SessionBusyError
+  /**
+   * ServiceUnavailableError
+   */
+  503: ServiceUnavailableError
 }
 
 export type SessionShellError = SessionShellErrors[keyof SessionShellErrors]

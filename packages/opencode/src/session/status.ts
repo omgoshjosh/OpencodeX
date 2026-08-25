@@ -6,7 +6,7 @@ import { NonNegativeInt } from "@opencode-ai/core/schema"
 import { SessionExecutionTable, SessionStatusTable } from "@opencode-ai/core/session/sql"
 import { ensureRunID } from "@opencode-ai/core/util/opencode-process"
 import { and, eq } from "drizzle-orm"
-import { Context, Duration, Effect, Layer, Option, Schedule, Schema } from "effect"
+import { Context, Duration, Effect, Layer, Option, Schedule, Schema, Scope } from "effect"
 import { SessionID } from "./schema"
 import { SessionExecutionOwner } from "./execution-owner"
 
@@ -89,6 +89,7 @@ export const ExecutionGeneration = Context.Reference<{ sessionID: SessionID; gen
 )
 
 const decode = Schema.decodeUnknownOption(Info)
+const ACTIVITY_FLUSH_MILLIS = 250
 
 function normalize(status: Info, current: Info | undefined, now: number): Info {
   if (status.type !== "busy") return status
@@ -106,7 +107,9 @@ export const layer = Layer.effect(
   Effect.gen(function* () {
     const events = yield* EventV2Bridge.Service
     const { db } = yield* Database.Service
+    const scope = yield* Scope.Scope
     const processRunID = ensureRunID()
+    const activityPending = yield* InstanceState.make(() => Effect.sync(() => new Map<SessionID, { at: number }>()))
 
     // `sessionID` scopes the scan to one row. Reads take that path so a status
     // lookup stays an indexed point query instead of two full table scans in an
@@ -305,9 +308,26 @@ export const layer = Layer.effect(
     })
 
     const activity = Effect.fn("SessionStatus.activity")(function* (sessionID: SessionID) {
-      return yield* patchCurrentGeneration(sessionID, (current, now) =>
-        current.type === "busy" ? { ...current, lastActivityAt: now } : undefined,
-      )
+      const pending = yield* InstanceState.get(activityPending)
+      const now = Date.now()
+      const current = pending.get(sessionID)
+      if (current) {
+        current.at = now
+        return false
+      }
+      pending.set(sessionID, { at: now })
+      yield* Effect.gen(function* () {
+        yield* Effect.sleep(ACTIVITY_FLUSH_MILLIS)
+        const at = pending.get(sessionID)?.at
+        pending.delete(sessionID)
+        if (at === undefined) return
+        yield* patchCurrentGeneration(sessionID, (current) =>
+          current.type === "busy"
+            ? { ...current, lastActivityAt: Math.max(current.lastActivityAt ?? 0, at) }
+            : undefined,
+        )
+      }).pipe(Effect.forkIn(scope))
+      return false
     })
 
     const toolStart = Effect.fn("SessionStatus.toolStart")(function* (sessionID: SessionID, title: string) {
@@ -321,7 +341,7 @@ export const layer = Layer.effect(
     const toolEnd = Effect.fn("SessionStatus.toolEnd")(function* (sessionID: SessionID) {
       return yield* patchCurrentGeneration(sessionID, (current, now) => {
         if (current.type !== "busy") return undefined
-        const { runningTool, ...next } = current
+        const { runningTool: _runningTool, ...next } = current
         return { ...next, lastActivityAt: now }
       })
     })

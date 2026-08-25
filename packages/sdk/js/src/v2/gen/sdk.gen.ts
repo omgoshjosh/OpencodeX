@@ -69,6 +69,14 @@ import type {
   GlobalConfigUpdateResponses,
   GlobalDisposeErrors,
   GlobalDisposeResponses,
+  GlobalDrainBeginErrors,
+  GlobalDrainBeginResponses,
+  GlobalDrainCancelErrors,
+  GlobalDrainCancelResponses,
+  GlobalDrainReplayErrors,
+  GlobalDrainReplayResponses,
+  GlobalDrainStatusErrors,
+  GlobalDrainStatusResponses,
   GlobalEventErrors,
   GlobalEventResponses,
   GlobalGuiBridgeRespondErrors,
@@ -932,6 +940,70 @@ export class Global extends HeyApiClient {
     return (options?.client ?? this.client).sse.get<GlobalEventResponses, GlobalEventErrors, ThrowOnError>({
       url: "/global/event",
       ...options,
+    })
+  }
+
+  public drainStatus<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
+    return (options?.client ?? this.client).get<GlobalDrainStatusResponses, GlobalDrainStatusErrors, ThrowOnError>({
+      url: "/global/drain",
+      ...options,
+    })
+  }
+
+  public drainBegin<ThrowOnError extends boolean = false>(
+    parameters?: {
+      expectedRunID?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "body", key: "expectedRunID" }] }])
+    return (options?.client ?? this.client).post<GlobalDrainBeginResponses, GlobalDrainBeginErrors, ThrowOnError>({
+      url: "/global/drain/begin",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  public drainCancel<ThrowOnError extends boolean = false>(
+    parameters?: {
+      expectedRunID?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "body", key: "expectedRunID" }] }])
+    return (options?.client ?? this.client).post<GlobalDrainCancelResponses, GlobalDrainCancelErrors, ThrowOnError>({
+      url: "/global/drain/cancel",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  public drainReplay<ThrowOnError extends boolean = false>(
+    parameters?: {
+      expectedRunID?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "body", key: "expectedRunID" }] }])
+    return (options?.client ?? this.client).post<GlobalDrainReplayResponses, GlobalDrainReplayErrors, ThrowOnError>({
+      url: "/global/drain/replay",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
     })
   }
 

@@ -228,6 +228,28 @@ describe("SessionStatus.Info", () => {
     expect(decode({ type: "busy" })).toEqual({ type: "busy" })
   })
 
+  test("accepts rich busy status and pending wakes without rejecting legacy payloads", () => {
+    expect(
+      decode({
+        type: "busy",
+        since: 10,
+        lastActivityAt: 11,
+        runningTool: { title: "bash", startedAt: 12 },
+        pendingWake: { at: 13, reason: "retry" },
+      }),
+    ).toEqual({
+      type: "busy",
+      since: 10,
+      lastActivityAt: 11,
+      runningTool: { title: "bash", startedAt: 12 },
+      pendingWake: { at: 13, reason: "retry" },
+    })
+    expect(decode({ type: "idle", pendingWake: { at: 14 } })).toEqual({
+      type: "idle",
+      pendingWake: { at: 14 },
+    })
+  })
+
   test("retry carries attempt/message/next", () => {
     const input = {
       type: "retry" as const,

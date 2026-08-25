@@ -26,12 +26,14 @@ export const assertScanRoot = Effect.fn("Tool.assertScanRoot")(function* (
   const roots = [ins.directory, ins.worktree, ...(ins.opencodex?.folders ?? [])].filter(
     (candidate) => path.resolve(candidate) !== path.parse(candidate).root,
   )
-  const allowed = yield* Effect.forEach(roots, (candidate) =>
-    Effect.tryPromise({
-      try: () => realpath(candidate),
-      // A stale optional workspace folder must not make valid scans fail.
-      catch: () => candidate,
-    }),
+  const allowed = yield* Effect.all(
+    roots.map((candidate) =>
+      Effect.tryPromise({
+        try: () => realpath(candidate),
+        // A stale optional workspace folder must not make valid scans fail.
+        catch: () => candidate,
+      }),
+    ),
   )
 
   const lexicalWorkspacePath = roots.some((candidate) => AppFileSystem.contains(candidate, path.resolve(target)))

@@ -148,11 +148,10 @@ describe("tool.glob", () => {
     Effect.gen(function* () {
       const test = yield* TestInstance
       yield* Effect.promise(() => fs.mkdir(path.join(test.directory, "nested", "deep"), { recursive: true }))
-      yield* Effect.forEach(
-        Array.from({ length: 101 }, (_, index) =>
-          Effect.promise(() => Bun.write(path.join(test.directory, "nested", "deep", `${index}.ts`), "export {}\n")),
-        ),
-      )
+      for (const index of Array.from({ length: 101 }, (_, index) => index))
+        yield* Effect.promise(() =>
+          Bun.write(path.join(test.directory, "nested", "deep", `${index}.ts`), "export {}\n"),
+        )
       const info = yield* GlobTool
       const glob = yield* info.init()
       const result = yield* glob.execute({ pattern: "*.ts", path: path.join(test.directory, "nested") }, ctx)
@@ -166,7 +165,9 @@ describe("tool.glob", () => {
       const test = yield* TestInstance
       const info = yield* GlobTool
       const glob = yield* info.init()
-      const root = yield* glob.execute({ pattern: "*.ts", path: path.parse(test.directory).root }, ctx).pipe(Effect.exit)
+      const root = yield* glob
+        .execute({ pattern: "*.ts", path: path.parse(test.directory).root }, ctx)
+        .pipe(Effect.exit)
       expect(Exit.isFailure(root)).toBe(true)
       if (Exit.isFailure(root)) expect(String(Cause.squash(root.cause))).toContain("filesystem root")
     }),
@@ -194,7 +195,9 @@ describe("tool.glob", () => {
       abort.abort(new Error("cancelled by test"))
       const info = yield* GlobTool
       const glob = yield* info.init()
-      const result = yield* glob.execute({ pattern: "*.ts", path: test.directory }, { ...ctx, abort: abort.signal }).pipe(Effect.exit)
+      const result = yield* glob
+        .execute({ pattern: "*.ts", path: test.directory }, { ...ctx, abort: abort.signal })
+        .pipe(Effect.exit)
       expect(Exit.isFailure(result)).toBe(true)
       if (Exit.isFailure(result)) expect(String(Cause.squash(result.cause))).toContain("cancelled by test")
     }),

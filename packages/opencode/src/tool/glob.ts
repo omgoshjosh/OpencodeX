@@ -71,9 +71,12 @@ export const GlobTool = Tool.define(
             Stream.take(limit + 1),
             Stream.runCollect,
             Effect.map((chunk) => [...chunk]),
-            Effect.timeoutFail({
+            Effect.timeoutOrElse({
               duration: SCAN_TIMEOUT,
-              onTimeout: () => new Error(`Glob scan timed out after ${SCAN_TIMEOUT}. Use a more specific path or pattern.`),
+              orElse: () =>
+                Effect.die(
+                  new Error(`Glob scan timed out after ${SCAN_TIMEOUT}. Use a more specific path or pattern.`),
+                ),
             }),
           )
 

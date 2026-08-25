@@ -169,22 +169,19 @@ describe("tool.grep", () => {
   it.instance("caps aggregate matches across multiple files", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
-      yield* Effect.forEach(
-        Array.from({ length: 2 }, (_, index) =>
-          Effect.promise(() =>
-            Bun.write(
-              path.join(test.directory, `match-${index}.txt`),
-              Array.from({ length: 75 }, () => "needle").join("\n"),
-            ),
+      for (const index of [0, 1])
+        yield* Effect.promise(() =>
+          Bun.write(
+            path.join(test.directory, `match-${index}.txt`),
+            Array.from({ length: 75 }, () => "needle").join("\n"),
           ),
-        ),
-      )
+        )
       const info = yield* GrepTool
       const grep = yield* info.init()
       const result = yield* grep.execute({ pattern: "needle", path: test.directory, include: "*.txt" }, ctx)
       expect(result.metadata.matches).toBe(100)
       expect(result.metadata.truncated).toBe(true)
-      expect(result.metadata.truncation).toBe("results")
+      expect("truncation" in result.metadata ? result.metadata.truncation : undefined).toBe("results")
       expect(result.output).toContain("at least 100 matches")
     }),
   )

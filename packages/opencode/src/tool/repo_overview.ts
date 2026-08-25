@@ -236,9 +236,14 @@ export const RepoOverviewTool = Tool.define<typeof Parameters, Metadata, AppFile
             ]),
           )
           const structureResult = yield* structure(target.path, depth).pipe(
-            Effect.timeoutFail({
+            Effect.timeoutOrElse({
               duration: SCAN_TIMEOUT,
-              onTimeout: () => new Error(`Repository scan timed out after ${SCAN_TIMEOUT}. Use a smaller repository or lower depth.`),
+              orElse: () =>
+                Effect.die(
+                  new Error(
+                    `Repository scan timed out after ${SCAN_TIMEOUT}. Use a smaller repository or lower depth.`,
+                  ),
+                ),
             }),
           )
           const branch = yield* git.branch(target.path)

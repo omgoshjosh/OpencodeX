@@ -147,11 +147,8 @@ describe("file.ripgrep", () => {
     Effect.gen(function* () {
       const dir = yield* tmpdir((dir) =>
         Effect.gen(function* () {
-          yield* Effect.forEach(
-            Array.from({ length: 100 }, (_, index) =>
-              write(path.join(dir, `match-${index}.ts`), Array.from({ length: 100 }, () => "needle").join("\n")),
-            ),
-          )
+          for (const index of Array.from({ length: 100 }, (_, index) => index))
+            yield* write(path.join(dir, `match-${index}.ts`), Array.from({ length: 100 }, () => "needle").join("\n"))
         }),
       )
 
@@ -168,11 +165,8 @@ describe("file.ripgrep", () => {
     Effect.gen(function* () {
       const dir = yield* tmpdir((dir) =>
         Effect.gen(function* () {
-          yield* Effect.forEach(
-            Array.from({ length: 100 }, (_, index) =>
-              write(path.join(dir, `match-${index}.ts`), `needle ${"x".repeat(4096)}`),
-            ),
-          )
+          for (const index of Array.from({ length: 100 }, (_, index) => index))
+            yield* write(path.join(dir, `match-${index}.ts`), `needle ${"x".repeat(4096)}`)
         }),
       )
 
@@ -182,6 +176,40 @@ describe("file.ripgrep", () => {
       expect(result.truncation).toBe("bytes")
       expect(result.terminated).toBe(true)
       expect(result.bytes).toBeLessThanOrEqual(128)
+    }),
+  )
+
+  it.live("terminates ripgrep when its time budget expires", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdir((dir) =>
+        Effect.gen(function* () {
+          for (const index of Array.from({ length: 100 }, (_, index) => index))
+            yield* write(path.join(dir, `match-${index}.ts`), `needle ${"x".repeat(4096)}`)
+        }),
+      )
+
+      const result = yield* Ripgrep.use.search({ cwd: dir, pattern: "needle", timeout: 1, maxBytes: 1024 * 1024 })
+      expect(result.truncated).toBe(true)
+      expect(result.truncation).toBe("time")
+      expect(result.terminated).toBe(true)
+    }),
+  )
+
+  it.live("propagates ripgrep failures that did not hit a budget", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdir((dir) => write(path.join(dir, "match.ts"), "needle"))
+      const exit = yield* Ripgrep.use.search({ cwd: dir, pattern: "[" }).pipe(Effect.exit)
+      expect(exit._tag).toBe("Failure")
+    }),
+  )
+
+  it.live("propagates caller cancellation", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdir((dir) => write(path.join(dir, "match.ts"), "needle"))
+      const abort = new AbortController()
+      abort.abort(new Error("cancelled by test"))
+      const exit = yield* Ripgrep.use.search({ cwd: dir, pattern: "needle", signal: abort.signal }).pipe(Effect.exit)
+      expect(exit._tag).toBe("Failure")
     }),
   )
 

@@ -96,6 +96,8 @@ const Summary = Schema.Struct({
 const Result = Schema.Union([Begin, Match, End, Summary])
 const decodeResult = Schema.decodeUnknownEffect(Schema.fromJsonString(Result))
 
+class SearchStopped extends Schema.TaggedErrorClass<SearchStopped>()("SearchStopped", {}) {}
+
 export type Result = Schema.Schema.Type<typeof Result>
 export type Match = Schema.Schema.Type<typeof Match>
 export type Item = Match["data"]
@@ -397,10 +399,8 @@ export const layer: Layer.Layer<Service, never, AppFileSystem.Service | ChildPro
             const terminate = Effect.fnUntraced(function* (reason: NonNullable<SearchResult["truncation"]>) {
               if (truncation) return
               truncation = reason
-              yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(
-                Effect.tap(() => Effect.sync(() => (terminated = true))),
-                Effect.ignore,
-              )
+              yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.forkScoped)
+              terminated = true
             })
             const stderr = yield* Stream.mkString(Stream.decodeText(handle.stderr)).pipe(Effect.forkScoped)
             const timer = input.timeout
@@ -410,10 +410,14 @@ export const layer: Layer.Layer<Service, never, AppFileSystem.Service | ChildPro
                 )
               : undefined
             const collect = Effect.fnUntraced(function* (line: string) {
-              if (truncation || !line) return
+              if (truncation) return yield* new SearchStopped()
+              if (!line) return
               const result = yield* parse(line.endsWith("\r") ? line.slice(0, -1) : line)
               if (result.type !== "match") return
-              if (input.limit !== undefined && items.length >= input.limit) return yield* terminate("results")
+              if (input.limit !== undefined && items.length >= input.limit) {
+                yield* terminate("results")
+                return yield* new SearchStopped()
+              }
               items.push(row(result.data))
             })
             const decoder = new TextDecoder()
@@ -423,27 +427,46 @@ export const layer: Layer.Layer<Service, never, AppFileSystem.Service | ChildPro
             yield* handle.stdout.pipe(
               Stream.runForEach((chunk) =>
                 Effect.gen(function* () {
-                  if (truncation) return
-                  if (bytes + chunk.length > maxBytes) return yield* terminate("bytes")
+                  if (truncation) return yield* new SearchStopped()
+                  if (bytes + chunk.length > maxBytes) {
+                    yield* terminate("bytes")
+                    return yield* new SearchStopped()
+                  }
                   bytes += chunk.length
                   const lines = (pending + decoder.decode(chunk, { stream: true })).split("\n")
                   pending = lines.pop() ?? ""
-                  yield* Effect.forEach(lines, collect)
+                  for (const line of lines) yield* collect(line)
                 }),
+              ),
+              Effect.catch((cause) =>
+                cause instanceof SearchStopped || truncation ? Effect.void : Effect.fail(cause),
               ),
             )
             if (!truncation) yield* collect(pending + decoder.decode())
-            if (timer) yield* Fiber.interrupt(timer)
+            if (timer && truncation === "time") yield* Fiber.join(timer)
+            if (timer && truncation !== "time") yield* Fiber.interrupt(timer)
+            if (truncation) {
+              yield* handle.exitCode.pipe(Effect.ignore)
+              yield* Fiber.join(stderr).pipe(Effect.ignore)
+              return {
+                items,
+                partial: false,
+                truncated: true,
+                truncation,
+                bytes,
+                terminated,
+              }
+            }
             const code = yield* handle.exitCode
             const errors = yield* Fiber.join(stderr)
 
-            if (!truncation && code !== 0 && code !== 1 && code !== 2) {
+            if (code !== 0 && code !== 1) {
               return yield* Effect.fail(error(errors, code))
             }
 
             return {
               items: code === 1 ? [] : items,
-              partial: code === 2,
+              partial: false,
               truncated: Boolean(truncation),
               truncation,
               bytes,

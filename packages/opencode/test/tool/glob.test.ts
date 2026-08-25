@@ -1,4 +1,5 @@
 import { describe, expect } from "bun:test"
+import fs from "fs/promises"
 import path from "path"
 import { Cause, Effect, Exit, Layer } from "effect"
 import { GlobTool } from "../../src/tool/glob"
@@ -140,6 +141,77 @@ describe("tool.glob", () => {
         const err = Cause.squash(exit.cause)
         expect(err instanceof Error ? err.message : String(err)).toContain("glob path must be a directory")
       }
+    }),
+  )
+
+  it.instance("scans nested workspace directories within the result limit", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => fs.mkdir(path.join(test.directory, "nested", "deep"), { recursive: true }))
+      yield* Effect.forEach(
+        Array.from({ length: 101 }, (_, index) =>
+          Effect.promise(() => Bun.write(path.join(test.directory, "nested", "deep", `${index}.ts`), "export {}\n")),
+        ),
+      )
+      const info = yield* GlobTool
+      const glob = yield* info.init()
+      const result = yield* glob.execute({ pattern: "*.ts", path: path.join(test.directory, "nested") }, ctx)
+      expect(result.metadata.count).toBe(100)
+      expect(result.metadata.truncated).toBe(true)
+    }),
+  )
+
+  it.instance("refuses filesystem roots", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const info = yield* GlobTool
+      const glob = yield* info.init()
+      const root = yield* glob.execute({ pattern: "*.ts", path: path.parse(test.directory).root }, ctx).pipe(Effect.exit)
+      expect(Exit.isFailure(root)).toBe(true)
+      if (Exit.isFailure(root)) expect(String(Cause.squash(root.cause))).toContain("filesystem root")
+    }),
+  )
+
+  it.instance("refuses symlinked scan roots that leave the workspace", () =>
+    Effect.gen(function* () {
+      if (process.platform === "win32") return
+      const test = yield* TestInstance
+      const outside = yield* tmpdirScoped()
+      const alias = path.join(test.directory, "outside")
+      yield* Effect.promise(() => fs.symlink(outside, alias, "dir"))
+      const info = yield* GlobTool
+      const glob = yield* info.init()
+      const result = yield* glob.execute({ pattern: "*.ts", path: alias }, ctx).pipe(Effect.exit)
+      expect(Exit.isFailure(result)).toBe(true)
+      if (Exit.isFailure(result)) expect(String(Cause.squash(result.cause))).toContain("outside the active workspace")
+    }),
+  )
+
+  it.instance("honors an already-cancelled scan", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const abort = new AbortController()
+      abort.abort(new Error("cancelled by test"))
+      const info = yield* GlobTool
+      const glob = yield* info.init()
+      const result = yield* glob.execute({ pattern: "*.ts", path: test.directory }, { ...ctx, abort: abort.signal }).pipe(Effect.exit)
+      expect(Exit.isFailure(result)).toBe(true)
+      if (Exit.isFailure(result)) expect(String(Cause.squash(result.cause))).toContain("cancelled by test")
+    }),
+  )
+
+  it.instance("surfaces inaccessible directory errors where supported", () =>
+    Effect.gen(function* () {
+      if (process.platform === "win32" || process.getuid?.() === 0) return
+      const test = yield* TestInstance
+      const blocked = path.join(test.directory, "blocked")
+      yield* Effect.promise(() => fs.mkdir(blocked))
+      yield* Effect.promise(() => fs.chmod(blocked, 0))
+      yield* Effect.addFinalizer(() => Effect.promise(() => fs.chmod(blocked, 0o700)))
+      const info = yield* GlobTool
+      const glob = yield* info.init()
+      const result = yield* glob.execute({ pattern: "*.ts", path: blocked }, ctx).pipe(Effect.exit)
+      expect(Exit.isFailure(result)).toBe(true)
     }),
   )
 

@@ -7,6 +7,7 @@ import DESCRIPTION from "./repo_overview.txt"
 import * as Tool from "./tool"
 import { parseRepositoryReference, repositoryCachePath } from "@/util/repository"
 import { InstanceState } from "@/effect/instance-state"
+import { assertScanRoot, SCAN_TIMEOUT } from "./scan-bounds"
 
 export const Parameters = Schema.Struct({
   repository: Schema.optional(Schema.String).annotate({
@@ -143,7 +144,7 @@ export const RepoOverviewTool = Tool.define<typeof Parameters, Metadata, AppFile
         const sorted = yield* Effect.forEach(
           entries,
           Effect.fnUntraced(function* (entry) {
-            if (IGNORED_DIRS.has(entry.name)) return undefined
+            if (IGNORED_DIRS.has(entry.name) || entry.type === "symlink") return undefined
             const full = path.join(dir, entry.name)
             const info = yield* fs.stat(full).pipe(Effect.catch(() => Effect.succeed(undefined)))
             if (!info) return undefined
@@ -182,7 +183,15 @@ export const RepoOverviewTool = Tool.define<typeof Parameters, Metadata, AppFile
           const depth =
             !params.depth || !Number.isInteger(params.depth) || params.depth < 1 || params.depth > 6 ? 3 : params.depth
 
+          const info = yield* fs.stat(target.path).pipe(Effect.catch(() => Effect.succeed(undefined)))
+          if (!info) {
+            if (target.repository)
+              throw new Error(`Repository is not cloned: ${target.repository}. Use repo_clone first.`)
+            throw new Error(`Directory not found: ${target.path}`)
+          }
+          if (info.type !== "Directory") throw new Error(`Path is not a directory: ${target.path}`)
           yield* assertExternalDirectoryEffect(ctx, target.path, { kind: "directory" })
+          yield* assertScanRoot(target.path, { allowExternal: true })
           yield* ctx.ask({
             permission: "repo_overview",
             patterns: [target.repository ?? target.path],
@@ -193,14 +202,6 @@ export const RepoOverviewTool = Tool.define<typeof Parameters, Metadata, AppFile
               depth,
             },
           })
-
-          const info = yield* fs.stat(target.path).pipe(Effect.catch(() => Effect.succeed(undefined)))
-          if (!info) {
-            if (target.repository)
-              throw new Error(`Repository is not cloned: ${target.repository}. Use repo_clone first.`)
-            throw new Error(`Directory not found: ${target.path}`)
-          }
-          if (info.type !== "Directory") throw new Error(`Path is not a directory: ${target.path}`)
 
           const entries = yield* fs.readDirectoryEntries(target.path).pipe(Effect.orElseSucceed(() => []))
           const topLevel = new Set(entries.map((entry) => entry.name))
@@ -234,7 +235,12 @@ export const RepoOverviewTool = Tool.define<typeof Parameters, Metadata, AppFile
                 .flatMap(() => ["src/index.ts", "src/index.tsx", "src/index.js", "src/main.ts", "src/main.js"]),
             ]),
           )
-          const structureResult = yield* structure(target.path, depth)
+          const structureResult = yield* structure(target.path, depth).pipe(
+            Effect.timeoutFail({
+              duration: SCAN_TIMEOUT,
+              onTimeout: () => new Error(`Repository scan timed out after ${SCAN_TIMEOUT}. Use a smaller repository or lower depth.`),
+            }),
+          )
           const branch = yield* git.branch(target.path)
           const head = yield* git.run(["rev-parse", "HEAD"], { cwd: target.path })
           const headText = head.exitCode === 0 ? head.text().trim() : undefined

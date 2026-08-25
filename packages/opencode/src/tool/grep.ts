@@ -8,6 +8,7 @@ import { assertExternalDirectoryEffect } from "./external-directory"
 import DESCRIPTION from "./grep.txt"
 import * as Tool from "./tool"
 import { Reference } from "@/reference/reference"
+import { assertScanRoot, SCAN_TIMEOUT } from "./scan-bounds"
 
 const MAX_LINE_LENGTH = 2000
 
@@ -68,14 +69,26 @@ export const GrepTool = Tool.define(
           const info = yield* fs.stat(search).pipe(Effect.catch(() => Effect.succeed(undefined)))
           const cwd = info?.type === "Directory" ? search : path.dirname(search)
           const file = info?.type === "Directory" ? undefined : [path.relative(cwd, search)]
-
-          const result = yield* rg.search({
-            cwd,
-            pattern: params.pattern,
-            glob: params.include ? [params.include] : undefined,
-            file,
-            signal: ctx.abort,
+          yield* assertScanRoot(search, {
+            allowExternal: true,
           })
+
+          const limit = 100
+          const result = yield* rg
+            .search({
+              cwd,
+              pattern: params.pattern,
+              glob: params.include ? [params.include] : undefined,
+              file,
+              limit,
+              signal: ctx.abort,
+            })
+            .pipe(
+              Effect.timeoutFail({
+                duration: SCAN_TIMEOUT,
+                onTimeout: () => new Error(`Grep scan timed out after ${SCAN_TIMEOUT}. Use a more specific path or pattern.`),
+              }),
+            )
           if (result.items.length === 0) return empty
 
           const rows = result.items.map((item) => ({
@@ -110,7 +123,6 @@ export const GrepTool = Tool.define(
 
           matches.sort((a, b) => b.mtime - a.mtime)
 
-          const limit = 100
           const truncated = matches.length > limit
           const final = truncated ? matches.slice(0, limit) : matches
           if (final.length === 0) return empty

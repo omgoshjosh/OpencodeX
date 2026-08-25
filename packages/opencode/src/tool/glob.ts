@@ -8,6 +8,7 @@ import { assertExternalDirectoryEffect } from "./external-directory"
 import DESCRIPTION from "./glob.txt"
 import * as Tool from "./tool"
 import { Reference } from "@/reference/reference"
+import { assertScanRoot, SCAN_TIMEOUT } from "./scan-bounds"
 
 export const Parameters = Schema.Struct({
   pattern: Schema.String.annotate({ description: "The glob pattern to match files against" }),
@@ -50,6 +51,7 @@ export const GlobTool = Tool.define(
             bypass: yield* reference.contains(search),
             kind: "directory",
           })
+          yield* assertScanRoot(search, { allowExternal: true })
 
           const limit = 100
           let truncated = false
@@ -69,6 +71,10 @@ export const GlobTool = Tool.define(
             Stream.take(limit + 1),
             Stream.runCollect,
             Effect.map((chunk) => [...chunk]),
+            Effect.timeoutFail({
+              duration: SCAN_TIMEOUT,
+              onTimeout: () => new Error(`Glob scan timed out after ${SCAN_TIMEOUT}. Use a more specific path or pattern.`),
+            }),
           )
 
           if (files.length > limit) {

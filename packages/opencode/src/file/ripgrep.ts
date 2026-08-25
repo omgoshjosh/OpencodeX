@@ -107,6 +107,10 @@ export type Row = Match["data"]
 export interface SearchResult {
   items: Item[]
   partial: boolean
+  truncated: boolean
+  truncation?: "results" | "bytes" | "time"
+  bytes: number
+  terminated: boolean
 }
 
 export interface FilesInput {
@@ -123,6 +127,8 @@ export interface SearchInput {
   pattern: string
   glob?: string[]
   limit?: number
+  maxBytes?: number
+  timeout?: number
   follow?: boolean
   file?: string[]
   signal?: AbortSignal
@@ -215,7 +221,6 @@ function searchArgs(input: SearchInput) {
   if (input.glob) {
     for (const glob of input.glob) args.push(`--glob=${glob}`)
   }
-  if (input.limit) args.push(`--max-count=${input.limit}`)
   args.push("--", input.pattern, ...(input.file ?? ["."]))
   return args
 }
@@ -384,31 +389,65 @@ export const layer: Layer.Layer<Service, never, AppFileSystem.Service | ChildPro
         const program = Effect.scoped(
           Effect.gen(function* () {
             const handle = yield* spawner.spawn(yield* command(input.cwd, searchArgs(input)))
+            const items: Item[] = []
+            const maxBytes = input.maxBytes ?? 1024 * 1024
+            let bytes = 0
+            let truncation: SearchResult["truncation"]
+            let terminated = false
+            const terminate = Effect.fnUntraced(function* (reason: NonNullable<SearchResult["truncation"]>) {
+              if (truncation) return
+              truncation = reason
+              yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(
+                Effect.tap(() => Effect.sync(() => (terminated = true))),
+                Effect.ignore,
+              )
+            })
+            const stderr = yield* Stream.mkString(Stream.decodeText(handle.stderr)).pipe(Effect.forkScoped)
+            const timer = input.timeout
+              ? yield* Effect.sleep(input.timeout).pipe(
+                  Effect.tap(() => terminate("time")),
+                  Effect.forkScoped,
+                )
+              : undefined
+            const collect = Effect.fnUntraced(function* (line: string) {
+              if (truncation || !line) return
+              const result = yield* parse(line.endsWith("\r") ? line.slice(0, -1) : line)
+              if (result.type !== "match") return
+              if (input.limit !== undefined && items.length >= input.limit) return yield* terminate("results")
+              items.push(row(result.data))
+            })
+            const decoder = new TextDecoder()
+            let pending = ""
 
-            const [items, stderr, code] = yield* Effect.all(
-              [
-                Stream.decodeText(handle.stdout).pipe(
-                  Stream.splitLines,
-                  Stream.filter((line) => line.length > 0),
-                  Stream.mapEffect(parse),
-                  Stream.filter((item): item is Match => item.type === "match"),
-                  Stream.map((item) => row(item.data)),
-                  Stream.runCollect,
-                  Effect.map((chunk) => [...chunk]),
-                ),
-                Stream.mkString(Stream.decodeText(handle.stderr)),
-                handle.exitCode,
-              ],
-              { concurrency: "unbounded" },
+            // Cap raw chunks before decoding so one oversized JSON record cannot bypass the output budget.
+            yield* handle.stdout.pipe(
+              Stream.runForEach((chunk) =>
+                Effect.gen(function* () {
+                  if (truncation) return
+                  if (bytes + chunk.length > maxBytes) return yield* terminate("bytes")
+                  bytes += chunk.length
+                  const lines = (pending + decoder.decode(chunk, { stream: true })).split("\n")
+                  pending = lines.pop() ?? ""
+                  yield* Effect.forEach(lines, collect)
+                }),
+              ),
             )
+            if (!truncation) yield* collect(pending + decoder.decode())
+            if (timer) yield* Fiber.interrupt(timer)
+            const code = yield* handle.exitCode
+            const errors = yield* Fiber.join(stderr)
 
-            if (code !== 0 && code !== 1 && code !== 2) {
-              return yield* Effect.fail(error(stderr, code))
+            if (!truncation && code !== 0 && code !== 1 && code !== 2) {
+              return yield* Effect.fail(error(errors, code))
             }
 
             return {
               items: code === 1 ? [] : items,
               partial: code === 2,
+              truncated: Boolean(truncation),
+              truncation,
+              bytes,
+              terminated,
             }
           }),
         )

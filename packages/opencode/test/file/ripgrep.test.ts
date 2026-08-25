@@ -143,6 +143,48 @@ describe("file.ripgrep", () => {
     }),
   )
 
+  it.live("bounds aggregate matches across files and terminates ripgrep", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdir((dir) =>
+        Effect.gen(function* () {
+          yield* Effect.forEach(
+            Array.from({ length: 100 }, (_, index) =>
+              write(path.join(dir, `match-${index}.ts`), Array.from({ length: 100 }, () => "needle").join("\n")),
+            ),
+          )
+        }),
+      )
+
+      const result = yield* Ripgrep.use.search({ cwd: dir, pattern: "needle", limit: 100, maxBytes: 1024 * 1024 })
+      expect(result.items).toHaveLength(100)
+      expect(result.truncated).toBe(true)
+      expect(result.truncation).toBe("results")
+      expect(result.terminated).toBe(true)
+      expect(result.bytes).toBeLessThan(1024 * 1024)
+    }),
+  )
+
+  it.live("bounds buffered search output by bytes", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdir((dir) =>
+        Effect.gen(function* () {
+          yield* Effect.forEach(
+            Array.from({ length: 100 }, (_, index) =>
+              write(path.join(dir, `match-${index}.ts`), `needle ${"x".repeat(4096)}`),
+            ),
+          )
+        }),
+      )
+
+      const result = yield* Ripgrep.use.search({ cwd: dir, pattern: "needle", maxBytes: 128 })
+      expect(result.items).toEqual([])
+      expect(result.truncated).toBe(true)
+      expect(result.truncation).toBe("bytes")
+      expect(result.terminated).toBe(true)
+      expect(result.bytes).toBeLessThanOrEqual(128)
+    }),
+  )
+
   it.live("files returns empty when glob matches no files", () =>
     Effect.gen(function* () {
       const dir = yield* tmpdir((dir) =>

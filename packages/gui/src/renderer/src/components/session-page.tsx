@@ -263,7 +263,7 @@ export function SessionPage(props: SessionPageProps) {
               so an arriving permission never resizes the transcript viewport. */}
           <div class="session-dock-anchor">
           <Show when={blocked()}>
-            <SessionSafetyDock permissions={props.permissions} questions={props.questions} messages={props.data.messages} replyPermission={props.replyPermission} replyQuestion={props.replyQuestion} rejectQuestion={props.rejectQuestion} />
+            <SessionSafetyDock sessionID={props.session?.id} permissions={props.permissions} questions={props.questions} messages={props.data.messages} replyPermission={props.replyPermission} replyQuestion={props.replyQuestion} rejectQuestion={props.rejectQuestion} />
           </Show>
           <SessionComposer
             blocked={blocked()}

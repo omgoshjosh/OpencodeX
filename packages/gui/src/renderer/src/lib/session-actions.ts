@@ -8,6 +8,25 @@ export function sessionDirectoryForRequest(sessions: Session[], request: Permiss
   return sessions.find((session) => session.id === request.sessionID)?.directory
 }
 
+/** Pending child questions belong on their parent's safety surface, but retain
+ * their original request and session IDs for the reply route. */
+export function questionsForSessionAttention(sessions: Session[], sessionID: string, questions: QuestionRequest[]) {
+  const visible = new Set([sessionID])
+  for (;;) {
+    const before = visible.size
+    for (const session of sessions) {
+      if (session.parentID && visible.has(session.parentID)) visible.add(session.id)
+    }
+    if (visible.size === before) break
+  }
+  const requestIDs = new Set<string>()
+  return questions.filter((request) => visible.has(request.sessionID) && !requestIDs.has(request.id) && requestIDs.add(request.id))
+}
+
+export function questionSourceLabel(request: QuestionRequest, sessionID: string) {
+  return request.sessionID === sessionID ? undefined : `Child session: ${request.sessionID}`
+}
+
 export function sidePanelDirectoryForSession(input: {
   session?: Session
   projects: GuiSnapshot["projects"]

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import type { PermissionRequest, QuestionRequest, Session } from "@opencode-ai/sdk/v2/client"
-import { moveSessionBlockedMessage, moveSessionConfirmInput, permissionAlwaysConfirmInput, permissionRejectDialog, runMoveSessionAction, runPermissionAction, sessionDirectoryForRequest, sidePanelDirectoryForSession } from "../src/renderer/src/lib/session-actions"
+import { moveSessionBlockedMessage, moveSessionConfirmInput, permissionAlwaysConfirmInput, permissionRejectDialog, questionSourceLabel, questionsForSessionAttention, runMoveSessionAction, runPermissionAction, sessionDirectoryForRequest, sidePanelDirectoryForSession } from "../src/renderer/src/lib/session-actions"
 import type { GuiSnapshot } from "../src/renderer/src/lib/session-api"
 
 describe("GUI session action decisions", () => {
@@ -9,6 +9,28 @@ describe("GUI session action decisions", () => {
 
     expect(sessionDirectoryForRequest(sessions, permission("s2"))).toBe("C:/Two")
     expect(sessionDirectoryForRequest(sessions, question("missing"))).toBeUndefined()
+  })
+
+  test("shows deduplicated descendant questions on the parent safety surface", () => {
+    const parent = session("parent", "C:/Parent")
+    const child = { ...session("child", "C:/Child"), parentID: parent.id }
+    const grandchild = { ...session("grandchild", "C:/Grandchild"), parentID: child.id }
+    const childQuestion = { ...question(child.id), id: "child-question" }
+    const requests = [
+      { ...question(parent.id), id: "parent-question" },
+      childQuestion,
+      childQuestion,
+      { ...question("other"), id: "other-question" },
+      { ...question(grandchild.id), id: "grandchild-question" },
+    ]
+
+    expect(questionsForSessionAttention([parent, child, grandchild], parent.id, requests).map((request) => request.sessionID)).toEqual([
+      "parent",
+      "child",
+      "grandchild",
+    ])
+    expect(questionSourceLabel(childQuestion, parent.id)).toBe("Child session: child")
+    expect(questionSourceLabel(question(parent.id), parent.id)).toBeUndefined()
   })
 
   test("roots project sessions in their configured project folders", () => {

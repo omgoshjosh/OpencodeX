@@ -25,8 +25,7 @@ const probe = (run: (ctx: Tool.Context) => Effect.Effect<void>): Tool.Def => ({
   id: "probe",
   description: "test tool",
   parameters: Schema.Struct({}),
-  execute: (_args, ctx) =>
-    run(ctx).pipe(Effect.as({ title: "done", metadata: { truncated: false }, output: "done" })),
+  execute: (_args, ctx) => run(ctx).pipe(Effect.as({ title: "done", metadata: { truncated: false }, output: "done" })),
 })
 
 const services = (tool: Tool.Def) =>
@@ -53,14 +52,11 @@ const services = (tool: Tool.Def) =>
     Layer.succeed(Truncate.Service, {
       output: (text: string) => Effect.succeed({ truncated: false, content: text }),
     } as unknown as Truncate.Interface),
-    Layer.succeed(
-      SessionStatus.Service,
-      {
-        activity: () => Effect.succeed(false),
-        toolStart: () => Effect.succeed(false),
-        toolEnd: () => Effect.succeed(false),
-      } as unknown as SessionStatus.Interface,
-    ),
+    Layer.succeed(SessionStatus.Service, {
+      activity: () => Effect.succeed(false),
+      toolStart: () => Effect.succeed(false),
+      toolEnd: () => Effect.succeed(false),
+    } as unknown as SessionStatus.Interface),
   )
 
 const run = (tool: Tool.Def) =>
@@ -92,7 +88,11 @@ const run = (tool: Tool.Def) =>
     if (!entry?.execute) throw new Error("probe tool was not resolved")
     yield* Effect.promise(() =>
       Promise.resolve(
-        entry.execute!({}, { toolCallId: "call_probe", messages: [], abortSignal: new AbortController().signal } as any),
+        entry.execute!({}, {
+          toolCallId: "call_probe",
+          messages: [],
+          abortSignal: new AbortController().signal,
+        } as any),
       ),
     )
   }).pipe(Effect.provide(services(tool)))

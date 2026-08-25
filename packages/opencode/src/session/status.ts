@@ -13,6 +13,12 @@ import { SessionExecutionOwner } from "./execution-owner"
 export const Info = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("idle"),
+    pendingWake: Schema.optional(
+      Schema.Struct({
+        at: NonNegativeInt,
+        reason: Schema.optional(Schema.String),
+      }),
+    ),
   }),
   Schema.Struct({
     type: Schema.Literal("retry"),
@@ -22,6 +28,20 @@ export const Info = Schema.Union([
   }),
   Schema.Struct({
     type: Schema.Literal("busy"),
+    since: Schema.optional(NonNegativeInt),
+    lastActivityAt: Schema.optional(NonNegativeInt),
+    runningTool: Schema.optional(
+      Schema.Struct({
+        title: Schema.String,
+        startedAt: NonNegativeInt,
+      }),
+    ),
+    pendingWake: Schema.optional(
+      Schema.Struct({
+        at: NonNegativeInt,
+        reason: Schema.optional(Schema.String),
+      }),
+    ),
   }),
 ]).annotate({ identifier: "SessionStatus" })
 export type Info = Schema.Schema.Type<typeof Info>
@@ -52,6 +72,13 @@ export interface Interface {
   readonly list: () => Effect.Effect<Map<SessionID, Info>>
   readonly set: (sessionID: SessionID, status: Info) => Effect.Effect<void>
   readonly setForGeneration: (sessionID: SessionID, generation: number, status: Info) => Effect.Effect<boolean>
+  readonly activity: (sessionID: SessionID) => Effect.Effect<boolean>
+  readonly toolStart: (sessionID: SessionID, title: string) => Effect.Effect<boolean>
+  readonly toolEnd: (sessionID: SessionID) => Effect.Effect<boolean>
+  readonly setPendingWake: (
+    sessionID: SessionID,
+    pendingWake?: { at: number; reason?: string },
+  ) => Effect.Effect<boolean>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionStatus") {}
@@ -62,7 +89,17 @@ export const ExecutionGeneration = Context.Reference<{ sessionID: SessionID; gen
 )
 
 const decode = Schema.decodeUnknownOption(Info)
-const OWNERLESS_STALE_MILLIS = 15_000
+
+function normalize(status: Info, current: Info | undefined, now: number): Info {
+  if (status.type !== "busy") return status
+  const previous = current?.type === "busy" ? current : undefined
+  return {
+    ...previous,
+    ...status,
+    since: status.since ?? previous?.since ?? now,
+    lastActivityAt: status.lastActivityAt ?? now,
+  }
+}
 
 export const layer = Layer.effect(
   Service,
@@ -99,7 +136,10 @@ export const layer = Layer.effect(
               )
               const stale = statuses.filter((row) => {
                 const execution = executions.get(row.session_id)
-                if (!execution) return row.time_updated + OWNERLESS_STALE_MILLIS <= now
+                // Status is presentation state, never execution authority. A
+                // busy row without an execution lease is a crashed/restarted
+                // writer, not proof that work is still running.
+                if (!execution) return true
                 if (execution.state !== "running" || !execution.owner_id) return true
                 if (!execution.lease_expires_at || execution.lease_expires_at <= now) return true
                 return !SessionExecutionOwner.alive(execution.owner_id, processRunID)
@@ -169,13 +209,23 @@ export const layer = Layer.effect(
       )
     })
 
-    const write = Effect.fnUntraced(function* (sessionID: SessionID, status: Info, generation?: number) {
+    const write = Effect.fnUntraced(function* (
+      sessionID: SessionID,
+      status: Info | ((current: Info | undefined, now: number) => Info | undefined),
+      generation?: number,
+    ) {
       const ctx = yield* InstanceState.context
       const now = Date.now()
       const committed = yield* events.barrier(
         db.transaction(
           (transaction) =>
             Effect.gen(function* () {
+              const existing = yield* transaction
+                .select({ status: SessionStatusTable.status })
+                .from(SessionStatusTable)
+                .where(eq(SessionStatusTable.session_id, sessionID))
+                .get()
+              const current = existing ? Option.getOrUndefined(decode(existing.status)) : undefined
               if (generation !== undefined) {
                 const execution = yield* transaction
                   .select({ generation: SessionExecutionTable.generation, state: SessionExecutionTable.state })
@@ -183,15 +233,21 @@ export const layer = Layer.effect(
                   .where(eq(SessionExecutionTable.session_id, sessionID))
                   .get()
                 if (execution?.generation !== generation) return undefined
-                if (status.type !== "idle" && execution.state !== "running") return undefined
+                if ((typeof status === "function" || status.type !== "idle") && execution.state !== "running")
+                  return undefined
               }
+              const next =
+                typeof status === "function"
+                  ? status(current, now)
+                  : normalize(status, current, now)
+              if (!next) return undefined
               yield* transaction
                 .insert(SessionStatusTable)
                 .values({
                   session_id: sessionID,
                   project_id: ctx.project.id,
                   directory: ctx.directory,
-                  status,
+                  status: next,
                   time_created: now,
                   time_updated: now,
                 })
@@ -200,14 +256,14 @@ export const layer = Layer.effect(
                   set: {
                     project_id: ctx.project.id,
                     directory: ctx.directory,
-                    status,
+                    status: next,
                     time_updated: now,
                   },
                 })
                 .run()
               return {
-                status: yield* events.commit(Event.Status, { sessionID, status }),
-                idle: status.type === "idle" ? yield* events.commit(Event.Idle, { sessionID }) : undefined,
+                status: yield* events.commit(Event.Status, { sessionID, status: next }),
+                idle: next.type === "idle" ? yield* events.commit(Event.Idle, { sessionID }) : undefined,
               }
             }),
           { behavior: "immediate" },
@@ -236,6 +292,51 @@ export const layer = Layer.effect(
       yield* write(sessionID, status)
     })
 
+    const patchCurrentGeneration = Effect.fnUntraced(function* (
+      sessionID: SessionID,
+      patch: (current: Info, now: number) => Info | undefined,
+    ) {
+      const generation = yield* ExecutionGeneration
+      return yield* write(
+        sessionID,
+        (current, now) => (current ? patch(current, now) : undefined),
+        generation?.sessionID === sessionID ? generation.generation : undefined,
+      )
+    })
+
+    const activity = Effect.fn("SessionStatus.activity")(function* (sessionID: SessionID) {
+      return yield* patchCurrentGeneration(sessionID, (current, now) =>
+        current.type === "busy" ? { ...current, lastActivityAt: now } : undefined,
+      )
+    })
+
+    const toolStart = Effect.fn("SessionStatus.toolStart")(function* (sessionID: SessionID, title: string) {
+      return yield* patchCurrentGeneration(sessionID, (current, now) =>
+        current.type === "busy"
+          ? { ...current, lastActivityAt: now, runningTool: { title, startedAt: now } }
+          : undefined,
+      )
+    })
+
+    const toolEnd = Effect.fn("SessionStatus.toolEnd")(function* (sessionID: SessionID) {
+      return yield* patchCurrentGeneration(sessionID, (current, now) => {
+        if (current.type !== "busy") return undefined
+        const { runningTool, ...next } = current
+        return { ...next, lastActivityAt: now }
+      })
+    })
+
+    const setPendingWake = Effect.fn("SessionStatus.setPendingWake")(function* (
+      sessionID: SessionID,
+      pendingWake?: { at: number; reason?: string },
+    ) {
+      return yield* patchCurrentGeneration(sessionID, (current) => {
+        if (current.type !== "busy" && current.type !== "idle") return undefined
+        const { pendingWake: _, ...next } = current
+        return pendingWake ? { ...next, pendingWake } : next
+      })
+    })
+
     // Recovery reconciles rows whose owning execution died. It used to run on
     // every read, which meant two full table scans inside an immediate
     // transaction under the event barrier for something as routine as painting
@@ -253,7 +354,7 @@ export const layer = Layer.effect(
       Effect.forkScoped,
     )
 
-    return Service.of({ get, list, set, setForGeneration })
+    return Service.of({ get, list, set, setForGeneration, activity, toolStart, toolEnd, setPendingWake })
   }),
 )
 

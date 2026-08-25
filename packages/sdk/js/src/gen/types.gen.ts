@@ -453,6 +453,10 @@ export type EventPermissionReplied = {
 export type SessionStatus =
   | {
       type: "idle"
+      pendingWake?: {
+        at: number
+        reason?: string
+      }
     }
   | {
       type: "retry"
@@ -462,6 +466,16 @@ export type SessionStatus =
     }
   | {
       type: "busy"
+      since?: number
+      lastActivityAt?: number
+      runningTool?: {
+        title: string
+        startedAt: number
+      }
+      pendingWake?: {
+        at: number
+        reason?: string
+      }
     }
 
 export type EventSessionStatus = {

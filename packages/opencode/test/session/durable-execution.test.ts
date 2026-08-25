@@ -8,6 +8,7 @@ import { QuestionID } from "@/question/schema"
 import { SessionRunState } from "@/session/run-state"
 import { MessageID, SessionID } from "@/session/schema"
 import { SessionStatus } from "@/session/status"
+import { ensureRunID } from "@opencode-ai/core/util/opencode-process"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Database } from "@opencode-ai/core/database/database"
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
@@ -157,9 +158,9 @@ it.instance("rejects stale status writes after a newer execution generation clai
     )
     yield* Fiber.join(firstFiber)
 
-    expect(yield* second.status.get(sessionID)).toEqual({ type: "busy" })
+    expect(yield* second.status.get(sessionID)).toMatchObject({ type: "busy" })
     expect(yield* second.status.setForGeneration(sessionID, 1, { type: "idle" })).toBe(false)
-    expect(yield* second.status.get(sessionID)).toEqual({ type: "busy" })
+    expect(yield* second.status.get(sessionID)).toMatchObject({ type: "busy" })
     yield* release.open
     yield* Fiber.join(secondFiber)
   }),
@@ -300,6 +301,111 @@ it.instance("recovers a dead owner and stale busy status", () =>
         .get()
         .pipe(Effect.orDie),
     ).toEqual({ state: "interrupted" })
+  }),
+)
+
+it.instance("clears a hollow busy status without an execution lease", () =>
+  Effect.gen(function* () {
+    const graph = yield* buildRunGraph()
+    const { db } = yield* Database.Service
+    const now = Date.now()
+    yield* db
+      .insert(SessionStatusTable)
+      .values({
+        session_id: sessionID,
+        project_id: "project",
+        directory: process.cwd(),
+        status: { type: "busy", since: now - 60_000, lastActivityAt: now - 60_000 },
+        time_created: now - 60_000,
+        time_updated: now - 60_000,
+      })
+      .run()
+      .pipe(Effect.orDie)
+
+    expect(yield* graph.status.get(sessionID)).toEqual({ type: "idle" })
+  }),
+)
+
+it.instance("publishes activity, tools, and pending wakes for the owning generation", () =>
+  Effect.gen(function* () {
+    const graph = yield* buildRunGraph()
+    const release = yield* Latch.make()
+    const fiber = yield* graph.run
+      .ensureRunning(sessionID, Effect.succeed(output), release.await.pipe(Effect.as(output)))
+      .pipe(Effect.forkScoped)
+    const { db } = yield* Database.Service
+    const generation = yield* pollWithTimeout(
+      db
+        .select({ generation: SessionExecutionTable.generation })
+        .from(SessionExecutionTable)
+        .where(eq(SessionExecutionTable.session_id, sessionID))
+        .get()
+        .pipe(Effect.orDie, Effect.map((row) => (row ? row.generation : undefined))),
+      "execution generation never claimed",
+    )
+    const generationContext = { sessionID, generation }
+    const busy = yield* graph.status.get(sessionID)
+    expect(busy).toMatchObject({ type: "busy" })
+    if (busy.type !== "busy") throw new Error("session never became busy")
+    expect(busy.since).toBeNumber()
+    expect(busy.lastActivityAt).toBeNumber()
+
+    yield* graph.status.toolStart(sessionID, "bash").pipe(
+      Effect.provideService(SessionStatus.ExecutionGeneration, generationContext),
+    )
+    yield* graph.status.activity(sessionID).pipe(Effect.provideService(SessionStatus.ExecutionGeneration, generationContext))
+    yield* graph.status.setPendingWake(sessionID, { at: Date.now() + 1_000, reason: "follow-up" }).pipe(
+      Effect.provideService(SessionStatus.ExecutionGeneration, generationContext),
+    )
+    expect(yield* graph.status.get(sessionID)).toMatchObject({
+      type: "busy",
+      runningTool: { title: "bash" },
+      pendingWake: { reason: "follow-up" },
+    })
+    yield* graph.status.toolEnd(sessionID).pipe(Effect.provideService(SessionStatus.ExecutionGeneration, generationContext))
+    expect(yield* graph.status.get(sessionID)).toMatchObject({ type: "busy", pendingWake: { reason: "follow-up" } })
+
+    yield* release.open
+    yield* Fiber.join(fiber)
+    yield* graph.status.setPendingWake(sessionID, { at: Date.now() + 1_000 })
+    expect(yield* graph.status.get(sessionID)).toEqual({ type: "idle", pendingWake: { at: expect.any(Number) } })
+  }),
+)
+
+it.instance("does not clear a stale-looking status while its lease owner is live", () =>
+  Effect.gen(function* () {
+    const graph = yield* buildRunGraph()
+    const { db } = yield* Database.Service
+    const now = Date.now()
+    yield* db
+      .insert(SessionExecutionTable)
+      .values({
+        session_id: sessionID,
+        project_id: "project",
+        directory: process.cwd(),
+        state: "running",
+        owner_id: `local:${process.pid}:${ensureRunID()}:live`,
+        generation: 1,
+        lease_expires_at: now + 60_000,
+        time_created: now,
+        time_updated: now,
+      })
+      .run()
+      .pipe(Effect.orDie)
+    yield* db
+      .insert(SessionStatusTable)
+      .values({
+        session_id: sessionID,
+        project_id: "project",
+        directory: process.cwd(),
+        status: { type: "busy", since: now - 60_000, lastActivityAt: now - 60_000 },
+        time_created: now - 60_000,
+        time_updated: now - 60_000,
+      })
+      .run()
+      .pipe(Effect.orDie)
+
+    expect(yield* graph.status.get(sessionID)).toMatchObject({ type: "busy", since: now - 60_000 })
   }),
 )
 

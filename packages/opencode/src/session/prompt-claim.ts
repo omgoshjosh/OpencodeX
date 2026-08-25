@@ -25,6 +25,7 @@ export interface Deps {
     commandID: string
     generation: number
     reason: string
+    owner?: string
   }) => Effect.Effect<number>
   readonly commandLeaseMillis?: number
   readonly clock?: () => number
@@ -243,6 +244,7 @@ export function make(deps: Deps) {
               commandID,
               generation: command.claim_generation,
               reason: "command claim resumed or settled before tool completion",
+              owner: commandOwner,
             })
           }
           return yield* loop({ sessionID: command.session_id, messageID: command.message_id })
@@ -272,15 +274,6 @@ export function make(deps: Deps) {
         .get()
         .pipe(Effect.orDie)
       if (!owned) return
-      if (deps.reconcileToolParts) {
-        yield* deps.reconcileToolParts({
-          sessionID: command.session_id,
-          messageID: command.message_id,
-          commandID,
-          generation: command.claim_generation,
-          reason: error ? "command failed before tool completion" : "command settled before tool completion",
-        })
-      }
       if (!error) {
         yield* db
           .update(SessionCommandTable)
@@ -301,6 +294,15 @@ export function make(deps: Deps) {
           )
           .run()
           .pipe(Effect.orDie)
+        if (deps.reconcileToolParts) {
+          yield* deps.reconcileToolParts({
+            sessionID: command.session_id,
+            messageID: command.message_id,
+            commandID,
+            generation: command.claim_generation,
+            reason: "command settled before tool completion",
+          })
+        }
         return
       }
 
@@ -324,6 +326,15 @@ export function make(deps: Deps) {
         )
         .run()
         .pipe(Effect.orDie)
+      if (deps.reconcileToolParts) {
+        yield* deps.reconcileToolParts({
+          sessionID: command.session_id,
+          messageID: command.message_id,
+          commandID,
+          generation: command.claim_generation,
+          reason: "command failed before tool completion",
+        })
+      }
       if (Exit.isSuccess(exit)) return
       yield* Effect.logError("prompt_async failed").pipe(
         Effect.annotateLogs({ sessionID: command.session_id, cause: exit.cause }),

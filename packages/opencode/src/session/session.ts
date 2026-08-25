@@ -23,7 +23,14 @@ import { inArray } from "drizzle-orm"
 import { lt } from "drizzle-orm"
 import { or } from "drizzle-orm"
 import type { SQL } from "drizzle-orm"
-import { MessageTable, PartTable, SessionTable, TodoTable } from "@opencode-ai/core/session/sql"
+import {
+  MessageTable,
+  PartTable,
+  SessionCommandTable,
+  SessionExecutionTable,
+  SessionTable,
+  TodoTable,
+} from "@opencode-ai/core/session/sql"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import * as Log from "@opencode-ai/core/util/log"
 import { MessageV2 } from "./message-v2"
@@ -540,10 +547,7 @@ export interface Interface {
    * `transient` publishes the revision to live subscribers without journaling
    * it. Use it for in-flight progress only - terminal state must stay durable.
    */
-  readonly updatePart: <T extends SessionLegacy.Part>(
-    part: T,
-    options?: { transient?: boolean },
-  ) => Effect.Effect<T>
+  readonly updatePart: <T extends SessionLegacy.Part>(part: T, options?: { transient?: boolean }) => Effect.Effect<T>
   readonly updatePartDelta: (input: {
     sessionID: SessionID
     messageID: MessageID
@@ -558,6 +562,7 @@ export interface Interface {
     commandID: string
     generation: number
     reason: string
+    owner?: string
   }) => Effect.Effect<number>
   /** Finds the first message matching the predicate, searching newest-first. */
   readonly findMessage: (
@@ -845,68 +850,78 @@ export const layer: Layer.Layer<
         // revision is unobservable. Same shape as `message.part.delta`, which
         // has always been broadcast-only.
         if (options?.transient) {
-          yield* events.broadcast(
-            yield* events.payload(SessionLegacy.Event.PartUpdated, data, { location }),
-          )
+          yield* events.broadcast(yield* events.payload(SessionLegacy.Event.PartUpdated, data, { location }))
           return part
         }
         yield* events.publish(SessionLegacy.Event.PartUpdated, data, { location })
         return part
       }).pipe(Effect.withSpan("Session.updatePart"))
 
-    const reconcileToolParts: Interface["reconcileToolParts"] = Effect.fn("Session.reconcileToolParts")(function* (input) {
-      const allMessages = yield* messages({ sessionID: input.sessionID }).pipe(Effect.orDie)
-      const turn = new Set<MessageID>([input.messageID])
-      let changed = true
-      while (changed) {
-        changed = false
-        for (const message of allMessages) {
-          if (
-            message.info.role !== "assistant" ||
-            !message.info.parentID ||
-            !turn.has(message.info.parentID) ||
-            turn.has(message.info.id)
-          )
-            continue
-          turn.add(message.info.id)
-          changed = true
-        }
-      }
-      const orphaned = allMessages.flatMap((message) =>
-        !turn.has(message.info.id)
-          ? []
-          : message.parts.filter(
-              (part): part is SessionLegacy.ToolPart =>
-                part.type === "tool" && (part.state.status === "pending" || part.state.status === "running"),
+    const reconcileToolParts: Interface["reconcileToolParts"] = Effect.fn("Session.reconcileToolParts")(
+      function* (input) {
+        const command = yield* db
+          .select({ status: SessionCommandTable.status, owner: SessionCommandTable.owner_id })
+          .from(SessionCommandTable)
+          .where(
+            and(
+              eq(SessionCommandTable.id, input.commandID),
+              eq(SessionCommandTable.session_id, input.sessionID),
+              eq(SessionCommandTable.message_id, input.messageID),
+              eq(SessionCommandTable.claim_generation, input.generation),
             ),
-      )
-      const end = Date.now()
-      yield* Effect.forEach(
-        orphaned,
-        (part) =>
-          updatePart({
-            ...part,
-            state: {
-              status: "error",
-              input: part.state.input,
-              error: "Tool execution interrupted before turn settlement",
-              metadata: {
-                ...("metadata" in part.state ? part.state.metadata : {}),
-                interrupted: true,
-                reconciledAt: end,
-                reconciliation: {
-                  commandID: input.commandID,
-                  generation: input.generation,
-                  reason: input.reason,
+          )
+          .get()
+          .pipe(Effect.orDie)
+        if (!command) return 0
+        const settled = ["succeeded", "failed", "cancelled"].includes(command.status)
+        if (!settled && (!input.owner || command.status !== "running" || command.owner !== input.owner)) return 0
+        if (!settled) {
+          const execution = yield* db
+            .select({ state: SessionExecutionTable.state, leaseExpiresAt: SessionExecutionTable.lease_expires_at })
+            .from(SessionExecutionTable)
+            .where(eq(SessionExecutionTable.session_id, input.sessionID))
+            .get()
+            .pipe(Effect.orDie)
+          if (execution?.state === "running" && execution.leaseExpiresAt && execution.leaseExpiresAt > Date.now())
+            return 0
+        }
+        const allMessages = yield* messages({ sessionID: input.sessionID }).pipe(Effect.orDie)
+        const orphaned = allMessages.flatMap((message) =>
+          message.info.role !== "assistant" || message.info.parentID !== input.messageID
+            ? []
+            : message.parts.filter(
+                (part): part is SessionLegacy.ToolPart =>
+                  part.type === "tool" && (part.state.status === "pending" || part.state.status === "running"),
+              ),
+        )
+        const end = Date.now()
+        yield* Effect.forEach(
+          orphaned,
+          (part) =>
+            updatePart({
+              ...part,
+              state: {
+                status: "error",
+                input: part.state.input,
+                error: "Tool execution interrupted before turn settlement",
+                metadata: {
+                  ...("metadata" in part.state ? part.state.metadata : {}),
+                  interrupted: true,
+                  reconciledAt: end,
+                  reconciliation: {
+                    commandID: input.commandID,
+                    generation: input.generation,
+                    reason: input.reason,
+                  },
                 },
+                time: { start: part.state.status === "running" ? part.state.time.start : end, end },
               },
-              time: { start: part.state.status === "running" ? part.state.time.start : end, end },
-            },
-          } satisfies SessionLegacy.ToolPart),
-        { concurrency: 1, discard: true },
-      )
-      return orphaned.length
-    })
+            } satisfies SessionLegacy.ToolPart),
+          { concurrency: 1, discard: true },
+        )
+        return orphaned.length
+      },
+    )
 
     const getPart: Interface["getPart"] = Effect.fn("Session.getPart")(function* (input) {
       const row = yield* db

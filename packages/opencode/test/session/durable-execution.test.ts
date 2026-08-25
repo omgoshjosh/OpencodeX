@@ -153,7 +153,10 @@ it.instance("rejects stale status writes after a newer execution generation clai
         .from(SessionExecutionTable)
         .where(eq(SessionExecutionTable.session_id, sessionID))
         .get()
-        .pipe(Effect.orDie, Effect.map((row) => (row?.generation === 2 ? true : undefined))),
+        .pipe(
+          Effect.orDie,
+          Effect.map((row) => (row?.generation === 2 ? true : undefined)),
+        ),
       "new execution generation never claimed",
     )
     yield* Fiber.join(firstFiber)
@@ -340,7 +343,10 @@ it.instance("publishes activity, tools, and pending wakes for the owning generat
         .from(SessionExecutionTable)
         .where(eq(SessionExecutionTable.session_id, sessionID))
         .get()
-        .pipe(Effect.orDie, Effect.map((row) => (row ? row.generation : undefined))),
+        .pipe(
+          Effect.orDie,
+          Effect.map((row) => (row ? row.generation : undefined)),
+        ),
       "execution generation never claimed",
     )
     const generationContext = { sessionID, generation }
@@ -350,19 +356,23 @@ it.instance("publishes activity, tools, and pending wakes for the owning generat
     expect(busy.since).toBeNumber()
     expect(busy.lastActivityAt).toBeNumber()
 
-    yield* graph.status.toolStart(sessionID, "bash").pipe(
-      Effect.provideService(SessionStatus.ExecutionGeneration, generationContext),
-    )
-    yield* graph.status.activity(sessionID).pipe(Effect.provideService(SessionStatus.ExecutionGeneration, generationContext))
-    yield* graph.status.setPendingWake(sessionID, { at: Date.now() + 1_000, reason: "follow-up" }).pipe(
-      Effect.provideService(SessionStatus.ExecutionGeneration, generationContext),
-    )
+    yield* graph.status
+      .toolStart(sessionID, "bash")
+      .pipe(Effect.provideService(SessionStatus.ExecutionGeneration, generationContext))
+    yield* graph.status
+      .activity(sessionID)
+      .pipe(Effect.provideService(SessionStatus.ExecutionGeneration, generationContext))
+    yield* graph.status
+      .setPendingWake(sessionID, { at: Date.now() + 1_000, reason: "follow-up" })
+      .pipe(Effect.provideService(SessionStatus.ExecutionGeneration, generationContext))
     expect(yield* graph.status.get(sessionID)).toMatchObject({
       type: "busy",
       runningTool: { title: "bash" },
       pendingWake: { reason: "follow-up" },
     })
-    yield* graph.status.toolEnd(sessionID).pipe(Effect.provideService(SessionStatus.ExecutionGeneration, generationContext))
+    yield* graph.status
+      .toolEnd(sessionID)
+      .pipe(Effect.provideService(SessionStatus.ExecutionGeneration, generationContext))
     expect(yield* graph.status.get(sessionID)).toMatchObject({ type: "busy", pendingWake: { reason: "follow-up" } })
 
     yield* release.open
@@ -386,7 +396,10 @@ it.instance("coalesces stream activity into one latest timestamp update", () =>
         .from(SessionExecutionTable)
         .where(eq(SessionExecutionTable.session_id, sessionID))
         .get()
-        .pipe(Effect.orDie, Effect.map((row) => (row ? row.generation : undefined))),
+        .pipe(
+          Effect.orDie,
+          Effect.map((row) => (row ? row.generation : undefined)),
+        ),
       "execution generation never claimed",
     )
     const events = yield* EventV2Bridge.Service
@@ -400,9 +413,15 @@ it.instance("coalesces stream activity into one latest timestamp update", () =>
     yield* Effect.addFinalizer(() => unsubscribe)
     const observedAt = Date.now()
     const generationContext = { sessionID, generation }
-    yield* graph.status.activity(sessionID).pipe(Effect.provideService(SessionStatus.ExecutionGeneration, generationContext))
-    yield* graph.status.activity(sessionID).pipe(Effect.provideService(SessionStatus.ExecutionGeneration, generationContext))
-    yield* graph.status.activity(sessionID).pipe(Effect.provideService(SessionStatus.ExecutionGeneration, generationContext))
+    yield* graph.status
+      .activity(sessionID)
+      .pipe(Effect.provideService(SessionStatus.ExecutionGeneration, generationContext))
+    yield* graph.status
+      .activity(sessionID)
+      .pipe(Effect.provideService(SessionStatus.ExecutionGeneration, generationContext))
+    yield* graph.status
+      .activity(sessionID)
+      .pipe(Effect.provideService(SessionStatus.ExecutionGeneration, generationContext))
     yield* Effect.sleep(300)
 
     expect(yield* Ref.get(updates)).toBe(1)
@@ -428,7 +447,10 @@ it.instance("flushes pending activity before terminal idle and cancels its delay
         .from(SessionExecutionTable)
         .where(eq(SessionExecutionTable.session_id, sessionID))
         .get()
-        .pipe(Effect.orDie, Effect.map((row) => (row ? row.generation : undefined))),
+        .pipe(
+          Effect.orDie,
+          Effect.map((row) => (row ? row.generation : undefined)),
+        ),
       "execution generation never claimed",
     )
     const updates = yield* Ref.make({ busy: 0, lastActivityAt: 0 })
@@ -445,9 +467,9 @@ it.instance("flushes pending activity before terminal idle and cancels its delay
     })
     yield* Effect.addFinalizer(() => unsubscribe)
     const observedAt = Date.now()
-    yield* graph.status.activity(sessionID).pipe(
-      Effect.provideService(SessionStatus.ExecutionGeneration, { sessionID, generation }),
-    )
+    yield* graph.status
+      .activity(sessionID)
+      .pipe(Effect.provideService(SessionStatus.ExecutionGeneration, { sessionID, generation }))
     yield* release.open
     yield* Fiber.join(fiber)
     yield* pollWithTimeout(
@@ -474,17 +496,24 @@ it.instance("does not emit a stale busy update when activity timer flushes befor
         .from(SessionExecutionTable)
         .where(eq(SessionExecutionTable.session_id, sessionID))
         .get()
-        .pipe(Effect.orDie, Effect.map((row) => (row ? row.generation : undefined))),
+        .pipe(
+          Effect.orDie,
+          Effect.map((row) => (row ? row.generation : undefined)),
+        ),
       "execution generation never claimed",
     )
     const observedAt = Date.now()
-    yield* graph.status.activity(sessionID).pipe(
-      Effect.provideService(SessionStatus.ExecutionGeneration, { sessionID, generation }),
-    )
+    yield* graph.status
+      .activity(sessionID)
+      .pipe(Effect.provideService(SessionStatus.ExecutionGeneration, { sessionID, generation }))
     yield* pollWithTimeout(
-      graph.status.get(sessionID).pipe(
-        Effect.map((status) => (status.type === "busy" && (status.lastActivityAt ?? 0) >= observedAt ? true : undefined)),
-      ),
+      graph.status
+        .get(sessionID)
+        .pipe(
+          Effect.map((status) =>
+            status.type === "busy" && (status.lastActivityAt ?? 0) >= observedAt ? true : undefined,
+          ),
+        ),
       "activity timer never flushed",
     )
     yield* release.open
@@ -560,10 +589,7 @@ it.instance("shares permission requests, replies once, and persists always grant
       "permission was not visible across graphs",
     )
 
-    yield* Effect.all([
-      first.reply({ requestID, reply: "always" }),
-      second.reply({ requestID, reply: "reject" }),
-    ])
+    yield* Effect.all([first.reply({ requestID, reply: "always" }), second.reply({ requestID, reply: "reject" })])
     yield* Fiber.await(ask)
     expect(yield* Ref.get(replies)).toBe(1)
 
@@ -653,10 +679,7 @@ it.instance("shares questions and settles the owning Deferred from a remote repl
         : Effect.void,
     )
     yield* Effect.addFinalizer(() => unsubscribe)
-    yield* Effect.all([
-      first.reply({ requestID: pending.id, answers: [["Yes"]] }),
-      second.reject(pending.id),
-    ])
+    yield* Effect.all([first.reply({ requestID: pending.id, answers: [["Yes"]] }), second.reject(pending.id)])
     const exit = yield* Fiber.await(ask)
     expect(Exit.isSuccess(exit) ? exit.value : exit.cause).toBeDefined()
     expect(yield* Ref.get(replies)).toBe(1)

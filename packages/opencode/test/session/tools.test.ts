@@ -86,6 +86,7 @@ const run = (tool: Tool.Def) =>
       bypassAgentCheck: true,
       messages: [],
       promptOps: {} as any,
+      status: yield* SessionStatus.Service,
     })
     const entry = resolved[tool.id]
     if (!entry?.execute) throw new Error("probe tool was not resolved")

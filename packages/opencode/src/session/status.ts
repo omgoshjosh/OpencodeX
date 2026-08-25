@@ -110,9 +110,7 @@ export const layer = Layer.effect(
     const { db } = yield* Database.Service
     const scope = yield* Scope.Scope
     const processRunID = ensureRunID()
-    const activityPending = yield* InstanceState.make(() =>
-      Effect.sync(() => new Map<SessionID, { at: number }>()),
-    )
+    const activityPending = yield* InstanceState.make(() => Effect.sync(() => new Map<SessionID, { at: number }>()))
 
     // `sessionID` scopes the scan to one row. Reads take that path so a status
     // lookup stays an indexed point query instead of two full table scans in an
@@ -121,70 +119,70 @@ export const layer = Layer.effect(
     const recover = Effect.fn("SessionStatus.recover")(function* (sessionID?: SessionID) {
       const now = Date.now()
       const broadcasts = yield* events.barrier(
-        db.transaction(
-          (transaction) =>
-            Effect.gen(function* () {
-              const statusQuery = transaction.select().from(SessionStatusTable)
-              const statuses = (yield* (sessionID
-                ? statusQuery.where(eq(SessionStatusTable.session_id, sessionID))
-                : statusQuery
-              ).all()).filter((row) => {
-                const status = Option.getOrUndefined(decode(row.status))
-                return status?.type === "busy" || status?.type === "retry"
-              })
-              if (statuses.length === 0) return [] as EventV2.Payload[]
-              const executionQuery = transaction.select().from(SessionExecutionTable)
-              const executions = new Map(
-                (yield* (sessionID
-                  ? executionQuery.where(eq(SessionExecutionTable.session_id, sessionID))
-                  : executionQuery
-                ).all()).map((row) => [row.session_id, row]),
-              )
-              const stale = statuses.filter((row) => {
-                const execution = executions.get(row.session_id)
-                // Status is presentation state, never execution authority. A
-                // busy row without an execution lease is a crashed/restarted
-                // writer, not proof that work is still running.
-                if (!execution) return true
-                if (execution.state !== "running" || !execution.owner_id) return true
-                if (!execution.lease_expires_at || execution.lease_expires_at <= now) return true
-                return !SessionExecutionOwner.alive(execution.owner_id, processRunID)
-              })
-              const result: EventV2.Payload[] = []
-              for (const row of stale) {
-                const execution = executions.get(row.session_id)
-                if (execution) {
-                  yield* transaction
-                    .update(SessionExecutionTable)
-                    .set({
-                      state: "interrupted",
-                      owner_id: null,
-                      lease_expires_at: null,
-                      completed_at: now,
-                      time_updated: now,
-                    })
-                    .where(
-                      and(
-                        eq(SessionExecutionTable.session_id, row.session_id),
-                        eq(SessionExecutionTable.generation, execution.generation),
-                      ),
-                    )
-                    .run()
-                }
-                yield* transaction
-                  .update(SessionStatusTable)
-                  .set({ status: { type: "idle" }, time_updated: now })
-                  .where(eq(SessionStatusTable.session_id, row.session_id))
-                  .run()
-                result.push(
-                  yield* events.commit(Event.Status, { sessionID: row.session_id, status: { type: "idle" } }),
-                  yield* events.commit(Event.Idle, { sessionID: row.session_id }),
+        db
+          .transaction(
+            (transaction) =>
+              Effect.gen(function* () {
+                const statusQuery = transaction.select().from(SessionStatusTable)
+                const statuses = (yield* (
+                  sessionID ? statusQuery.where(eq(SessionStatusTable.session_id, sessionID)) : statusQuery
+                ).all()).filter((row) => {
+                  const status = Option.getOrUndefined(decode(row.status))
+                  return status?.type === "busy" || status?.type === "retry"
+                })
+                if (statuses.length === 0) return [] as EventV2.Payload[]
+                const executionQuery = transaction.select().from(SessionExecutionTable)
+                const executions = new Map(
+                  (yield* (
+                    sessionID ? executionQuery.where(eq(SessionExecutionTable.session_id, sessionID)) : executionQuery
+                  ).all()).map((row) => [row.session_id, row]),
                 )
-              }
-              return result
-            }),
-          { behavior: "immediate" },
-        ).pipe(Effect.orDie),
+                const stale = statuses.filter((row) => {
+                  const execution = executions.get(row.session_id)
+                  // Status is presentation state, never execution authority. A
+                  // busy row without an execution lease is a crashed/restarted
+                  // writer, not proof that work is still running.
+                  if (!execution) return true
+                  if (execution.state !== "running" || !execution.owner_id) return true
+                  if (!execution.lease_expires_at || execution.lease_expires_at <= now) return true
+                  return !SessionExecutionOwner.alive(execution.owner_id, processRunID)
+                })
+                const result: EventV2.Payload[] = []
+                for (const row of stale) {
+                  const execution = executions.get(row.session_id)
+                  if (execution) {
+                    yield* transaction
+                      .update(SessionExecutionTable)
+                      .set({
+                        state: "interrupted",
+                        owner_id: null,
+                        lease_expires_at: null,
+                        completed_at: now,
+                        time_updated: now,
+                      })
+                      .where(
+                        and(
+                          eq(SessionExecutionTable.session_id, row.session_id),
+                          eq(SessionExecutionTable.generation, execution.generation),
+                        ),
+                      )
+                      .run()
+                  }
+                  yield* transaction
+                    .update(SessionStatusTable)
+                    .set({ status: { type: "idle" }, time_updated: now })
+                    .where(eq(SessionStatusTable.session_id, row.session_id))
+                    .run()
+                  result.push(
+                    yield* events.commit(Event.Status, { sessionID: row.session_id, status: { type: "idle" } }),
+                    yield* events.commit(Event.Idle, { sessionID: row.session_id }),
+                  )
+                }
+                return result
+              }),
+            { behavior: "immediate" },
+          )
+          .pipe(Effect.orDie),
       )
       yield* Effect.forEach(broadcasts, events.broadcast, { discard: true })
     })
@@ -223,57 +221,56 @@ export const layer = Layer.effect(
       const ctx = yield* InstanceState.context
       const now = Date.now()
       const committed = yield* events.barrier(
-        db.transaction(
-          (transaction) =>
-            Effect.gen(function* () {
-              const existing = yield* transaction
-                .select({ status: SessionStatusTable.status })
-                .from(SessionStatusTable)
-                .where(eq(SessionStatusTable.session_id, sessionID))
-                .get()
-              const current = existing ? Option.getOrUndefined(decode(existing.status)) : undefined
-              if (generation !== undefined) {
-                const execution = yield* transaction
-                  .select({ generation: SessionExecutionTable.generation, state: SessionExecutionTable.state })
-                  .from(SessionExecutionTable)
-                  .where(eq(SessionExecutionTable.session_id, sessionID))
+        db
+          .transaction(
+            (transaction) =>
+              Effect.gen(function* () {
+                const existing = yield* transaction
+                  .select({ status: SessionStatusTable.status })
+                  .from(SessionStatusTable)
+                  .where(eq(SessionStatusTable.session_id, sessionID))
                   .get()
-                if (execution?.generation !== generation) return undefined
-                if ((typeof status === "function" || status.type !== "idle") && execution.state !== "running")
-                  return undefined
-              }
-              const next =
-                typeof status === "function"
-                  ? status(current, now)
-                  : normalize(status, current, now)
-              if (!next) return undefined
-              yield* transaction
-                .insert(SessionStatusTable)
-                .values({
-                  session_id: sessionID,
-                  project_id: ctx.project.id,
-                  directory: ctx.directory,
-                  status: next,
-                  time_created: now,
-                  time_updated: now,
-                })
-                .onConflictDoUpdate({
-                  target: SessionStatusTable.session_id,
-                  set: {
+                const current = existing ? Option.getOrUndefined(decode(existing.status)) : undefined
+                if (generation !== undefined) {
+                  const execution = yield* transaction
+                    .select({ generation: SessionExecutionTable.generation, state: SessionExecutionTable.state })
+                    .from(SessionExecutionTable)
+                    .where(eq(SessionExecutionTable.session_id, sessionID))
+                    .get()
+                  if (execution?.generation !== generation) return undefined
+                  if ((typeof status === "function" || status.type !== "idle") && execution.state !== "running")
+                    return undefined
+                }
+                const next = typeof status === "function" ? status(current, now) : normalize(status, current, now)
+                if (!next) return undefined
+                yield* transaction
+                  .insert(SessionStatusTable)
+                  .values({
+                    session_id: sessionID,
                     project_id: ctx.project.id,
                     directory: ctx.directory,
                     status: next,
+                    time_created: now,
                     time_updated: now,
-                  },
-                })
-                .run()
-              return {
-                status: yield* events.commit(Event.Status, { sessionID, status: next }),
-                idle: next.type === "idle" ? yield* events.commit(Event.Idle, { sessionID }) : undefined,
-              }
-            }),
-          { behavior: "immediate" },
-        ).pipe(Effect.orDie),
+                  })
+                  .onConflictDoUpdate({
+                    target: SessionStatusTable.session_id,
+                    set: {
+                      project_id: ctx.project.id,
+                      directory: ctx.directory,
+                      status: next,
+                      time_updated: now,
+                    },
+                  })
+                  .run()
+                return {
+                  status: yield* events.commit(Event.Status, { sessionID, status: next }),
+                  idle: next.type === "idle" ? yield* events.commit(Event.Idle, { sessionID }) : undefined,
+                }
+              }),
+            { behavior: "immediate" },
+          )
+          .pipe(Effect.orDie),
       )
       if (!committed) return false
       yield* events.broadcast(committed.status)
@@ -312,7 +309,10 @@ export const layer = Layer.effect(
       )
     })
 
-    const flushActivity = Effect.fn("SessionStatus.flushActivity")(function* (sessionID: SessionID, generation?: number) {
+    const flushActivity = Effect.fn("SessionStatus.flushActivity")(function* (
+      sessionID: SessionID,
+      generation?: number,
+    ) {
       const pending = yield* InstanceState.get(activityPending)
       const current = pending.get(sessionID)
       if (!current) return false
@@ -392,9 +392,6 @@ export const layer = Layer.effect(
   }),
 )
 
-export const defaultLayer = layer.pipe(
-  Layer.provide(Database.defaultLayer),
-  Layer.provide(EventV2Bridge.defaultLayer),
-)
+export const defaultLayer = layer.pipe(Layer.provide(Database.defaultLayer), Layer.provide(EventV2Bridge.defaultLayer))
 
 export * as SessionStatus from "./status"

@@ -99,13 +99,13 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   bypassAgentCheck: boolean
   messages: SessionLegacy.WithParts[]
   promptOps: TaskPromptOps
+  status: SessionStatus.Interface
 }) {
   using _ = log.time("resolveTools")
   const tools: Record<string, AITool> = {}
   const run = yield* EffectBridge.make()
   const plugin = yield* Plugin.Service
   const permission = yield* Permission.Service
-  const status = yield* SessionStatus.Service
   const registry = yield* ToolRegistry.Service
   const mcp = yield* MCP.Service
   const truncate = yield* Truncate.Service
@@ -171,7 +171,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
         return run.promise(
           Effect.gen(function* () {
             const ctx = yield* context(args, options)
-            yield* status.toolStart(ctx.sessionID, item.id)
+            yield* input.status.toolStart(ctx.sessionID, item.id)
             const result = yield* Effect.gen(function* () {
               yield* plugin.trigger(
                 "tool.execute.before",
@@ -179,7 +179,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
                 { args },
               )
               return yield* item.execute(args, ctx)
-            }).pipe(Effect.ensuring(status.toolEnd(ctx.sessionID)))
+            }).pipe(Effect.ensuring(input.status.toolEnd(ctx.sessionID)))
             const output = {
               ...result,
               attachments: result.attachments?.map((attachment) => ({
@@ -215,7 +215,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
       run.promise(
         Effect.gen(function* () {
           const ctx = yield* context(args, opts)
-          yield* status.toolStart(ctx.sessionID, key)
+          yield* input.status.toolStart(ctx.sessionID, key)
           const result: Awaited<ReturnType<NonNullable<typeof execute>>> = yield* Effect.gen(function* () {
             yield* plugin.trigger(
               "tool.execute.before",
@@ -235,7 +235,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
                 },
               }),
             )
-          }).pipe(Effect.ensuring(status.toolEnd(ctx.sessionID)))
+          }).pipe(Effect.ensuring(input.status.toolEnd(ctx.sessionID)))
           yield* plugin.trigger(
             "tool.execute.after",
             { tool: key, sessionID: ctx.sessionID, callID: opts.toolCallId, args },

@@ -4,6 +4,7 @@ import { MCP } from "@/mcp"
 import { Permission } from "@/permission"
 import { Plugin } from "@/plugin"
 import { SessionTools } from "@/session/tools"
+import { SessionStatus } from "@/session/status"
 import { Tool } from "@/tool/tool"
 import { ToolRegistry } from "@/tool/registry"
 import { Truncate } from "@/tool/truncate"
@@ -52,6 +53,14 @@ const services = (tool: Tool.Def) =>
     Layer.succeed(Truncate.Service, {
       output: (text: string) => Effect.succeed({ truncated: false, content: text }),
     } as unknown as Truncate.Interface),
+    Layer.succeed(
+      SessionStatus.Service,
+      {
+        activity: () => Effect.succeed(false),
+        toolStart: () => Effect.succeed(false),
+        toolEnd: () => Effect.succeed(false),
+      } as unknown as SessionStatus.Interface,
+    ),
   )
 
 const run = (tool: Tool.Def) =>

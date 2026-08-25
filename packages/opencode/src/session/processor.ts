@@ -652,7 +652,7 @@ export const layer = Layer.effect(
             const stream = llm.stream(streamInput)
 
             yield* stream.pipe(
-              Stream.tap((event) => handleEvent(event)),
+              Stream.tap((event) => handleEvent(event).pipe(Effect.andThen(status.activity(ctx.sessionID)))),
               Stream.takeUntil(() => ctx.needsCompaction),
               Stream.runDrain,
             )

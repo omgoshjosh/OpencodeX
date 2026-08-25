@@ -587,14 +587,10 @@ describe("claude stream-json mapper", () => {
   })
 })
 
-describe("background subagents keep the turn open", () => {
-  // The SDK ends the main model's turn (a `result` event) while backgrounded
-  // subagents are still running, then re-wakes the model on the same stream
-  // when they report back. Finishing on that first result is what flipped
-  // sessions to idle mid-delegation and orphaned the continuation.
+describe("background subagents settle the turn without a durable wake", () => {
   const agentTask = { task_id: "a1", task_type: "local_agent", description: "probe agent" }
 
-  test("a result while background tasks are live does not finish the turn", () => {
+  test("a result while background tasks are live settles the turn", () => {
     const { writes, state } = run([
       { type: "system", subtype: "init", session_id: "cc-1" },
       { type: "assistant", message: { id: "m1", content: [{ type: "text", text: "Waiting for the agents..." }] } },
@@ -602,21 +598,15 @@ describe("background subagents keep the turn open", () => {
       { type: "result", subtype: "success", total_cost_usd: 0.02, usage: { input_tokens: 10, output_tokens: 5 } },
     ])
 
-    expect(state.finished).toBeFalsy()
-    // The turn stays open: no completed assistant message yet.
-    expect(messages(writes).some((message) => message.time.completed !== undefined)).toBe(false)
-    // But the step's cost still lands, so billing survives even an abandoned wait.
+    expect(state.finished).toBe(true)
+    expect(messages(writes).some((message) => message.time.completed !== undefined)).toBe(true)
     expect(parts(writes).find((part) => part.type === "step-finish")).toMatchObject({ cost: 0.02 })
   })
 
-  test("the turn finishes on the result that arrives after background tasks drain", () => {
+  test("a durable completion result is still terminal", () => {
     const { writes, state } = run([
       { type: "system", subtype: "init", session_id: "cc-1" },
       { type: "assistant", message: { id: "m1", content: [{ type: "text", text: "Waiting for the agents..." }] } },
-      { type: "system", subtype: "background_tasks_changed", tasks: [agentTask] } as ClaudeEvent,
-      { type: "result", subtype: "success", total_cost_usd: 0.02, usage: { input_tokens: 10, output_tokens: 5 } },
-      // The agent reports back; the CLI re-wakes the model on the same stream.
-      { type: "assistant", message: { id: "m2", content: [{ type: "text", text: "FINISHED" }] } },
       { type: "system", subtype: "background_tasks_changed", tasks: [] } as ClaudeEvent,
       { type: "result", subtype: "success", total_cost_usd: 0.05, usage: { input_tokens: 20, output_tokens: 8 } },
     ])
@@ -624,16 +614,12 @@ describe("background subagents keep the turn open", () => {
     expect(state.finished).toBe(true)
     const completed = messages(writes).at(-1)
     expect(completed?.time.completed).toBeGreaterThan(0)
-    // The whole wait is one assistant message; the continuation lands on it.
     const texts = parts(writes).flatMap((part) => (part.type === "text" ? [part] : []))
-    expect(texts.map((part) => part.text)).toEqual(["Waiting for the agents...", "FINISHED"])
+    expect(texts.map((part) => part.text)).toEqual(["Waiting for the agents..."])
     expect(new Set(texts.map((part) => part.messageID)).size).toBe(1)
-    // Each step billed its own delta of the cumulative total; the message
-    // carries the whole turn's cost.
     const steps = parts(writes).flatMap((part) => (part.type === "step-finish" ? [part] : []))
-    expect(steps.length).toBe(2)
-    expect(steps[0]?.cost).toBeCloseTo(0.02, 10)
-    expect(steps[1]?.cost).toBeCloseTo(0.03, 10)
+    expect(steps.length).toBe(1)
+    expect(steps[0]?.cost).toBeCloseTo(0.05, 10)
     expect(completed?.cost).toBeCloseTo(0.05, 10)
   })
 

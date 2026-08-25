@@ -561,11 +561,9 @@ function finishTurn(event: ClaudeEvent, writes: SessionWrite[], state: MapperSta
   // naming a conversation. That is the signal to stop reusing the stored id.
   if (failed && !state.claudeSessionID) state.resumeRejected = true
   writes.push(stepFinish(state, context, { reason: event.subtype ?? "stop", cost, tokens }))
-  // A successful result with backgrounded subagents still running is a pause,
-  // not the end of the turn: the CLI holds the stream open and re-wakes the
-  // model when they report back. Bill the step but keep the message - and the
-  // session - open, so delegation reads as in-progress instead of idle.
-  if (!failed && state.liveBackgroundTasks > 0) return
+  // A CLI-side background task is only prose/telemetry. It has no durable job
+  // record or deadline that survives this turn, so it cannot keep this session
+  // execution alive while waiting for a future notification.
   writes.push({
     kind: "message",
     message: assistantMessage(state, context, { completed: context.now(), cost: state.turnCost, tokens, error }),

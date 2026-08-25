@@ -16,6 +16,15 @@ import {
 import type { JobStore } from "./job-store"
 
 export function createJobLifecycle(db: Database.Interface["db"], events: EventV2.Interface, store: JobStore) {
+  const cancelDescendants = Effect.fn("OpencodeXJob.cancelDescendants")(function* (parentJobID: string) {
+    const children = yield* db
+      .select({ id: OpencodeXJobTable.id })
+      .from(OpencodeXJobTable)
+      .where(eq(OpencodeXJobTable.parent_job_id, parentJobID))
+      .all()
+      .pipe(Effect.orDie)
+    yield* Effect.forEach(children, (child) => cancel(child.id), { concurrency: 1, discard: true })
+  })
   const claim = Effect.fn("OpencodeXJob.claim")(function* (input: ClaimInput) {
     const current = yield* store.get(input.jobID)
     if (current.timeoutAt && current.timeoutAt <= Date.now()) {
@@ -251,7 +260,7 @@ export function createJobLifecycle(db: Database.Interface["db"], events: EventV2
       return current
     const now = Date.now()
     if (["queued", "failed", "interrupted"].includes(current.status)) {
-      return yield* store.transition({
+      const cancelled = yield* store.transition({
         job: current,
         target: "cancelled",
         settlement,
@@ -263,8 +272,13 @@ export function createJobLifecycle(db: Database.Interface["db"], events: EventV2
           status_reason: "Cancelled by user",
         },
       })
+      yield* cancelDescendants(current.id)
+      return cancelled
     }
-    if (current.cancelRequestedAt) return current
+    if (current.cancelRequestedAt) {
+      yield* cancelDescendants(current.id)
+      return current
+    }
     const committed = yield* events.barrier(
       db
         .transaction(
@@ -301,6 +315,7 @@ export function createJobLifecycle(db: Database.Interface["db"], events: EventV2
       })
     }
     yield* events.broadcast(committed.event)
+    yield* cancelDescendants(committed.result.id)
     return committed.result
   })
 

@@ -305,6 +305,34 @@ it.live("cancels queued children when their parent fails", () =>
   }),
 )
 
+it.live("propagates parent cancellation through persisted child links", () =>
+  Effect.gen(function* () {
+    const jobs = yield* OpencodeXJob.Service
+    const dispatcher = yield* OpencodeXJobDispatcher.Service
+    const release = yield* Deferred.make<void>()
+    let children = 0
+    yield* dispatcher.register("test.cancel-parent", () => Deferred.await(release).pipe(Effect.as({ parent: true })))
+    yield* dispatcher.register("test.cancel-child", () =>
+      Effect.sync(() => {
+        children += 1
+      }),
+    )
+
+    const parent = yield* jobs.create({ kind: "test.cancel-parent", idempotencyKey: "dispatcher-cancel-parent" })
+    const child = yield* jobs.create({
+      kind: "test.cancel-child",
+      idempotencyKey: "dispatcher-cancel-parent-child",
+      parentJobID: parent.id,
+    })
+    yield* waitForStatus(jobs, parent.id, "running")
+    yield* jobs.cancel(parent.id)
+    expect((yield* waitForStatus(jobs, child.id, "cancelled")).status).toBe("cancelled")
+    expect(children).toBe(0)
+    yield* Deferred.succeed(release, undefined)
+    yield* waitForStatus(jobs, parent.id, "cancelled")
+  }),
+)
+
 function waitForAbort(signal: AbortSignal, onAbort: () => void) {
   return Effect.callback<Record<string, unknown>, Error>((resume) => {
     const abort = () => {

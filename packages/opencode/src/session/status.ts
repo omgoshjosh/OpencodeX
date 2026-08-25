@@ -4,8 +4,9 @@ import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
 import { NonNegativeInt } from "@opencode-ai/core/schema"
 import { SessionExecutionTable, SessionStatusTable } from "@opencode-ai/core/session/sql"
+import { OpencodeXJobTable } from "@opencode-ai/core/opencodex/sql"
 import { ensureRunID } from "@opencode-ai/core/util/opencode-process"
-import { and, eq } from "drizzle-orm"
+import { and, eq, inArray } from "drizzle-orm"
 import { Context, Duration, Effect, Layer, Option, Schedule, Schema, Scope } from "effect"
 import { SessionID } from "./schema"
 import { SessionExecutionOwner } from "./execution-owner"
@@ -16,6 +17,7 @@ export const Info = Schema.Union([
     pendingWake: Schema.optional(
       Schema.Struct({
         at: NonNegativeInt,
+        jobID: Schema.String,
         reason: Schema.optional(Schema.String),
       }),
     ),
@@ -39,6 +41,7 @@ export const Info = Schema.Union([
     pendingWake: Schema.optional(
       Schema.Struct({
         at: NonNegativeInt,
+        jobID: Schema.String,
         reason: Schema.optional(Schema.String),
       }),
     ),
@@ -78,7 +81,7 @@ export interface Interface {
   readonly toolEnd: (sessionID: SessionID) => Effect.Effect<boolean>
   readonly setPendingWake: (
     sessionID: SessionID,
-    pendingWake?: { at: number; reason?: string },
+    pendingWake?: { jobID: string; reason?: string },
   ) => Effect.Effect<boolean>
 }
 
@@ -362,12 +365,29 @@ export const layer = Layer.effect(
 
     const setPendingWake = Effect.fn("SessionStatus.setPendingWake")(function* (
       sessionID: SessionID,
-      pendingWake?: { at: number; reason?: string },
+      pendingWake?: { jobID: string; reason?: string },
     ) {
+      const wake = pendingWake
+        ? yield* db
+            .select({ timeoutAt: OpencodeXJobTable.timeout_at })
+            .from(OpencodeXJobTable)
+            .where(
+              and(
+                eq(OpencodeXJobTable.id, pendingWake.jobID),
+                eq(OpencodeXJobTable.session_id, sessionID),
+                inArray(OpencodeXJobTable.status, ["queued", "claimed", "running"]),
+              ),
+            )
+            .get()
+            .pipe(Effect.orDie)
+        : undefined
+      // A notification promise without a persisted job and deadline cannot
+      // survive a restart, so reject it instead of displaying a phantom wake.
+      if (pendingWake && (!wake?.timeoutAt || wake.timeoutAt <= Date.now())) return false
       return yield* patchCurrentGeneration(sessionID, (current) => {
         if (current.type !== "busy" && current.type !== "idle") return undefined
         const { pendingWake: _, ...next } = current
-        return pendingWake ? { ...next, pendingWake } : next
+        return wake ? { ...next, pendingWake: { ...pendingWake!, at: wake.timeoutAt } } : next
       })
     })
 

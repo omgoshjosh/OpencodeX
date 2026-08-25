@@ -1125,6 +1125,9 @@ export const layer: Layer.Layer<
       return yield* mutate(input.sessionID, (current) => {
         const stored = delegationRecord(current.metadata)
         if (!stored || stored.runID !== input.runID) return undefined
+        // Delivery is an edge, not a level. Replaying a completion after a
+        // restart must not make a second durable delivery claim for this run.
+        if (stored.deliveryOutcome !== "pending") return undefined
         return {
           ...current,
           metadata: withDelegationRecord(current.metadata, {

@@ -228,25 +228,25 @@ describe("SessionStatus.Info", () => {
     expect(decode({ type: "busy" })).toEqual({ type: "busy" })
   })
 
-  test("accepts rich busy status and pending wakes without rejecting legacy payloads", () => {
+  test("accepts job-backed pending wakes", () => {
     expect(
       decode({
         type: "busy",
         since: 10,
         lastActivityAt: 11,
         runningTool: { title: "bash", startedAt: 12 },
-        pendingWake: { at: 13, reason: "retry" },
+        pendingWake: { at: 13, jobID: "oxj_retry", reason: "retry" },
       }),
     ).toEqual({
       type: "busy",
       since: 10,
       lastActivityAt: 11,
       runningTool: { title: "bash", startedAt: 12 },
-      pendingWake: { at: 13, reason: "retry" },
+      pendingWake: { at: 13, jobID: "oxj_retry", reason: "retry" },
     })
-    expect(decode({ type: "idle", pendingWake: { at: 14 } })).toEqual({
+    expect(decode({ type: "idle", pendingWake: { at: 14, jobID: "oxj_idle" } })).toEqual({
       type: "idle",
-      pendingWake: { at: 14 },
+      pendingWake: { at: 14, jobID: "oxj_idle" },
     })
   })
 

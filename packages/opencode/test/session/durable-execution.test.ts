@@ -8,6 +8,7 @@ import { QuestionID } from "@/question/schema"
 import { SessionRunState } from "@/session/run-state"
 import { MessageID, SessionID } from "@/session/schema"
 import { SessionStatus } from "@/session/status"
+import { OpencodeXJob } from "@/opencodex/job"
 import { ensureRunID } from "@opencode-ai/core/util/opencode-process"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Database } from "@opencode-ai/core/database/database"
@@ -63,15 +64,17 @@ const buildRunGraph = Effect.fn("DurableExecutionTest.buildRunGraph")(function* 
   const databaseLayer = Layer.succeed(Database.Service, database)
   const eventsLayer = Layer.succeed(EventV2Bridge.Service, events)
   const statusLayer = SessionStatus.layer.pipe(Layer.provide(databaseLayer), Layer.provide(eventsLayer))
+  const jobsLayer = OpencodeXJob.layer.pipe(Layer.provide(databaseLayer), Layer.provide(eventsLayer))
   const runLayer = SessionRunState.layer.pipe(
     Layer.provide(Layer.succeed(BackgroundJob.Service, background)),
     Layer.provide(databaseLayer),
     Layer.provide(statusLayer),
   )
-  const context = yield* Layer.build(Layer.fresh(Layer.mergeAll(runLayer, statusLayer)))
+  const context = yield* Layer.build(Layer.fresh(Layer.mergeAll(runLayer, statusLayer, jobsLayer)))
   return {
     run: Context.get(context, SessionRunState.Service),
     status: Context.get(context, SessionStatus.Service),
+    jobs: Context.get(context, OpencodeXJob.Service),
   }
 })
 
@@ -362,8 +365,14 @@ it.instance("publishes activity, tools, and pending wakes for the owning generat
     yield* graph.status
       .activity(sessionID)
       .pipe(Effect.provideService(SessionStatus.ExecutionGeneration, generationContext))
+    expect(
+      yield* graph.status
+        .setPendingWake(sessionID, { jobID: "missing", reason: "follow-up" })
+        .pipe(Effect.provideService(SessionStatus.ExecutionGeneration, generationContext)),
+    ).toBe(false)
+    const job = yield* graph.jobs.create({ kind: "test.wake", sessionID, timeoutAt: Date.now() + 60_000 })
     yield* graph.status
-      .setPendingWake(sessionID, { at: Date.now() + 1_000, reason: "follow-up" })
+      .setPendingWake(sessionID, { jobID: job.id, reason: "follow-up" })
       .pipe(Effect.provideService(SessionStatus.ExecutionGeneration, generationContext))
     expect(yield* graph.status.get(sessionID)).toMatchObject({
       type: "busy",
@@ -377,8 +386,8 @@ it.instance("publishes activity, tools, and pending wakes for the owning generat
 
     yield* release.open
     yield* Fiber.join(fiber)
-    yield* graph.status.setPendingWake(sessionID, { at: Date.now() + 1_000 })
-    expect(yield* graph.status.get(sessionID)).toEqual({ type: "idle", pendingWake: { at: expect.any(Number) } })
+    yield* graph.status.setPendingWake(sessionID, { jobID: job.id })
+    expect(yield* graph.status.get(sessionID)).toEqual({ type: "idle", pendingWake: { at: expect.any(Number), jobID: job.id } })
   }),
 )
 

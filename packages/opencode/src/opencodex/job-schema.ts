@@ -137,10 +137,7 @@ export class TransitionError extends Schema.TaggedErrorClass<TransitionError>()(
 }) {}
 
 export type Transaction = Parameters<Parameters<Database.Interface["db"]["transaction"]>[0]>[0]
-export type TransactionalSettlement = (
-  job: Info,
-  transaction: Transaction,
-) => Effect.Effect<Effect.Effect<void>, never>
+export type TransactionalSettlement = (job: Info, transaction: Transaction) => Effect.Effect<Effect.Effect<void>, never>
 
 export type TerminalOutcome =
   | { status: "succeeded"; result?: Record<string, unknown> }

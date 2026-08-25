@@ -48,7 +48,7 @@ export const insertJob = Effect.fnUntraced(function* (
     time_updated: now,
   }
   const insert = transaction.insert(OpencodeXJobTable).values(values)
-  const row = yield* (input.idempotencyKey ? insert.onConflictDoNothing().returning().get() : insert.returning().get())
+  const row = yield* input.idempotencyKey ? insert.onConflictDoNothing().returning().get() : insert.returning().get()
   if (!row) {
     if (!input.idempotencyKey) return yield* Effect.die(new Error("Job insert did not return the inserted row"))
     const existing = yield* transaction
@@ -124,31 +124,33 @@ export function createJobStore(db: Database.Interface["db"], events: EventV2.Int
       })
     }
     const committed = yield* events.barrier(
-      db.transaction(
-        (transaction) =>
-          Effect.gen(function* () {
-            const row = yield* transaction
-              .update(OpencodeXJobTable)
-              .set({ ...input.values, status: input.target, time_updated: Date.now() })
-              .where(
-                and(
-                  eq(OpencodeXJobTable.id, input.job.id),
-                  eq(OpencodeXJobTable.status, input.job.status),
-                  eq(OpencodeXJobTable.attempt, input.job.attempt),
-                  input.owner ? eq(OpencodeXJobTable.lease_owner, input.owner) : undefined,
-                  input.condition,
-                ),
-              )
-              .returning()
-              .get()
-            if (!row) return undefined
-            const result = hydrate(row)
-            const afterCommit = input.settlement ? yield* input.settlement(result, transaction) : Effect.void
-            const event = yield* events.commit(Event.Transitioned, { jobID: result.id, status: result.status })
-            return { result, event, afterCommit }
-          }),
-        { behavior: "immediate" },
-      ).pipe(Effect.orDie),
+      db
+        .transaction(
+          (transaction) =>
+            Effect.gen(function* () {
+              const row = yield* transaction
+                .update(OpencodeXJobTable)
+                .set({ ...input.values, status: input.target, time_updated: Date.now() })
+                .where(
+                  and(
+                    eq(OpencodeXJobTable.id, input.job.id),
+                    eq(OpencodeXJobTable.status, input.job.status),
+                    eq(OpencodeXJobTable.attempt, input.job.attempt),
+                    input.owner ? eq(OpencodeXJobTable.lease_owner, input.owner) : undefined,
+                    input.condition,
+                  ),
+                )
+                .returning()
+                .get()
+              if (!row) return undefined
+              const result = hydrate(row)
+              const afterCommit = input.settlement ? yield* input.settlement(result, transaction) : Effect.void
+              const event = yield* events.commit(Event.Transitioned, { jobID: result.id, status: result.status })
+              return { result, event, afterCommit }
+            }),
+          { behavior: "immediate" },
+        )
+        .pipe(Effect.orDie),
     )
     if (!committed) {
       return yield* new TransitionError({
@@ -189,29 +191,31 @@ export function createJobStore(db: Database.Interface["db"], events: EventV2.Int
       })
     }
     const committed = yield* events.barrier(
-      db.transaction(
-        (transaction) =>
-          Effect.gen(function* () {
-            const row = yield* transaction
-              .update(OpencodeXJobTable)
-              .set({
-                title: input.title,
-                session_id: input.sessionID,
-                timeout_at: input.timeoutAt,
-                status_reason: input.statusReason,
-                metadata_json: encode(input.metadata),
-                time_updated: Date.now(),
-              })
-              .where(eq(OpencodeXJobTable.id, input.id))
-              .returning()
-              .get()
-            if (!row) return undefined
-            const result = hydrate(row)
-            const event = yield* events.commit(Event.Transitioned, { jobID: result.id, status: result.status })
-            return { result, event }
-          }),
-        { behavior: "immediate" },
-      ).pipe(Effect.orDie),
+      db
+        .transaction(
+          (transaction) =>
+            Effect.gen(function* () {
+              const row = yield* transaction
+                .update(OpencodeXJobTable)
+                .set({
+                  title: input.title,
+                  session_id: input.sessionID,
+                  timeout_at: input.timeoutAt,
+                  status_reason: input.statusReason,
+                  metadata_json: encode(input.metadata),
+                  time_updated: Date.now(),
+                })
+                .where(eq(OpencodeXJobTable.id, input.id))
+                .returning()
+                .get()
+              if (!row) return undefined
+              const result = hydrate(row)
+              const event = yield* events.commit(Event.Transitioned, { jobID: result.id, status: result.status })
+              return { result, event }
+            }),
+          { behavior: "immediate" },
+        )
+        .pipe(Effect.orDie),
     )
     if (!committed) return yield* new NotFoundError({ jobID: input.id })
     yield* events.broadcast(committed.event)

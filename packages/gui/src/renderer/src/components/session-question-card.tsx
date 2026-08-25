@@ -1,7 +1,12 @@
 import type { QuestionAnswer, QuestionRequest } from "@opencode-ai/sdk/v2/client"
 import { For, Show, createEffect, createMemo, createSignal, createUniqueId, onCleanup } from "solid-js"
 import { Markdown } from "@opencode-ai/ui/markdown"
-import { finalQuestionAnswers, nextUnansweredStep, questionAnswersComplete, toggleQuestionAnswer } from "../lib/safety-present"
+import {
+  finalQuestionAnswers,
+  nextUnansweredStep,
+  questionAnswersComplete,
+  toggleQuestionAnswer,
+} from "../lib/safety-present"
 import { isKeyboardEditingTarget } from "../lib/keyboard-shortcuts"
 import { SafetyCardHeader, type SafetyQueuePosition } from "./session-safety-card"
 import { SafetyDismissConfirm } from "./session-safety-confirm"
@@ -57,7 +62,9 @@ export function SessionQuestionCard(props: {
   const selected = createMemo(() => props.draft.answers[props.step] ?? [])
   const customValue = createMemo(() => props.draft.custom[props.step] ?? "")
   const complete = createMemo(() => questionAnswersComplete(props.draft.answers, props.draft.custom))
-  const stepAnswered = createMemo(() => (finalQuestionAnswers(props.draft.answers, props.draft.custom)[props.step] ?? []).length > 0)
+  const stepAnswered = createMemo(
+    () => (finalQuestionAnswers(props.draft.answers, props.draft.custom)[props.step] ?? []).length > 0,
+  )
 
   onCleanup(() => clearTimeout(submitTimer))
 
@@ -117,7 +124,8 @@ export function SessionQuestionCard(props: {
       }}
       onKeyDown={(event) => {
         if (isKeyboardEditingTarget(event.target)) {
-          if (event.key === "Enter" && (event.ctrlKey || event.metaKey) && complete()) submitWith(props.draft.answers, props.draft.custom)
+          if (event.key === "Enter" && (event.ctrlKey || event.metaKey) && complete())
+            submitWith(props.draft.answers, props.draft.custom)
           return
         }
         if (event.key === "Escape") setConfirmOpen(true)
@@ -162,12 +170,19 @@ export function SessionQuestionCard(props: {
             <Show when={contextClamped() || contextOpen() || props.context?.plan}>
               <div class="question-context-actions">
                 <Show when={contextClamped() || contextOpen()}>
-                  <Button appearance="ghost" size="compact" aria-expanded={contextOpen()} onClick={() => setContextOpen((open) => !open)}>
+                  <Button
+                    appearance="ghost"
+                    size="compact"
+                    aria-expanded={contextOpen()}
+                    onClick={() => setContextOpen((open) => !open)}
+                  >
                     {contextOpen() ? "Show less" : "Show more"}
                   </Button>
                 </Show>
                 <Show when={props.context?.plan}>
-                  <Button appearance="outline" size="compact" leadingIcon="file" onClick={() => setPlanOpen(true)}>View plan</Button>
+                  <Button appearance="outline" size="compact" leadingIcon="file" onClick={() => setPlanOpen(true)}>
+                    View plan
+                  </Button>
                 </Show>
               </div>
             </Show>
@@ -177,12 +192,19 @@ export function SessionQuestionCard(props: {
           {(current) => (
             <div class="question-step">
               <h2 class="question-headline">{current().question}</h2>
-              <div class="question-options" role={current().multiple ? "group" : "radiogroup"} aria-label={current().header}>
+              <div
+                class="question-options"
+                role={current().multiple ? "group" : "radiogroup"}
+                aria-label={current().header}
+              >
                 <For each={current().options}>
                   {(option, index) => (
                     <Button
                       class="question-option"
-                      classList={{ "is-selected": selected().includes(option.label), "is-pulsing": pulsing() === option.label }}
+                      classList={{
+                        "is-selected": selected().includes(option.label),
+                        "is-pulsing": pulsing() === option.label,
+                      }}
                       appearance="ghost"
                       role={current().multiple ? "checkbox" : "radio"}
                       aria-checked={selected().includes(option.label)}
@@ -191,8 +213,15 @@ export function SessionQuestionCard(props: {
                       onClick={() => choose(option.label)}
                     >
                       <kbd aria-hidden="true">{index() + 1}</kbd>
-                      <span class="question-option-copy"><strong>{option.label}</strong><Show when={option.description}><small>{option.description}</small></Show></span>
-                      <Show when={current().multiple}><span class="question-option-check" aria-hidden="true" /></Show>
+                      <span class="question-option-copy">
+                        <strong>{option.label}</strong>
+                        <Show when={option.description}>
+                          <small>{option.description}</small>
+                        </Show>
+                      </span>
+                      <Show when={current().multiple}>
+                        <span class="question-option-check" aria-hidden="true" />
+                      </Show>
                     </Button>
                   )}
                 </For>
@@ -219,7 +248,12 @@ export function SessionQuestionCard(props: {
               </Show>
               <Show when={current().multiple && stepAnswered()}>
                 <div class="question-inline-confirm">
-                  <Button appearance="solid" tone="accent" trailingIcon={complete() ? "send" : "chevronRight"} onClick={confirmStep}>
+                  <Button
+                    appearance="solid"
+                    tone="accent"
+                    trailingIcon={complete() ? "send" : "chevronRight"}
+                    onClick={confirmStep}
+                  >
                     {complete() ? "Send answers" : "Next"}
                   </Button>
                 </div>
@@ -245,8 +279,16 @@ export function SessionQuestionCard(props: {
       />
       <Show when={props.context?.plan}>
         {(plan) => (
-          <Dialog open={planOpen()} onClose={() => setPlanOpen(false)} title="Proposed plan" size="lg" class="safety-plan-dialog">
-            <div class="tool-plan"><Markdown text={plan()} /></div>
+          <Dialog
+            open={planOpen()}
+            onClose={() => setPlanOpen(false)}
+            title="Proposed plan"
+            size="lg"
+            class="safety-plan-dialog"
+          >
+            <div class="tool-plan">
+              <Markdown text={plan()} />
+            </div>
           </Dialog>
         )}
       </Show>

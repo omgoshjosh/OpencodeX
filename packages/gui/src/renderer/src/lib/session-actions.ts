@@ -20,7 +20,9 @@ export function questionsForSessionAttention(sessions: Session[], sessionID: str
     if (visible.size === before) break
   }
   const requestIDs = new Set<string>()
-  return questions.filter((request) => visible.has(request.sessionID) && !requestIDs.has(request.id) && requestIDs.add(request.id))
+  return questions.filter(
+    (request) => visible.has(request.sessionID) && !requestIDs.has(request.id) && requestIDs.add(request.id),
+  )
 }
 
 export function questionSourceLabel(request: QuestionRequest, sessionID: string) {
@@ -36,10 +38,12 @@ export function sidePanelDirectoryForSession(input: {
   const project = input.projects.find((item) => item.sessions.some((session) => session.id === input.session?.id))
   if (!project) return input.session.directory || input.clientDirectory
   const directory = normalizeDirectoryPath(input.session.directory)
-  return project.folders
-    .filter((folder) => directoryIsWithin(directory, normalizeDirectoryPath(folder.path)))
-    .toSorted((a, b) => normalizeDirectoryPath(b.path).length - normalizeDirectoryPath(a.path).length)[0]?.path
-    ?? project.folders.find((folder) => folder.path)?.path
+  return (
+    project.folders
+      .filter((folder) => directoryIsWithin(directory, normalizeDirectoryPath(folder.path)))
+      .toSorted((a, b) => normalizeDirectoryPath(b.path).length - normalizeDirectoryPath(a.path).length)[0]?.path ??
+    project.folders.find((folder) => folder.path)?.path
+  )
 }
 
 export function moveSessionBlockedMessage(projects: GuiSnapshot["projects"]) {
@@ -76,9 +80,17 @@ export function permissionRejectDialog(reply: "once" | "always" | "reject"): Tex
   return reply === "reject" ? { title: "Reject Permission", message: "Optional feedback for the agent" } : undefined
 }
 
-export function permissionAlwaysConfirmInput(request: PermissionRequest, reply: "once" | "always" | "reject"): ConfirmDialogInput | undefined {
+export function permissionAlwaysConfirmInput(
+  request: PermissionRequest,
+  reply: "once" | "always" | "reject",
+): ConfirmDialogInput | undefined {
   return reply === "always"
-    ? { title: "Always Allow", message: request.always.join("\n") || request.permission, confirm: "Always Allow", scope: request.sessionID }
+    ? {
+        title: "Always Allow",
+        message: request.always.join("\n") || request.permission,
+        confirm: "Always Allow",
+        scope: request.sessionID,
+      }
     : undefined
 }
 
@@ -88,14 +100,24 @@ export async function runPermissionAction(input: {
   sessions: Session[]
   askText: (input: TextDialogInput) => Promise<string | undefined>
   confirm: (input: ConfirmDialogInput) => Promise<boolean>
-  replyPermission: (requestID: string, reply: "once" | "always" | "reject", message?: string, directory?: string) => Promise<void>
+  replyPermission: (
+    requestID: string,
+    reply: "once" | "always" | "reject",
+    message?: string,
+    directory?: string,
+  ) => Promise<void>
   refresh: () => Promise<void>
 }) {
   const rejectDialog = permissionRejectDialog(input.reply)
   const message = rejectDialog ? await input.askText(rejectDialog) : undefined
   const allowDialog = permissionAlwaysConfirmInput(input.request, input.reply)
   if (allowDialog && !(await input.confirm(allowDialog))) return
-  await input.replyPermission(input.request.id, input.reply, message, sessionDirectoryForRequest(input.sessions, input.request))
+  await input.replyPermission(
+    input.request.id,
+    input.reply,
+    message,
+    sessionDirectoryForRequest(input.sessions, input.request),
+  )
   await input.refresh()
 }
 

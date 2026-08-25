@@ -1,6 +1,17 @@
 import { describe, expect, test } from "bun:test"
 import type { PermissionRequest, QuestionRequest, Session } from "@opencode-ai/sdk/v2/client"
-import { moveSessionBlockedMessage, moveSessionConfirmInput, permissionAlwaysConfirmInput, permissionRejectDialog, questionSourceLabel, questionsForSessionAttention, runMoveSessionAction, runPermissionAction, sessionDirectoryForRequest, sidePanelDirectoryForSession } from "../src/renderer/src/lib/session-actions"
+import {
+  moveSessionBlockedMessage,
+  moveSessionConfirmInput,
+  permissionAlwaysConfirmInput,
+  permissionRejectDialog,
+  questionSourceLabel,
+  questionsForSessionAttention,
+  runMoveSessionAction,
+  runPermissionAction,
+  sessionDirectoryForRequest,
+  sidePanelDirectoryForSession,
+} from "../src/renderer/src/lib/session-actions"
 import type { GuiSnapshot } from "../src/renderer/src/lib/session-api"
 
 describe("GUI session action decisions", () => {
@@ -24,28 +35,37 @@ describe("GUI session action decisions", () => {
       { ...question(grandchild.id), id: "grandchild-question" },
     ]
 
-    expect(questionsForSessionAttention([parent, child, grandchild], parent.id, requests).map((request) => request.sessionID)).toEqual([
-      "parent",
-      "child",
-      "grandchild",
-    ])
+    expect(
+      questionsForSessionAttention([parent, child, grandchild], parent.id, requests).map(
+        (request) => request.sessionID,
+      ),
+    ).toEqual(["parent", "child", "grandchild"])
     expect(questionSourceLabel(childQuestion, parent.id)).toBe("Child session: child")
     expect(questionSourceLabel(question(parent.id), parent.id)).toBeUndefined()
   })
 
   test("roots project sessions in their configured project folders", () => {
     const selected = session("s1", "c:\\PROJECT\\packages\\app\\src")
-    const projects = [project({
-      folders: ["C:/Project", "C:/Project/packages/app"],
-      sessions: [selected],
-    })]
+    const projects = [
+      project({
+        folders: ["C:/Project", "C:/Project/packages/app"],
+        sessions: [selected],
+      }),
+    ]
 
-    expect(sidePanelDirectoryForSession({ session: selected, projects, clientDirectory: "C:/Gui" }))
-      .toBe("C:/Project/packages/app")
-    expect(sidePanelDirectoryForSession({ session: { ...selected, directory: "D:/Unrelated" }, projects, clientDirectory: "C:/Gui" }))
-      .toBe("C:/Project")
-    expect(sidePanelDirectoryForSession({ session: session("other", "D:/Standalone"), projects, clientDirectory: "C:/Gui" }))
-      .toBe("D:/Standalone")
+    expect(sidePanelDirectoryForSession({ session: selected, projects, clientDirectory: "C:/Gui" })).toBe(
+      "C:/Project/packages/app",
+    )
+    expect(
+      sidePanelDirectoryForSession({
+        session: { ...selected, directory: "D:/Unrelated" },
+        projects,
+        clientDirectory: "C:/Gui",
+      }),
+    ).toBe("C:/Project")
+    expect(
+      sidePanelDirectoryForSession({ session: session("other", "D:/Standalone"), projects, clientDirectory: "C:/Gui" }),
+    ).toBe("D:/Standalone")
     expect(sidePanelDirectoryForSession({ projects, clientDirectory: "C:/Gui" })).toBe("C:/Gui")
   })
 
@@ -54,7 +74,7 @@ describe("GUI session action decisions", () => {
     expect(moveSessionBlockedMessage([project()])).toBeUndefined()
     expect(moveSessionConfirmInput(session("s1", "C:/One"), "project-1")).toEqual({
       title: "Move Session",
-      message: "Move \"s1\" to this project?\n\nproject-1",
+      message: 'Move "s1" to this project?\n\nproject-1',
       confirm: "Move",
     })
   })
@@ -62,7 +82,10 @@ describe("GUI session action decisions", () => {
   test("prepares permission dialogs only for replies that need them", () => {
     const request = permission("s1")
 
-    expect(permissionRejectDialog("reject")).toEqual({ title: "Reject Permission", message: "Optional feedback for the agent" })
+    expect(permissionRejectDialog("reject")).toEqual({
+      title: "Reject Permission",
+      message: "Optional feedback for the agent",
+    })
     expect(permissionRejectDialog("once")).toBeUndefined()
     expect(permissionAlwaysConfirmInput(request, "always")).toEqual({
       title: "Always Allow",
@@ -70,7 +93,9 @@ describe("GUI session action decisions", () => {
       confirm: "Always Allow",
       scope: "s1",
     })
-    expect(permissionAlwaysConfirmInput({ ...request, always: ["write", "read"] }, "always")?.message).toBe("write\nread")
+    expect(permissionAlwaysConfirmInput({ ...request, always: ["write", "read"] }, "always")?.message).toBe(
+      "write\nread",
+    )
     expect(permissionAlwaysConfirmInput(request, "reject")).toBeUndefined()
   })
 
@@ -126,7 +151,8 @@ describe("GUI session action decisions", () => {
       sessions: [session("s1", "C:/One")],
       askText: async () => "not now",
       confirm: async () => true,
-      replyPermission: async (requestID, reply, message, directory) => calls.push(`${requestID}:${reply}:${message}:${directory}`),
+      replyPermission: async (requestID, reply, message, directory) =>
+        calls.push(`${requestID}:${reply}:${message}:${directory}`),
       refresh: async () => calls.push("refresh"),
     })
 

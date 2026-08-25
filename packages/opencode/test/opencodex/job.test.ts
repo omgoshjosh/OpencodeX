@@ -179,8 +179,9 @@ it.live("runs terminal settlement while recovering an exhausted lease", () =>
     yield* jobs.start(created.id, "expired-owner")
     let settled: OpencodeXJob.Info | undefined
 
-    const recovered = yield* jobs.recover(Date.now() + 60_000, () => (job) =>
-      Effect.succeed(Effect.sync(() => (settled = job)).pipe(Effect.asVoid)),
+    const recovered = yield* jobs.recover(
+      Date.now() + 60_000,
+      () => (job) => Effect.succeed(Effect.sync(() => (settled = job)).pipe(Effect.asVoid)),
     )
 
     expect(recovered.find((job) => job.id === created.id)?.status).toBe("interrupted")
@@ -279,8 +280,8 @@ dbIt.live("rejects renewal and settlement after a lease expires", () =>
     expect(
       (yield* jobs.renew({ jobID: created.id, owner: "stale-owner", leaseMs: 30_000 }).pipe(Effect.flip))._tag,
     ).toBe("OpencodeX.Job.TransitionError")
-    expect(
-      (yield* jobs.succeed({ jobID: created.id, owner: "stale-owner" }).pipe(Effect.flip))._tag,
-    ).toBe("OpencodeX.Job.TransitionError")
+    expect((yield* jobs.succeed({ jobID: created.id, owner: "stale-owner" }).pipe(Effect.flip))._tag).toBe(
+      "OpencodeX.Job.TransitionError",
+    )
   }),
 )

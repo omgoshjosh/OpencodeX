@@ -27,7 +27,12 @@ export function SessionSafetyDock(props: {
   let preferredIndex = 0
   let card: HTMLElement | undefined
   let focusFrame = 0
-  const activeIndex = createMemo(() => Math.max(0, queue().findIndex((item) => item.id === activeID())))
+  const activeIndex = createMemo(() =>
+    Math.max(
+      0,
+      queue().findIndex((item) => item.id === activeID()),
+    ),
+  )
   const active = createMemo(() => queue()[activeIndex()])
 
   createEffect(() => {
@@ -81,20 +86,27 @@ export function SessionSafetyDock(props: {
     setDrafts((current) => ({ ...current, [request.id]: update(current[request.id] ?? draftFor(request)) }))
 
   return (
-    <div class="safety-dock" role="region" aria-label={`${queue().length} pending request${queue().length === 1 ? "" : "s"}`}>
+    <div
+      class="safety-dock"
+      role="region"
+      aria-label={`${queue().length} pending request${queue().length === 1 ? "" : "s"}`}
+    >
       <Show when={active()?.id} keyed>
         {(_id) => {
           const item = active()
           if (!item) return <></>
-          if (item.kind === "permission") return (
-            <SessionPermissionCard
-              request={item.request}
-              tool={permissionToolPart(item.request, props.messages)}
-              position={position()}
-              setCard={(element) => { card = element }}
-              reply={props.replyPermission}
-            />
-          )
+          if (item.kind === "permission")
+            return (
+              <SessionPermissionCard
+                request={item.request}
+                tool={permissionToolPart(item.request, props.messages)}
+                position={position()}
+                setCard={(element) => {
+                  card = element
+                }}
+                reply={props.replyPermission}
+              />
+            )
           return (
             <SessionQuestionCard
               request={item.request}
@@ -102,7 +114,9 @@ export function SessionSafetyDock(props: {
               draft={draftFor(item.request)}
               updateDraft={(update) => updateDraft(item.request, update)}
               position={position()}
-              setCard={(element) => { card = element }}
+              setCard={(element) => {
+                card = element
+              }}
               reply={props.replyQuestion}
               reject={props.rejectQuestion}
               context={context()}

@@ -6,7 +6,7 @@ import { SessionLegacy } from "@opencode-ai/core/session/legacy"
 import { SessionCommandTable, SessionExecutionTable } from "@opencode-ai/core/session/sql"
 import { ensureRunID } from "@opencode-ai/core/util/opencode-process"
 import { and, eq, inArray } from "drizzle-orm"
-import { Context, Effect, Latch, Layer, Scope } from "effect"
+import { Context, Effect, Latch, Layer, Option, Scope } from "effect"
 import * as Session from "./session"
 import { SessionID } from "./schema"
 import { SessionStatus } from "./status"
@@ -49,7 +49,7 @@ export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const background = yield* BackgroundJob.Service
-    const sessions = yield* Session.Service
+    const sessions = yield* Effect.serviceOption(Session.Service)
     const status = yield* SessionStatus.Service
     const { db } = yield* Database.Service
     const processRunID = ensureRunID()
@@ -370,34 +370,36 @@ export const layer = Layer.effect(
 
       // `cancel` settles commands durably even when their owner has already
       // died, so repair their unfinished tool parts at this same boundary.
-      const cancelled = yield* db
-        .select({
-          id: SessionCommandTable.id,
-          messageID: SessionCommandTable.message_id,
-          generation: SessionCommandTable.claim_generation,
-        })
-        .from(SessionCommandTable)
-        .where(
-          and(
-            eq(SessionCommandTable.session_id, sessionID),
-            eq(SessionCommandTable.status, "cancelled"),
-            eq(SessionCommandTable.completed_at, now),
-          ),
+      if (Option.isSome(sessions)) {
+        const cancelled = yield* db
+          .select({
+            id: SessionCommandTable.id,
+            messageID: SessionCommandTable.message_id,
+            generation: SessionCommandTable.claim_generation,
+          })
+          .from(SessionCommandTable)
+          .where(
+            and(
+              eq(SessionCommandTable.session_id, sessionID),
+              eq(SessionCommandTable.status, "cancelled"),
+              eq(SessionCommandTable.completed_at, now),
+            ),
+          )
+          .all()
+          .pipe(Effect.orDie)
+        yield* Effect.forEach(
+          cancelled,
+          (command) =>
+            sessions.value.reconcileToolParts({
+              sessionID,
+              messageID: command.messageID,
+              commandID: command.id,
+              generation: command.generation,
+              reason: "command cancelled before tool completion",
+            }),
+          { concurrency: 1, discard: true },
         )
-        .all()
-        .pipe(Effect.orDie)
-      yield* Effect.forEach(
-        cancelled,
-        (command) =>
-          sessions.reconcileToolParts({
-            sessionID,
-            messageID: command.messageID,
-            commandID: command.id,
-            generation: command.generation,
-            reason: "command cancelled before tool completion",
-          }),
-        { concurrency: 1, discard: true },
-      )
+      }
 
       const data = yield* InstanceState.get(state)
       const existing = data.runners.get(sessionID)
@@ -524,7 +526,6 @@ export const layer = Layer.effect(
 export const defaultLayer = layer.pipe(
   Layer.provide(BackgroundJob.defaultLayer),
   Layer.provide(Database.defaultLayer),
-  Layer.provide(Session.defaultLayer),
   Layer.provide(SessionStatus.defaultLayer),
 )
 

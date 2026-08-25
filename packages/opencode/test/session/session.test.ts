@@ -16,6 +16,7 @@ import { BackgroundJob } from "@/background/job"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { EventV2 } from "@opencode-ai/core/event"
 import { EventTable } from "@opencode-ai/core/event/sql"
+import { SessionCommandTable } from "@opencode-ai/core/session/sql"
 import { eq } from "drizzle-orm"
 import {
   DELEGATION_RECORD_VERSION,
@@ -361,11 +362,14 @@ describe("interrupted tool reconciliation", () => {
   it.instance("durably settles only unfinished tools in the command turn", () =>
     Effect.gen(function* () {
       const session = yield* SessionNs.Service
+      const { db } = yield* Database.Service
       const info = yield* Effect.acquireRelease(session.create({ title: "reconcile" }), (created) =>
         session.remove(created.id).pipe(Effect.ignore),
       )
       const userID = MessageID.ascending()
       const assistantID = MessageID.ascending()
+      const otherUserID = MessageID.ascending()
+      const otherAssistantID = MessageID.ascending()
       yield* session.updateMessage({
         id: userID,
         sessionID: info.id,
@@ -374,6 +378,53 @@ describe("interrupted tool reconciliation", () => {
         agent: "user",
         model: { providerID: "test", modelID: "test" },
       } as unknown as SessionLegacy.Info)
+      yield* session.updateMessage({
+        id: otherUserID,
+        sessionID: info.id,
+        role: "user",
+        time: { created: Date.now() },
+        agent: "user",
+        model: { providerID: "test", modelID: "test" },
+      } as unknown as SessionLegacy.Info)
+      yield* session.updateMessage({
+        id: otherAssistantID,
+        sessionID: info.id,
+        parentID: otherUserID,
+        role: "assistant",
+        time: { created: Date.now() },
+      } as unknown as SessionLegacy.Info)
+      const now = Date.now()
+      yield* db
+        .insert(SessionCommandTable)
+        .values([
+          {
+            id: "sec_reconcile",
+            session_id: info.id,
+            message_id: userID,
+            project_id: info.projectID,
+            directory: info.directory,
+            status: "cancelled",
+            claim_generation: 4,
+            completed_at: now,
+            time_created: now,
+            time_updated: now,
+          },
+          {
+            id: "sec_other_generation",
+            session_id: info.id,
+            message_id: otherUserID,
+            project_id: info.projectID,
+            directory: info.directory,
+            status: "running",
+            owner_id: "other-owner",
+            claim_generation: 5,
+            lease_expires_at: now + 60_000,
+            time_created: now,
+            time_updated: now,
+          },
+        ])
+        .run()
+        .pipe(Effect.orDie)
       yield* session.updateMessage({
         id: assistantID,
         sessionID: info.id,
@@ -394,11 +445,29 @@ describe("interrupted tool reconciliation", () => {
         ...pending,
         id: PartID.ascending(),
         callID: "completed",
-        state: { status: "completed" as const, input: {}, output: "ok", title: "grep", time: { start: 1, end: 2 } },
+        state: {
+          status: "completed" as const,
+          input: {},
+          output: "ok",
+          title: "grep",
+          metadata: {},
+          time: { start: 1, end: 2 },
+        },
       }
       yield* session.updatePart(pending)
       yield* session.updatePart(completed)
+      const other = { ...pending, id: PartID.ascending(), messageID: otherAssistantID, callID: "other" }
+      yield* session.updatePart(other)
 
+      expect(
+        yield* session.reconcileToolParts({
+          sessionID: info.id,
+          messageID: userID,
+          commandID: "sec_reconcile",
+          generation: 3,
+          reason: "stale generation",
+        }),
+      ).toBe(0)
       expect(
         yield* session.reconcileToolParts({
           sessionID: info.id,
@@ -409,14 +478,38 @@ describe("interrupted tool reconciliation", () => {
         }),
       ).toBe(1)
       expect(
-        (yield* session.getPart({ sessionID: info.id, messageID: assistantID, partID: pending.id }) as SessionLegacy.ToolPart).state,
+        (
+          (yield* session.getPart({
+            sessionID: info.id,
+            messageID: assistantID,
+            partID: pending.id,
+          })) as SessionLegacy.ToolPart
+        ).state,
       ).toMatchObject({
         status: "error",
-        metadata: { interrupted: true, reconciliation: { commandID: "sec_reconcile", generation: 4, reason: "rejected" } },
+        metadata: {
+          interrupted: true,
+          reconciliation: { commandID: "sec_reconcile", generation: 4, reason: "rejected" },
+        },
       })
       expect(
-        (yield* session.getPart({ sessionID: info.id, messageID: assistantID, partID: completed.id }) as SessionLegacy.ToolPart).state,
+        (
+          (yield* session.getPart({
+            sessionID: info.id,
+            messageID: assistantID,
+            partID: completed.id,
+          })) as SessionLegacy.ToolPart
+        ).state,
       ).toEqual(completed.state)
+      expect(
+        (
+          (yield* session.getPart({
+            sessionID: info.id,
+            messageID: otherAssistantID,
+            partID: other.id,
+          })) as SessionLegacy.ToolPart
+        ).state.status,
+      ).toBe("pending")
       expect(
         yield* session.reconcileToolParts({
           sessionID: info.id,

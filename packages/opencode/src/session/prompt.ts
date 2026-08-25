@@ -768,6 +768,7 @@ export const layer = Layer.effect(
       events,
       scope,
       admit: drain.admit,
+      reconcileToolParts: (input) => sessions.reconcileToolParts(input),
       loop: (input) => loop(input),
     })
 

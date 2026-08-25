@@ -357,6 +357,79 @@ describe("transient part updates", () => {
   )
 })
 
+describe("interrupted tool reconciliation", () => {
+  it.instance("durably settles only unfinished tools in the command turn", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const info = yield* Effect.acquireRelease(session.create({ title: "reconcile" }), (created) =>
+        session.remove(created.id).pipe(Effect.ignore),
+      )
+      const userID = MessageID.ascending()
+      const assistantID = MessageID.ascending()
+      yield* session.updateMessage({
+        id: userID,
+        sessionID: info.id,
+        role: "user",
+        time: { created: Date.now() },
+        agent: "user",
+        model: { providerID: "test", modelID: "test" },
+      } as unknown as SessionLegacy.Info)
+      yield* session.updateMessage({
+        id: assistantID,
+        sessionID: info.id,
+        parentID: userID,
+        role: "assistant",
+        time: { created: Date.now() },
+      } as unknown as SessionLegacy.Info)
+      const pending = {
+        id: PartID.ascending(),
+        messageID: assistantID,
+        sessionID: info.id,
+        type: "tool" as const,
+        tool: "grep",
+        callID: "pending",
+        state: { status: "pending" as const, input: {}, raw: "" },
+      }
+      const completed = {
+        ...pending,
+        id: PartID.ascending(),
+        callID: "completed",
+        state: { status: "completed" as const, input: {}, output: "ok", title: "grep", time: { start: 1, end: 2 } },
+      }
+      yield* session.updatePart(pending)
+      yield* session.updatePart(completed)
+
+      expect(
+        yield* session.reconcileToolParts({
+          sessionID: info.id,
+          messageID: userID,
+          commandID: "sec_reconcile",
+          generation: 4,
+          reason: "rejected",
+        }),
+      ).toBe(1)
+      expect(
+        (yield* session.getPart({ sessionID: info.id, messageID: assistantID, partID: pending.id }) as SessionLegacy.ToolPart).state,
+      ).toMatchObject({
+        status: "error",
+        metadata: { interrupted: true, reconciliation: { commandID: "sec_reconcile", generation: 4, reason: "rejected" } },
+      })
+      expect(
+        (yield* session.getPart({ sessionID: info.id, messageID: assistantID, partID: completed.id }) as SessionLegacy.ToolPart).state,
+      ).toEqual(completed.state)
+      expect(
+        yield* session.reconcileToolParts({
+          sessionID: info.id,
+          messageID: userID,
+          commandID: "sec_reconcile",
+          generation: 4,
+          reason: "rejected",
+        }),
+      ).toBe(0)
+    }),
+  )
+})
+
 describe("session delegation stamping", () => {
   const record = (overrides: Partial<DelegationRecord> = {}): DelegationRecord => ({
     version: DELEGATION_RECORD_VERSION,

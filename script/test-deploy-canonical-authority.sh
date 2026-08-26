@@ -54,6 +54,50 @@ run() {
 }
 assert() { "$@" || { printf 'assertion failed: %s\n' "$*" >&2; exit 1; }; }
 
+snapshot_under_writes() {
+  local dir
+  dir="$(mktemp -d)"
+  trap "rm -rf '$dir'" RETURN
+  sqlite3 "$dir/src.db" \
+    "pragma journal_mode=wal; create table t(id integer primary key, b blob);"
+  sqlite3 "$dir/src.db" \
+    "insert into t(b) select randomblob(4096) from generate_series(1,40000);"
+
+  (
+    for _ in $(seq 1 100000); do
+      sqlite3 "$dir/src.db" "insert into t(b) values(randomblob(2048));" 2>/dev/null || true
+    done
+  ) &
+  local writer=$!
+  sleep 1
+
+  local start deadline=60 rc
+  start="$(date +%s)"
+  sqlite3 "$dir/src.db" "VACUUM INTO '$dir/out.db'" >/dev/null 2>&1 &
+  local snap=$!
+  while :; do
+    if ! kill -0 "$snap" 2>/dev/null; then
+      wait "$snap"
+      rc=$?
+      break
+    fi
+    if (( $(date +%s) - start >= deadline )); then
+      kill -9 "$snap" 2>/dev/null || true
+      rc=124
+      break
+    fi
+    sleep 1
+  done
+  kill "$writer" 2>/dev/null || true
+  wait "$writer" 2>/dev/null || true
+
+  [ "$rc" = 0 ] || { printf 'snapshot did not converge under writes (rc=%s)\n' "$rc"; return 1; }
+  [ "$(sqlite3 "$dir/out.db" 'pragma integrity_check;' | head -1)" = ok ] || {
+    printf 'snapshot failed integrity_check\n'
+    return 1
+  }
+}
+
 base="$TMP/dry"; make_fixture "$base"
 run "$base" --dry-run
 assert test "$(grep -c '/global/drain' "$base/lifecycle" || true)" = 0
@@ -121,4 +165,5 @@ assert test -d "$base/backups/deploy-unknown-1"
 assert test -d "$base/backups/deploy-current"
 assert grep -F 'VACUUM INTO' "$SCRIPT"
 assert test "$(grep -c '".backup ' "$SCRIPT" || true)" = 0
+assert snapshot_under_writes
 printf 'deploy-canonical-authority tests passed\n'

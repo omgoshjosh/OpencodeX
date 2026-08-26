@@ -171,12 +171,15 @@ describe("session.llm.hasToolCalls", () => {
 })
 
 describe("session.llm API error logging", () => {
-  test("redacts request payloads while retaining API error diagnostics", () => {
+  test("redacts unbounded API error data while retaining bounded diagnostics", () => {
     const error = new APICallError({
-      message: "Request failed",
-      url: "https://api.example.com/v1/chat/completions",
+      message: "Request failed with message-secret-that-must-not-be-logged",
+      url: "https://url-user:url-credential@api.example.com/v1/chat/completions?query-secret=must-not-be-logged",
       statusCode: 429,
       isRetryable: true,
+      responseHeaders: { authorization: "header-secret-that-must-not-be-logged" },
+      responseBody: "response-secret-that-must-not-be-logged",
+      data: { secret: "data-secret-that-must-not-be-logged" },
       requestBodyValues: {
         system: "system-text-that-must-not-be-logged",
         messages: [
@@ -194,16 +197,23 @@ describe("session.llm API error logging", () => {
     const logged = LLM.redactAPICallError(error)
     const output = JSON.stringify(logged)
 
+    expect(output).not.toContain("message-secret-that-must-not-be-logged")
+    expect(output).not.toContain("url-user")
+    expect(output).not.toContain("url-credential")
+    expect(output).not.toContain("query-secret=must-not-be-logged")
+    expect(output).not.toContain("header-secret-that-must-not-be-logged")
+    expect(output).not.toContain("response-secret-that-must-not-be-logged")
+    expect(output).not.toContain("data-secret-that-must-not-be-logged")
     expect(output).not.toContain("system-text-that-must-not-be-logged")
     expect(output).not.toContain("user-text-that-must-not-be-logged")
     expect(output).not.toContain("aW1hZ2UtZGF0YS10aGF0LW11c3Qtbm90LWJlLWxvZ2dlZA==")
     expect(logged).toEqual({
       name: "AI_APICallError",
-      message: "Request failed",
       url: "https://api.example.com/v1/chat/completions",
       statusCode: 429,
       isRetryable: true,
     })
+    expect(output.length).toBeLessThanOrEqual(512)
   })
 })
 

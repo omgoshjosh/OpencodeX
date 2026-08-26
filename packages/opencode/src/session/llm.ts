@@ -31,15 +31,28 @@ import { LLMRequestPrep } from "./llm/request"
 
 const log = Log.create({ service: "llm" })
 export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
+const LOGGED_API_ERROR_URL_MAX_LENGTH = 256
 
 export function redactAPICallError(error: unknown) {
   if (!APICallError.isInstance(error)) return error
+  const url = redactAPICallErrorURL(error.url)
   return {
-    name: error.name,
-    message: error.message,
-    url: error.url,
-    statusCode: error.statusCode,
-    isRetryable: error.isRetryable,
+    name: "AI_APICallError",
+    statusCode:
+      typeof error.statusCode === "number" && Number.isFinite(error.statusCode) ? error.statusCode : undefined,
+    isRetryable: error.isRetryable === true,
+    url,
+  }
+}
+
+function redactAPICallErrorURL(input: string | undefined) {
+  if (!input) return undefined
+  try {
+    const url = new URL(input)
+    const result = url.origin + url.pathname
+    return result.length <= LOGGED_API_ERROR_URL_MAX_LENGTH ? result : undefined
+  } catch {
+    return undefined
   }
 }
 

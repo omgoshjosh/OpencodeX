@@ -245,6 +245,21 @@ describe("claude channel", () => {
     expect(state.aborted).toBe(true)
   })
 
+  test("closes and ends the turn when query creation never resolves", async () => {
+    const channel = new Channel<Handlers>("s1", () => new Promise<never>(() => {}), { interruptGraceMs: 20 })
+    const turn = channel.turn([user("one")], { name: "t1" })
+    const iterator = turn.events[Symbol.asyncIterator]()
+
+    void turn.interrupt()
+    const next = await Promise.race([
+      iterator.next(),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("turn did not end")), 200)),
+    ])
+
+    expect(next.done).toBe(true)
+    expect(channel.dead).toBe(true)
+  })
+
   test("rejects a second concurrent turn", async () => {
     const { create } = fakeQuery()
     const channel = new Channel<Handlers>("s1", create)

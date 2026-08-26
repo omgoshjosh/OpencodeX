@@ -243,13 +243,13 @@ export class Channel<H> {
         // the session hostage: if the turn is still attached after the grace
         // window, the whole channel is torn down and the next turn respawns
         // with resume.
-        const query = await this.queryPromise.catch(() => undefined)
         setTimeout(() => {
           if (this.sink === sink && !this.dead) {
             log.warn("claude channel unresponsive to interrupt; closing", { channel: this.key })
             void this.close()
           }
         }, this.interruptGraceMs).unref?.()
+        const query = await this.queryPromise.catch(() => undefined)
         await query?.interrupt().catch(() => undefined)
       },
     }
@@ -261,9 +261,13 @@ export class Channel<H> {
     const sink = this.sink
     this.sink = undefined
     this.handlers = undefined
-    const query = await this.queryPromise.catch(() => undefined)
-    query?.abort()
     sink?.end()
+    void this.queryPromise
+      .then(
+        (query) => query.abort(),
+        () => undefined,
+      )
+      .catch(() => undefined)
   }
 }
 

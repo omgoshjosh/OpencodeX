@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test"
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
 import path from "path"
-import { tool, type ModelMessage } from "ai"
+import { APICallError, tool, type ModelMessage } from "ai"
 import { Cause, Effect, Exit, Fiber, Layer, Stream } from "effect"
 import { InstanceRef } from "../../src/effect/instance-ref"
 import { HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
@@ -167,6 +167,43 @@ describe("session.llm.hasToolCalls", () => {
       },
     ] as ModelMessage[]
     expect(LLM.hasToolCalls(messages)).toBe(true)
+  })
+})
+
+describe("session.llm API error logging", () => {
+  test("redacts request payloads while retaining API error diagnostics", () => {
+    const error = new APICallError({
+      message: "Request failed",
+      url: "https://api.example.com/v1/chat/completions",
+      statusCode: 429,
+      isRetryable: true,
+      requestBodyValues: {
+        system: "system-text-that-must-not-be-logged",
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "user-text-that-must-not-be-logged" },
+              { type: "image", image: "data:image/png;base64,aW1hZ2UtZGF0YS10aGF0LW11c3Qtbm90LWJlLWxvZ2dlZA==" },
+            ],
+          },
+        ],
+      },
+    })
+
+    const logged = LLM.redactAPICallError(error)
+    const output = JSON.stringify(logged)
+
+    expect(output).not.toContain("system-text-that-must-not-be-logged")
+    expect(output).not.toContain("user-text-that-must-not-be-logged")
+    expect(output).not.toContain("aW1hZ2UtZGF0YS10aGF0LW11c3Qtbm90LWJlLWxvZ2dlZA==")
+    expect(logged).toEqual({
+      name: "AI_APICallError",
+      message: "Request failed",
+      url: "https://api.example.com/v1/chat/completions",
+      statusCode: 429,
+      isRetryable: true,
+    })
   })
 })
 

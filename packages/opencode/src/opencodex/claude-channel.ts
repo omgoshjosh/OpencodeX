@@ -244,13 +244,13 @@ export class Channel<H> {
         // window, the whole channel is torn down and the next turn respawns
         // with resume.
         const query = await this.queryPromise.catch(() => undefined)
-        await query?.interrupt().catch(() => undefined)
         setTimeout(() => {
           if (this.sink === sink && !this.dead) {
             log.warn("claude channel unresponsive to interrupt; closing", { channel: this.key })
             void this.close()
           }
         }, this.interruptGraceMs).unref?.()
+        await query?.interrupt().catch(() => undefined)
       },
     }
   }

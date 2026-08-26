@@ -6,7 +6,7 @@ import type { ClaudeEvent } from "../../src/opencodex/claude-mapper"
 type Handlers = { name: string }
 
 /** A scriptable stand-in for the SDK query a channel wraps. */
-function fakeQuery() {
+function fakeQuery(options?: { interrupt?: () => Promise<void> }) {
   const stream = createPushable<ClaudeEvent>()
   const state = {
     prompts: [] as SDKUserMessage[],
@@ -27,6 +27,7 @@ function fakeQuery() {
       events: stream.iterable,
       interrupt: async () => {
         state.interrupts += 1
+        await options?.interrupt?.()
       },
       abort: () => {
         state.aborted = true
@@ -223,6 +224,23 @@ describe("claude channel", () => {
     // The child never acknowledges: no events, no stream end. After the grace
     // window the channel must tear itself down rather than wedge the session.
     await new Promise((resolve) => setTimeout(resolve, 60))
+    expect(channel.dead).toBe(true)
+    expect(state.aborted).toBe(true)
+  })
+
+  test("closes and ends the turn when interrupt never resolves", async () => {
+    const { create, state } = fakeQuery({ interrupt: () => new Promise<void>(() => {}) })
+    const channel = new Channel<Handlers>("s1", create, { interruptGraceMs: 20 })
+    const turn = channel.turn([user("one")], { name: "t1" })
+    const iterator = turn.events[Symbol.asyncIterator]()
+
+    void turn.interrupt()
+    const next = await Promise.race([
+      iterator.next(),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("turn did not end")), 200)),
+    ])
+
+    expect(next.done).toBe(true)
     expect(channel.dead).toBe(true)
     expect(state.aborted).toBe(true)
   })

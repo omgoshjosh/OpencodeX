@@ -119,4 +119,6 @@ assert test ! -d "$base/backups/deploy-failed-1"
 assert test -d "$base/backups/deploy-incomplete-1"
 assert test -d "$base/backups/deploy-unknown-1"
 assert test -d "$base/backups/deploy-current"
+assert grep -F 'VACUUM INTO' "$SCRIPT"
+assert test "$(grep -c '".backup ' "$SCRIPT" || true)" = 0
 printf 'deploy-canonical-authority tests passed\n'

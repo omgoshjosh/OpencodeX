@@ -117,7 +117,7 @@ on_exit() {
 on_signal() { exit 1; }
 
 preflight() {
-  [ -d "$ROOT/.git" ] || die "source repository is unavailable"
+  git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1 || die "source repository is unavailable"
   [ "$(git -C "$ROOT" rev-parse HEAD)" = "$EXPECTED_HEAD" ] || die "source head changed"
   [ -x "$SOURCE_BIN" ] || die "source binary is unavailable"
   [ -d "$SOURCE_APP" ] || die "source app is unavailable"
@@ -155,7 +155,7 @@ backup() {
   cp "$LIVE_BIN" "$BACKUP/opencodex"
   ditto "$LIVE_APP" "$BACKUP/OpencodeX.app"
   cp "$SERVE_HUB" "$BACKUP/serve-hub.sh"
-  sqlite3 "$DB" ".backup '$BACKUP/opencode.db'"
+  sqlite3 "$DB" "VACUUM INTO '$BACKUP/opencode.db'"
   state backup complete
 }
 

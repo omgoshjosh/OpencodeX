@@ -4,7 +4,7 @@ import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import * as Log from "@opencode-ai/core/util/log"
 import { Context, Effect, Layer } from "effect"
 import * as Stream from "effect/Stream"
-import { streamText, wrapLanguageModel, type ModelMessage, type Tool } from "ai"
+import { APICallError, streamText, wrapLanguageModel, type ModelMessage, type Tool } from "ai"
 import type { LLMEvent } from "@opencode-ai/llm"
 import { LLMClient, RequestExecutor, WebSocketExecutor } from "@opencode-ai/llm/route"
 import type { LLMClientService } from "@opencode-ai/llm/route"
@@ -31,6 +31,17 @@ import { LLMRequestPrep } from "./llm/request"
 
 const log = Log.create({ service: "llm" })
 export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
+
+export function redactAPICallError(error: unknown) {
+  if (!APICallError.isInstance(error)) return error
+  return {
+    name: error.name,
+    message: error.message,
+    url: error.url,
+    statusCode: error.statusCode,
+    isRetryable: error.isRetryable,
+  }
+}
 
 export type StreamInput = {
   user: SessionLegacy.User
@@ -285,7 +296,7 @@ const live: Layer.Layer<
         result: streamText({
           onError(error) {
             l.error("stream error", {
-              error,
+              error: redactAPICallError(error),
             })
           },
           async experimental_repairToolCall(failed) {

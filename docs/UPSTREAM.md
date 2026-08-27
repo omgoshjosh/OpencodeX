@@ -74,15 +74,30 @@ git diff v1.15.13 v1.18.21 -- <path>
 The manifest splits them by whether the fork ever touched the file, because the two halves need
 opposite handling:
 
-| Bucket             | Count | Meaning                                                                                                                                                                                                                                                       |
-| ------------------ | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `unmodifiedByFork` | 371   | Byte-identical to the imported snapshot — the fork never edited them, so they are stale by neglect rather than by decision. Upstream's version can be adopted mechanically with no fork work at risk. **Follow-up adoption work, not deliberate divergence.** |
-| `modifiedByFork`   | 352   | The fork has its own changes, so upstream's version cannot be taken wholesale. Each needs a per-file decision: adopt, port the behavior, or record as deliberate divergence below.                                                                            |
+| Bucket             | Count | Meaning                                                                                                                                                                                         |
+| ------------------ | ----- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `unmodifiedByFork` | 371   | Byte-identical to the imported snapshot — the fork never edited them, so they are stale by neglect rather than by decision. **Not mechanically adoptable, though** — see the measurement below. |
+| `modifiedByFork`   | 352   | The fork has its own changes, so upstream's version cannot be taken wholesale. Each needs a per-file decision: adopt, port the behavior, or record as deliberate divergence below.              |
 
 The `unmodifiedByFork` half concentrates in `packages/opencode` (117), `packages/core` (55),
-`packages/ui` (24), `packages/llm` (23), and `packages/http-recorder` (12). The provider auth
-plugins are the clearest example of the cost of leaving it: upstream changed 33 of them by
-roughly +1100 lines across this range, and the fork has adopted essentially none of it.
+`packages/ui` (24), `packages/llm` (23), and `packages/http-recorder` (12). Of those 371, upstream
+_modified_ 320 and _deleted_ 51; the deletions are a separate policy question (whether the fork
+follows) rather than adoption candidates.
+
+**Bulk adoption of the 320 was measured, and it does not work.** Checking them out from `v1.18.21`
+onto the fork produces roughly 2140 type errors, because upstream's newer files import the package
+split this fork rejected (`@opencode-ai/schema/permission`, `@opencode-ai/plugin/v2/effect`,
+`../../v1/config/*`, `../../credential`, `../../integration`, `../../plugin/internal`). Narrowing
+does not rescue it: the 56 provider plugins alone still produce ~169 errors, and the 186 files whose
+_relative_ imports all resolve against the fork still produce ~975 — the incompatibility is at the
+type level as well as the module level.
+
+So the practical status of this bucket is "stale, and each file is a **port** rather than a
+checkout" — the same conclusion the package-split paragraph above reaches, now measured rather than
+asserted. It is also why none of this is a quick win. The provider auth plugins remain the
+highest-value target (upstream changed 33 of them by roughly +1100 lines across this range, and the
+fork has adopted essentially none), but they need porting behind the fork's own plugin surface, not
+a merge.
 
 Neither bucket is a claim that the merge was wrong — it is the record that makes the choice
 auditable and reversible by hand, which is what `docs/UPSTREAM.md` requires of a first sync.

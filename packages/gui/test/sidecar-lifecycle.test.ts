@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { spawn } from "node:child_process"
 import { createSidecarLifecycle, stopDetachedChild } from "../src/main/sidecar-lifecycle"
+import { isCoordinatorHealthyWithRetry } from "@opencode-ai/sdk/coordinator"
 
 describe("sidecar lifecycle", () => {
   test("shares a successful startup and resets it on stop", async () => {
@@ -183,5 +184,67 @@ describe("sidecar lifecycle", () => {
     await stopped
     expect(child.exitCode !== null || child.signalCode !== null).toBe(true)
     await expect(startup).rejects.toMatchObject({ name: "AbortError" })
+  })
+})
+
+describe("cached coordinator health", () => {
+  const connection = { url: "http://127.0.0.1:4096/", username: "opencodex-local", password: "secret" }
+
+  /** A fetch that hangs until the probe's own deadline aborts it. */
+  const stalls: typeof globalThis.fetch = (_url, init) =>
+    new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => {
+        const error = new Error("The operation was aborted")
+        error.name = "AbortError"
+        reject(error)
+      })
+    })
+
+  function lifecycleWithHealth(fetch: typeof globalThis.fetch) {
+    const events: string[] = []
+    let starts = 0
+    const lifecycle = createSidecarLifecycle({
+      start: async () => {
+        starts += 1
+        events.push("start")
+        return connection
+      },
+      /* The real production path, with only the transport injected. */
+      health: (value) => isCoordinatorHealthyWithRetry(value, { timeout: 10, delay: async () => {}, fetch }),
+      install: () => {},
+      reset: () => events.push("reset"),
+      stop: () => {
+        events.push("stop")
+      },
+    })
+    return { lifecycle, events, starts: () => starts }
+  }
+
+  test("one flaky probe does not tear down a cached connection", async () => {
+    let calls = 0
+    const { lifecycle, events, starts } = lifecycleWithHealth((url, init) => {
+      calls += 1
+      /* The cached-connection check stalls once, then answers. The single-shot
+         probe used to read that stall as death and silently stop and respawn a
+         perfectly good coordinator mid-session, with no error surfaced. */
+      return calls === 1 ? stalls(url, init) : Promise.resolve(Response.json({ healthy: true }))
+    })
+
+    expect(await lifecycle.ensure()).toBe(connection)
+    expect(await lifecycle.ensure()).toBe(connection)
+
+    expect(starts()).toBe(1)
+    expect(events).toEqual(["start"])
+    expect(calls).toBe(2)
+  })
+
+  test("a coordinator that stays silent is still replaced", async () => {
+    const { lifecycle, events, starts } = lifecycleWithHealth((url, init) => stalls(url, init))
+
+    expect(await lifecycle.ensure()).toBe(connection)
+    expect(await lifecycle.ensure()).toBe(connection)
+
+    expect(starts()).toBe(2)
+    expect(events).toEqual(["start", "reset", "stop", "start"])
   })
 })

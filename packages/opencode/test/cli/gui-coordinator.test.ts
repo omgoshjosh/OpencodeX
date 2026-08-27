@@ -228,7 +228,7 @@ describe("GUI coordinator direct entry", () => {
               "10 seconds",
             ),
           ).toBe(1)
-          expect(yield* Effect.promise(() => child.stderr)).toContain("is alive but unhealthy; refusing to replace it")
+          expect(yield* Effect.promise(() => child.stderr)).toContain("did not answer its health")
           expect(yield* readManifest(fixture)).toMatchObject({ pid: process.pid, token })
           yield* Effect.promise(() => fs.rm(fixture.manifest, { force: true }))
         }),

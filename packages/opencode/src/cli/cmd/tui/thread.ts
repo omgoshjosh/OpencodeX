@@ -224,6 +224,7 @@ export const TuiThreadCommand = cmd({
 
             const file = await target()
             const worker = new Worker(file, { env })
+            const client = Rpc.client<typeof rpc>(worker)
             worker.onerror = (e) => {
               Log.Default.error("thread error", {
                 message: e.message,
@@ -232,9 +233,11 @@ export const TuiThreadCommand = cmd({
                 colno: e.colno,
                 error: e.error,
               })
+              // A worker that dies before (or without) answering leaves every
+              // pending RPC un-timed; settle them so startup fails visibly
+              // instead of hanging the TUI with no output and no exit.
+              client.fail(new Error(`The TUI worker failed: ${e.message ?? "unknown worker error"}`))
             }
-
-            const client = Rpc.client<typeof rpc>(worker)
             const error = (e: unknown) => {
               Log.Default.error("process error", { error: errorMessage(e) })
             }

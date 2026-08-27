@@ -59,3 +59,27 @@ describe("rpc error propagation", () => {
     }
   })
 })
+
+test("fail settles every pending call and rejects future ones", async () => {
+  const target = {
+    postMessage: () => {},
+    onmessage: null as ((this: Worker, ev: MessageEvent) => unknown) | null,
+  }
+  const rpc = Rpc.client<{ ping: () => string }>(target as never)
+
+  const hanging = rpc.call("ping", undefined)
+  rpc.fail(new Error("worker died during init"))
+
+  expect(
+    await hanging.then(
+      () => "resolved",
+      (error: unknown) => (error instanceof Error ? error.message : String(error)),
+    ),
+  ).toBe("worker died during init")
+  expect(
+    await rpc.call("ping", undefined).then(
+      () => "resolved",
+      (error: unknown) => (error instanceof Error ? error.message : String(error)),
+    ),
+  ).toBe("worker died during init")
+})

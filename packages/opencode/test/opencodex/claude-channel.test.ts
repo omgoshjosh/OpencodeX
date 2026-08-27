@@ -1,5 +1,6 @@
-import { describe, expect, test } from "bun:test"
+import { describe, expect, spyOn, test } from "bun:test"
 import type { SDKUserMessage } from "@anthropic-ai/claude-agent-sdk"
+import * as Log from "@opencode-ai/core/util/log"
 import { Channel, createChannelRegistry, createPushable, type CreateQuery } from "../../src/opencodex/claude-channel"
 import type { ClaudeEvent } from "../../src/opencodex/claude-mapper"
 
@@ -154,6 +155,21 @@ describe("claude channel", () => {
     expect(channel.dead).toBe(true)
   })
 
+  test("fails the turn when background tasks never report that they settled", async () => {
+    const { create, emit } = fakeQuery()
+    const channel = new Channel<Handlers>("s1", create, { closeOutGraceMs: 20 })
+    const turn = channel.turn([user("wake")], { name: "t1" })
+    emit(event({ type: "system", subtype: "background_tasks_changed", tasks: [{ task_id: "a1" }] }))
+    emit(result)
+
+    const outcome = await collect(turn.events, 3).then(
+      () => "completed",
+      (error: unknown) => (error instanceof Error ? error.message : String(error)),
+    )
+    expect(outcome).toContain("background tasks did not settle")
+    await waitFor(() => channel.dead)
+  })
+
   test("forwards results normally on a channel that did not resume", async () => {
     const { create, emit } = fakeQuery()
     const channel = new Channel<Handlers>("s1", create)
@@ -163,9 +179,10 @@ describe("claude channel", () => {
     expect(typeOf(seen[0])).toBe("result")
   })
 
-  test("drops results that arrive between turns", async () => {
+  test("drops every event type that arrives between turns", async () => {
     const { create, emit } = fakeQuery()
     const channel = new Channel<Handlers>("s1", create)
+    const dropped = spyOn(Log.create({ service: "claude-channel" }), "info")
     const first = channel.turn([user("one")], { name: "t1" })
     emit(assistant)
     emit(result)
@@ -174,8 +191,18 @@ describe("claude channel", () => {
     // Nobody is consuming: background chatter and stray results must not leak
     // into the next turn.
     emit(result)
-    emit(event({ type: "system", subtype: "task_done" }))
+    emit(event({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "call_1", content: "secret" }] } }))
+    emit(event({ type: "assistant", message: { content: [{ type: "text", text: "secret" }] } }))
     await settled()
+
+    const calls = dropped.mock.calls.filter(([message]) => message === "dropped out-of-turn event")
+    expect(calls.map(([, fields]) => fields)).toEqual([
+      { channel: "s1", type: "result" },
+      { channel: "s1", type: "user" },
+      { channel: "s1", type: "assistant" },
+    ])
+    expect(JSON.stringify(calls)).not.toContain("secret")
+    dropped.mockRestore()
 
     const second = channel.turn([user("two")], { name: "t2" })
     emit(assistant)

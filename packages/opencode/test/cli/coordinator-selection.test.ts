@@ -5,11 +5,14 @@ import path from "path"
 import {
   coordinatorDatabaseIdentity,
   coordinatorClientDir,
+  coordinatorManifestPath,
   discoverActiveGuiCoordinatorDatabase,
+  readActiveCoordinator,
   readActiveCoordinatorClientLeases,
   readBackendAuthority,
   selectBackendAuthority,
 } from "../../src/cli/cmd/tui/coordinator-registry"
+import { createCoordinatorProber } from "@opencode-ai/sdk/coordinator"
 import { discoverBackendDatabase } from "../../src/cli/cmd/tui/database-discovery"
 import { tmpdir } from "../fixture/fixture"
 
@@ -118,3 +121,106 @@ function createDatabase(file: string, projects: number, sessions: number) {
   )
   database.close()
 }
+
+describe("attaching to a live coordinator", () => {
+  /**
+   * Bun's `fetch` type carries a `preconnect` member the probe never calls, so
+   * a bare arrow function is not assignable to it.
+   */
+  const injectedFetch = (
+    handler: (...args: Parameters<typeof globalThis.fetch>) => Promise<Response>,
+  ): typeof globalThis.fetch => Object.assign(handler, { preconnect: async () => {} })
+
+  /** A fetch that hangs until the probe's own deadline aborts it. */
+  const stalls = injectedFetch((_url, init) =>
+    new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => {
+        const error = new Error("The operation was aborted")
+        error.name = "AbortError"
+        reject(error)
+      })
+    }),
+  )
+
+  async function withManifest(run: (input: { key: string; database: string }) => Promise<void>) {
+    await using tmp = await tmpdir()
+    const database = path.join(tmp.path, "coordinator.db")
+    const key = `attach-test-${process.pid}-${Date.now()}`
+    const file = coordinatorManifestPath(key)
+    await Bun.write(database, "")
+    await Bun.write(
+      file,
+      JSON.stringify({
+        version: 2,
+        key,
+        directory: tmp.path,
+        database,
+        pid: process.pid,
+        url: "http://127.0.0.1:4096/",
+        username: "opencodex-local",
+        password: "secret",
+        token: "token",
+        createdAt: new Date().toISOString(),
+        serverVersion: "local",
+      }),
+    )
+    try {
+      await run({ key, database })
+    } finally {
+      await fs.rm(file, { force: true })
+    }
+  }
+
+  test("attaches to a coordinator that answers slowly on retry instead of declaring it unhealthy", async () => {
+    await withManifest(async ({ key, database }) => {
+      let calls = 0
+      const manifest = await readActiveCoordinator(key, database, {
+        probe: createCoordinatorProber({
+          timeout: 10,
+          delay: async () => {},
+          fetch: injectedFetch((url, init) => {
+            calls += 1
+            /* The reported bug exactly: the first probes abort mid-stall. */
+            return calls < 3 ? stalls(url, init) : Promise.resolve(Response.json({ healthy: true, version: "local" }))
+          }),
+        }),
+      })
+
+      expect(manifest?.key).toBe(key)
+      expect(calls).toBe(3)
+      expect(await Bun.file(coordinatorManifestPath(key)).exists()).toBe(true)
+    })
+  })
+
+  test("refuses a live but unanswering coordinator without deleting its manifest", async () => {
+    await withManifest(async ({ key, database }) => {
+      const probe = createCoordinatorProber({ timeout: 10, delay: async () => {}, fetch: stalls })
+
+      const error = await readActiveCoordinator(key, database, { probe }).then(
+        () => undefined,
+        (reason: unknown) => reason,
+      )
+
+      expect(String(error)).toContain("did not answer its health")
+      expect(await Bun.file(coordinatorManifestPath(key)).exists()).toBe(true)
+    })
+  })
+
+  test("a quick read probes once so the startup poll loop stays on its own cadence", async () => {
+    await withManifest(async ({ key, database }) => {
+      let calls = 0
+      const probe = createCoordinatorProber({
+        timeout: 10,
+        delay: async () => {},
+        fetch: injectedFetch((url, init) => {
+          calls += 1
+          return stalls(url, init)
+        }),
+      })
+
+      await readActiveCoordinator(key, database, { mode: "quick", probe }).catch(() => undefined)
+
+      expect(calls).toBe(1)
+    })
+  })
+})

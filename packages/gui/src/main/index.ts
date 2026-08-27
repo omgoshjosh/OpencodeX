@@ -11,7 +11,7 @@ import {
   shell,
   type MessageBoxOptions,
 } from "electron"
-import { isCoordinatorHealthy } from "@opencode-ai/sdk/coordinator"
+import { isCoordinatorHealthyWithRetry } from "@opencode-ai/sdk/coordinator"
 import { type SidecarConnection, startSidecar, stopSidecar } from "./sidecar.js"
 import { editorCommand } from "./editor-command.js"
 import { registerBrowserIpc, secureSession } from "./browser-ipc.js"
@@ -40,7 +40,10 @@ const RENDERER_CSP = [
 let authorizedSidecar: { origin: string; header: string } | undefined
 const sidecarLifecycle = createSidecarLifecycle({
   start: startSidecar,
-  health: isCoordinatorHealthy,
+  /* Retrying, not single-shot: a `false` here silently stops the coordinator
+     and respawns it mid-session with no error surfaced anywhere, so one flaky
+     probe must not be enough to reach that conclusion. */
+  health: (connection: SidecarConnection) => isCoordinatorHealthyWithRetry(connection),
   install: authorizeSidecar,
   reset: () => {
     authorizedSidecar = undefined

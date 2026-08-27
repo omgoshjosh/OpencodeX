@@ -3,14 +3,16 @@ import { randomBytes } from "node:crypto"
 import { rememberBackendAuthority } from "./backend-authority.js"
 import fs from "node:fs"
 import {
-  checkCoordinatorCompatibility,
-  fetchCoordinatorHealth,
-  isCoordinatorProcessAlive,
+  CoordinatorUnreachableError,
+  createCoordinatorProber,
   isMissingCoordinatorFile,
   readCoordinatorManifestFile,
   readCoordinatorManifestToken,
   removeCoordinatorManifest as removeCoordinatorManifestIn,
+  resolveCoordinatorAttachment,
   startCoordinatorClientLease as startCoordinatorClientLeaseIn,
+  type CoordinatorProbeMode,
+  type CoordinatorProber,
 } from "@opencode-ai/sdk/coordinator"
 import {
   COORDINATOR_STATE_ROOT,
@@ -157,34 +159,40 @@ function connectionFromManifest(manifest: CoordinatorManifest, directory: string
   }
 }
 
-async function activeCoordinator(key: string, database: string) {
+export type CoordinatorAttachOptions = {
+  mode?: CoordinatorProbeMode
+  fetch?: typeof globalThis.fetch
+  probe?: CoordinatorProber
+}
+
+/**
+ * The GUI's half of the attach decision. It used to be a near-verbatim copy of
+ * the TUI's, and carried the identical single-probe bug; both now apply the
+ * side effects of one shared `resolveCoordinatorAttachment` so they cannot
+ * diverge again.
+ */
+async function activeCoordinator(key: string, database: string, options?: CoordinatorAttachOptions) {
   const manifest = await readActiveManifest(key)
   if (!manifest) return undefined
-  if (
-    manifest.key !== key ||
-    coordinatorDatabaseIdentity(manifest.database) !== coordinatorDatabaseIdentity(database)
-  ) {
-    await removeCoordinatorManifest(key, manifest.token)
+  const resolution = await resolveCoordinatorAttachment({
+    manifest,
+    key,
+    database,
+    clientVersion: sidecarVersion(),
+    mode: options?.mode ?? "decide",
+    probe: options?.probe ?? createCoordinatorProber({ fetch: options?.fetch }),
+    identity: coordinatorDatabaseIdentity,
+  })
+  if (resolution.action === "attach") {
+    if (resolution.warning) console.warn(resolution.warning)
+    return resolution.manifest
+  }
+  if (resolution.action === "reclaim") {
+    await removeCoordinatorManifest(key, resolution.manifest.token)
     return undefined
   }
-  const health = await fetchCoordinatorHealth(manifest)
-  if (health?.healthy === true) {
-    const compatibility = checkCoordinatorCompatibility({
-      manifest,
-      clientVersion: sidecarVersion(),
-      healthVersion: health.version,
-    })
-    if (!compatibility.compatible) {
-      throw new CoordinatorVersionMismatchError(compatibility.message ?? "Coordinator version mismatch")
-    }
-    if (compatibility.reason === "local" && compatibility.message) console.warn(compatibility.message)
-    return manifest
-  }
-  if (isCoordinatorProcessAlive(manifest.pid)) {
-    throw new Error(`OpencodeX coordinator process ${manifest.pid} is alive but unhealthy; refusing to replace it`)
-  }
-  await removeCoordinatorManifest(key, manifest.token)
-  return undefined
+  if (resolution.code === "version") throw new CoordinatorVersionMismatchError(resolution.message)
+  throw new CoordinatorUnreachableError(resolution.manifest, resolution.probe, resolution.message)
 }
 
 async function readActiveManifest(key: string) {

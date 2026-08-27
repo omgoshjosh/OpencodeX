@@ -5,24 +5,27 @@ import * as Log from "@opencode-ai/core/util/log"
 import { Flock } from "@opencode-ai/core/util/flock"
 import { ensureRunID, OPENCODE_PROCESS_ROLE, OPENCODE_RUN_ID } from "@opencode-ai/core/util/opencode-process"
 import {
-  checkCoordinatorCompatibility,
   coordinatorClientDir as coordinatorClientDirIn,
   coordinatorDatabaseIdentity as coordinatorDatabaseIdentityOf,
   coordinatorHeaders as coordinatorHeadersFor,
   coordinatorKey as coordinatorKeyOf,
   coordinatorManifestPath as coordinatorManifestPathIn,
   coordinatorRoot,
-  fetchCoordinatorHealth,
+  CoordinatorUnreachableError,
+  createCoordinatorProber,
   isCoordinatorClientLease,
   isCoordinatorProcessAlive,
   isMissingCoordinatorFile,
   readCoordinatorManifestFile,
   readCoordinatorManifestToken,
   removeCoordinatorManifest as removeCoordinatorManifestIn,
+  resolveCoordinatorAttachment,
   startCoordinatorClientLease as startCoordinatorClientLeaseIn,
   writeCoordinatorManifest as writeCoordinatorManifestIn,
   type CoordinatorClientLease,
   type CoordinatorManifest,
+  type CoordinatorProbeMode,
+  type CoordinatorProber,
 } from "@opencode-ai/sdk/coordinator"
 import { errorMessage } from "@/util/error"
 import { randomBytes } from "crypto"
@@ -136,36 +139,44 @@ export class CoordinatorVersionMismatchError extends Error {
   }
 }
 
-export async function readActiveCoordinator(key = coordinatorKey(), database = coordinatorDatabaseIdentity()) {
+/**
+ * Injection points for the health probe. Threaded through every reader so the
+ * attach decision is testable without a live coordinator — it previously was
+ * not, which is why the single-shot probe's failure mode went unnoticed.
+ */
+export type CoordinatorAttachOptions = {
+  /** `decide` escalates through retries; `quick` probes once. Defaults to `decide`. */
+  mode?: CoordinatorProbeMode
+  fetch?: typeof globalThis.fetch
+  probe?: CoordinatorProber
+}
+
+export async function readActiveCoordinator(
+  key = coordinatorKey(),
+  database = coordinatorDatabaseIdentity(),
+  options?: CoordinatorAttachOptions,
+) {
   const manifest = await readActiveManifest(key)
   if (!manifest) return undefined
-  if (
-    manifest.key !== key ||
-    coordinatorDatabaseIdentity(manifest.database) !== coordinatorDatabaseIdentity(database)
-  ) {
-    await removeCoordinatorManifest(key, manifest.token)
+  const resolution = await resolveCoordinatorAttachment({
+    manifest,
+    key,
+    database,
+    clientVersion: InstallationVersion,
+    mode: options?.mode ?? "decide",
+    probe: options?.probe ?? createCoordinatorProber({ fetch: options?.fetch }),
+    identity: coordinatorDatabaseIdentity,
+  })
+  if (resolution.action === "attach") {
+    if (resolution.warning) Log.Default.warn("tui coordinator version unverified", { detail: resolution.warning })
+    return resolution.manifest
+  }
+  if (resolution.action === "reclaim") {
+    await removeCoordinatorManifest(key, resolution.manifest.token)
     return undefined
   }
-  const health = await fetchCoordinatorHealth(manifest)
-  if (health?.healthy === true) {
-    const compatibility = checkCoordinatorCompatibility({
-      manifest,
-      clientVersion: InstallationVersion,
-      healthVersion: health.version,
-    })
-    if (!compatibility.compatible) {
-      throw new CoordinatorVersionMismatchError(manifest, compatibility.message ?? "Coordinator version mismatch")
-    }
-    if (compatibility.reason === "local" && compatibility.message) {
-      Log.Default.warn("tui coordinator version unverified", { detail: compatibility.message })
-    }
-    return manifest
-  }
-  if (isCoordinatorProcessAlive(manifest.pid)) {
-    throw new Error(`TUI coordinator process ${manifest.pid} is alive but unhealthy; refusing to replace it`)
-  }
-  await removeCoordinatorManifest(key, manifest.token)
-  return undefined
+  if (resolution.code === "version") throw new CoordinatorVersionMismatchError(resolution.manifest, resolution.message)
+  throw new CoordinatorUnreachableError(resolution.manifest, resolution.probe, resolution.message)
 }
 
 export async function readPreferredCoordinator() {
@@ -251,7 +262,9 @@ async function waitForCoordinator(key: string, database: string) {
   const started = Date.now()
   let lastError = "coordinator did not publish a manifest"
   while (Date.now() - started < START_TIMEOUT) {
-    const manifest = await readActiveCoordinator(key, database).catch((error) => {
+    /* `quick`: this loop is already the retry, and it polls every 150ms for up
+       to START_TIMEOUT. Escalating inside it would only stretch each tick. */
+    const manifest = await readActiveCoordinator(key, database, { mode: "quick" }).catch((error) => {
       if (error instanceof CoordinatorVersionMismatchError) throw error
       lastError = errorMessage(error)
       return undefined
@@ -317,7 +330,13 @@ export function selectBackendAuthority(
   return active ?? persisted ?? discovered ?? fallback
 }
 
-export async function discoverActiveGuiCoordinatorDatabase(root = ROOT) {
+/**
+ * Probes every manifest concurrently, so this stays on `quick` forever: an
+ * escalating probe here would turn one stalled coordinator into a multi-second
+ * startup stall for a discovery step that has a perfectly good fallback.
+ */
+export async function discoverActiveGuiCoordinatorDatabase(root = ROOT, options?: CoordinatorAttachOptions) {
+  const probe = options?.probe ?? createCoordinatorProber({ fetch: options?.fetch })
   const manifests = await Promise.all(
     (await fs.readdir(root).catch(() => []))
       .filter((file) => file.endsWith(".json"))
@@ -328,7 +347,7 @@ export async function discoverActiveGuiCoordinatorDatabase(root = ROOT) {
       manifest
         ? [
             hasActiveGuiClient(manifest.key, root).then(async (active) => {
-              if (!active || (await fetchCoordinatorHealth(manifest))?.healthy !== true) return undefined
+              if (!active || (await probe(manifest, "quick")).probe.kind !== "healthy") return undefined
               return coordinatorDatabaseIdentity(manifest.database)
             }),
           ]

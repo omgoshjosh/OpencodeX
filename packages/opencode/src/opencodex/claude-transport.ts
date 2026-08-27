@@ -5,6 +5,9 @@ import type { SDKUserMessage } from "@anthropic-ai/claude-agent-sdk"
 import type { ClaudeEvent } from "./claude-mapper"
 import { ClaudeDelegate } from "./claude-delegate"
 import { createChannelRegistry, type CreateQuery } from "./claude-channel"
+import * as Log from "@opencode-ai/core/util/log"
+
+const log = Log.create({ service: "claude-transport" })
 
 /**
  * The process boundary for headless Claude Code. Everything SDK-specific lives

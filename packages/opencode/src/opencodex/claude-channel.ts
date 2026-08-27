@@ -205,6 +205,10 @@ export class Channel<H> {
       } else if (this.liveBackgroundTasks === 0 && this.backgroundWait === "final-output") {
         this.armFinalOutputWatchdog(sink)
       } else if (this.liveBackgroundTasks > 0 && this.backgroundWait === "final-output") {
+        if (this.backgroundTaskDeadline !== undefined && this.now() >= this.backgroundTaskDeadline) {
+          this.failBackgroundTaskWait(sink)
+          return
+        }
         this.backgroundWait = "drain"
         this.clearFinalOutputWatchdog()
         this.armBackgroundTaskWatchdog(sink)
@@ -283,13 +287,17 @@ export class Channel<H> {
     this.backgroundTaskWatchdog = setTimeout(() => {
       this.backgroundTaskWatchdog = undefined
       if (this.sink !== sink || this.backgroundWait !== "drain") return
-      log.warn("background tasks did not settle; closing the channel", {
-        channel: this.key,
-        liveBackgroundTasks: this.liveBackgroundTasks,
-      })
-      sink.end({ failure: new Error("Claude background tasks did not settle before timeout.") })
-      void this.close()
+      this.failBackgroundTaskWait(sink)
     }, Math.max(0, deadline - this.now()))
+  }
+
+  private failBackgroundTaskWait(sink: TurnSink) {
+    log.warn("background tasks did not settle; closing the channel", {
+      channel: this.key,
+      liveBackgroundTasks: this.liveBackgroundTasks,
+    })
+    sink.end({ failure: new Error("Claude background tasks did not settle before timeout.") })
+    void this.close()
   }
 
   private clearBackgroundTaskWatchdog() {
@@ -345,6 +353,7 @@ export class Channel<H> {
         notify?.()
       },
       end: (failure) => {
+        if (ended) return
         ended = failure ? { failure: failure.failure } : {}
         notify?.()
       },

@@ -223,6 +223,22 @@ async function* idlePrompt(): AsyncGenerator<never> {
  */
 const persistentChannels = createChannelRegistry<TurnHandlers>()
 
+/**
+ * Reclaims every live CLI child. Each channel owns one, and a backend that
+ * serves many sessions over a long life would otherwise accumulate them for
+ * its whole lifetime: an idle reaper handles the quiet ones, and this is the
+ * deterministic hook for instance disposal and shutdown. A later turn respawns
+ * and resumes, so calling this is never destructive to a conversation.
+ */
+export function closeAllPersistentChannels() {
+  return persistentChannels.closeAll()
+}
+
+/** Drops one session's channel, for session deletion. */
+export function closePersistentChannel(sessionKey: string) {
+  return persistentChannels.close(sessionKey)
+}
+
 export function createSdkTransport(): ClaudeTransport {
   const registry = persistentChannels
 

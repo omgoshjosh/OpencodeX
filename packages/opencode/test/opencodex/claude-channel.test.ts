@@ -63,6 +63,14 @@ async function collect(events: AsyncIterable<ClaudeEvent>, count: number) {
   return seen
 }
 
+async function waitFor(predicate: () => boolean, timeoutMs = 1_000) {
+  const start = Date.now()
+  while (!predicate()) {
+    if (Date.now() - start > timeoutMs) throw new Error("condition was never met")
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+}
+
 async function settled() {
   await new Promise((resolve) => setTimeout(resolve, 10))
 }
@@ -97,6 +105,53 @@ describe("claude channel", () => {
     emit(event({ type: "result", subtype: "error_during_execution", is_error: true }))
     const seen = await collect(turn.events, 1)
     expect(typeOf(seen[0]!)).toBe("result")
+  })
+
+  test("forwards an error result that lands in the close-out window", async () => {
+    // A rate limit, usage limit, upstream 5xx, or invalid model is reported as
+    // an error result after system.init and before any assistant output -
+    // exactly where the close-out guard looks. Dropping one stalls the turn
+    // forever, because the streaming input keeps the child alive so the query
+    // stream never ends.
+    const { create, emit } = fakeQuery()
+    const channel = new Channel<Handlers>("s1", create, { resumeID: "conv-1" })
+    const turn = channel.turn([user("wake")], { name: "t1" })
+    emit(init)
+    emit(event({ type: "result", subtype: "error_during_execution", is_error: true }))
+    const seen = await collect(turn.events, 2)
+    expect(seen.map(typeOf)).toEqual(["system", "result"])
+  })
+
+  test("forwards an is_error result even when its subtype reads as success", async () => {
+    const { create, emit } = fakeQuery()
+    const channel = new Channel<Handlers>("s1", create, { resumeID: "conv-1" })
+    const turn = channel.turn([user("wake")], { name: "t1" })
+    emit(init)
+    emit(event({ type: "result", subtype: "success", is_error: true }))
+    const seen = await collect(turn.events, 2)
+    expect(seen.map(typeOf)).toEqual(["system", "result"])
+  })
+
+  test("fails the turn when a dropped close-out is followed by nothing", async () => {
+    // The guard's blind spot must be bounded: without this the driver parks in
+    // nextClaudeEvent holding the session's execution lease indefinitely.
+    const { create, emit } = fakeQuery()
+    const channel = new Channel<Handlers>("s1", create, { resumeID: "conv-1", closeOutGraceMs: 20 })
+    const turn = channel.turn([user("wake")], { name: "t1" })
+    emit(init)
+    emit(result)
+
+    // The init is forwarded; the dropped close-out leaves nothing after it.
+    const outcome = await collect(turn.events, 2).then(
+      () => "completed",
+      (error: unknown) => (error instanceof Error ? error.message : String(error)),
+    )
+    expect(outcome).toContain("no output")
+    // The whole channel goes down with the turn: the child may still be alive
+    // and mid-answer, and detaching alone would let that output land in the
+    // next turn's sink - the previous prompt's answer on the new prompt.
+    await waitFor(() => channel.dead)
+    expect(channel.dead).toBe(true)
   })
 
   test("forwards results normally on a channel that did not resume", async () => {
@@ -298,5 +353,61 @@ describe("channel registry", () => {
     expect(b.dead).toBe(true)
     expect(one.state.aborted).toBe(true)
     expect(two.state.aborted).toBe(true)
+  })
+
+  test("reaps a channel left idle past its ttl", async () => {
+    // Every live channel owns a CLI child, so a session that goes quiet must
+    // not keep one for the backend's lifetime.
+    let clock = 0
+    const registry = createChannelRegistry<Handlers>({ idleTtlMs: 100, sweepMs: 5, now: () => clock })
+    const query = fakeQuery()
+    const channel = await registry.acquire("s1", "c", query.create)
+    expect(registry.size()).toBe(1)
+
+    clock = 1_000
+    await waitFor(() => registry.size() === 0)
+    expect(channel.dead).toBe(true)
+    expect(query.state.aborted).toBe(true)
+  })
+
+  test("never reaps a channel that is mid-turn", async () => {
+    let clock = 0
+    const registry = createChannelRegistry<Handlers>({ idleTtlMs: 100, sweepMs: 5, now: () => clock })
+    const query = fakeQuery()
+    const channel = await registry.acquire("s1", "c", query.create)
+    channel.turn([user("one")], { name: "t1" })
+
+    clock = 1_000
+    await new Promise((resolve) => setTimeout(resolve, 40))
+    expect(registry.size()).toBe(1)
+    expect(channel.dead).toBe(false)
+  })
+
+  test("closeAll leaves a mid-turn channel running", async () => {
+    // Instance disposal also runs on a global config change and a plugin
+    // install, so closing a busy channel would truncate a live turn into a
+    // silent clean completion.
+    const registry = createChannelRegistry<Handlers>()
+    const busy = fakeQuery()
+    const idle = fakeQuery()
+    const a = await registry.acquire("s1", "c", busy.create)
+    const b = await registry.acquire("s2", "c", idle.create)
+    a.turn([user("one")], { name: "t1" })
+
+    await registry.closeAll()
+    expect(a.dead).toBe(false)
+    expect(busy.state.aborted).toBe(false)
+    expect(b.dead).toBe(true)
+    expect(registry.get("s1")).toBe(a)
+  })
+
+  test("close drops a single session's channel", async () => {
+    const registry = createChannelRegistry<Handlers>()
+    const query = fakeQuery()
+    const channel = await registry.acquire("s1", "c", query.create)
+    await registry.close("s1")
+    expect(channel.dead).toBe(true)
+    expect(registry.size()).toBe(0)
+    expect(registry.get("s1")).toBeUndefined()
   })
 })

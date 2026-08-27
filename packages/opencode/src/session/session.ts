@@ -15,6 +15,7 @@ import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { NotFoundError } from "@/storage/storage"
 import { eq } from "drizzle-orm"
 import { and } from "drizzle-orm"
+import { closePersistentChannel } from "@/opencodex/claude-transport"
 import { gte } from "drizzle-orm"
 import { isNull } from "drizzle-orm"
 import { desc } from "drizzle-orm"
@@ -540,10 +541,7 @@ export interface Interface {
    * `transient` publishes the revision to live subscribers without journaling
    * it. Use it for in-flight progress only - terminal state must stay durable.
    */
-  readonly updatePart: <T extends SessionLegacy.Part>(
-    part: T,
-    options?: { transient?: boolean },
-  ) => Effect.Effect<T>
+  readonly updatePart: <T extends SessionLegacy.Part>(part: T, options?: { transient?: boolean }) => Effect.Effect<T>
   readonly updatePartDelta: (input: {
     sessionID: SessionID
     messageID: MessageID
@@ -804,6 +802,9 @@ export const layer: Layer.Layer<
       )
 
       if (hasInstance) yield* cancelBackgroundJobs(background, sessionID)
+      // A deleted session's Claude channel owns a live CLI child that nothing
+      // will ever prompt again; without this it survives to the idle sweep.
+      yield* Effect.promise(() => closePersistentChannel(sessionID)).pipe(Effect.ignore)
       const kids = yield* children(sessionID)
       for (const child of kids) yield* remove(child.id)
 
@@ -837,9 +838,7 @@ export const layer: Layer.Layer<
         // revision is unobservable. Same shape as `message.part.delta`, which
         // has always been broadcast-only.
         if (options?.transient) {
-          yield* events.broadcast(
-            yield* events.payload(SessionLegacy.Event.PartUpdated, data, { location }),
-          )
+          yield* events.broadcast(yield* events.payload(SessionLegacy.Event.PartUpdated, data, { location }))
           return part
         }
         yield* events.publish(SessionLegacy.Event.PartUpdated, data, { location })

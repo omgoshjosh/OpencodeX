@@ -131,7 +131,10 @@ async function readClientLease(file: string) {
  * same database.
  */
 export class CoordinatorVersionMismatchError extends Error {
-  constructor(readonly manifest: TuiCoordinatorManifest, message: string) {
+  constructor(
+    readonly manifest: TuiCoordinatorManifest,
+    message: string,
+  ) {
     super(message)
     this.name = "CoordinatorVersionMismatchError"
   }
@@ -335,12 +338,7 @@ export async function preferredCoordinatorDatabase() {
   const active = await discoverActiveGuiCoordinatorDatabase()
   const discovered =
     active || persisted ? undefined : coordinatorDatabaseIdentity((await discoverBackendDatabase()) ?? fallback)
-  const database = selectBackendAuthority(
-    active,
-    persisted,
-    discovered,
-    fallback,
-  )
+  const database = selectBackendAuthority(active, persisted, discovered, fallback)
   if (database !== fallback && database !== persisted) await rememberBackendAuthority(database).catch(() => undefined)
   return database
 }
@@ -367,7 +365,15 @@ export async function discoverActiveGuiCoordinatorDatabase(root = ROOT) {
             hasActiveGuiClient(manifest.key, root).then(async (active) => {
               if (!active) return undefined
               const health = await fetchCoordinatorHealth(manifest)
-              if (health?.healthy !== true || !isCoordinatorHealthForManifest(manifest, health)) return undefined
+              if (health?.healthy !== true) return undefined
+              // Same legacy tolerance as readActiveCoordinator: a sidecar from
+              // a build predating the health identity fields reports no
+              // coordinatorKey, and rejecting it here silently routes the CLI
+              // to the default database while the GUI keeps its own - two
+              // clients, two databases, sessions invisible across them. Only
+              // an identity that actively mismatches is another database.
+              if (health.coordinatorKey !== undefined && !isCoordinatorHealthForManifest(manifest, health))
+                return undefined
               return coordinatorDatabaseIdentity(manifest.database)
             }),
           ]
@@ -401,10 +407,6 @@ async function hasActiveGuiClient(key: string, root: string) {
 async function rememberBackendAuthority(database: string, file = BACKEND_AUTHORITY) {
   await fs.mkdir(path.dirname(file), { recursive: true })
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`
-  await fs.writeFile(
-    tmp,
-    JSON.stringify({ version: 1, database, updatedAt: Date.now() }, null, 2),
-    { mode: 0o600 },
-  )
+  await fs.writeFile(tmp, JSON.stringify({ version: 1, database, updatedAt: Date.now() }, null, 2), { mode: 0o600 })
   await fs.rename(tmp, file)
 }

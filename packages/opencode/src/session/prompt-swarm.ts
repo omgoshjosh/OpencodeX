@@ -215,11 +215,20 @@ export function make(deps: Deps) {
     toolUseID?: string
   }) {
     const role = SwarmBriefing.matchSwarmRole(input.roles, input.role)
-    if (!role) return ClaudeDelegate.failure("rejected")
-    if (!role.provider_id || !role.model_id) return ClaudeDelegate.failure("rejected")
+    // Each rejection carries the reason the orchestrator can act on. The
+    // unknown-role roster is the recovery path for a mistyped free-form role
+    // argument; without it the model retries the same bad name blind.
+    if (!role)
+      return ClaudeDelegate.failure(
+        "rejected",
+        `Unknown role "${input.role}". Available roles: ${input.roles.map((entry) => entry.name).join(", ")}.`,
+      )
+    if (!role.provider_id || !role.model_id)
+      return ClaudeDelegate.failure("rejected", `Role "${role.name}" has no model configured.`)
     // A role stored on the swarm facade has no concrete model to run: a child
     // prompted on the facade would take the swarm route itself and recurse.
-    if (isSwarmProvider(role.provider_id)) return ClaudeDelegate.failure("rejected")
+    if (isSwarmProvider(role.provider_id))
+      return ClaudeDelegate.failure("rejected", `Role "${role.name}" is not runnable: it points at the swarm itself.`)
     const parent = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
     const child = yield* sessions
       .create({
@@ -454,7 +463,9 @@ export function make(deps: Deps) {
             // Avoid doubling up when the subagent's own title already says
             // "subagent" (e.g. "code-reviewer subagent"), which would otherwise
             // render as "code-reviewer subagent (@claude subagent)".
-            const title = /subagent/i.test(spawnInput.title) ? spawnInput.title : `${spawnInput.title} (@claude subagent)`
+            const title = /subagent/i.test(spawnInput.title)
+              ? spawnInput.title
+              : `${spawnInput.title} (@claude subagent)`
             const child = yield* sessions
               .create({
                 parentID: sessionID,

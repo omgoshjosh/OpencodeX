@@ -104,7 +104,7 @@ describe("claude channel", () => {
     const turn = channel.turn([user("wake")], { name: "t1" })
     emit(event({ type: "result", subtype: "error_during_execution", is_error: true }))
     const seen = await collect(turn.events, 1)
-    expect(typeOf(seen[0]!)).toBe("result")
+    expect(typeOf(seen[0])).toBe("result")
   })
 
   test("forwards an error result that lands in the close-out window", async () => {
@@ -160,7 +160,7 @@ describe("claude channel", () => {
     const turn = channel.turn([user("hi")], { name: "t1" })
     emit(result)
     const seen = await collect(turn.events, 1)
-    expect(typeOf(seen[0]!)).toBe("result")
+    expect(typeOf(seen[0])).toBe("result")
   })
 
   test("drops results that arrive between turns", async () => {
@@ -180,7 +180,7 @@ describe("claude channel", () => {
     const second = channel.turn([user("two")], { name: "t2" })
     emit(assistant)
     const seen = await collect(second.events, 1)
-    expect(typeOf(seen[0]!)).toBe("assistant")
+    expect(typeOf(seen[0])).toBe("assistant")
   })
 
   test("runs consecutive turns over one query and swaps handlers per turn", async () => {
@@ -266,7 +266,7 @@ describe("claude channel", () => {
     const second = channel.turn([user("two")], { name: "t2" })
     emit(assistant)
     const seen = await collect(second.events, 1)
-    expect(typeOf(seen[0]!)).toBe("assistant")
+    expect(typeOf(seen[0])).toBe("assistant")
   })
 
   test("closes a channel whose child ignores an interrupt", async () => {

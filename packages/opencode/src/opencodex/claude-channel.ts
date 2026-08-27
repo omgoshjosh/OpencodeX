@@ -414,7 +414,7 @@ export function createChannelRegistry<H>(options?: { idleTtlMs?: number; sweepMs
   async function sweep() {
     const deadline = now() - idleTtlMs
     const expired: Channel<H>[] = []
-    for (const [key, entry] of [...channels.entries()]) {
+    for (const [key, entry] of channels) {
       // A channel mid-turn is never idle, however long the turn runs.
       if (entry.channel.busy) {
         entry.idleSince = now()
@@ -479,7 +479,7 @@ export function createChannelRegistry<H>(options?: { idleTtlMs?: number; sweepMs
      */
     async closeAll() {
       const open: Channel<H>[] = []
-      for (const [key, entry] of [...channels.entries()]) {
+      for (const [key, entry] of channels) {
         if (entry.channel.busy) continue
         channels.delete(key)
         open.push(entry.channel)

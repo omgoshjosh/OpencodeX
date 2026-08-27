@@ -172,9 +172,12 @@ export class Channel<H> {
     const sink = this.sink
     if (!sink) {
       // No turn is consuming. A result here is exactly the stale close-out
-      // this channel exists to contain; everything else between turns is
-      // background chatter nothing downstream is keyed to receive.
-      if (eventType(event) === "result") log.info("dropped out-of-turn result event", { channel: this.key })
+      // this channel exists to contain - but EVERY dropped event gets a trace,
+      // because the between-turns window is also where a late tool_result
+      // ("user") or trailing assistant text lands if a turn was finished too
+      // early, and a silent drop there turns into "tool succeeded but
+      // returned empty output" with no server-side evidence.
+      log.info("dropped out-of-turn event", { channel: this.key, type: eventType(event) })
       return
     }
     if (this.settling && this.sawInit && !sink.sawAssistantOutput && isSuccessCloseOut(event)) {

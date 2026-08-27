@@ -1,4 +1,5 @@
 import { createTwoFilesPatch } from "diff"
+import * as Log from "@opencode-ai/core/util/log"
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
 import type { SessionSchema } from "@opencode-ai/core/session/schema"
 import type { ConversationTask } from "./claude-driver-metadata"
@@ -17,6 +18,7 @@ type PartID = typeof SessionLegacy.PartID.Type
  * than failing a turn.
  */
 
+const log = Log.create({ service: "claude-mapper" })
 export type ClaudeEvent = {
   type?: string
   subtype?: string
@@ -110,7 +112,9 @@ export type MapperState = {
   taskSequence: number
 }
 
-export function initialState(input: { modelID?: string; billed?: MapperState["billed"]; tasks?: ConversationTask[] } = {}): MapperState {
+export function initialState(
+  input: { modelID?: string; billed?: MapperState["billed"]; tasks?: ConversationTask[] } = {},
+): MapperState {
   return {
     modelID: input.modelID ?? "claude-code",
     billed: input.billed ?? { cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -172,9 +176,19 @@ export function normalizeToolInput(tool: string, input: Record<string, unknown>)
   return input
 }
 
-export function mapEvent(event: ClaudeEvent, state: MapperState, context: MapperContext): { writes: SessionWrite[]; state: MapperState } {
+export function mapEvent(
+  event: ClaudeEvent,
+  state: MapperState,
+  context: MapperContext,
+): { writes: SessionWrite[]; state: MapperState } {
   const writes: SessionWrite[] = []
-  const next: MapperState = { ...state, toolParts: new Map(state.toolParts), textParts: new Map(state.textParts), streamText: new Map(state.streamText), tasks: new Map(state.tasks) }
+  const next: MapperState = {
+    ...state,
+    toolParts: new Map(state.toolParts),
+    textParts: new Map(state.textParts),
+    streamText: new Map(state.streamText),
+    tasks: new Map(state.tasks),
+  }
 
   if (event.type === "system" && event.subtype === "init") {
     if (typeof event.session_id === "string") next.claudeSessionID = event.session_id
@@ -200,7 +214,12 @@ export function mapEvent(event: ClaudeEvent, state: MapperState, context: Mapper
       next.apiMessageID = stream.message.id
       return { writes, state: next }
     }
-    if (stream.type === "content_block_delta" && typeof stream.index === "number" && isRecord(stream.delta) && next.apiMessageID) {
+    if (
+      stream.type === "content_block_delta" &&
+      typeof stream.index === "number" &&
+      isRecord(stream.delta) &&
+      next.apiMessageID
+    ) {
       const delta =
         stream.delta.type === "text_delta" && typeof stream.delta.text === "string"
           ? { kind: "text" as const, prefix: "text", text: stream.delta.text }
@@ -265,7 +284,13 @@ export function finalizeAbandonedTurn(
   input: { reason: string; error?: string },
 ): { writes: SessionWrite[]; state: MapperState } {
   const writes: SessionWrite[] = []
-  const next: MapperState = { ...state, toolParts: new Map(state.toolParts), textParts: new Map(state.textParts), streamText: new Map(state.streamText), tasks: new Map(state.tasks) }
+  const next: MapperState = {
+    ...state,
+    toolParts: new Map(state.toolParts),
+    textParts: new Map(state.textParts),
+    streamText: new Map(state.streamText),
+    tasks: new Map(state.tasks),
+  }
   // An explicit delivery failure must be visible even when the stream closed
   // before its first event. Error-free aborts retain the existing no-op path.
   if (!next.messageID && !input.error) return { writes, state: next }
@@ -302,7 +327,13 @@ export function finalizeAbandonedTurn(
 /** Opens an assistant message without any Claude event, for failure turns. */
 export function startTurn(state: MapperState, context: MapperContext): { writes: SessionWrite[]; state: MapperState } {
   const writes: SessionWrite[] = []
-  const next: MapperState = { ...state, toolParts: new Map(state.toolParts), textParts: new Map(state.textParts), streamText: new Map(state.streamText), tasks: new Map(state.tasks) }
+  const next: MapperState = {
+    ...state,
+    toolParts: new Map(state.toolParts),
+    textParts: new Map(state.textParts),
+    streamText: new Map(state.streamText),
+    tasks: new Map(state.tasks),
+  }
   ensureMessage(writes, next, context)
   return { writes, state: next }
 }
@@ -337,7 +368,13 @@ function reconciledKey(state: MapperState, prefix: string, content: string, fall
   return fallback
 }
 
-function mapAssistantBlock(block: ContentBlock, position: number, writes: SessionWrite[], state: MapperState, context: MapperContext) {
+function mapAssistantBlock(
+  block: ContentBlock,
+  position: number,
+  writes: SessionWrite[],
+  state: MapperState,
+  context: MapperContext,
+) {
   const messageID = state.messageID!
   if (block.type === "text" && typeof block.text === "string" && block.text.trim()) {
     const key = reconciledKey(state, "text", block.text, `text:${blockKey(block, state, position)}`)
@@ -451,7 +488,12 @@ function applyTaskTool(tool: string, input: Record<string, unknown>, output: str
     return taskRegistryTodos(state)
   }
   if (tool === "taskupdate") {
-    const id = typeof input.taskId === "string" ? input.taskId : typeof input.taskId === "number" ? String(input.taskId) : undefined
+    const id =
+      typeof input.taskId === "string"
+        ? input.taskId
+        : typeof input.taskId === "number"
+          ? String(input.taskId)
+          : undefined
     const current = id ? state.tasks.get(id) : undefined
     if (!id || !current) return undefined
     const status = typeof input.status === "string" && input.status ? input.status : current.status
@@ -470,7 +512,18 @@ function mapToolResult(block: ContentBlock, writes: SessionWrite[], state: Mappe
   const callID = typeof block.tool_use_id === "string" ? block.tool_use_id : undefined
   if (!callID) return
   const pending = state.toolParts.get(callID)
-  if (!pending || !state.messageID) return
+  if (!pending || !state.messageID) {
+    // A tool_result with no pending part means the output has nowhere to go -
+    // the part was already force-closed or the turn ended first. Losing it
+    // silently turned real tool output into "succeeded but returned empty
+    // output" reports with zero server-side trace.
+    log.warn("dropped tool_result with no pending part", {
+      sessionID: context.sessionID,
+      callID,
+      hadMessage: state.messageID !== undefined,
+    })
+    return
+  }
   state.toolParts.delete(callID)
   const output = readResultText(block.content)
   const end = context.now()
@@ -603,9 +656,7 @@ function assistantMessage(
     path: { cwd: context.directory, root: context.directory },
     cost: input.cost ?? 0,
     tokens: input.tokens ?? emptyTokens(),
-    ...(input.error
-      ? { error: { name: "UnknownError" as const, data: { message: input.error } } }
-      : {}),
+    ...(input.error ? { error: { name: "UnknownError" as const, data: { message: input.error } } } : {}),
   } as SessionLegacy.Assistant
 }
 
@@ -658,7 +709,9 @@ function readResultText(content: unknown): string {
   if (typeof content === "string") return content
   if (Array.isArray(content)) {
     return content
-      .map((item) => (isRecord(item) && typeof item.text === "string" ? item.text : typeof item === "string" ? item : ""))
+      .map((item) =>
+        isRecord(item) && typeof item.text === "string" ? item.text : typeof item === "string" ? item : "",
+      )
       .filter(Boolean)
       .join("\n")
   }
@@ -684,7 +737,8 @@ function readResultError(event: ClaudeEvent) {
 function readTodos(input: Record<string, unknown>) {
   const todos = Array.isArray(input.todos) ? input.todos : []
   return todos.filter(isRecord).map((todo) => ({
-    content: typeof todo.content === "string" ? todo.content : typeof todo.activeForm === "string" ? todo.activeForm : "Todo",
+    content:
+      typeof todo.content === "string" ? todo.content : typeof todo.activeForm === "string" ? todo.activeForm : "Todo",
     status: typeof todo.status === "string" ? todo.status : "pending",
     priority: typeof todo.priority === "string" ? todo.priority : "medium",
   }))

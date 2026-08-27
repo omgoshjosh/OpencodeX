@@ -131,7 +131,7 @@ function startServeAuthority(
     // A live authority (TUI coordinator, GUI sidecar, or another serve) must be
     // left strictly alone: attaching two writers to one database is the exact
     // failure this protocol exists to prevent. Fail loudly instead.
-    const existing = yield* Effect.promise(() => readActiveCoordinator(input.key, input.database))
+    const existing = yield* readCoordinator(input.key, input.database)
     if (existing) return yield* Effect.fail(collidingAuthorityError(existing))
     const ownerLock = yield* Effect.tryPromise({
       try: () => acquireCoordinatorOwnerLock(input.key),
@@ -144,18 +144,15 @@ function startServeAuthority(
             // Another contender may have won the lock while this process waited.
             // Surface the clear collision error when a healthy authority now
             // exists; otherwise preserve the underlying acquisition failure.
-            const now = yield* Effect.promise(() => readActiveCoordinator(input.key, input.database))
+            const now = yield* readCoordinator(input.key, input.database).pipe(Effect.orElseSucceed(() => undefined))
             if (now) return yield* Effect.fail(collidingAuthorityError(now))
             return yield* Effect.fail(new Error(`Failed to acquire backend authority: ${errorMessage(error)}`))
           }),
       ),
     )
     const launch = Effect.gen(function* () {
-      const claimed = yield* Effect.promise(() => readActiveCoordinator(input.key, input.database))
-      if (claimed) {
-        yield* Effect.promise(() => ownerLock.release())
-        return yield* Effect.fail(collidingAuthorityError(claimed))
-      }
+      const claimed = yield* readCoordinator(input.key, input.database)
+      if (claimed) return yield* Effect.fail(collidingAuthorityError(claimed))
       if (input.signal?.aborted) return yield* Effect.interrupt
 
       const needsCompanion = !LOOPBACK_HOSTS.has(input.hostname) && !WILDCARD_HOSTS.has(input.hostname)
@@ -175,7 +172,10 @@ function startServeAuthority(
             { hostname: "127.0.0.1", port: 0, mdns: false, prefer4096: false },
           ]
         : [primary]
-      const listeners = yield* Effect.promise(() => Server.listenShared(options))
+      const listeners = yield* Effect.tryPromise({
+        try: () => Server.listenShared(options),
+        catch: (error) => new Error(`Failed to bind the requested listener: ${errorMessage(error)}`),
+      })
       const companion = needsCompanion ? listeners[1] : undefined
       const manifest = {
         version: 2 as const,
@@ -192,7 +192,10 @@ function startServeAuthority(
            verify SDK/server skew before reaching the process. Schema stays 2. */
         serverVersion: InstallationVersion,
       }
-      return yield* Effect.promise(() => writeCoordinatorManifest(manifest)).pipe(
+      return yield* Effect.tryPromise({
+        try: () => writeCoordinatorManifest(manifest),
+        catch: (error) => new Error(`Failed to publish the backend authority manifest: ${errorMessage(error)}`),
+      }).pipe(
         Effect.as({
           manifest,
           ownerLock,
@@ -202,13 +205,14 @@ function startServeAuthority(
           stopped: false,
         }),
         Effect.onError(() =>
-          Effect.all(listeners.map((listener) => Effect.promise(() => listener.stop(true))), { discard: true }).pipe(
-            Effect.ignore,
+          Effect.all(
+            listeners.map((listener) => Effect.promise(() => listener.stop(true).catch(() => undefined))),
+            { discard: true },
           ),
         ),
       )
     })
-    return yield* launch.pipe(Effect.onError(() => Effect.promise(() => ownerLock.release()).pipe(Effect.ignore)))
+    return yield* launch.pipe(Effect.onError(() => Effect.promise(() => ownerLock.release().catch(() => undefined))))
   })
 
   return Effect.scoped(
@@ -219,6 +223,12 @@ function startServeAuthority(
   )
 }
 
+const readCoordinator = (key: string, database: string) =>
+  Effect.tryPromise({
+    try: () => readActiveCoordinator(key, database),
+    catch: (error) => new Error(`Failed to inspect the existing backend authority: ${errorMessage(error)}`),
+  })
+
 export function manifestURLFor(hostname: string, primaryPort: number, companion?: Listener) {
   const port = companion ? companion.port : primaryPort
   // Loopback hosts publish themselves; wildcard and LAN listeners publish a
@@ -226,8 +236,7 @@ export function manifestURLFor(hostname: string, primaryPort: number, companion?
   // resolve to the bracketed IPv6 loopback form `[::1]` (the WHATWG URL
   // hostname setter drops a bare IPv6 address), while 0.0.0.0 and LAN
   // hostnames use the IPv4 127.0.0.1 that their sockets map to.
-  const host =
-    hostname === "::" || hostname === "::1" ? "[::1]" : LOOPBACK_HOSTS.has(hostname) ? hostname : "127.0.0.1"
+  const host = hostname === "::" || hostname === "::1" ? "[::1]" : LOOPBACK_HOSTS.has(hostname) ? hostname : "127.0.0.1"
   return new URL(`http://${host}:${port}`).toString()
 }
 
@@ -306,7 +315,9 @@ function stopServeAuthority(resource: OwnedServeAuthority, reason: string) {
     )
     yield* Effect.tryPromise(() => resource.ownerLock.release()).pipe(
       Effect.catch((error) =>
-        Effect.sync(() => Log.Default.warn("backend authority owner lock release failed", { error: errorMessage(error) })),
+        Effect.sync(() =>
+          Log.Default.warn("backend authority owner lock release failed", { error: errorMessage(error) }),
+        ),
       ),
     )
   })

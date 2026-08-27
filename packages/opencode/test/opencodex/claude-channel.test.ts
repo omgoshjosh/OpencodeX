@@ -206,6 +206,37 @@ describe("claude channel", () => {
     expect(channel.dead).toBe(false)
   })
 
+  test("returns to background drain when tasks reappear after settling", async () => {
+    const { create, emit } = fakeQuery()
+    const channel = new Channel<Handlers>("s1", create, { closeOutGraceMs: 20, backgroundTaskGraceMs: 120 })
+    const turn = channel.turn([user("wake")], { name: "t1" })
+    emit(event({ type: "system", subtype: "background_tasks_changed", tasks: [{ task_id: "a1" }] }))
+    emit(result)
+    emit(event({ type: "system", subtype: "background_tasks_changed", tasks: [] }))
+    emit(event({ type: "system", subtype: "background_tasks_changed", tasks: [{ task_id: "b1" }] }))
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    expect(channel.dead).toBe(false)
+    emit(event({ type: "system", subtype: "background_tasks_changed", tasks: [] }))
+    emit(assistant)
+    emit(result)
+
+    const seen = await collect(turn.events, 7)
+    expect(seen.map(typeOf)).toEqual(["system", "result", "system", "system", "system", "assistant", "result"])
+  })
+
+  test("does not extend the drain cap across task-list flaps", async () => {
+    const { create, emit } = fakeQuery()
+    const channel = new Channel<Handlers>("s1", create, { closeOutGraceMs: 100, backgroundTaskGraceMs: 50 })
+    channel.turn([user("wake")], { name: "t1" })
+    emit(event({ type: "system", subtype: "background_tasks_changed", tasks: [{ task_id: "a1" }] }))
+    emit(result)
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    emit(event({ type: "system", subtype: "background_tasks_changed", tasks: [] }))
+    emit(event({ type: "system", subtype: "background_tasks_changed", tasks: [{ task_id: "b1" }] }))
+
+    await waitFor(() => channel.dead)
+  })
+
   test("completes normally when background tasks already drained", async () => {
     const { create, emit } = fakeQuery()
     const channel = new Channel<Handlers>("s1", create, { closeOutGraceMs: 20, backgroundTaskGraceMs: 100 })

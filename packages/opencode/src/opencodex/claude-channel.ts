@@ -191,10 +191,13 @@ export class Channel<H> {
       this.liveBackgroundTasks = Array.isArray(event.tasks) ? event.tasks.length : 0
       if (this.liveBackgroundTasks === 0 && this.backgroundWait === "drain") {
         this.backgroundWait = "final-output"
-        this.clearBackgroundTaskWatchdog()
         this.armFinalOutputWatchdog(sink)
       } else if (this.liveBackgroundTasks === 0 && this.backgroundWait === "final-output") {
         this.armFinalOutputWatchdog(sink)
+      } else if (this.liveBackgroundTasks > 0 && this.backgroundWait === "final-output") {
+        this.backgroundWait = "drain"
+        this.clearFinalOutputWatchdog()
+        this.armBackgroundTaskWatchdog(sink)
       }
     }
     if (this.settling && this.sawInit && !sink.sawAssistantOutput && isSuccessCloseOut(event)) {
@@ -261,6 +264,9 @@ export class Channel<H> {
   }
 
   private armBackgroundTaskWatchdog(sink: TurnSink) {
+    // Keep this cap running across a brief drain/reappearance flap. Otherwise
+    // repeated task-list updates could grant a permanently attached turn a new
+    // 30-minute lease each time.
     if (this.backgroundTaskWatchdog) return
     this.backgroundTaskWatchdog = setTimeout(() => {
       this.backgroundTaskWatchdog = undefined
@@ -281,7 +287,7 @@ export class Channel<H> {
   }
 
   private armFinalOutputWatchdog(sink: TurnSink) {
-    if (this.finalOutputWatchdog) clearTimeout(this.finalOutputWatchdog)
+    this.clearFinalOutputWatchdog()
     this.finalOutputWatchdog = setTimeout(() => {
       this.finalOutputWatchdog = undefined
       if (this.sink !== sink || this.backgroundWait !== "final-output") return
@@ -291,10 +297,15 @@ export class Channel<H> {
     }, this.closeOutGraceMs)
   }
 
+  private clearFinalOutputWatchdog() {
+    if (!this.finalOutputWatchdog) return
+    clearTimeout(this.finalOutputWatchdog)
+    this.finalOutputWatchdog = undefined
+  }
+
   private resetBackgroundWait() {
     this.clearBackgroundTaskWatchdog()
-    if (this.finalOutputWatchdog) clearTimeout(this.finalOutputWatchdog)
-    this.finalOutputWatchdog = undefined
+    this.clearFinalOutputWatchdog()
     this.liveBackgroundTasks = 0
     this.backgroundWait = undefined
   }

@@ -285,8 +285,17 @@ export function createSdkTransport(): ClaudeTransport {
               extra: { toolUseID?: string; signal?: AbortSignal },
             ) => {
               const handlers = input.handlers()
-              if (!handlers)
+              if (!handlers) {
+                // The CLI is asking for an approval while the daemon has no
+                // turn attached: proof the two turn lifecycles are desynced
+                // (the daemon finished a turn the CLI is still executing).
+                // The wedge this produces is selective - allowlisted calls
+                // never reach here and keep working - which made it read as
+                // "the repo is broken" for days while this path emitted no
+                // log at all. Count every occurrence.
+                log.warn("denied approval with no active turn", { channelKey, toolName })
                 return Promise.resolve({ behavior: "deny" as const, message: "No turn is active for this session." })
+              }
               return handlers.canUseTool(toolName, toolInput, extra)
             },
             ...(input.resumeID ? { resume: input.resumeID } : {}),

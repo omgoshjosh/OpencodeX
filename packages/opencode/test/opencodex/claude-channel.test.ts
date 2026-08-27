@@ -1,6 +1,6 @@
 import { describe, expect, spyOn, test } from "bun:test"
 import type { SDKUserMessage } from "@anthropic-ai/claude-agent-sdk"
-import * as Log from "@opencode-ai/core/util/log"
+import { create } from "@opencode-ai/core/util/log"
 import { Channel, createChannelRegistry, createPushable, type CreateQuery } from "../../src/opencodex/claude-channel"
 import type { ClaudeEvent } from "../../src/opencodex/claude-mapper"
 
@@ -155,19 +155,81 @@ describe("claude channel", () => {
     expect(channel.dead).toBe(true)
   })
 
-  test("fails the turn when background tasks never report that they settled", async () => {
+  test("keeps a live background task beyond the close-out grace", async () => {
     const { create, emit } = fakeQuery()
-    const channel = new Channel<Handlers>("s1", create, { closeOutGraceMs: 20 })
+    const channel = new Channel<Handlers>("s1", create, { closeOutGraceMs: 20, backgroundTaskGraceMs: 100 })
     const turn = channel.turn([user("wake")], { name: "t1" })
     emit(event({ type: "system", subtype: "background_tasks_changed", tasks: [{ task_id: "a1" }] }))
     emit(result)
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    expect(channel.dead).toBe(false)
+    emit(event({ type: "system", subtype: "background_tasks_changed", tasks: [] }))
+    emit(assistant)
+    emit(result)
 
-    const outcome = await collect(turn.events, 3).then(
+    const seen = await collect(turn.events, 5)
+    expect(seen.map(typeOf)).toEqual(["system", "result", "system", "assistant", "result"])
+  })
+
+  test("fails when background tasks settle without final output", async () => {
+    const { create, emit } = fakeQuery()
+    const channel = new Channel<Handlers>("s1", create, { closeOutGraceMs: 20, backgroundTaskGraceMs: 100 })
+    const turn = channel.turn([user("wake")], { name: "t1" })
+    emit(event({ type: "system", subtype: "background_tasks_changed", tasks: [{ task_id: "a1" }] }))
+    emit(result)
+    emit(event({ type: "system", subtype: "background_tasks_changed", tasks: [] }))
+
+    const outcome = await collect(turn.events, 4).then(
       () => "completed",
       (error: unknown) => (error instanceof Error ? error.message : String(error)),
     )
-    expect(outcome).toContain("background tasks did not settle")
+    expect(outcome).toContain("no final output")
     await waitFor(() => channel.dead)
+  })
+
+  test("refreshes final-output inactivity after background tasks settle", async () => {
+    const { create, emit } = fakeQuery()
+    const channel = new Channel<Handlers>("s1", create, { closeOutGraceMs: 80, backgroundTaskGraceMs: 300 })
+    const turn = channel.turn([user("wake")], { name: "t1" })
+    emit(event({ type: "system", subtype: "background_tasks_changed", tasks: [{ task_id: "a1" }] }))
+    emit(result)
+    emit(event({ type: "system", subtype: "background_tasks_changed", tasks: [] }))
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    emit(assistant)
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    emit(event({ type: "stream_event", event: { type: "content_block_delta" } }))
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    emit(result)
+
+    const seen = await collect(turn.events, 6)
+    expect(seen.map(typeOf)).toEqual(["system", "result", "system", "assistant", "stream_event", "result"])
+    expect(channel.dead).toBe(false)
+  })
+
+  test("completes normally when background tasks already drained", async () => {
+    const { create, emit } = fakeQuery()
+    const channel = new Channel<Handlers>("s1", create, { closeOutGraceMs: 20, backgroundTaskGraceMs: 100 })
+    const turn = channel.turn([user("wake")], { name: "t1" })
+    emit(event({ type: "system", subtype: "background_tasks_changed", tasks: [] }))
+    emit(result)
+
+    const seen = await collect(turn.events, 2)
+    expect(seen.map(typeOf)).toEqual(["system", "result"])
+  })
+
+  test("does not carry background state into a turn after a failed result", async () => {
+    const { create, emit } = fakeQuery()
+    const channel = new Channel<Handlers>("s1", create, { closeOutGraceMs: 20, backgroundTaskGraceMs: 30 })
+    const first = channel.turn([user("wake")], { name: "t1" })
+    emit(event({ type: "system", subtype: "background_tasks_changed", tasks: [{ task_id: "a1" }] }))
+    emit(event({ type: "result", subtype: "error_during_execution", is_error: true }))
+    await collect(first.events, 2)
+
+    const second = channel.turn([user("retry")], { name: "t2" })
+    emit(result)
+    await collect(second.events, 1)
+    await new Promise((resolve) => setTimeout(resolve, 40))
+    expect(channel.dead).toBe(false)
   })
 
   test("forwards results normally on a channel that did not resume", async () => {
@@ -180,19 +242,19 @@ describe("claude channel", () => {
   })
 
   test("drops every event type that arrives between turns", async () => {
-    const { create, emit } = fakeQuery()
-    const channel = new Channel<Handlers>("s1", create)
-    const dropped = spyOn(Log.create({ service: "claude-channel" }), "info")
+    const query = fakeQuery()
+    const channel = new Channel<Handlers>("s1", query.create)
+    const dropped = spyOn(create({ service: "claude-channel" }), "info")
     const first = channel.turn([user("one")], { name: "t1" })
-    emit(assistant)
-    emit(result)
+    query.emit(assistant)
+    query.emit(result)
     await collect(first.events, 2)
 
     // Nobody is consuming: background chatter and stray results must not leak
     // into the next turn.
-    emit(result)
-    emit(event({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "call_1", content: "secret" }] } }))
-    emit(event({ type: "assistant", message: { content: [{ type: "text", text: "secret" }] } }))
+    query.emit(result)
+    query.emit(event({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "call_1", content: "secret" }] } }))
+    query.emit(event({ type: "assistant", message: { content: [{ type: "text", text: "secret" }] } }))
     await settled()
 
     const calls = dropped.mock.calls.filter(([message]) => message === "dropped out-of-turn event")
@@ -205,7 +267,7 @@ describe("claude channel", () => {
     dropped.mockRestore()
 
     const second = channel.turn([user("two")], { name: "t2" })
-    emit(assistant)
+    query.emit(assistant)
     const seen = await collect(second.events, 1)
     expect(typeOf(seen[0])).toBe("assistant")
   })

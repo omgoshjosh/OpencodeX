@@ -1,5 +1,5 @@
 import { describe, expect, spyOn, test } from "bun:test"
-import * as Log from "@opencode-ai/core/util/log"
+import { create } from "@opencode-ai/core/util/log"
 import { nextClaudeEvent } from "../../src/opencodex/claude-driver"
 import {
   finalizeAbandonedTurn,
@@ -117,7 +117,7 @@ describe("claude stream-json mapper", () => {
   })
 
   test("warns safely when a tool result has no pending call", () => {
-    const warning = spyOn(Log.create({ service: "claude-mapper" }), "warn")
+    const warning = spyOn(create({ service: "claude-mapper" }), "warn")
     run([
       {
         type: "user",

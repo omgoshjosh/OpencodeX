@@ -484,7 +484,11 @@ export function createChannelRegistry<H>(options?: { idleTtlMs?: number; sweepMs
         channels.delete(key)
         open.push(entry.channel)
       }
-      if (channels.size === 0) stopSweeper()
+      // Unconditionally, even if a busy channel was skipped: this is a
+      // teardown, and leaving a repeating timer behind keeps the process
+      // alive. The next acquire restarts the sweeper, and a skipped channel
+      // is re-examined then.
+      stopSweeper()
       await Promise.all(open.map((channel) => channel.close().catch(() => undefined)))
     },
   }

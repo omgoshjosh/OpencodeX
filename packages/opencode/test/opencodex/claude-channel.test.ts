@@ -316,6 +316,7 @@ describe("channel registry", () => {
     expect(first.state.aborted).toBe(true)
     await settled()
     expect(second.state.resumeID).toBe("conv-9")
+    await registry.closeAll()
   })
 
   test("replaces a dead channel even with an unchanged config", async () => {
@@ -381,6 +382,7 @@ describe("channel registry", () => {
     await new Promise((resolve) => setTimeout(resolve, 40))
     expect(registry.size()).toBe(1)
     expect(channel.dead).toBe(false)
+    await registry.closeAll()
   })
 
   test("closeAll leaves a mid-turn channel running", async () => {
@@ -399,6 +401,7 @@ describe("channel registry", () => {
     expect(busy.state.aborted).toBe(false)
     expect(b.dead).toBe(true)
     expect(registry.get("s1")).toBe(a)
+    await registry.closeAll()
   })
 
   test("close drops a single session's channel", async () => {

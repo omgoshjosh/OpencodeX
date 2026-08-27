@@ -104,8 +104,14 @@ async function runProbe(withPolicy: boolean): Promise<ProbeResult | undefined> {
     stdout: "pipe",
     stderr: "pipe",
   })
-  const output = await new Response(spawned.stdout).text()
+  // A binary that exists but never starts (headless runner, no display) would
+  // otherwise hang this read until the whole CI shard hits its wall clock.
+  // The probe self-reports a timeout at 25s; this is the outer bound for the
+  // case where it never gets far enough to do even that.
+  const timer = setTimeout(() => spawned.kill(), 60_000)
+  const output = await new Response(spawned.stdout).text().catch(() => "")
   await spawned.exited
+  clearTimeout(timer)
   const line = output.split("\n").find((entry) => entry.startsWith("PROBE "))
   if (!line) return undefined
   const parsed: unknown = JSON.parse(line.slice("PROBE ".length))

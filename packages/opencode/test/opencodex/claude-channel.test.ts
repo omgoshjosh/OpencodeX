@@ -366,7 +366,8 @@ describe("channel registry", () => {
     expect(registry.size()).toBe(1)
 
     clock = 1_000
-    await waitFor(() => registry.size() === 0)
+    await registry.sweepNow()
+    expect(registry.size()).toBe(0)
     expect(channel.dead).toBe(true)
     expect(query.state.aborted).toBe(true)
   })
@@ -379,7 +380,7 @@ describe("channel registry", () => {
     channel.turn([user("one")], { name: "t1" })
 
     clock = 1_000
-    await new Promise((resolve) => setTimeout(resolve, 40))
+    await registry.sweepNow()
     expect(registry.size()).toBe(1)
     expect(channel.dead).toBe(false)
     await registry.closeAll()

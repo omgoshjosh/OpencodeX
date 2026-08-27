@@ -225,7 +225,6 @@ export class Channel<H> {
       sink.end({ failure: new Error("Claude produced no output for this turn.") })
       void this.close()
     }, this.closeOutGraceMs)
-    this.closeOutWatchdog.unref?.()
   }
 
   private clearCloseOutWatchdog() {
@@ -311,7 +310,7 @@ export class Channel<H> {
             log.warn("claude channel unresponsive to interrupt; closing", { channel: this.key })
             void this.close()
           }
-        }, this.interruptGraceMs).unref?.()
+        }, this.interruptGraceMs)
       },
     }
   }
@@ -434,6 +433,13 @@ export function createChannelRegistry<H>(options?: { idleTtlMs?: number; sweepMs
     get: (sessionKey: string) => channels.get(sessionKey)?.channel,
     /** Live channel count; the reaper's observable surface for tests. */
     size: () => channels.size,
+    /**
+     * Runs one reap pass immediately. The interval that normally drives this
+     * is `unref`'d so an idle process is not held open, and an `unref`'d timer
+     * is not reliably scheduled everywhere - so nothing, tests included,
+     * should wait on it firing.
+     */
+    sweepNow: () => sweep(),
     acquire(
       sessionKey: string,
       config: string,

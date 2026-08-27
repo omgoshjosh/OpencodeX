@@ -96,8 +96,7 @@ const buildLayer = (state: Ref.Ref<MockState>) =>
     Layer.provide(AppFileSystem.defaultLayer),
   )
 
-const writeCache = (data: object, mtimeMs?: number) =>
-  writeCacheText(JSON.stringify(data), mtimeMs)
+const writeCache = (data: object, mtimeMs?: number) => writeCacheText(JSON.stringify(data), mtimeMs)
 
 const writeCacheText = (text: string, mtimeMs?: number) =>
   Effect.promise(async () => {
@@ -168,6 +167,60 @@ describe("ModelsDev Service", () => {
         }),
       )
       for (const result of results) expect(result).toEqual(fixture)
+    }),
+  )
+
+  it.live("get() trusts a clean stat and never re-reads an unchanged old file", () =>
+    Effect.gen(function* () {
+      // File mtime well outside the racy window relative to adoption.
+      const mtimeMs = Date.now() - 60_000
+      yield* writeCache(fixture, mtimeMs)
+      const state = yield* Ref.make(initialState)
+      const result = yield* provided(
+        state,
+        Effect.gen(function* () {
+          const svc = yield* ModelsDev.Service
+          const a = yield* svc.get()
+          // Corrupt the file WITHOUT changing size or mtime. If get() were
+          // still reading per call, this would surface; the racy-clean stat
+          // gate must serve from cache without touching the contents.
+          const text = JSON.stringify(fixture)
+          const corrupted = text.replace(text.slice(2, 10), "!!!!!!!!")
+          yield* writeCacheText(corrupted, mtimeMs)
+          const b = yield* svc.get()
+          return { a, b }
+        }),
+      )
+      expect(result.a).toEqual(fixture)
+      expect(result.b).toEqual(fixture)
+    }),
+  )
+
+  it.live("a cold-start fetch populates once with no spurious refresh event", () =>
+    Effect.gen(function* () {
+      // No cache file: populate takes the network path and writes the file.
+      const state = yield* Ref.make(initialState)
+      const result = yield* provided(
+        state,
+        Effect.gen(function* () {
+          const svc = yield* ModelsDev.Service
+          const events = yield* EventV2.Service
+          const received: string[] = []
+          yield* events.listen((event) =>
+            Effect.sync(() => {
+              if (event.type === ModelsDev.Event.Refreshed.type) received.push(event.type)
+            }),
+          )
+          const a = yield* svc.get()
+          const b = yield* svc.get()
+          return { a, b, received }
+        }),
+      )
+      // The first get() used to see "unknown version" in the file populate had
+      // just written, invalidate, load the multi-MB catalog a second time, and
+      // publish Refreshed - a GUI-wide capability refresh on every cold start.
+      expect(result.a).toEqual(result.b)
+      expect(result.received).toEqual([])
     }),
   )
 

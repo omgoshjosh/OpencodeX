@@ -14,6 +14,7 @@ function fakeQuery() {
     resumeID: undefined as string | undefined,
     interrupts: 0,
     aborted: false,
+    aborts: 0,
     promptEnded: false,
     handlers: undefined as (() => Handlers | undefined) | undefined,
   }
@@ -31,6 +32,7 @@ function fakeQuery() {
       },
       abort: () => {
         state.aborted = true
+        state.aborts += 1
         stream.end()
       },
     }
@@ -255,6 +257,34 @@ describe("claude channel", () => {
     emit(event({ type: "system", subtype: "background_tasks_changed", tasks: [{ task_id: "b1" }] }))
 
     await waitFor(() => channel.dead)
+  })
+
+  test("fails synchronously when expired background work reappears", async () => {
+    const { create, emit, state } = fakeQuery()
+    let now = 0
+    const channel = new Channel<Handlers>("s1", create, {
+      closeOutGraceMs: 100,
+      backgroundTaskGraceMs: 20,
+      now: () => now,
+    })
+    const turn = channel.turn([user("wake")], { name: "t1" })
+    emit(event({ type: "system", subtype: "background_tasks_changed", tasks: [{ task_id: "a1" }] }))
+    emit(result)
+    emit(event({ type: "system", subtype: "background_tasks_changed", tasks: [] }))
+    await settled()
+    now = 21
+    emit(event({ type: "system", subtype: "background_tasks_changed", tasks: [{ task_id: "b1" }] }))
+    emit(event({ type: "system", subtype: "background_tasks_changed", tasks: [] }))
+    emit(assistant)
+    emit(result)
+
+    const outcome = await collect(turn.events, 4).then(
+      () => "completed",
+      (error: unknown) => (error instanceof Error ? error.message : String(error)),
+    )
+    expect(outcome).toContain("background tasks did not settle")
+    await waitFor(() => state.aborts === 1)
+    expect(channel.dead).toBe(true)
   })
 
   test("allows final output after the background deadline when no tasks reappear", async () => {

@@ -3,15 +3,16 @@ import { randomBytes } from "node:crypto"
 import { rememberBackendAuthority } from "./backend-authority.js"
 import fs from "node:fs"
 import {
-  checkCoordinatorCompatibility,
-  fetchCoordinatorHealth,
-  isCoordinatorHealthForManifest,
-  isCoordinatorProcessAlive,
+  CoordinatorUnreachableError,
+  createCoordinatorProber,
   isMissingCoordinatorFile,
   readCoordinatorManifestFile,
   readCoordinatorManifestToken,
   removeCoordinatorManifest as removeCoordinatorManifestIn,
+  resolveCoordinatorAttachment,
   startCoordinatorClientLease as startCoordinatorClientLeaseIn,
+  type CoordinatorProbeMode,
+  type CoordinatorProber,
 } from "@opencode-ai/sdk/coordinator"
 import {
   COORDINATOR_STATE_ROOT,
@@ -172,59 +173,58 @@ function connectionFromManifest(manifest: CoordinatorManifest, directory: string
   }
 }
 
-async function activeCoordinator(key: string, database: string) {
+export type CoordinatorAttachOptions = {
+  mode?: CoordinatorProbeMode
+  fetch?: typeof globalThis.fetch
+  probe?: CoordinatorProber
+}
+
+/**
+ * The GUI's half of the attach decision. It used to be a near-verbatim copy of
+ * the TUI's, and carried the identical single-probe bug; both now apply the
+ * side effects of one shared `resolveCoordinatorAttachment` so they cannot
+ * diverge again.
+ */
+async function activeCoordinator(key: string, database: string, options?: CoordinatorAttachOptions) {
   const manifest = await readActiveManifest(key)
   if (!manifest) {
     coordinatorMismatchApproval.clear()
     return undefined
   }
-  if (
-    manifest.key !== key ||
-    coordinatorDatabaseIdentity(manifest.database) !== coordinatorDatabaseIdentity(database)
-  ) {
+  const resolution = await resolveCoordinatorAttachment({
+    manifest,
+    key,
+    database,
+    clientVersion: sidecarVersion(),
+    mode: options?.mode ?? "decide",
+    probe: options?.probe ?? createCoordinatorProber({ fetch: options?.fetch }),
+    identity: coordinatorDatabaseIdentity,
+  })
+  if (resolution.action === "attach") {
     coordinatorMismatchApproval.clear()
-    await removeCoordinatorManifest(key, manifest.token)
+    if (resolution.warning) console.warn(resolution.warning)
+    return resolution.manifest
+  }
+  if (resolution.action === "reclaim") {
+    coordinatorMismatchApproval.clear()
+    await removeCoordinatorManifest(key, resolution.manifest.token)
     return undefined
   }
-  const health = await fetchCoordinatorHealth(manifest)
-  if (health?.healthy === true) {
-    // A legacy health response has no coordinator key. Let compatibility
-    // produce the actionable version-mismatch path instead.
-    if (health.coordinatorKey !== undefined && !isCoordinatorHealthForManifest(manifest, health)) {
-      coordinatorMismatchApproval.clear()
-      if (isCoordinatorProcessAlive(manifest.pid)) {
-        throw new Error(
-          `OpencodeX coordinator process ${manifest.pid} answered for a different database; refusing to attach`,
-        )
-      }
-      await removeCoordinatorManifest(key, manifest.token)
-      return undefined
-    }
-    const compatibility = checkCoordinatorCompatibility({
-      manifest,
-      clientVersion: sidecarVersion(),
-      healthVersion: health.version,
-    })
-    if (!compatibility.compatible) {
-      if (compatibility.reason !== "mismatch") {
-        coordinatorMismatchApproval.clear()
-        throw new Error(compatibility.message ?? "Coordinator compatibility check failed")
-      }
-      const identity = { key: manifest.key, token: manifest.token }
-      if (coordinatorMismatchApproval.consume(identity)) return manifest
-      coordinatorMismatchApproval.observe(identity)
-      throw new CoordinatorVersionMismatchError(compatibility.message ?? "Coordinator version mismatch")
-    }
-    coordinatorMismatchApproval.clear()
-    if (compatibility.reason === "local" && compatibility.message) console.warn(compatibility.message)
-    return manifest
+  /* Only a plain version mismatch is a question for the human; every other
+     refusal invalidates whatever they last approved, so the approval is
+     dropped before the throw. */
+  if (resolution.code === "version" && resolution.reason === "mismatch") {
+    const identity = { key: resolution.manifest.key, token: resolution.manifest.token }
+    if (coordinatorMismatchApproval.consume(identity)) return resolution.manifest
+    coordinatorMismatchApproval.observe(identity)
+    throw new CoordinatorVersionMismatchError(resolution.message)
   }
   coordinatorMismatchApproval.clear()
-  if (isCoordinatorProcessAlive(manifest.pid)) {
-    throw new Error(`OpencodeX coordinator process ${manifest.pid} is alive but unhealthy; refusing to replace it`)
-  }
-  await removeCoordinatorManifest(key, manifest.token)
-  return undefined
+  /* `identity` and the non-mismatch compatibility refusals are facts about the
+     process that answered, not about how long it took; only the unreachable
+     ones carry the probe transcript worth reporting. */
+  if (resolution.code === "version" || resolution.code === "identity") throw new Error(resolution.message)
+  throw new CoordinatorUnreachableError(resolution.manifest, resolution.probe, resolution.message)
 }
 
 async function readActiveManifest(key: string) {

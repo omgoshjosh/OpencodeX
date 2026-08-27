@@ -6,6 +6,8 @@ import {
   mapConcurrent,
   REVIEW_REPO,
   normalizeCheckStatus,
+  readRollupPage,
+  reviewRepoParts,
   type CheckRun,
   type PullRequestSnapshot,
 } from "./pr-review-select.js"
@@ -25,6 +27,7 @@ type GhPullRequest = {
   author: { login: string } | null
   isDraft: boolean
   headRefOid: string
+  updatedAt: string
   statusCheckRollup: GhRollupEntry[] | null
   headCommittedAt: string
 }
@@ -34,7 +37,7 @@ type GhListPullRequest = { number: number }
 const PR_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
-      number title isDraft headRefOid author { login }
+      number title isDraft headRefOid updatedAt author { login }
       commits(last: 1) { nodes { commit { committedDate } } }
     }
   }
@@ -51,6 +54,7 @@ const CHECK_QUERY = `query($owner: String!, $name: String!, $number: Int!, $afte
   }
 }`
 
+const REPO = reviewRepoParts()
 const PR_CONCURRENCY = 4
 const requestedPr = process.argv[2] === "--pr" ? Number(process.argv[3]) : undefined
 if (process.argv.length > 2 && (requestedPr === undefined || !Number.isInteger(requestedPr) || requestedPr < 1))
@@ -60,7 +64,7 @@ const listed = await paginated<GhListPullRequest>(
   `repos/${REVIEW_REPO}/pulls?state=open&per_page=100`,
   isListPullRequest,
 )
-const selected = requestedPr === undefined ? listed : listed.filter((pull) => pull.number === requestedPr!)
+const selected = requestedPr === undefined ? listed : listed.filter((pull) => pull.number === requestedPr)
 if (requestedPr !== undefined && selected.length !== 1)
   throw new Error(`open pull request #${requestedPr} was not found`)
 const pulls = await mapConcurrent(selected, PR_CONCURRENCY, (pull) => loadPullRequest(pull.number))
@@ -80,6 +84,7 @@ const decisions = pulls.map((pull) => {
     isDraft: pull.isDraft,
     headRefOid: pull.headRefOid,
     headCommittedAt: pull.headCommittedAt,
+    updatedAt: pull.updatedAt,
     checks,
   }
 
@@ -93,7 +98,7 @@ function isGhPullRequest(value: unknown): value is GhPullRequest {
   if (typeof value.number !== "number" || typeof value.title !== "string") return false
   if (typeof value.isDraft !== "boolean" || typeof value.headRefOid !== "string") return false
   if (value.author !== null && (!record(value.author) || typeof value.author.login !== "string")) return false
-  if (typeof value.headCommittedAt !== "string") return false
+  if (typeof value.headCommittedAt !== "string" || typeof value.updatedAt !== "string") return false
   return (
     value.statusCheckRollup === null ||
     (Array.isArray(value.statusCheckRollup) && value.statusCheckRollup.every(isCheck))
@@ -102,7 +107,7 @@ function isGhPullRequest(value: unknown): value is GhPullRequest {
 
 async function loadPullRequest(number: number): Promise<GhPullRequest> {
   const raw: unknown =
-    await $`gh api graphql -f query=${PR_QUERY} -F owner=ecgreen -F name=OpencodeX -F number=${number}`.json()
+    await $`gh api graphql -f query=${PR_QUERY} -F owner=${REPO.owner} -F name=${REPO.name} -F number=${number}`.json()
   const pull =
     record(raw) && record(raw.data) && record(raw.data.repository) ? raw.data.repository.pullRequest : undefined
   if (!record(pull) || !record(pull.commits) || !Array.isArray(pull.commits.nodes))
@@ -122,30 +127,16 @@ async function loadPullRequest(number: number): Promise<GhPullRequest> {
 
 async function loadCheckContexts(number: number, after?: string): Promise<GhRollupEntry[]> {
   const raw: unknown = after
-    ? await $`gh api graphql -f query=${CHECK_QUERY} -F owner=ecgreen -F name=OpencodeX -F number=${number} -F after=${after}`.json()
-    : await $`gh api graphql -f query=${CHECK_QUERY} -F owner=ecgreen -F name=OpencodeX -F number=${number}`.json()
-  const contexts =
-    record(raw) &&
-    record(raw.data) &&
-    record(raw.data.repository) &&
-    record(raw.data.repository.pullRequest) &&
-    record(raw.data.repository.pullRequest.statusCheckRollup) &&
-    record(raw.data.repository.pullRequest.statusCheckRollup.contexts)
-      ? raw.data.repository.pullRequest.statusCheckRollup.contexts
-      : undefined
-  if (
-    !record(contexts) ||
-    !Array.isArray(contexts.nodes) ||
-    !contexts.nodes.every(isCheck) ||
-    !record(contexts.pageInfo) ||
-    typeof contexts.pageInfo.hasNextPage !== "boolean" ||
-    (contexts.pageInfo.endCursor !== null && typeof contexts.pageInfo.endCursor !== "string")
-  )
-    throw new Error(`gh api graphql returned invalid check contexts for #${number}`)
-  if (!contexts.pageInfo.hasNextPage) return contexts.nodes
-  if (typeof contexts.pageInfo.endCursor !== "string")
-    throw new Error(`gh api graphql returned no next check cursor for #${number}`)
-  return [...contexts.nodes, ...(await loadCheckContexts(number, contexts.pageInfo.endCursor))]
+    ? await $`gh api graphql -f query=${CHECK_QUERY} -F owner=${REPO.owner} -F name=${REPO.name} -F number=${number} -F after=${after}`.json()
+    : await $`gh api graphql -f query=${CHECK_QUERY} -F owner=${REPO.owner} -F name=${REPO.name} -F number=${number}`.json()
+  // A null rollup means the head commit has no checks at all - the no-CI case,
+  // not bad data. It used to throw, which aborted the whole run for every PR.
+  const page = readRollupPage(raw)
+  if (!page) return []
+  const nodes = page.nodes
+  if (!nodes.every(isCheck)) throw new Error(`gh api graphql returned invalid check contexts for #${number}`)
+  if (!page.hasNextPage || page.endCursor === undefined) return nodes
+  return [...nodes, ...(await loadCheckContexts(number, page.endCursor))]
 }
 
 async function paginated<T>(path: string, validate: (value: unknown) => value is T): Promise<T[]> {
@@ -159,7 +150,7 @@ function isListPullRequest(value: unknown): value is GhListPullRequest {
   return record(value) && typeof value.number === "number"
 }
 
-function isCheck(value: unknown) {
+function isCheck(value: unknown): value is GhRollupEntry {
   if (!record(value)) return false
   return [value.name, value.context, value.status, value.state].every(
     (entry) => entry === undefined || typeof entry === "string",

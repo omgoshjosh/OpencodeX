@@ -124,11 +124,13 @@ export class Channel<H> {
   private readonly interruptGraceMs: number
   private readonly closeOutGraceMs: number
   private readonly backgroundTaskGraceMs: number
+  private readonly now: () => number
   private closeOutWatchdog: ReturnType<typeof setTimeout> | undefined
   private backgroundTaskWatchdog: ReturnType<typeof setTimeout> | undefined
   private finalOutputWatchdog: ReturnType<typeof setTimeout> | undefined
   private liveBackgroundTasks = 0
   private backgroundWait: "drain" | "final-output" | undefined
+  private backgroundTaskDeadline: number | undefined
   /** Input reached EOF (for native images); finish this query, never reuse it. */
   retiring = false
 
@@ -140,11 +142,18 @@ export class Channel<H> {
   constructor(
     readonly key: string,
     createQuery: CreateQuery<H>,
-    options?: { resumeID?: string; interruptGraceMs?: number; closeOutGraceMs?: number; backgroundTaskGraceMs?: number },
+    options?: {
+      resumeID?: string
+      interruptGraceMs?: number
+      closeOutGraceMs?: number
+      backgroundTaskGraceMs?: number
+      now?: () => number
+    },
   ) {
     this.interruptGraceMs = options?.interruptGraceMs ?? INTERRUPT_GRACE_MS
     this.closeOutGraceMs = options?.closeOutGraceMs ?? CLOSE_OUT_GRACE_MS
     this.backgroundTaskGraceMs = options?.backgroundTaskGraceMs ?? BACKGROUND_TASK_GRACE_MS
+    this.now = options?.now ?? (() => Date.now())
     this.settling = options?.resumeID !== undefined
     log.info("claude channel created", { channel: key, resumed: this.settling })
     this.queryPromise = createQuery({
@@ -195,6 +204,7 @@ export class Channel<H> {
       this.liveBackgroundTasks = Array.isArray(event.tasks) ? event.tasks.length : 0
       if (this.liveBackgroundTasks === 0 && this.backgroundWait === "drain") {
         this.backgroundWait = "final-output"
+        this.clearBackgroundTaskWatchdog()
         this.armFinalOutputWatchdog(sink)
       } else if (this.liveBackgroundTasks === 0 && this.backgroundWait === "final-output") {
         this.armFinalOutputWatchdog(sink)
@@ -235,6 +245,7 @@ export class Channel<H> {
     sink.push(event)
     if (isSuccessCloseOut(event) && this.liveBackgroundTasks > 0) {
       this.backgroundWait = "drain"
+      this.backgroundTaskDeadline ??= this.now() + this.backgroundTaskGraceMs
       this.armBackgroundTaskWatchdog(sink)
     }
   }
@@ -268,10 +279,11 @@ export class Channel<H> {
   }
 
   private armBackgroundTaskWatchdog(sink: TurnSink) {
-    // Keep this cap running across a brief drain/reappearance flap. Otherwise
-    // repeated task-list updates could grant a permanently attached turn a new
-    // 30-minute lease each time.
+    // The deadline spans drain/final-output flaps. A task list that oscillates
+    // must not receive a fresh 30-minute lease on every reappearance.
     if (this.backgroundTaskWatchdog) return
+    const deadline = this.backgroundTaskDeadline
+    if (deadline === undefined) return
     this.backgroundTaskWatchdog = setTimeout(() => {
       this.backgroundTaskWatchdog = undefined
       if (this.sink !== sink || this.backgroundWait !== "drain") return
@@ -281,7 +293,7 @@ export class Channel<H> {
       })
       sink.end({ failure: new Error("Claude background tasks did not settle before timeout.") })
       void this.close()
-    }, this.backgroundTaskGraceMs)
+    }, Math.max(0, deadline - this.now()))
   }
 
   private clearBackgroundTaskWatchdog() {
@@ -312,6 +324,7 @@ export class Channel<H> {
     this.clearFinalOutputWatchdog()
     this.liveBackgroundTasks = 0
     this.backgroundWait = undefined
+    this.backgroundTaskDeadline = undefined
   }
 
   /**

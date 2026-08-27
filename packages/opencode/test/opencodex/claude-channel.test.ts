@@ -237,6 +237,46 @@ describe("claude channel", () => {
     await waitFor(() => channel.dead)
   })
 
+  test("does not grant reappearing tasks a new grace after the drain deadline passes", async () => {
+    const { create, emit } = fakeQuery()
+    let now = 0
+    const channel = new Channel<Handlers>("s1", create, {
+      closeOutGraceMs: 100,
+      backgroundTaskGraceMs: 20,
+      now: () => now,
+    })
+    channel.turn([user("wake")], { name: "t1" })
+    emit(event({ type: "system", subtype: "background_tasks_changed", tasks: [{ task_id: "a1" }] }))
+    emit(result)
+    emit(event({ type: "system", subtype: "background_tasks_changed", tasks: [] }))
+    // The original drain timer has fired while final output was pending.
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    now = 21
+    emit(event({ type: "system", subtype: "background_tasks_changed", tasks: [{ task_id: "b1" }] }))
+
+    await waitFor(() => channel.dead)
+  })
+
+  test("allows final output after the background deadline when no tasks reappear", async () => {
+    const { create, emit } = fakeQuery()
+    let now = 0
+    const channel = new Channel<Handlers>("s1", create, {
+      closeOutGraceMs: 100,
+      backgroundTaskGraceMs: 20,
+      now: () => now,
+    })
+    const turn = channel.turn([user("wake")], { name: "t1" })
+    emit(event({ type: "system", subtype: "background_tasks_changed", tasks: [{ task_id: "a1" }] }))
+    emit(result)
+    emit(event({ type: "system", subtype: "background_tasks_changed", tasks: [] }))
+    now = 21
+    emit(assistant)
+    emit(result)
+
+    const seen = await collect(turn.events, 5)
+    expect(seen.map(typeOf)).toEqual(["system", "result", "system", "assistant", "result"])
+  })
+
   test("completes normally when background tasks already drained", async () => {
     const { create, emit } = fakeQuery()
     const channel = new Channel<Handlers>("s1", create, { closeOutGraceMs: 20, backgroundTaskGraceMs: 100 })

@@ -123,9 +123,12 @@ export class Channel<H> {
 
   private readonly interruptGraceMs: number
   private readonly closeOutGraceMs: number
+  private readonly backgroundTaskGraceMs: number
   private closeOutWatchdog: ReturnType<typeof setTimeout> | undefined
-  private backgroundWatchdog: ReturnType<typeof setTimeout> | undefined
+  private backgroundTaskWatchdog: ReturnType<typeof setTimeout> | undefined
+  private finalOutputWatchdog: ReturnType<typeof setTimeout> | undefined
   private liveBackgroundTasks = 0
+  private backgroundWait: "drain" | "final-output" | undefined
   /** Input reached EOF (for native images); finish this query, never reuse it. */
   retiring = false
 
@@ -137,10 +140,11 @@ export class Channel<H> {
   constructor(
     readonly key: string,
     createQuery: CreateQuery<H>,
-    options?: { resumeID?: string; interruptGraceMs?: number; closeOutGraceMs?: number },
+    options?: { resumeID?: string; interruptGraceMs?: number; closeOutGraceMs?: number; backgroundTaskGraceMs?: number },
   ) {
     this.interruptGraceMs = options?.interruptGraceMs ?? INTERRUPT_GRACE_MS
     this.closeOutGraceMs = options?.closeOutGraceMs ?? CLOSE_OUT_GRACE_MS
+    this.backgroundTaskGraceMs = options?.backgroundTaskGraceMs ?? BACKGROUND_TASK_GRACE_MS
     this.settling = options?.resumeID !== undefined
     log.info("claude channel created", { channel: key, resumed: this.settling })
     this.queryPromise = createQuery({
@@ -170,15 +174,12 @@ export class Channel<H> {
     })
     const sink = this.sink
     this.sink = undefined
+    this.resetBackgroundWait()
     sink?.end(failure)
   }
 
   private route(event: ClaudeEvent) {
     if (eventType(event) === "system" && (event as { subtype?: string }).subtype === "init") this.sawInit = true
-    if (eventType(event) === "system" && (event as { subtype?: string }).subtype === "background_tasks_changed") {
-      this.liveBackgroundTasks = Array.isArray(event.tasks) ? event.tasks.length : 0
-      if (this.liveBackgroundTasks === 0) this.clearBackgroundWatchdog()
-    }
     const sink = this.sink
     if (!sink) {
       // No turn is consuming. A result here is exactly the stale close-out
@@ -189,6 +190,16 @@ export class Channel<H> {
       // returned empty output" with no server-side evidence.
       log.info("dropped out-of-turn event", { channel: this.key, type: eventType(event) })
       return
+    }
+    if (eventType(event) === "system" && (event as { subtype?: string }).subtype === "background_tasks_changed") {
+      this.liveBackgroundTasks = Array.isArray(event.tasks) ? event.tasks.length : 0
+      if (this.liveBackgroundTasks === 0 && this.backgroundWait === "drain") {
+        this.backgroundWait = "final-output"
+        this.clearBackgroundTaskWatchdog()
+        this.armFinalOutputWatchdog(sink)
+      } else if (this.liveBackgroundTasks === 0 && this.backgroundWait === "final-output") {
+        this.armFinalOutputWatchdog(sink)
+      }
     }
     if (this.settling && this.sawInit && !sink.sawAssistantOutput && isSuccessCloseOut(event)) {
       // Post-resume close-out of a dangling previous turn: after a successful
@@ -214,9 +225,15 @@ export class Channel<H> {
       sink.sawAssistantOutput = true
       this.settling = false
       this.clearCloseOutWatchdog()
+      if (this.backgroundWait === "final-output") this.armFinalOutputWatchdog(sink)
     }
+    if (eventType(event) === "result" && !isSuccessCloseOut(event)) this.resetBackgroundWait()
+    if (isSuccessCloseOut(event) && this.liveBackgroundTasks === 0) this.resetBackgroundWait()
     sink.push(event)
-    if (isSuccessCloseOut(event) && this.liveBackgroundTasks > 0) this.armBackgroundWatchdog(sink)
+    if (isSuccessCloseOut(event) && this.liveBackgroundTasks > 0) {
+      this.backgroundWait = "drain"
+      this.armBackgroundTaskWatchdog(sink)
+    }
   }
 
   /**
@@ -247,29 +264,43 @@ export class Channel<H> {
     this.closeOutWatchdog = undefined
   }
 
-  /**
-   * A background result is a pause, but the CLI is expected to later replace
-   * its task list with zero. Bound that wait so a lost transition cannot retain
-   * the turn's execution lease and channel forever.
-   */
-  private armBackgroundWatchdog(sink: TurnSink) {
-    if (this.backgroundWatchdog) return
-    this.backgroundWatchdog = setTimeout(() => {
-      this.backgroundWatchdog = undefined
-      if (this.sink !== sink || this.liveBackgroundTasks === 0) return
+  private armBackgroundTaskWatchdog(sink: TurnSink) {
+    if (this.backgroundTaskWatchdog) return
+    this.backgroundTaskWatchdog = setTimeout(() => {
+      this.backgroundTaskWatchdog = undefined
+      if (this.sink !== sink || this.backgroundWait !== "drain") return
       log.warn("background tasks did not settle; closing the channel", {
         channel: this.key,
         liveBackgroundTasks: this.liveBackgroundTasks,
       })
       sink.end({ failure: new Error("Claude background tasks did not settle before timeout.") })
       void this.close()
+    }, this.backgroundTaskGraceMs)
+  }
+
+  private clearBackgroundTaskWatchdog() {
+    if (!this.backgroundTaskWatchdog) return
+    clearTimeout(this.backgroundTaskWatchdog)
+    this.backgroundTaskWatchdog = undefined
+  }
+
+  private armFinalOutputWatchdog(sink: TurnSink) {
+    if (this.finalOutputWatchdog) clearTimeout(this.finalOutputWatchdog)
+    this.finalOutputWatchdog = setTimeout(() => {
+      this.finalOutputWatchdog = undefined
+      if (this.sink !== sink || this.backgroundWait !== "final-output") return
+      log.warn("background tasks settled without final output; closing the channel", { channel: this.key })
+      sink.end({ failure: new Error("Claude produced no final output after background tasks settled.") })
+      void this.close()
     }, this.closeOutGraceMs)
   }
 
-  private clearBackgroundWatchdog() {
-    if (!this.backgroundWatchdog) return
-    clearTimeout(this.backgroundWatchdog)
-    this.backgroundWatchdog = undefined
+  private resetBackgroundWait() {
+    this.clearBackgroundTaskWatchdog()
+    if (this.finalOutputWatchdog) clearTimeout(this.finalOutputWatchdog)
+    this.finalOutputWatchdog = undefined
+    this.liveBackgroundTasks = 0
+    this.backgroundWait = undefined
   }
 
   /**
@@ -281,6 +312,7 @@ export class Channel<H> {
     if (this.dead) throw new Error("The Claude channel is closed.")
     if (this.retiring) throw new Error("The Claude channel is retiring.")
     if (this.sink) throw new Error("A turn is already active on this Claude channel.")
+    this.resetBackgroundWait()
     this.handlers = handlers
     this.lastHandlers = handlers
 
@@ -312,7 +344,7 @@ export class Channel<H> {
 
     const detach = () => {
       this.clearCloseOutWatchdog()
-      this.clearBackgroundWatchdog()
+      this.resetBackgroundWait()
       if (this.sink === sink) {
         this.sink = undefined
         this.handlers = undefined
@@ -359,7 +391,7 @@ export class Channel<H> {
   async close() {
     this.dead = true
     this.clearCloseOutWatchdog()
-    this.clearBackgroundWatchdog()
+    this.resetBackgroundWait()
     this.input.end()
     const sink = this.sink
     this.sink = undefined
@@ -377,6 +409,11 @@ const INTERRUPT_GRACE_MS = 10_000
  * that a session's execution lease is not held for the process lifetime.
  */
 const CLOSE_OUT_GRACE_MS = 120_000
+/**
+ * Legitimate background subagents can exceed the close-out grace. This cap
+ * only prevents a lost drain event from retaining a turn forever.
+ */
+const BACKGROUND_TASK_GRACE_MS = 30 * 60_000
 /**
  * How long a channel may sit with no turn before its CLI child is reclaimed.
  * A later turn simply respawns and resumes the conversation, so the only cost

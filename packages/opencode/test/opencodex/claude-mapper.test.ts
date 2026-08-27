@@ -1,4 +1,5 @@
-import { describe, expect, test } from "bun:test"
+import { describe, expect, spyOn, test } from "bun:test"
+import * as Log from "@opencode-ai/core/util/log"
 import { nextClaudeEvent } from "../../src/opencodex/claude-driver"
 import {
   finalizeAbandonedTurn,
@@ -114,6 +115,24 @@ describe("claude stream-json mapper", () => {
       tool: "read",
       state: { status: "completed", output: "line one", input: { file_path: "a.ts" } },
     })
+  })
+
+  test("warns safely when a tool result has no pending call", () => {
+    const warning = spyOn(Log.create({ service: "claude-mapper" }), "warn")
+    run([
+      {
+        type: "user",
+        message: { content: [{ type: "tool_result", tool_use_id: "call_missing", content: "secret output" }] },
+      },
+    ])
+
+    expect(warning).toHaveBeenCalledWith("dropped tool_result with no pending part", {
+      sessionID: "ses_1",
+      callID: "call_missing",
+      hadMessage: false,
+    })
+    expect(JSON.stringify(warning.mock.calls)).not.toContain("secret output")
+    warning.mockRestore()
   })
 
   test("normalizes file tool inputs to native keys so transcript titles resolve", () => {
@@ -579,6 +598,27 @@ describe("background subagents keep the turn open", () => {
     expect(steps[0]?.cost).toBeCloseTo(0.02, 10)
     expect(steps[1]?.cost).toBeCloseTo(0.03, 10)
     expect(completed?.cost).toBeCloseTo(0.05, 10)
+  })
+
+  test("a failed result ignores live background tasks and finishes promptly", () => {
+    const { writes, state } = run([
+      { type: "system", subtype: "background_tasks_changed", tasks: [agentTask] } as ClaudeEvent,
+      { type: "result", subtype: "error_during_execution", is_error: true },
+    ])
+
+    expect(state.finished).toBe(true)
+    expect(messages(writes).at(-1)?.time.completed).toBeGreaterThan(0)
+  })
+
+  test("an abort ignores live background tasks and finishes promptly", () => {
+    const paused = run([
+      { type: "assistant", message: { id: "m1", content: [{ type: "text", text: "Waiting" }] } },
+      { type: "system", subtype: "background_tasks_changed", tasks: [agentTask] } as ClaudeEvent,
+    ])
+    const closing = finalizeAbandonedTurn(paused.state, context(), { reason: "abort" })
+
+    expect(closing.state.finished).toBe(true)
+    expect(messages(closing.writes).at(-1)?.time.completed).toBeGreaterThan(0)
   })
 
   test("a malformed background_tasks_changed payload counts as no live tasks", () => {

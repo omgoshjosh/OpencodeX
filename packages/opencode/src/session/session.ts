@@ -817,6 +817,19 @@ export const layer: Layer.Layer<
       )
 
       if (hasInstance) yield* cancelBackgroundJobs(background, sessionID)
+      // A deleted session's Claude channel owns a live CLI child that nothing
+      // will ever prompt again; without this it survives to the idle sweep.
+      //
+      // Imported lazily on purpose. A static edge from the session domain to
+      // the Claude transport drags the transport, the channel registry, the
+      // delegate surface and zod into the module graph of everything that
+      // touches sessions - which is most of the codebase and most of the test
+      // suite. (The tidier shape is for the driver to subscribe to the
+      // Event.Deleted published below, which would remove the direction
+      // entirely; that needs a registration point this module does not own.)
+      yield* Effect.promise(() =>
+        import("@/opencodex/claude-transport").then((transport) => transport.closePersistentChannel(sessionID)),
+      ).pipe(Effect.ignore)
       const kids = yield* children(sessionID)
       for (const child of kids) yield* remove(child.id)
 

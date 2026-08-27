@@ -103,9 +103,11 @@ describe("swarm role model fallback", () => {
       unavailableModels: ["anthropic/claude-sonnet-5"],
       promptResults: [success("fallback worked")],
     })
-    expect(await Effect.runPromise(
-      run(runSwarmRole, { roles: [role({ name: "Specialist", skill: null, instructions: "", fallbacks: true })] }),
-    )).toEqual({ ok: true, text: "fallback worked" })
+    expect(
+      await Effect.runPromise(
+        run(runSwarmRole, { roles: [role({ name: "Specialist", skill: null, instructions: "", fallbacks: true })] }),
+      ),
+    ).toEqual({ ok: true, text: "fallback worked" })
     expect(models).toEqual(["openai/gpt-5"])
     expect(loops()).toBe(0)
   })
@@ -154,10 +156,14 @@ describe("swarm role delegation validation", () => {
   test("rejects an unknown role without creating or stamping child work", async () => {
     const { runSwarmRole, prompts, stamps } = harness({ skills: {} })
 
-    expect(await Effect.runPromise(run(runSwarmRole, { role: "Unknown" }))).toEqual({
+    const result = await Effect.runPromise(run(runSwarmRole, { role: "Unknown" }))
+    expect(result).toEqual({
       ok: false,
       reason: "rejected",
+      // The roster is the model's self-correction path for a mistyped role.
+      detail: expect.stringContaining("Available roles:"),
     })
+    if (!result.ok) expect(result.detail).toContain('"Unknown"')
     expect(prompts).toHaveLength(0)
     expect(stamps).toHaveLength(0)
   })
@@ -171,6 +177,7 @@ describe("swarm role delegation validation", () => {
     expect(await Effect.runPromise(run(runSwarmRole, { roles: [configuredRole] }))).toEqual({
       ok: false,
       reason: "rejected",
+      detail: 'Role "Specialist" has no model configured.',
     })
     expect(prompts).toHaveLength(0)
     expect(stamps).toHaveLength(0)
@@ -335,9 +342,10 @@ describe("swarm role delegation stamping", () => {
       },
     })
 
-    expect(
-      await capability.run({ role: "Specialist", prompt: "Do the task.", signal: controller.signal }),
-    ).toEqual({ ok: false, reason: "cancelled" })
+    expect(await capability.run({ role: "Specialist", prompt: "Do the task.", signal: controller.signal })).toEqual({
+      ok: false,
+      reason: "cancelled",
+    })
     expect(events).toEqual([])
     expect(prompts).toHaveLength(0)
     expect(stamps).toHaveLength(0)
@@ -467,9 +475,7 @@ function role(input: {
     provider_id: input.providerID === undefined ? "anthropic" : input.providerID,
     model_id: input.modelID === undefined ? "claude-sonnet-5" : input.modelID,
     variant: null,
-    fallback_models: input.fallbacks
-      ? JSON.stringify([{ providerID: "openai", modelID: "gpt-5" }])
-      : "[]",
+    fallback_models: input.fallbacks ? JSON.stringify([{ providerID: "openai", modelID: "gpt-5" }]) : "[]",
   }
 }
 
@@ -536,9 +542,7 @@ function harness(input: {
       get: (name: string) =>
         input.skillFailure ??
         Effect.succeed(
-          input.skills[name] !== undefined
-            ? { name, location: "builtin", content: input.skills[name] }
-            : undefined,
+          input.skills[name] !== undefined ? { name, location: "builtin", content: input.skills[name] } : undefined,
         ),
     } as never,
     resolveModel: (model: { providerID: string; modelID: string }) =>
@@ -547,7 +551,11 @@ function harness(input: {
           ? undefined
           : { variants: { low: {}, medium: {}, high: {} } },
       ),
-    prompt: (promptInput: { messageID?: string; model?: { providerID: string; modelID: string }; parts: Array<{ type: string; text?: string }> }) => {
+    prompt: (promptInput: {
+      messageID?: string
+      model?: { providerID: string; modelID: string }
+      parts: Array<{ type: string; text?: string }>
+    }) => {
       input.onPrompt?.()
       if (promptInput.model) models.push(`${promptInput.model.providerID}/${promptInput.model.modelID}`)
       const messageID = promptInput.messageID ?? "msg_user"
@@ -555,7 +563,9 @@ function harness(input: {
         info: { id: messageID, role: "user", model: promptInput.model },
         parts: promptInput.parts,
       } as unknown as SessionLegacy.WithParts)
-      const text = promptInput.parts.flatMap((part) => (part.type === "text" && part.text ? [part.text] : [])).join("\n")
+      const text = promptInput.parts
+        .flatMap((part) => (part.type === "text" && part.text ? [part.text] : []))
+        .join("\n")
       prompts.push(text)
       for (const parts of input.priorAssistantParts ?? []) record(failure("insufficient_quota", parts), messageID)
       if (input.promptResults?.length) return Effect.succeed(record(input.promptResults.shift()!, messageID))
@@ -597,5 +607,8 @@ function failure(code: string, parts: Array<Record<string, unknown>> = []): Sess
 }
 
 function success(text: string): SessionLegacy.WithParts {
-  return { info: { role: "assistant", error: undefined }, parts: [{ type: "text", text, synthetic: false }] } as SessionLegacy.WithParts
+  return {
+    info: { role: "assistant", error: undefined },
+    parts: [{ type: "text", text, synthetic: false }],
+  } as SessionLegacy.WithParts
 }

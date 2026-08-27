@@ -56,13 +56,29 @@ export function client<T extends Definition>(target: {
       }
     }
   }
+  let failure: Error | undefined
   return {
     call<Method extends keyof T>(method: Method, input: Parameters<T[Method]>[0]): Promise<ReturnType<T[Method]>> {
+      if (failure) return Promise.reject(failure)
       const requestId = id++
       return new Promise((resolve, reject) => {
         pending.set(requestId, { resolve, reject })
         target.postMessage(JSON.stringify({ type: "rpc.request", method, input, id: requestId }))
       })
+    },
+    /**
+     * Marks the peer dead: rejects every pending call and every future one.
+     * The rpc.error path only covers a handler that rejects - a worker that
+     * throws during module init (before Rpc.listen installs onmessage) or is
+     * terminated answers nothing, and an un-timed call would hang forever
+     * with the TUI silent. The worker's error/exit hooks call this.
+     */
+    fail(error: Error) {
+      if (failure) return
+      failure = error
+      const entries = [...pending.values()]
+      pending.clear()
+      for (const entry of entries) entry.reject(error)
     },
     on<Data>(event: string, handler: (data: Data) => void) {
       let handlers = listeners.get(event)

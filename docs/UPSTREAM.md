@@ -28,24 +28,24 @@ fork's removal**, not by restoring upstream's file — unless the entry says oth
 
 `upstream/policy.json` (`permanentlyPrunedPaths`) is the machine-enforced half of this and is
 checked by `bun run surface:audit`. This section is the human-readable half: it also covers files
-that were *moved or split* rather than pruned, which policy.json cannot express.
+that were _moved or split_ rather than pruned, which policy.json cannot express.
 
 ### 2026-07 — cleanup branch (pre-first-sync)
 
 Deleted, upstream-owned (do not restore on merge):
 
-| Path | Note |
-| --- | --- |
-| `packages/opencode/src/cli/cmd/run/` (33 files) + `packages/opencode/test/cli/run/` (18 files) | The `run --interactive` second TUI. `cmd/run.ts` (non-interactive `opencode run`) is **kept**; only the interactive front end is gone, along with the `--interactive` flag. |
-| `packages/opencode/src/share/`, `packages/core/src/share/sql.ts`, `test/share/` | Share pipeline (`opncd.ai` egress) and its `/share` surface. |
-| `packages/opencode/src/account/`, `packages/core/src/account*`, `cli/cmd/account.ts`, `component/dialog-console-org.tsx` | Console/account login. |
-| `packages/opencode/src/server/shared/ui.ts`, `public-ui.ts`, `test/server/httpapi-ui.test.ts` | The `app.opencode.ai` web-UI reverse proxy and the `web` command. |
-| `packages/opencode/src/pty/`, `httpapi/handlers/pty.ts`, `server/shared/pty-ticket.ts`, `test/pty/` | The PTY HTTP surface. |
-| `httpapi/groups/v2/`, `httpapi/handlers/v2/`, `cli/cmd/tui/context/sync-v2.tsx`, `feature-plugins/system/session-v2*` , `packages/sdk/js/src/v2/data.ts` | The experimental v2 event/session system. |
-| `packages/sdk/js/src/v2/legacy-session-sync.ts`, `script/check-legacy-session-sync.ts`, `docs/session-sync-compatibility.md` | The legacy session-sync endpoint and its compatibility gate. |
+| Path                                                                                                                                                                          | Note                                                                                                                                                                                                                                                                                                                                                                                                 |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `packages/opencode/src/cli/cmd/run/` (33 files) + `packages/opencode/test/cli/run/` (18 files)                                                                                | The `run --interactive` second TUI. `cmd/run.ts` (non-interactive `opencode run`) is **kept**; only the interactive front end is gone, along with the `--interactive` flag.                                                                                                                                                                                                                          |
+| `packages/opencode/src/share/`, `packages/core/src/share/sql.ts`, `test/share/`                                                                                               | Share pipeline (`opncd.ai` egress) and its `/share` surface.                                                                                                                                                                                                                                                                                                                                         |
+| `packages/opencode/src/account/`, `packages/core/src/account*`, `cli/cmd/account.ts`, `component/dialog-console-org.tsx`                                                      | Console/account login.                                                                                                                                                                                                                                                                                                                                                                               |
+| `packages/opencode/src/server/shared/ui.ts`, `public-ui.ts`, `test/server/httpapi-ui.test.ts`                                                                                 | The `app.opencode.ai` web-UI reverse proxy and the `web` command.                                                                                                                                                                                                                                                                                                                                    |
+| `packages/opencode/src/pty/`, `httpapi/handlers/pty.ts`, `server/shared/pty-ticket.ts`, `test/pty/`                                                                           | The PTY HTTP surface.                                                                                                                                                                                                                                                                                                                                                                                |
+| `httpapi/groups/v2/`, `httpapi/handlers/v2/`, `cli/cmd/tui/context/sync-v2.tsx`, `feature-plugins/system/session-v2*` , `packages/sdk/js/src/v2/data.ts`                      | The experimental v2 event/session system.                                                                                                                                                                                                                                                                                                                                                            |
+| `packages/sdk/js/src/v2/legacy-session-sync.ts`, `script/check-legacy-session-sync.ts`, `docs/session-sync-compatibility.md`                                                  | The legacy session-sync endpoint and its compatibility gate.                                                                                                                                                                                                                                                                                                                                         |
 | ~76% of `packages/ui/src` — all of `theme/`, `hooks/`, `storybook/`, `styles/tailwind/`, the icon/favicon/image asset sets, most of `components/`, `v2/`, `i18n/`, `context/` | Upstream web-frontend residue. `packages/ui` survives only as the Solid components the GUI still imports (`file`, `markdown`, `code-block`, `popover`, `logo`, `session-diff`, `tool-output-preview`, `context/marked`, four `v2/components/*-v2`) plus the five notification `.mp3`s the TUI imports. Anything outside that set is intentionally gone; re-adding a file here needs a live importer. |
-| `packages/{containers,identity,extensions,effect-sqlite-node}`, `script/{publish.ts,release,generate.ts}`, `packages/plugin/src/example*.ts` | Vestigial upstream packages and scripts. Also in `permanentlyPrunedPaths`. |
-| `packages/opencode/script/publish.ts`, `packages/plugin/script/publish.ts`, `packages/sdk/js/script/publish.ts` | Upstream's release pipeline: Docker push to `ghcr.io/anomalyco/opencode`, AUR PKGBUILDs, a Homebrew tap, and `npm publish` to the `@opencode-ai` scope this fork does not own. The fork releases via `.github/workflows/release-cli.yml` + `script/build.ts` only. Also in `permanentlyPrunedPaths`. |
+| `packages/{containers,identity,extensions,effect-sqlite-node}`, `script/{publish.ts,release,generate.ts}`, `packages/plugin/src/example*.ts`                                  | Vestigial upstream packages and scripts. Also in `permanentlyPrunedPaths`.                                                                                                                                                                                                                                                                                                                           |
+| `packages/opencode/script/publish.ts`, `packages/plugin/script/publish.ts`, `packages/sdk/js/script/publish.ts`                                                               | Upstream's release pipeline: Docker push to `ghcr.io/anomalyco/opencode`, AUR PKGBUILDs, a Homebrew tap, and `npm publish` to the `@opencode-ai` scope this fork does not own. The fork releases via `.github/workflows/release-cli.yml` + `script/build.ts` only. Also in `permanentlyPrunedPaths`.                                                                                                 |
 
 ### 2026-08 — first-lineage sync to v1.18.21
 
@@ -57,12 +57,57 @@ permanently prunes those new workspaces in `upstream/policy.json`, and ports onl
 independently compatible server behavior. Future behavior ports remain explicit
 follow-up work; the rejected package split must not be restored implicitly.
 
-Moved or split (a merge conflict here means upstream edited the *old* path — port the change into the new one):
+Resolved to the fork's side by the lineage merge (recorded before the merge base moved):
 
-| Upstream path | Now |
-| --- | --- |
-| `packages/opencode/src/session/prompt.ts` (monolith) | Split into `prompt.ts` + `prompt-{claim,schema,shell,structured-output,subtask,swarm,user-message}.ts` in the same directory. |
-| `packages/opencode/src/util/filesystem.ts` (pure path helpers) | Path helpers now live in `@opencode-ai/core/util/fs-path` and are re-exported from `util/filesystem.ts`, so the namespace API is unchanged for callers. |
-| `packages/gui/src/renderer/src/lib/store.ts` | `lib/session-api.ts` (fork-owned; renamed for accuracy — it is an API facade, not a store). |
-| `packages/gui/src/renderer/src/lib/message-text.ts` | `packages/sdk/js/src/v2/client-message-text.ts` (unified with the TUI's copy). |
-| Numbered GUI stylesheets (`styles/**/base-N.css`, `states-N.css`) | Renamed to semantic names (fork-owned; listed in `git log -M --diff-filter=R`). |
+Between the imported snapshot `v1.15.13` and this sync target `v1.18.21`, upstream changed 723
+files that still exist in this fork. The lineage merge takes upstream's side for only a handful,
+so the rest keep the fork's content. Once the merge lands, `v1.18.21` becomes the three-way base
+and **git will never surface those upstream changes as a conflict or a diff again** — so they are
+enumerated in [`upstream/divergence-v1.18.21.json`](../upstream/divergence-v1.18.21.json) while
+they are still visible. Both tags remain in the repository, so any individual file's dropped
+upstream change stays reproducible:
+
+```sh
+git diff v1.15.13 v1.18.21 -- <path>
+```
+
+The manifest splits them by whether the fork ever touched the file, because the two halves need
+opposite handling:
+
+| Bucket             | Count | Meaning                                                                                                                                                                                         |
+| ------------------ | ----- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `unmodifiedByFork` | 371   | Byte-identical to the imported snapshot — the fork never edited them, so they are stale by neglect rather than by decision. **Not mechanically adoptable, though** — see the measurement below. |
+| `modifiedByFork`   | 352   | The fork has its own changes, so upstream's version cannot be taken wholesale. Each needs a per-file decision: adopt, port the behavior, or record as deliberate divergence below.              |
+
+The `unmodifiedByFork` half concentrates in `packages/opencode` (117), `packages/core` (55),
+`packages/ui` (24), `packages/llm` (23), and `packages/http-recorder` (12). Of those 371, upstream
+_modified_ 320 and _deleted_ 51; the deletions are a separate policy question (whether the fork
+follows) rather than adoption candidates.
+
+**Bulk adoption of the 320 was measured, and it does not work.** Checking them out from `v1.18.21`
+onto the fork produces roughly 2140 type errors, because upstream's newer files import the package
+split this fork rejected (`@opencode-ai/schema/permission`, `@opencode-ai/plugin/v2/effect`,
+`../../v1/config/*`, `../../credential`, `../../integration`, `../../plugin/internal`). Narrowing
+does not rescue it: the 56 provider plugins alone still produce ~169 errors, and the 186 files whose
+_relative_ imports all resolve against the fork still produce ~975 — the incompatibility is at the
+type level as well as the module level.
+
+So the practical status of this bucket is "stale, and each file is a **port** rather than a
+checkout" — the same conclusion the package-split paragraph above reaches, now measured rather than
+asserted. It is also why none of this is a quick win. The provider auth plugins remain the
+highest-value target (upstream changed 33 of them by roughly +1100 lines across this range, and the
+fork has adopted essentially none), but they need porting behind the fork's own plugin surface, not
+a merge.
+
+Neither bucket is a claim that the merge was wrong — it is the record that makes the choice
+auditable and reversible by hand, which is what `docs/UPSTREAM.md` requires of a first sync.
+
+Moved or split (a merge conflict here means upstream edited the _old_ path — port the change into the new one):
+
+| Upstream path                                                     | Now                                                                                                                                                     |
+| ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `packages/opencode/src/session/prompt.ts` (monolith)              | Split into `prompt.ts` + `prompt-{claim,schema,shell,structured-output,subtask,swarm,user-message}.ts` in the same directory.                           |
+| `packages/opencode/src/util/filesystem.ts` (pure path helpers)    | Path helpers now live in `@opencode-ai/core/util/fs-path` and are re-exported from `util/filesystem.ts`, so the namespace API is unchanged for callers. |
+| `packages/gui/src/renderer/src/lib/store.ts`                      | `lib/session-api.ts` (fork-owned; renamed for accuracy — it is an API facade, not a store).                                                             |
+| `packages/gui/src/renderer/src/lib/message-text.ts`               | `packages/sdk/js/src/v2/client-message-text.ts` (unified with the TUI's copy).                                                                          |
+| Numbered GUI stylesheets (`styles/**/base-N.css`, `states-N.css`) | Renamed to semantic names (fork-owned; listed in `git log -M --diff-filter=R`).                                                                         |

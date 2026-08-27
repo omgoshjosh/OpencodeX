@@ -3,7 +3,20 @@ import { EffectBridge } from "@/effect/bridge"
 
 export type FailureReason = "cancelled" | "errored" | "empty-output" | "rejected"
 
-export type Result = { ok: true; text: string } | { ok: false; reason: FailureReason }
+export type Result =
+  | { ok: true; text: string }
+  | {
+      ok: false
+      reason: FailureReason
+      /**
+       * A safe, orchestrator-actionable sentence appended to the generic
+       * message - the unknown-role roster being the canonical case, since it
+       * is what lets a model that mistyped a role name correct itself instead
+       * of retrying the same bad call. Never provider error detail: "errored"
+       * stays generic on purpose so upstream failures cannot leak secrets.
+       */
+      detail?: string
+    }
 
 export type Swarm = {
   roles: Array<{ name: string; description?: string }>
@@ -20,11 +33,11 @@ export function failureMessage(input: Extract<Result, { ok: false }>): string {
         : input.reason === "rejected"
           ? "The delegation request was rejected."
           : "The delegated role failed."
-  return message
+  return input.detail ? `${message} ${input.detail}` : message
 }
 
-export function failure(reason: FailureReason): Extract<Result, { ok: false }> {
-  return { ok: false, reason }
+export function failure(reason: FailureReason, detail?: string): Extract<Result, { ok: false }> {
+  return { ok: false, reason, ...(detail ? { detail } : {}) }
 }
 
 /** Bridges one SDK request signal to its delegate fiber without detaching work. */

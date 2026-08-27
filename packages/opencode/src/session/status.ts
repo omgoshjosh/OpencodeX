@@ -383,11 +383,21 @@ export const layer = Layer.effect(
         : undefined
       // A notification promise without a persisted job and deadline cannot
       // survive a restart, so reject it instead of displaying a phantom wake.
-      if (pendingWake && (!wake?.timeoutAt || wake.timeoutAt <= Date.now())) return false
+      // Narrowed once here so the closure below sees `number`, not
+      // `number | null` - the schema's pendingWake.at cannot be null.
+      const wakeAt = wake?.timeoutAt ?? undefined
+      if (pendingWake && (!wakeAt || wakeAt <= Date.now())) return false
       return yield* patchCurrentGeneration(sessionID, (current) => {
-        if (current.type !== "busy" && current.type !== "idle") return undefined
-        const { pendingWake: _, ...next } = current
-        return wake ? { ...next, pendingWake: { ...pendingWake!, at: wake.timeoutAt } } : next
+        // pendingWake exists only on the idle variant; the previous
+        // destructure-over-the-union compiled on the older checker but could
+        // fabricate a busy status carrying pendingWake, which the schema
+        // rejects. Narrow per variant instead.
+        if (current.type === "idle") {
+          const { pendingWake: _ignored, ...rest } = current
+          return wakeAt !== undefined && wakeAt > 0 ? { ...rest, pendingWake: { ...pendingWake!, at: wakeAt } } : rest
+        }
+        if (current.type === "busy") return current
+        return undefined
       })
     })
 

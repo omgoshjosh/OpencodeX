@@ -5,6 +5,9 @@ import type { SDKUserMessage } from "@anthropic-ai/claude-agent-sdk"
 import type { ClaudeEvent } from "./claude-mapper"
 import { ClaudeDelegate } from "./claude-delegate"
 import { createChannelRegistry, type CreateQuery } from "./claude-channel"
+import * as Log from "@opencode-ai/core/util/log"
+
+const log = Log.create({ service: "claude-transport" })
 
 /**
  * The process boundary for headless Claude Code. Everything SDK-specific lives
@@ -223,6 +226,22 @@ async function* idlePrompt(): AsyncGenerator<never> {
  */
 const persistentChannels = createChannelRegistry<TurnHandlers>()
 
+/**
+ * Reclaims every live CLI child. Each channel owns one, and a backend that
+ * serves many sessions over a long life would otherwise accumulate them for
+ * its whole lifetime: an idle reaper handles the quiet ones, and this is the
+ * deterministic hook for instance disposal and shutdown. A later turn respawns
+ * and resumes, so calling this is never destructive to a conversation.
+ */
+export function closeAllPersistentChannels() {
+  return persistentChannels.closeAll()
+}
+
+/** Drops one session's channel, for session deletion. */
+export function closePersistentChannel(sessionKey: string) {
+  return persistentChannels.close(sessionKey)
+}
+
 export function createSdkTransport(): ClaudeTransport {
   const registry = persistentChannels
 
@@ -269,8 +288,17 @@ export function createSdkTransport(): ClaudeTransport {
               extra: { toolUseID?: string; signal?: AbortSignal },
             ) => {
               const handlers = input.handlers()
-              if (!handlers)
+              if (!handlers) {
+                // The CLI is asking for an approval while the daemon has no
+                // turn attached: proof the two turn lifecycles are desynced
+                // (the daemon finished a turn the CLI is still executing).
+                // The wedge this produces is selective - allowlisted calls
+                // never reach here and keep working - which made it read as
+                // "the repo is broken" for days while this path emitted no
+                // log at all. Count every occurrence.
+                log.warn("denied approval with no active turn", { channelKey, toolName })
                 return Promise.resolve({ behavior: "deny" as const, message: "No turn is active for this session." })
+              }
               return handlers.canUseTool(toolName, toolInput, extra)
             },
             ...(input.resumeID ? { resume: input.resumeID } : {}),

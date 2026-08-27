@@ -96,6 +96,55 @@ describe("local coordinator database selection", () => {
     }
   })
 
+  test("still discovers a legacy sidecar whose health carries no identity", async () => {
+    // A GUI sidecar from a build predating the coordinatorKey health field
+    // reports healthy with no identity. Rejecting it silently routes the CLI
+    // to the default database while the GUI keeps its own - sessions invisible
+    // across the two clients. Only an actively mismatching identity means
+    // another database; readActiveCoordinator already applies exactly this
+    // tolerance.
+    await using tmp = await tmpdir()
+    const database = path.join(tmp.path, "gui.db")
+    const key = "gui-authority"
+    const clients = path.join(tmp.path, `${key}.clients`)
+    await Bun.write(database, "")
+    await Bun.write(
+      path.join(clients, `${process.pid}.gui.json`),
+      JSON.stringify({
+        version: 1,
+        key,
+        pid: process.pid,
+        updatedAt: Date.now(),
+      }),
+    )
+    const server = Bun.serve({
+      port: 0,
+      // Legacy shape: healthy, no coordinatorKey.
+      fetch: () => Response.json({ healthy: true }),
+    })
+    await Bun.write(
+      path.join(tmp.path, `${key}.json`),
+      JSON.stringify({
+        version: 2,
+        key,
+        directory: tmp.path,
+        database,
+        pid: process.pid,
+        url: server.url.href,
+        username: "gui",
+        password: "secret",
+        token: "token",
+        createdAt: new Date().toISOString(),
+      }),
+    )
+
+    try {
+      expect(await discoverActiveGuiCoordinatorDatabase(tmp.path)).toBe(coordinatorDatabaseIdentity(database))
+    } finally {
+      await server.stop(true)
+    }
+  })
+
   test("ignores an active GUI manifest answered by another database", async () => {
     await using tmp = await tmpdir()
     const database = path.join(tmp.path, "gui.db")

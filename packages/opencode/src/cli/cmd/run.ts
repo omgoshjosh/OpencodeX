@@ -22,6 +22,9 @@ import { createOpencodeClient, type OpencodeClient, type ToolPart } from "@openc
 import { Agent } from "@/agent/agent"
 import { Permission } from "@/permission"
 import { InstanceRef } from "@/effect/instance-ref"
+import { InstanceStore } from "@/project/instance-store"
+import { AppRuntime } from "@/effect/app-runtime"
+import type { InstanceContext } from "@/project/instance-context"
 import { FormatError, FormatUnknownError } from "../error"
 import {
   acquirePreferredCoordinatorAccess,
@@ -129,12 +132,12 @@ async function toolError(part: ToolPart) {
 export const RunCommand = effectCmd({
   command: "run [message..]",
   describe: "run opencode with a message",
-  // --attach connects to a remote server (no local instance needed); the
-  // default path runs an in-process server and needs the project instance.
-  instance: (args) => !args.attach,
-  // For --dir without --attach, load instance for the resolved target dir.
-  // The handler also chdirs (preserving the legacy order: chdir → file resolution).
-  directory: (args) => (args.dir && !args.attach ? path.resolve(process.cwd(), args.dir) : process.cwd()),
+  // No eager instance: whether this run attaches (remote, or a discovered
+  // local authority) is decided inside the handler, and loading first would
+  // open the local database as a second writer for exactly the case the
+  // coordinator-attach path exists to prevent. The handler loads lazily on
+  // the local-fallback branch only.
+  instance: false,
   builder: (yargs: Argv) =>
     yargs
       .positional("message", {
@@ -223,7 +226,17 @@ export const RunCommand = effectCmd({
       }),
   handler: Effect.fn("Cli.run")(function* (args) {
     const agentSvc = yield* Agent.Service
-    const localInstance = yield* InstanceRef
+    const store = yield* InstanceStore.Service
+    // Same directory the eager load used, captured before the handler chdirs.
+    const instanceDirectory = args.dir && !args.attach ? path.resolve(process.cwd(), args.dir) : process.cwd()
+    let loadedInstance: InstanceContext | undefined
+    const localInstance = async () => {
+      // AppRuntime, not the default runtime: the store's log output must go
+      // through the app logger (file-backed), never the console - with
+      // --format json a stray console line corrupts the stdout event stream.
+      loadedInstance ??= await AppRuntime.runPromise(store.load({ directory: instanceDirectory }))
+      return loadedInstance
+    }
     yield* Effect.promise(async () => {
       const thinking = args.thinking ?? false
 
@@ -415,7 +428,7 @@ export const RunCommand = effectCmd({
         const name = args.agent
 
         const entry = await Effect.runPromise(
-          agentSvc.get(name).pipe(Effect.provideService(InstanceRef, localInstance)),
+          agentSvc.get(name).pipe(Effect.provideService(InstanceRef, await localInstance())),
         )
         if (!entry) {
           UI.println(
@@ -752,6 +765,9 @@ export const RunCommand = effectCmd({
         return
       }
 
+      // The in-process server serves the local database: this is the one
+      // branch that is genuinely the writer, so load here and only here.
+      await localInstance()
       const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
         const { Server } = await import("@/server/server")
         const request = new Request(input, init)
@@ -767,6 +783,6 @@ export const RunCommand = effectCmd({
       } finally {
         await access.release()
       }
-    })
+    }).pipe(Effect.ensuring(Effect.suspend(() => (loadedInstance ? store.dispose(loadedInstance) : Effect.void))))
   }),
 })

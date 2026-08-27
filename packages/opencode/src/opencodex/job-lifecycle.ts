@@ -6,6 +6,7 @@ import { and, eq, gt, inArray, isNotNull, isNull, lt, lte, or } from "drizzle-or
 import { hydrate } from "./job-model"
 import {
   Event,
+  NotFoundError,
   TransitionError,
   type ClaimInput,
   type CompleteInput,
@@ -16,7 +17,11 @@ import {
 import type { JobStore } from "./job-store"
 
 export function createJobLifecycle(db: Database.Interface["db"], events: EventV2.Interface, store: JobStore) {
-  const cancelDescendants = Effect.fn("OpencodeXJob.cancelDescendants")(function* (parentJobID: string) {
+  // Mutually recursive with `cancel`; the annotation breaks the inference
+  // cycle (TS7022) that the stricter compiler settings on this line surface.
+  const cancelDescendants: (parentJobID: string) => Effect.Effect<void, NotFoundError | TransitionError> = Effect.fn(
+    "OpencodeXJob.cancelDescendants",
+  )(function* (parentJobID: string) {
     const children = yield* db
       .select({ id: OpencodeXJobTable.id })
       .from(OpencodeXJobTable)

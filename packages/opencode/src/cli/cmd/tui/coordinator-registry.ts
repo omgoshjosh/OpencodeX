@@ -373,7 +373,15 @@ export async function discoverActiveGuiCoordinatorDatabase(root = ROOT) {
             hasActiveGuiClient(manifest.key, root).then(async (active) => {
               if (!active) return undefined
               const health = await fetchCoordinatorHealth(manifest)
-              if (health?.healthy !== true || !isCoordinatorHealthForManifest(manifest, health)) return undefined
+              if (health?.healthy !== true) return undefined
+              // Same legacy tolerance as readActiveCoordinator: a sidecar from
+              // a build predating the health identity fields reports no
+              // coordinatorKey, and rejecting it here silently routes the CLI
+              // to the default database while the GUI keeps its own - two
+              // clients, two databases, sessions invisible across them. Only
+              // an identity that actively mismatches is another database.
+              if (health.coordinatorKey !== undefined && !isCoordinatorHealthForManifest(manifest, health))
+                return undefined
               return coordinatorDatabaseIdentity(manifest.database)
             }),
           ]

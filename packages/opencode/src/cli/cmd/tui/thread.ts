@@ -8,6 +8,8 @@ import * as Log from "@opencode-ai/core/util/log"
 import { errorMessage } from "@/util/error"
 import { withTimeout } from "@/util/timeout"
 import { withNetworkOptions, resolveNetworkOptionsNoConfig } from "@/cli/network"
+import { validateServeAuthorityNetwork } from "@/cli/cmd/serve-authority"
+import { Effect } from "effect"
 import { Filesystem } from "@/util/filesystem"
 import { win32DisableProcessedInput, win32InstallCtrlCGuard } from "./win32"
 import { writeHeapSnapshot } from "v8"
@@ -208,6 +210,21 @@ export const TuiThreadCommand = cmd({
             // participates in the same authority protocol (owner lock, manifest,
             // token-matched teardown), so a racing client attaches instead of
             // starting a second writer.
+            //
+            // Validate the network posture with the password the user actually
+            // configured, BEFORE the random fallback is minted. The fallback
+            // exists for loopback convenience; letting it satisfy the guard for
+            // a non-loopback listener binds (and mDNS-advertises) a LAN socket
+            // that no remote client can ever authenticate against, because the
+            // secret is never shown to anyone. `opencodex serve` refuses this
+            // configuration - the TUI path must too.
+            await Effect.runPromise(
+              validateServeAuthorityNetwork({
+                hostname: network.hostname,
+                password: process.env.OPENCODE_SERVER_PASSWORD ?? "",
+                allowInsecureLan: process.env.OPENCODE_SERVER_ALLOW_INSECURE_LAN,
+              }),
+            )
             const username = process.env.OPENCODE_SERVER_USERNAME ?? "opencodex-local"
             const password = process.env.OPENCODE_SERVER_PASSWORD ?? randomBytes(32).toString("base64url")
             const token = randomBytes(32).toString("base64url")
@@ -224,6 +241,7 @@ export const TuiThreadCommand = cmd({
 
             const file = await target()
             const worker = new Worker(file, { env })
+            const client = Rpc.client<typeof rpc>(worker)
             worker.onerror = (e) => {
               Log.Default.error("thread error", {
                 message: e.message,
@@ -232,9 +250,11 @@ export const TuiThreadCommand = cmd({
                 colno: e.colno,
                 error: e.error,
               })
+              // A worker that dies before (or without) answering leaves every
+              // pending RPC un-timed; settle them so startup fails visibly
+              // instead of hanging the TUI with no output and no exit.
+              client.fail(new Error(`The TUI worker failed: ${e.message ?? "unknown worker error"}`))
             }
-
-            const client = Rpc.client<typeof rpc>(worker)
             const error = (e: unknown) => {
               Log.Default.error("process error", { error: errorMessage(e) })
             }

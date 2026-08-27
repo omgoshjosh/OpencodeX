@@ -152,8 +152,33 @@ export const layer = Layer.effect(
     const ttl = Duration.minutes(5)
     const lockKey = `models-dev:${filepath}`
 
+    const RACY_STAT_WINDOW_MS = 5_000
     const loadedVersion = yield* Ref.make<string | undefined>(undefined)
+    // mtime+size of the catalog file the cache was loaded from, and when it
+    // was adopted. get() uses these as its per-call freshness probe: a stat is
+    // microseconds, while the full readCatalog (multi-MB readFile + JSON
+    // decode + hash) it used to run per call sits on the prompt hot path
+    // behind refreshLock.
+    //
+    // The probe is trusted only for files whose mtime predates adoption by
+    // more than RACY_STAT_WINDOW_MS - git's "racy clean" rule. A same-length
+    // rewrite can reuse an mtime on coarse-granularity filesystems, so a stat
+    // match near the adoption instant proves nothing and falls through to the
+    // content hash; models.test.ts pins exactly that adversarial case.
+    const loadedStat = yield* Ref.make<{ key: string; adoptedAt: number } | undefined>(undefined)
     const refreshLock = Semaphore.makeUnsafe(1)
+
+    const catalogStatKey = Effect.fnUntraced(function* () {
+      const stat = yield* fs.stat(catalogPath).pipe(Effect.catch(() => Effect.succeed(undefined)))
+      if (!stat) return undefined
+      const mtimeMs = Option.getOrElse(stat.mtime, () => new Date(0)).getTime()
+      return { key: `${mtimeMs}:${String(stat.size)}`, mtimeMs }
+    })
+
+    const adoptStat = Effect.fnUntraced(function* () {
+      const stat = yield* catalogStatKey()
+      yield* Ref.set(loadedStat, stat ? { key: stat.key, adoptedAt: Date.now() } : undefined)
+    })
 
     const fresh = Effect.fnUntraced(function* () {
       const stat = yield* fs.stat(filepath).pipe(Effect.catch(() => Effect.succeed(undefined)))
@@ -186,6 +211,7 @@ export const layer = Layer.effect(
       const catalog = yield* readCatalog().pipe(Effect.catch(() => Effect.succeed(undefined)))
       if (!catalog) return undefined
       yield* Ref.set(loadedVersion, catalog.version)
+      yield* adoptStat()
       return catalog.value
     })
 
@@ -214,6 +240,8 @@ export const layer = Layer.effect(
           return yield* fetchAndWrite()
         }),
       )
+      yield* Ref.set(loadedVersion, Hash.fast(Buffer.from(text)))
+      yield* adoptStat()
       return Schema.decodeUnknownSync(Schema.fromJsonString(Catalog))(text)
     }).pipe(Effect.withSpan("ModelsDev.populate"), Effect.orDie)
 
@@ -223,8 +251,17 @@ export const layer = Layer.effect(
       refreshLock.withPermit(
         Effect.gen(function* () {
           const cached = yield* cachedGet
+          const stat = yield* catalogStatKey()
+          const adopted = yield* Ref.get(loadedStat)
+          if (stat && adopted && stat.key === adopted.key && stat.mtimeMs + RACY_STAT_WINDOW_MS < adopted.adoptedAt)
+            return cached
           const catalog = yield* readCatalog().pipe(Effect.catch(() => Effect.succeed(undefined)))
-          if (!catalog || catalog.version === (yield* Ref.get(loadedVersion))) return cached
+          if (!catalog || catalog.version === (yield* Ref.get(loadedVersion))) {
+            // Touched but not changed (or unreadable): remember the new stat so
+            // the next call can be a pure stat hit again.
+            if (catalog) yield* adoptStat()
+            return cached
+          }
           yield* invalidate
           const next = yield* cachedGet
           yield* events.publish(Event.Refreshed, {})

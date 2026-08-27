@@ -124,6 +124,8 @@ export class Channel<H> {
   private readonly interruptGraceMs: number
   private readonly closeOutGraceMs: number
   private closeOutWatchdog: ReturnType<typeof setTimeout> | undefined
+  private backgroundWatchdog: ReturnType<typeof setTimeout> | undefined
+  private liveBackgroundTasks = 0
   /** Input reached EOF (for native images); finish this query, never reuse it. */
   retiring = false
 
@@ -173,6 +175,10 @@ export class Channel<H> {
 
   private route(event: ClaudeEvent) {
     if (eventType(event) === "system" && (event as { subtype?: string }).subtype === "init") this.sawInit = true
+    if (eventType(event) === "system" && (event as { subtype?: string }).subtype === "background_tasks_changed") {
+      this.liveBackgroundTasks = Array.isArray(event.tasks) ? event.tasks.length : 0
+      if (this.liveBackgroundTasks === 0) this.clearBackgroundWatchdog()
+    }
     const sink = this.sink
     if (!sink) {
       // No turn is consuming. A result here is exactly the stale close-out
@@ -210,6 +216,7 @@ export class Channel<H> {
       this.clearCloseOutWatchdog()
     }
     sink.push(event)
+    if (isSuccessCloseOut(event) && this.liveBackgroundTasks > 0) this.armBackgroundWatchdog(sink)
   }
 
   /**
@@ -238,6 +245,31 @@ export class Channel<H> {
     if (!this.closeOutWatchdog) return
     clearTimeout(this.closeOutWatchdog)
     this.closeOutWatchdog = undefined
+  }
+
+  /**
+   * A background result is a pause, but the CLI is expected to later replace
+   * its task list with zero. Bound that wait so a lost transition cannot retain
+   * the turn's execution lease and channel forever.
+   */
+  private armBackgroundWatchdog(sink: TurnSink) {
+    if (this.backgroundWatchdog) return
+    this.backgroundWatchdog = setTimeout(() => {
+      this.backgroundWatchdog = undefined
+      if (this.sink !== sink || this.liveBackgroundTasks === 0) return
+      log.warn("background tasks did not settle; closing the channel", {
+        channel: this.key,
+        liveBackgroundTasks: this.liveBackgroundTasks,
+      })
+      sink.end({ failure: new Error("Claude background tasks did not settle before timeout.") })
+      void this.close()
+    }, this.closeOutGraceMs)
+  }
+
+  private clearBackgroundWatchdog() {
+    if (!this.backgroundWatchdog) return
+    clearTimeout(this.backgroundWatchdog)
+    this.backgroundWatchdog = undefined
   }
 
   /**
@@ -280,6 +312,7 @@ export class Channel<H> {
 
     const detach = () => {
       this.clearCloseOutWatchdog()
+      this.clearBackgroundWatchdog()
       if (this.sink === sink) {
         this.sink = undefined
         this.handlers = undefined
@@ -326,6 +359,7 @@ export class Channel<H> {
   async close() {
     this.dead = true
     this.clearCloseOutWatchdog()
+    this.clearBackgroundWatchdog()
     this.input.end()
     const sink = this.sink
     this.sink = undefined

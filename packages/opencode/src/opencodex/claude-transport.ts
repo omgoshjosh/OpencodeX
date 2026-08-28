@@ -82,6 +82,7 @@ export type DelegateCapability = {
     role: string
     prompt: string
     toolUseID?: string
+    background?: boolean
     signal?: AbortSignal
   }) => Promise<ClaudeDelegate.Result>
 }
@@ -510,9 +511,13 @@ export function delegateServer(
         DELEGATE_TOOL,
         [
           "Delegate a task to one of this swarm's specialist roles.",
-          "The role runs as its own OpencodeX session on the model configured for it,",
-          "and its final report is returned to you. Prefer several calls in one turn",
-          "for independent roles.",
+          "The role runs as its own OpencodeX session on the model configured for it.",
+          "With background=true the call returns at once and the role's report is",
+          "delivered to you later as a message - prefer this for anything that may",
+          "take more than a minute (builds, CI, long reviews) so this session stays",
+          "responsive and the human can keep talking to you. Without it the call",
+          "blocks until the role finishes. Prefer several calls in one turn for",
+          "independent roles.",
           "",
           "Roles:",
           roster,
@@ -522,6 +527,10 @@ export function delegateServer(
           prompt: z
             .string()
             .describe("Self-contained instructions: scope, expected output, and whether files may be edited."),
+          background: z
+            .boolean()
+            .optional()
+            .describe("Return immediately; the report arrives later as a message. Do not poll for it."),
         },
         async (args, extra) => {
           try {
@@ -540,6 +549,7 @@ export function delegateServer(
               role: args.role,
               prompt: args.prompt,
               ...(toolUseID ? { toolUseID } : {}),
+              ...(args.background ? { background: true } : {}),
               ...(signal ? { signal } : {}),
             })
             if (result.ok) return { content: [{ type: "text" as const, text: result.text }] }

@@ -43,7 +43,9 @@ export function buildSwarmBriefing(input: BriefingInput): string | undefined {
   return [
     `${SWARM_BRIEFING_MARK} swarm="${input.title}">`,
     `You are the orchestrator of the "${input.title}" swarm for this session. The user talks only to you; you coordinate the team and own the final answer.`,
-    ...(orchestrator?.instructions?.trim() ? ["", "Your orchestrator instructions:", orchestrator.instructions.trim()] : []),
+    ...(orchestrator?.instructions?.trim()
+      ? ["", "Your orchestrator instructions:", orchestrator.instructions.trim()]
+      : []),
     "",
     specialists.length > 0
       ? `Your team (delegate with ${viaDelegateTool ? DELEGATE_TOOL_REFERENCE : "the task tool"}):`
@@ -72,6 +74,11 @@ export function buildSwarmBriefing(input: BriefingInput): string | undefined {
     "- For work with several parts, prefer the graph_plan tool: declare the whole task graph once and the team is delegated automatically, in parallel where the graph allows, with loops that repeat until their check passes.",
     "- Synthesize the team's results yourself: reconcile conflicts, state decisions, risks, and next actions in your final reply.",
     "- Skip delegation entirely when the request is trivial or conversational.",
+    ...(viaDelegateTool
+      ? [
+          "- Any delegation that may take more than a minute (builds, CI, long reviews) MUST use background=true and you MUST end your turn afterwards: the report arrives as a message. A blocking delegation freezes this session - the human cannot talk to you until it returns.",
+        ]
+      : []),
     "</swarm-briefing>",
   ].join("\n")
 }
@@ -83,7 +90,9 @@ function specialistLine(role: BriefingRole, viaDelegateTool: boolean) {
     // The delegate tool resolves the agent and model from the role itself, so
     // only the task tool needs them spelled out on every call. swarm_role is
     // what ties the child session back to this role in the team view.
-    ...(viaDelegateTool ? [] : [`swarm_role="${role.name}"`, `subagent_type="${role.agent?.trim() || DEFAULT_SUBAGENT}"`]),
+    ...(viaDelegateTool
+      ? []
+      : [`swarm_role="${role.name}"`, `subagent_type="${role.agent?.trim() || DEFAULT_SUBAGENT}"`]),
     ...(model && !viaDelegateTool ? [`model="${model}"`] : []),
     ...(role.skill ? [`skill: ${role.skill}`] : []),
     ...(role.instructions?.trim() ? [`instructions: ${collapse(role.instructions)}`] : []),
@@ -105,7 +114,10 @@ export function matchSwarmRole<T extends { name: string }>(roles: readonly T[], 
 }
 
 function normalizeRoleName(value: string) {
-  return value.trim().toLowerCase().replace(/[\s_-]+/g, "")
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_-]+/g, "")
 }
 
 export * as SwarmBriefing from "./swarm-briefing"

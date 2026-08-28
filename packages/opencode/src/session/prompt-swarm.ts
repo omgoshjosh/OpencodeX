@@ -8,6 +8,7 @@ import { Image } from "@/image/image"
 import { OpencodeXClaudeDriver } from "@/opencodex/claude-driver"
 import { ClaudeDelegate } from "@/opencodex/claude-delegate"
 import { SwarmBriefing } from "@/opencodex/swarm-briefing"
+import type { BackgroundJob } from "@/background/job"
 import { Skill } from "@/skill"
 import { CLAUDE_CODE_DEFAULT_MODEL_ID, isClaudeCodeProvider } from "@/provider/claude-code-provider"
 import { isSwarmProvider } from "@/provider/swarm-provider"
@@ -49,6 +50,11 @@ export interface Deps {
   readonly skills: Context.Service.Shape<typeof Skill.Service>
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionLegacy.WithParts, Image.Error>
   readonly loop: (input: { sessionID: SessionID; messageID?: MessageID }) => Effect.Effect<SessionLegacy.WithParts>
+  /**
+   * Runs a background delegation's role fiber and owns its lifetime. Absent
+   * (older callers, tests), `background: true` delegations run inline.
+   */
+  readonly background?: Pick<Context.Service.Shape<typeof BackgroundJob.Service>, "start">
 }
 
 /**
@@ -63,6 +69,38 @@ export function claudeTurnMessage<T extends { info: { id: string; role: string }
   if (messageID === undefined) return messages.findLast((message) => message.info.role === "user")
   const message = messages.find((message) => message.info.id === messageID)
   return message?.info.role === "user" ? message : undefined
+}
+
+/** What the orchestrator sees the moment a background delegation starts. */
+export function backgroundDelegationStarted(childSessionID: string, role: string) {
+  return [
+    `<task id="${childSessionID}" state="running" role="${role}">`,
+    `<summary>Delegation started: ${role}</summary>`,
+    "<task_result>",
+    `${role} is working in the background. Its report will arrive as a message; do not poll or wait for it.`,
+    "End your turn when nothing else is ready - the human can talk to you meanwhile.",
+    "</task_result>",
+    "</task>",
+  ].join("\n")
+}
+
+/** The synthetic message that wakes the orchestrator when the role finishes. */
+export function backgroundDelegationMessage(input: {
+  childSessionID: string
+  role: string
+  state: "completed" | "error"
+  text: string
+}) {
+  const tag = input.state === "completed" ? "task_result" : "task_error"
+  const title = input.state === "completed" ? `Delegation completed: ${input.role}` : `Delegation failed: ${input.role}`
+  return [
+    `<task id="${input.childSessionID}" state="${input.state}" role="${input.role}">`,
+    `<summary>${title}</summary>`,
+    `<${tag}>`,
+    input.text,
+    `</${tag}>`,
+    "</task>",
+  ].join("\n")
 }
 
 /**
@@ -213,6 +251,13 @@ export function make(deps: Deps) {
      * session this role runs in.
      */
     toolUseID?: string
+    /**
+     * Start the role and return at once. The report is delivered to the
+     * parent later as a synthetic message (the same wake the native task
+     * tool's background mode uses), so the orchestrator's turn can end and
+     * the human can keep talking to it while the role works.
+     */
+    background?: boolean
   }) {
     const role = SwarmBriefing.matchSwarmRole(input.roles, input.role)
     // Each rejection carries the reason the orchestrator can act on. The
@@ -280,9 +325,18 @@ export function make(deps: Deps) {
         ),
       )
     const settle = (outcome: DelegationOutcome, summary?: string) =>
-      stamp(settleDelegation(started, { outcome, summary }), runID).pipe(Effect.asVoid)
+      stamp(
+        settleDelegation(started, {
+          outcome,
+          summary,
+          // A background completion still has to be durably delivered to the
+          // parent; the delivery stamp below only lands on a pending record.
+          ...(input.background && outcome === "completed" ? { deliveryOutcome: "pending" as const } : {}),
+        }),
+        runID,
+      ).pipe(Effect.asVoid)
     yield* stamp(started)
-    const outcome: ClaudeDelegate.Result = yield* Effect.gen(function* () {
+    const runRole: Effect.Effect<ClaudeDelegate.Result> = Effect.gen(function* () {
       // The role's skill is its base definition; the built-in role skills carry
       // the full role prompt. The task-tool path gets it through the specialist
       // loading the skill itself, but a delegated specialist never sees the
@@ -370,7 +424,103 @@ export function make(deps: Deps) {
       ),
       Effect.catch(Effect.die),
     )
-    return outcome
+    if (input.background && !deps.background) {
+      // The tool contract promises background=true returns at once. Running
+      // inline instead would freeze the orchestrator for the whole role - the
+      // exact failure this mode exists to prevent - so refuse loudly.
+      yield* settle("errored", "Background delegation is not available in this runtime.")
+      return ClaudeDelegate.failure("rejected", "Background delegation is not available in this runtime.")
+    }
+    if (input.background && deps.background) {
+      // Fire-and-forget under BackgroundJob so disposal can cancel it, then
+      // wake the parent with the report. The parent is prompted through the
+      // ordinary session loop, which for a Claude-hosted orchestrator opens a
+      // real turn on its persistent channel - the same path that re-invokes
+      // background pollers, and the reason a blocked tool call was never
+      // needed to get a result back.
+      const notify = Effect.fnUntraced(function* (state: "completed" | "error", text: string) {
+        // Attributed to the parent's own agent, as the native task tool does:
+        // an unattributed prompt would resolve the default agent's model and
+        // could knock the orchestrator off the swarm facade.
+        const currentParent = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+        const wakeID = MessageID.ascending()
+        yield* deps.prompt({
+          sessionID: input.sessionID,
+          messageID: wakeID,
+          // Deferred: the default "immediate" delivery interrupts an in-flight
+          // turn to steer it, which would abort whatever the orchestrator is
+          // doing right now. A report queues behind the current turn.
+          delivery: "deferred",
+          ...(currentParent.agent ? { agent: currentParent.agent } : {}),
+          parts: [
+            {
+              type: "text",
+              synthetic: true,
+              text: backgroundDelegationMessage({ childSessionID: child.id, role: role.name, state, text }),
+            },
+          ],
+        })
+        // If the parent was mid-turn, prompt() only awaited that run and the
+        // wake message sat unanswered in the transcript; run its turn now so
+        // the report is never silently orphaned.
+        const answered = yield* sessions.messageWithChildren({ sessionID: input.sessionID, messageID: wakeID }).pipe(
+          Effect.map((turn) =>
+            turn.some((message) => message.info.role === "assistant" && message.info.parentID === wakeID),
+          ),
+          Effect.orElseSucceed(() => true),
+        )
+        if (!answered) yield* deps.loop({ sessionID: input.sessionID, messageID: wakeID })
+      })
+      const wake = (state: "completed" | "error", text: string) =>
+        notify(state, text).pipe(
+          Effect.matchCauseEffect({
+            onSuccess: () =>
+              sessions
+                .stampDelegationDelivery({ sessionID: child.id, runID, outcome: "delivered" })
+                .pipe(Effect.ignore),
+            // A report that never reached the parent is a failed job, not a
+            // completed one; the job status must not say otherwise.
+            onFailure: () =>
+              sessions
+                .stampDelegationDelivery({ sessionID: child.id, runID, outcome: "failed" })
+                .pipe(Effect.ignore, Effect.andThen(Effect.fail(new Error("Delegation report was not delivered")))),
+          }),
+        )
+      yield* deps.background.start({
+        id: child.id,
+        type: "swarm-delegate",
+        title: `${role.name} (swarm role)`,
+        // The keys every BackgroundJob consumer reads: cancel-on-abort,
+        // cancel-on-delete, and the parent loop's unfinished-work accounting.
+        metadata: {
+          parentSessionId: input.sessionID,
+          sessionId: child.id,
+          runID,
+          swarmID: input.swarmID,
+          role: role.name,
+          background: true,
+        },
+        run: runRole.pipe(
+          // Every exit wakes the parent: clean report, structured failure,
+          // defect. Only an interruption stays silent (the parent asked for
+          // it). Mirrors task.ts's matchCauseEffect around inject().
+          Effect.matchCauseEffect({
+            onSuccess: (result) =>
+              result.ok
+                ? wake("completed", result.text).pipe(Effect.as(result.text))
+                : wake("error", ClaudeDelegate.failureMessage(result)).pipe(
+                    Effect.andThen(Effect.fail(new Error(ClaudeDelegate.failureMessage(result)))),
+                  ),
+            onFailure: (cause) =>
+              (Cause.hasInterruptsOnly(cause) ? Effect.void : wake("error", errorMessageOf(Cause.squash(cause)))).pipe(
+                Effect.andThen(Effect.failCause(cause)),
+              ),
+          }),
+        ),
+      })
+      return { ok: true as const, text: backgroundDelegationStarted(child.id, role.name) }
+    }
+    return yield* runRole
   })
 
   /**
@@ -448,6 +598,7 @@ export function make(deps: Deps) {
                   role: delegated.role,
                   prompt: delegated.prompt,
                   ...(delegated.toolUseID ? { toolUseID: delegated.toolUseID } : {}),
+                  ...(delegated.background ? { background: true } : {}),
                 }),
             },
           }
@@ -526,4 +677,8 @@ export function make(deps: Deps) {
     lastUserMessage,
     userMessage,
   }
+}
+
+function errorMessageOf(error: unknown) {
+  return error instanceof Error ? error.message : String(error)
 }

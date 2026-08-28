@@ -333,22 +333,24 @@ describe("Claude driver prompt assembly", () => {
     }),
   )
 
-  it.effect("places text before images in a mixed turn", () =>
+  // Images lead the prompt: with a long text block first (swarm briefing,
+  // replayed history) Claude reported "no image was attached" (OpencodeX-i13).
+  it.effect("places images before text in a mixed turn", () =>
     Effect.gen(function* () {
       reset(success)
       yield* runTurn({ text: "describe this", images: [image] })
-      expect(prompt).toEqual([{ type: "text", text: "describe this" }, image])
+      expect(prompt).toEqual([image, { type: "text", text: "describe this" }])
     }),
   )
 
-  it.effect("places the handoff primer before a first-turn image", () =>
+  it.effect("places the handoff primer after a first-turn image", () =>
     Effect.gen(function* () {
       reset(success, {
         history: [historyMessage("msg_prior", "user", "Earlier request"), historyMessage(parentMessageID, "user", "")],
       })
       yield* runTurn({ text: "", images: [image] })
-      expect(prompt).toEqual([{ type: "text", text: expect.stringContaining("User: Earlier request") }, image])
-      expect((prompt as Exclude<ClaudePrompt, string>)[0]).toMatchObject({ text: expect.stringMatching(/\n\n$/) })
+      expect(prompt).toEqual([image, { type: "text", text: expect.stringContaining("User: Earlier request") }])
+      expect((prompt as Exclude<ClaudePrompt, string>)[1]).toMatchObject({ text: expect.stringMatching(/\n\n$/) })
     }),
   )
 

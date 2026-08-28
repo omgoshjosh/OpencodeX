@@ -633,7 +633,18 @@ export type SessionStatus =
       type: "idle"
       pendingWake?: {
         at: number
+        jobID: string
         reason?: string
+      }
+      background?: {
+        running: number
+        jobs: Array<{
+          sessionID: string
+          title: string
+          role?: string
+          since: number
+          owner: string
+        }>
       }
     }
   | {
@@ -641,6 +652,16 @@ export type SessionStatus =
       attempt: number
       message: string
       next: number
+      background?: {
+        running: number
+        jobs: Array<{
+          sessionID: string
+          title: string
+          role?: string
+          since: number
+          owner: string
+        }>
+      }
     }
   | {
       type: "busy"
@@ -650,8 +671,19 @@ export type SessionStatus =
         title: string
         startedAt: number
       }
+      background?: {
+        running: number
+        jobs: Array<{
+          sessionID: string
+          title: string
+          role?: string
+          since: number
+          owner: string
+        }>
+      }
       pendingWake?: {
         at: number
+        jobID: string
         reason?: string
       }
     }

@@ -191,6 +191,59 @@ it.instance("rejects active status writes after their execution generation relea
   }),
 )
 
+it.instance("carries background delegations across status changes and lists an idle parent", () =>
+  Effect.gen(function* () {
+    const graph = yield* buildRunGraph()
+    const task = { sessionID: "ses_child", role: "QA", title: "Task QA: run the suite", since: 1 }
+
+    // Published while the parent is idle (the common case: its turn ended
+    // right after starting the delegation), so no execution gate applies.
+    expect(yield* graph.status.backgroundStart(sessionID, task)).toBe(true)
+    expect(yield* graph.status.get(sessionID)).toMatchObject({
+      type: "idle",
+      background: { running: 1, jobs: [{ ...task, owner: expect.stringMatching(/^local:\d+:/) }] },
+    })
+    expect(Array.from((yield* graph.status.list()).keys())).toEqual([sessionID])
+
+    // A turn that starts, and one that recovery forces back to idle because
+    // its owner died (no execution lease here), both keep the jobs.
+    // Re-publishing the same child does not duplicate it.
+    yield* graph.status.set(sessionID, { type: "busy" })
+    const { db } = yield* Database.Service
+    const stored = yield* db
+      .select({ status: SessionStatusTable.status })
+      .from(SessionStatusTable)
+      .where(eq(SessionStatusTable.session_id, sessionID))
+      .get()
+      .pipe(Effect.orDie)
+    expect(stored?.status).toMatchObject({ type: "busy", background: { running: 1 } })
+    expect(yield* graph.status.get(sessionID)).toMatchObject({ type: "idle", background: { running: 1 } })
+    expect(yield* graph.status.backgroundStart(sessionID, { ...task, title: "Task QA: rerun" })).toBe(true)
+    expect(yield* graph.status.get(sessionID)).toMatchObject({
+      type: "idle",
+      background: { running: 1, jobs: [{ sessionID: "ses_child", title: "Task QA: rerun" }] },
+    })
+
+    // Ending an unknown child is a no-op; ending the last one clears the field.
+    expect(yield* graph.status.backgroundEnd(sessionID, "ses_other")).toBe(false)
+    expect(yield* graph.status.backgroundEnd(sessionID, "ses_child")).toBe(true)
+    expect(yield* graph.status.get(sessionID)).toEqual({ type: "idle" })
+    expect((yield* graph.status.list()).size).toBe(0)
+
+    // A job published by a process that no longer exists is pruned on read:
+    // jobs live in memory, so the row it left behind is a phantom.
+    const dead = { ...task, owner: "local:2147483000:gone:background:ses_child" }
+    yield* db
+      .update(SessionStatusTable)
+      .set({ status: { type: "idle", background: { running: 1, jobs: [dead] } } })
+      .where(eq(SessionStatusTable.session_id, sessionID))
+      .run()
+      .pipe(Effect.orDie)
+    expect(yield* graph.status.get(sessionID)).toEqual({ type: "idle" })
+    expect((yield* graph.status.list()).size).toBe(0)
+  }),
+)
+
 it.instance("persists abort across graphs and interrupts the owner", () =>
   Effect.gen(function* () {
     const owner = yield* buildRunGraph()
@@ -387,7 +440,10 @@ it.instance("publishes activity, tools, and pending wakes for the owning generat
     yield* release.open
     yield* Fiber.join(fiber)
     yield* graph.status.setPendingWake(sessionID, { jobID: job.id })
-    expect(yield* graph.status.get(sessionID)).toEqual({ type: "idle", pendingWake: { at: expect.any(Number), jobID: job.id } })
+    expect(yield* graph.status.get(sessionID)).toEqual({
+      type: "idle",
+      pendingWake: { at: expect.any(Number), jobID: job.id },
+    })
   }),
 )
 

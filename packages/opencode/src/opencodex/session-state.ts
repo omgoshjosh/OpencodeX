@@ -126,7 +126,10 @@ export function deriveUiState(input: {
   questions: readonly Question.Request[]
   state?: Info
 }): UiState {
-  const active = input.status?.type === "busy" || input.status?.type === "retry"
+  // A parent whose delegations run in the background reads idle itself but
+  // is still working from the reader's point of view.
+  const active =
+    input.status?.type === "busy" || input.status?.type === "retry" || (input.status?.background?.running ?? 0) > 0
   // Review is a root-session concept (mirroring the unseen-review query in
   // session-card): a delegated child's report is consumed by its parent, so
   // nothing ever marks the child reviewed and it would read "needs review"
@@ -197,10 +200,10 @@ export const layer = Layer.effect(
       if (sessionIDs.length === 0) return {}
       return Object.fromEntries(
         (yield* db
-            .select()
-            .from(OpencodeXSessionStateTable)
-            .where(inArray(OpencodeXSessionStateTable.session_id, [...new Set(sessionIDs)]))
-            .all()
+          .select()
+          .from(OpencodeXSessionStateTable)
+          .where(inArray(OpencodeXSessionStateTable.session_id, [...new Set(sessionIDs)]))
+          .all()
           .pipe(Effect.orDie)).map((row) => [row.session_id, hydrate(row)]),
       )
     })
@@ -208,27 +211,27 @@ export const layer = Layer.effect(
     const update = Effect.fn("OpencodeXSessionState.update")(function* (input: UpdateInput) {
       return yield* events.barrier(
         Effect.gen(function* () {
-      const current = yield* get(input.sessionID)
-      if (input.reviewedFiles !== undefined) {
-        const expected = reviewedFiles(input.expectedReviewedFiles, undefined).toSorted()
-        const persisted = (current?.reviewedFiles ?? []).toSorted()
-        if (expected.length !== persisted.length || expected.some((file, index) => file !== persisted[index])) {
-          return yield* new ConflictError({ sessionID: input.sessionID })
-        }
-      }
-      const state = {
-        sessionID: input.sessionID,
-        ...(maxOptional(current?.seenAt, input.seenAt) === undefined
-          ? {}
-          : { seenAt: maxOptional(current?.seenAt, input.seenAt) }),
-        ...(maxOptional(current?.reviewedAt, input.reviewedAt) === undefined
-          ? {}
-          : { reviewedAt: maxOptional(current?.reviewedAt, input.reviewedAt) }),
-        reviewedFiles: reviewedFiles(input.reviewedFiles, current),
-        timeUpdated: Math.max(Date.now(), (current?.timeUpdated ?? 0) + 1),
-      }
-      yield* events.publish(Event.Updated, { sessionID: input.sessionID, state })
-      return state
+          const current = yield* get(input.sessionID)
+          if (input.reviewedFiles !== undefined) {
+            const expected = reviewedFiles(input.expectedReviewedFiles, undefined).toSorted()
+            const persisted = (current?.reviewedFiles ?? []).toSorted()
+            if (expected.length !== persisted.length || expected.some((file, index) => file !== persisted[index])) {
+              return yield* new ConflictError({ sessionID: input.sessionID })
+            }
+          }
+          const state = {
+            sessionID: input.sessionID,
+            ...(maxOptional(current?.seenAt, input.seenAt) === undefined
+              ? {}
+              : { seenAt: maxOptional(current?.seenAt, input.seenAt) }),
+            ...(maxOptional(current?.reviewedAt, input.reviewedAt) === undefined
+              ? {}
+              : { reviewedAt: maxOptional(current?.reviewedAt, input.reviewedAt) }),
+            reviewedFiles: reviewedFiles(input.reviewedFiles, current),
+            timeUpdated: Math.max(Date.now(), (current?.timeUpdated ?? 0) + 1),
+          }
+          yield* events.publish(Event.Updated, { sessionID: input.sessionID, state })
+          return state
         }),
       )
     })

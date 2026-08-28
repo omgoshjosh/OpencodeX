@@ -152,6 +152,57 @@ describe("swarm role model fallback", () => {
   })
 })
 
+describe("background swarm delegation", () => {
+  test("returns at once, runs the role under BackgroundJob, and wakes the parent with the report", async () => {
+    const { runSwarmRole, prompts, started, runJob } = harness({ skills: {}, background: true })
+
+    const result = await Effect.runPromise(run(runSwarmRole, { background: true }))
+    expect(result.ok).toBe(true)
+    if (result.ok) expect(result.text).toContain('state="running"')
+    // Nothing has been prompted to the child yet: the role runs in the job.
+    expect(started).toHaveLength(1)
+    expect(started[0]?.id).toBe("ses_child")
+    // The keys cancel-on-abort / cancel-on-delete / idle accounting read.
+    expect(started[0]?.metadata).toMatchObject({
+      parentSessionId: "ses_parent",
+      sessionId: "ses_child",
+      background: true,
+    })
+
+    await Effect.runPromise(runJob())
+    // The child's prompt ran, then the parent was woken with the report.
+    expect(prompts.some((text) => text.includes("Do the task."))).toBe(true)
+    const wake = prompts.find((text) => text.includes("Delegation completed"))
+    expect(wake).toBeDefined()
+    expect(wake).toContain('state="completed"')
+    expect(wake).toContain("done")
+  })
+
+  test("refuses background delegation when no BackgroundJob service is wired", async () => {
+    // Downgrading to an inline run would freeze the orchestrator for the
+    // whole role while the tool contract promised an immediate return.
+    const { runSwarmRole, prompts, stamps } = harness({ skills: {} })
+    const result = await Effect.runPromise(run(runSwarmRole, { background: true }))
+    expect(result).toMatchObject({ ok: false, reason: "rejected" })
+    expect(prompts).toHaveLength(0)
+    expect(stamps.at(-1)?.record.phase).toBe("settled")
+  })
+
+  test("wakes the parent with an error when the role itself fails", async () => {
+    const { runSwarmRole, prompts, runJob } = harness({
+      skills: {},
+      background: true,
+      promptResult: Effect.fail(new Error("provider exploded")),
+    })
+    const result = await Effect.runPromise(run(runSwarmRole, { background: true }))
+    expect(result.ok).toBe(true)
+    await Effect.runPromise(runJob())
+    const wake = prompts.find((text) => text.includes("Delegation failed"))
+    expect(wake).toBeDefined()
+    expect(wake).toContain('state="error"')
+  })
+})
+
 describe("swarm role delegation validation", () => {
   test("rejects an unknown role without creating or stamping child work", async () => {
     const { runSwarmRole, prompts, stamps } = harness({ skills: {} })
@@ -447,7 +498,7 @@ function toolPart(input: { id: string; callID: string }) {
 
 function run(
   runSwarmRole: ReturnType<typeof PromptSwarm.make>["runSwarmRole"],
-  overrides: { roles?: PromptSwarm.SwarmRoleRow[]; role?: string; toolUseID?: string } = {},
+  overrides: { roles?: PromptSwarm.SwarmRoleRow[]; role?: string; toolUseID?: string; background?: boolean } = {},
 ) {
   return runSwarmRole({
     sessionID: SessionID.make("ses_parent"),
@@ -456,6 +507,7 @@ function run(
     role: overrides.role ?? "Specialist",
     prompt: "Do the task.",
     ...(overrides.toolUseID ? { toolUseID: overrides.toolUseID } : {}),
+    ...(overrides.background ? { background: true } : {}),
   })
 }
 
@@ -496,7 +548,10 @@ function harness(input: {
   onUpdatePart?: () => void
   onPrompt?: () => void
   unavailableModels?: string[]
+  /** Provide a fake BackgroundJob so background delegations can be exercised. */
+  background?: boolean
 }) {
+  const started: Array<{ id?: string; metadata?: Record<string, unknown>; run: Effect.Effect<string, unknown> }> = []
   const prompts: string[] = []
   const models: string[] = []
   const stamps: Array<{ record: DelegationRecord; expectRunID?: string }> = []
@@ -529,6 +584,7 @@ function harness(input: {
         stamps.push({ record: write.record, ...(write.expectRunID ? { expectRunID: write.expectRunID } : {}) })
         return Effect.succeed(true)
       },
+      stampDelegationDelivery: () => Effect.void,
       findMessage: (_sessionID: string, predicate: (message: typeof parentMessage) => boolean) =>
         Effect.succeed(predicate(parentMessage) ? Option.some(parentMessage) : Option.none()),
       updatePart: (part: Record<string, unknown>) =>
@@ -551,6 +607,17 @@ function harness(input: {
           ? undefined
           : { variants: { low: {}, medium: {}, high: {} } },
       ),
+    ...(input.background
+      ? {
+          background: {
+            start: (job: { id?: string; metadata?: Record<string, unknown>; run: Effect.Effect<string, unknown> }) =>
+              Effect.sync(() => {
+                started.push(job)
+                return { id: job.id ?? "job", type: "swarm-delegate", status: "running", started_at: 0 }
+              }),
+          },
+        }
+      : {}),
     prompt: (promptInput: {
       messageID?: string
       model?: { providerID: string; modelID: string }
@@ -587,6 +654,8 @@ function harness(input: {
     models,
     stamps,
     parts,
+    started,
+    runJob: () => started[0]!.run.pipe(Effect.ignore),
     loops: () => loopCount,
     userMessages: () => turn.filter((message) => message.info.role === "user").length,
   }

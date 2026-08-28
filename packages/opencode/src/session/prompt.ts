@@ -743,6 +743,7 @@ export const layer = Layer.effect(
       database,
       sessions,
       skills,
+      background,
       resolveModel: (model) =>
         provider
           .getModel(ProviderV2.ID.make(model.providerID), ProviderV2.ModelID.make(model.modelID))

@@ -20,8 +20,17 @@ export type Result =
 
 export type Swarm = {
   roles: Array<{ name: string; description?: string }>
-  /** `toolUseID` is the orchestrator's tool call id for this delegation. */
-  run: (input: { role: string; prompt: string; toolUseID?: string }) => Effect.Effect<Result, unknown>
+  /**
+   * `toolUseID` is the orchestrator's tool call id for this delegation.
+   * `background` starts the role and returns immediately; the report arrives
+   * later as a synthetic message in the orchestrator's session.
+   */
+  run: (input: {
+    role: string
+    prompt: string
+    toolUseID?: string
+    background?: boolean
+  }) => Effect.Effect<Result, unknown>
 }
 
 export function failureMessage(input: Extract<Result, { ok: false }>): string {
@@ -44,7 +53,7 @@ export function failure(reason: FailureReason, detail?: string): Extract<Result,
 export function capability(bridge: EffectBridge.Shape, delegate: Swarm) {
   return {
     roles: delegate.roles,
-    run: (input: { role: string; prompt: string; toolUseID?: string; signal?: AbortSignal }) => {
+    run: (input: { role: string; prompt: string; toolUseID?: string; background?: boolean; signal?: AbortSignal }) => {
       if (input.signal?.aborted) return Promise.resolve(failure("cancelled"))
       return bridge
         .promiseExit(
@@ -52,6 +61,7 @@ export function capability(bridge: EffectBridge.Shape, delegate: Swarm) {
             role: input.role,
             prompt: input.prompt,
             ...(input.toolUseID ? { toolUseID: input.toolUseID } : {}),
+            ...(input.background ? { background: true } : {}),
           }),
           input.signal ? { signal: input.signal } : undefined,
         )

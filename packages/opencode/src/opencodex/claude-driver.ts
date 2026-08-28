@@ -68,7 +68,12 @@ export async function nextClaudeEvent(iterator: AsyncIterator<ClaudeMapper.Claud
 export type SwarmDelegate = {
   roles: Array<{ name: string; description?: string }>
   /** `toolUseID` is the orchestrator's tool call id for this delegation. */
-  run: (input: { role: string; prompt: string; toolUseID?: string }) => Effect.Effect<ClaudeDelegate.Result, unknown>
+  run: (input: {
+    role: string
+    prompt: string
+    toolUseID?: string
+    background?: boolean
+  }) => Effect.Effect<ClaudeDelegate.Result, unknown>
 }
 
 /**
@@ -80,7 +85,7 @@ function delegateCapability(bridge: EffectBridge.Shape, delegate: SwarmDelegate,
   const capability = ClaudeDelegate.capability(bridge, delegate)
   return {
     roles: capability.roles,
-    run: (input: { role: string; prompt: string; toolUseID?: string; signal?: AbortSignal }) => {
+    run: (input: { role: string; prompt: string; toolUseID?: string; background?: boolean; signal?: AbortSignal }) => {
       if (input.toolUseID) delegatedCallIDs.add(input.toolUseID)
       return capability.run(input)
     },

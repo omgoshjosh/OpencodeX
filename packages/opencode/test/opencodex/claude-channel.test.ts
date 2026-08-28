@@ -204,6 +204,36 @@ describe("claude channel", () => {
     expect(state.prompts.map((message) => message.message.content)).toEqual(["one", "two"])
   })
 
+  test("an image turn without closeInput keeps the channel open for tool approvals", async () => {
+    // Regression for the 2026-08-28 capture: closing input after an image
+    // message (the CLI 2.1.228 EOF workaround) also closed stdin, which is the
+    // canUseTool response path - every approval-gated tool call in the turn
+    // died with "Stream closed". The transport no longer passes closeInput;
+    // this pins that an image turn leaves the input open and handlers attached.
+    const { create, state, emit } = fakeQuery()
+    const channel = new Channel<Handlers>("s1", create)
+    const message = {
+      type: "user",
+      message: {
+        role: "user",
+        content: [
+          { type: "text", text: "describe it" },
+          { type: "image", source: { type: "base64", media_type: "image/png", data: "aGVsbG8=" } },
+        ],
+      },
+      parent_tool_use_id: null,
+    } as SDKUserMessage
+
+    const turn = channel.turn([message], { name: "image" })
+    await settled()
+    expect(state.promptEnded).toBe(false)
+    expect(channel.retiring).toBe(false)
+    // Mid-turn, the SDK can still resolve approvals through the turn's handlers.
+    expect(state.handlers?.()).toEqual({ name: "image" })
+    emit(assistant)
+    await collect(turn.events, 1)
+  })
+
   test("closes streaming input after a native image message", async () => {
     const { create, state } = fakeQuery()
     const channel = new Channel<Handlers>("s1", create)

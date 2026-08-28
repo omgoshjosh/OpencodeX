@@ -264,8 +264,13 @@ export function makeLayer(options: LayerOptions = {}) {
         // invisible to a conversation it has not been resuming. Replay it once,
         // when opening a new one on a session that already has history.
         const text = resumeID ? input.text : yield* primedPrompt(input.sessionID, input.parentMessageID, input.text)
+        // Images go first. With the text first, a long text block (the swarm
+        // briefing, a replayed history) made Claude answer "no image was
+        // attached" even though the block was in its transcript (OpencodeX-i13,
+        // live captures 2026-08-28: the same image/text was seen with the
+        // briefing removed). That is also Anthropic's documented ordering.
         const prompt: ClaudePrompt = input.images?.length
-          ? [...(text ? [{ type: "text" as const, text }] : []), ...input.images]
+          ? [...input.images, ...(text ? [{ type: "text" as const, text }] : [])]
           : text
 
         // Captured here so a permission prompt raised inside Claude's callback

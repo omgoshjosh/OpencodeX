@@ -333,9 +333,14 @@ export function createSdkTransport(): ClaudeTransport {
         options.resumeID ? { resumeID: options.resumeID } : undefined,
       )
       if (cancelled || options.signal?.aborted) return
-      active = channel.turn([userMessage(prompt)], turnHandlers(options), {
-        closeInput: typeof prompt !== "string",
-      })
+      // Never close the channel's input for an image turn. The EOF trick
+      // (commit 9b48394dc) was for CLI 2.1.228, which dropped native image
+      // blocks unless streaming input hit EOF - but stdin is also the
+      // canUseTool response path, so it silently killed every approval-gated
+      // tool call in the turn ("Stream closed"; live capture 2026-08-28).
+      // Verified 2026-08-28 against CLI 2.1.247: images are preserved with the
+      // input left open. Minimum CLI for image turns is therefore 2.1.247.
+      active = channel.turn([userMessage(prompt)], turnHandlers(options))
       if (cancelled) {
         // The interrupt raced the turn start: unwind what was just attached.
         await active.interrupt()

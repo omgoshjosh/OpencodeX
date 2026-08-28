@@ -156,6 +156,38 @@ const TOOL_NAMES: Record<string, string> = {
   mcpopencodexswarmdelegate: "task",
 }
 
+/** The longest a delegated prompt's opening line may run inside a title. */
+const DELEGATION_TITLE_LENGTH = 60
+
+/**
+ * Canonical title for a swarm delegation part, stamped server-side so every
+ * client (desktop, TUI, mobile) agrees. Delegation prompts open with the
+ * role's instruction boilerplate ("HIGHEST-PRIORITY HARD RULE: ..."), so a
+ * naive first-line title reads that boilerplate on every row; the first line
+ * that is not the instruction block is the one worth showing. Native task
+ * calls ({subagent_type, description}) keep their own shape.
+ */
+export function delegationTitle(tool: string, input: Record<string, unknown>): string | undefined {
+  if (tool !== "task") return undefined
+  const role = typeof input.role === "string" ? input.role.trim() : ""
+  if (!role || typeof input.description === "string") return undefined
+  const prompt = typeof input.prompt === "string" ? input.prompt : ""
+  const line = prompt
+    .split("\n")
+    .map((candidate) => candidate.trim())
+    .find((candidate) => candidate && !isInstructionBoilerplate(candidate))
+  const summary = line ? truncateTitle(line.replace(/\s+/g, " "), DELEGATION_TITLE_LENGTH) : "delegation"
+  return `Task ${role}: ${summary}`
+}
+
+function isInstructionBoilerplate(line: string) {
+  return /^HIGHEST-PRIORITY HARD RULE\b/i.test(line) || /^You are (a|an|the) /i.test(line)
+}
+
+function truncateTitle(value: string, max: number) {
+  return value.length <= max ? value : `${value.slice(0, Math.max(0, max - 1)).trimEnd()}…`
+}
+
 export function normalizeToolName(name: string) {
   const key = name.replace(/[\s_-]/g, "").toLowerCase()
   return TOOL_NAMES[key] ?? name.toLowerCase()
@@ -425,7 +457,12 @@ function mapAssistantBlock(
         type: "tool",
         callID: block.id,
         tool,
-        state: { status: "running", input, time: { start } },
+        state: {
+          status: "running",
+          input,
+          time: { start },
+          ...(delegationTitle(tool, input) ? { title: delegationTitle(tool, input) } : {}),
+        },
       },
     })
     if (tool === "todowrite") {
@@ -544,7 +581,7 @@ function mapToolResult(block: ContentBlock, writes: SessionWrite[], state: Mappe
             status: "completed",
             input,
             output,
-            title: pending.tool,
+            title: delegationTitle(pending.tool, input) ?? pending.tool,
             metadata: { ...completedMetadata(pending.tool, input, output), ...(todos ? { todos } : {}) },
             time: { start: pending.start, end },
           },

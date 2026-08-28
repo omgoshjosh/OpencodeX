@@ -9,6 +9,7 @@ import {
   type MapperContext,
   type MapperState,
   type SessionWrite,
+  delegationTitle,
 } from "../../src/opencodex/claude-mapper"
 
 function context(): MapperContext {
@@ -586,6 +587,59 @@ describe("background subagents keep the turn open", () => {
       { type: "result", subtype: "success", total_cost_usd: 0.01 },
     ])
     expect(state.finished).toBe(true)
+  })
+})
+
+describe("swarm delegation titles", () => {
+  // Every delegation prompt opens with the role's instruction boilerplate, so
+  // clients that title by first line showed "HIGHEST-PRIORITY HARD RULE: ..."
+  // on every row (mobile screenshot 2026-08-28). The server stamps the title.
+  const prompt = [
+    "HIGHEST-PRIORITY HARD RULE: Be as concise as possible at all times.",
+    "You are the QA engineer for this swarm.",
+    "Validate the coordinator health probe against a stalled backend and report failures first.",
+    "Details follow.",
+  ].join("\n")
+
+  test("stamps Task <role>: <first non-boilerplate line> on running and completed parts", () => {
+    const { writes } = run([
+      {
+        type: "assistant",
+        message: {
+          id: "m1",
+          content: [
+            {
+              type: "tool_use",
+              id: "call_d1",
+              name: "mcp__opencodex_swarm__delegate",
+              input: { role: "Goomba - QA (Validation)", prompt },
+            },
+          ],
+        },
+      },
+      {
+        type: "user",
+        message: {
+          content: [{ type: "tool_result", tool_use_id: "call_d1", content: [{ type: "text", text: "ok" }] }],
+        },
+      },
+    ])
+    const tools = parts(writes).flatMap((part) => (part.type === "tool" ? [part] : []))
+    expect(tools).toHaveLength(2)
+    const expected = "Task Goomba - QA (Validation): Validate the coordinator health probe against a stalled bac…"
+    expect(tools[0]?.state).toMatchObject({ status: "running", title: expected })
+    expect(tools[1]?.state).toMatchObject({ status: "completed", title: expected })
+  })
+
+  test("falls back to 'delegation' when the prompt is all boilerplate", () => {
+    expect(delegationTitle("task", { role: "Coder", prompt: "HIGHEST-PRIORITY HARD RULE: be concise." })).toBe(
+      "Task Coder: delegation",
+    )
+  })
+
+  test("leaves native task calls and other tools alone", () => {
+    expect(delegationTitle("task", { subagent_type: "general", description: "Do it" })).toBeUndefined()
+    expect(delegationTitle("bash", { role: "Coder", prompt: "x" })).toBeUndefined()
   })
 })
 

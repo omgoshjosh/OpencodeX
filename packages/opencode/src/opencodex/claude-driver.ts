@@ -588,7 +588,7 @@ export function makeLayer(options: LayerOptions = {}) {
           const first = yield* runTurn(input)
           const error = first.info.role === "assistant" ? first.info.error : undefined
           const window = options.startupAuthRetryWindowSeconds ?? STARTUP_AUTH_RETRY_WINDOW_SECONDS
-          if (error?.name !== "ProviderAuthError" || process.uptime() > window) return first
+          if (!error || !isAuthFailure(error) || process.uptime() > window) return first
           log.warn("claude auth failure during startup window; retrying once", {
             sessionID: input.sessionID,
             uptimeSeconds: Math.round(process.uptime()),
@@ -604,6 +604,13 @@ export function makeLayer(options: LayerOptions = {}) {
       return Service.of({ runTurn: runTurnWithStartupRetry })
     }),
   )
+}
+
+/** A sign-in failure however this line labels it: the typed auth error, or the CLI's own wording. */
+function isAuthFailure(error: { name: string; data?: unknown }) {
+  if (error.name === "ProviderAuthError") return true
+  const message = (error.data as { message?: unknown } | undefined)?.message
+  return typeof message === "string" && /not logged in|unauthorized|authentication|please run .*login/i.test(message)
 }
 
 const STARTUP_AUTH_RETRY_WINDOW_SECONDS = 180

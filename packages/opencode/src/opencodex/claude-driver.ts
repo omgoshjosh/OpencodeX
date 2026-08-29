@@ -1,4 +1,5 @@
-import { Context, Effect, Layer, Option } from "effect"
+import { stat } from "node:fs/promises"
+import { Context, Duration, Effect, Layer, Option } from "effect"
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
 import type { SessionSchema } from "@opencode-ai/core/session/schema"
 import { Agent } from "@/agent/agent"
@@ -40,6 +41,13 @@ const DELIVERY_FAILURE = "Claude response delivery failed before the turn comple
 export type LayerOptions = {
   transport?: Transport
   resolveExecutable?: () => Promise<string | undefined>
+  /**
+   * How long after process start a "not logged in" turn is retried once
+   * (OpencodeX-zx2). 0 disables the retry; tests set it explicitly.
+   */
+  startupAuthRetryWindowSeconds?: number
+  /** Pause before that retry; tests set 0. */
+  startupAuthRetryDelayMillis?: number
 }
 
 /** Keeps iterator rejection as data so Effect interruption remains distinct. */
@@ -257,6 +265,24 @@ export function makeLayer(options: LayerOptions = {}) {
             live,
             "Claude Code was not found. Install it from code.claude.com/docs/en/installation, then try again.",
             "missing-cli",
+          )
+        }
+        // A spawn into a directory that no longer exists fails inside the SDK,
+        // which reports it as the binary "failed to launch ... does not match
+        // this system libc" (OpencodeX-t5p, 2026-08-28). Say what is actually
+        // wrong before the CLI gets a chance to guess.
+        const directoryExists = yield* Effect.promise(() =>
+          stat(input.directory).then(
+            (info) => info.isDirectory(),
+            () => false,
+          ),
+        )
+        if (!directoryExists) {
+          return yield* failTurn(
+            context,
+            live,
+            `The session directory ${input.directory} does not exist. Recreate it or open the session in another directory.`,
+            "missing-directory",
           )
         }
 
@@ -530,10 +556,47 @@ export function makeLayer(options: LayerOptions = {}) {
         return Option.getOrElse(found, () => empty)
       })
 
-      return Service.of({ runTurn })
+      /**
+       * OpencodeX-zx2: right after a daemon restart every session's CLI child
+       * respawns at once, and the first turn can come back "Not logged in"
+       * although nothing about the login changed (live 2026-08-28, 11 s after
+       * kickstart; the same prompt passed 20 min later). One retry after a
+       * short pause, only while the process is young, so a real sign-out is
+       * still reported on the second attempt. The failed assistant message is
+       * removed first so the transcript does not show a phantom error.
+       */
+      const runTurnWithStartupRetry: Interface["runTurn"] = Effect.fn("OpencodeXClaudeDriver.runTurnWithStartupRetry")(
+        function* (input) {
+          const first = yield* runTurn(input)
+          const error = first.info.role === "assistant" ? first.info.error : undefined
+          const window = options.startupAuthRetryWindowSeconds ?? STARTUP_AUTH_RETRY_WINDOW_SECONDS
+          if (!error || !isAuthFailure(error) || process.uptime() > window) return first
+          log.warn("claude auth failure during startup window; retrying once", {
+            sessionID: input.sessionID,
+            uptimeSeconds: Math.round(process.uptime()),
+          })
+          yield* sessions
+            .removeMessage({ sessionID: input.sessionID, messageID: first.info.id as never })
+            .pipe(Effect.ignore)
+          yield* Effect.sleep(Duration.millis(options.startupAuthRetryDelayMillis ?? STARTUP_AUTH_RETRY_DELAY_MILLIS))
+          return yield* runTurn(input)
+        },
+      )
+
+      return Service.of({ runTurn: runTurnWithStartupRetry })
     }),
   )
 }
+
+/** A sign-in failure however this line labels it: the typed auth error, or the CLI's own wording. */
+function isAuthFailure(error: { name: string; data?: unknown }) {
+  if (error.name === "ProviderAuthError") return true
+  const message = (error.data as { message?: unknown } | undefined)?.message
+  return typeof message === "string" && /not logged in|unauthorized|authentication|please run .*login/i.test(message)
+}
+
+const STARTUP_AUTH_RETRY_WINDOW_SECONDS = 180
+const STARTUP_AUTH_RETRY_DELAY_MILLIS = 5_000
 
 export const layer = makeLayer()
 

@@ -75,13 +75,40 @@ export async function init(options: Options) {
   const shouldTruncate = !options.dev || !runID || process.env[initializedRunID] !== runID
   if (shouldTruncate) await fs.truncate(logpath).catch(() => {})
   if (options.dev && runID) process.env[initializedRunID] = runID
-  const stream = createWriteStream(logpath, { flags: "a" })
+  // A write error used to leave a destroyed stream behind: every later write
+  // failed as an ignored rejection and the daemon ran for hours with an empty
+  // log (live 2026-08-29, OpencodeX-iy6 - one "Failed to execute statement"
+  // ERROR line, then 4h of silence while everything that reads the log,
+  // including deploy gating, believed the daemon was idle). The logger now
+  // never rejects, reopens the stream once per failure, and falls back to
+  // stderr for the message that hit the error so it is not lost.
+  let stream = createWriteStream(logpath, { flags: "a" })
+  stream.on("error", () => {})
+  const reopen = () => {
+    try {
+      stream.destroy()
+    } catch {}
+    stream = createWriteStream(logpath, { flags: "a" })
+    stream.on("error", () => {})
+  }
   write = async (msg: any) => {
-    return new Promise((resolve, reject) => {
-      stream.write(msg, (err) => {
-        if (err) reject(err)
-        else resolve(msg.length)
-      })
+    return new Promise((resolve) => {
+      const fallback = (err: unknown) => {
+        try {
+          process.stderr.write(`[logger] file write failed (${String(err)}); reopening ${logpath}\n${msg}`)
+        } catch {}
+        reopen()
+        resolve(msg.length)
+      }
+      try {
+        if (stream.destroyed || stream.closed) reopen()
+        stream.write(msg, (err) => {
+          if (err) fallback(err)
+          else resolve(msg.length)
+        })
+      } catch (err) {
+        fallback(err)
+      }
     })
   }
 }

@@ -10,6 +10,84 @@ import * as Log from "@opencode-ai/core/util/log"
 const log = Log.create({ service: "claude-transport" })
 
 /**
+ * Orphan-approval adoption (OpencodeX-sxp). A cross-session message delivered
+ * to an idle daemon-hosted session wakes the CLI child through the harness
+ * queue with no daemon turn attached, so every approval-gated tool call it
+ * makes reaches `canUseTool` with no handlers and used to be denied "No turn
+ * is active" - a selective wedge (allowlisted calls kept working) that read
+ * as "the repo is broken". Instead of denying, the channel keeps the previous
+ * turn's `adoptOrphan` (bound to that turn's instance context) and uses it to
+ * open a real, visibly marked turn on the session, holding the approval until
+ * the new turn's handlers attach. Invariant this restores: a wake that can
+ * execute tools owns a turn.
+ */
+export type OrphanAdopter = (input: { toolName: string }) => Promise<void>
+
+/** Two adoptions closer than this on one channel mean the adoption turn did not stay open (tripwire, logged). */
+const ORPHAN_ADOPTION_TRIPWIRE_MS = 60_000
+const ORPHAN_ADOPTION_WAIT_MS = 30_000
+let orphanAdoptionCount = 0
+
+/** How many orphan approvals were adopted in this process - the standing argument for the root fix (Layer A). */
+export function orphanApprovalAdoptions() {
+  return orphanAdoptionCount
+}
+
+/** Per-channel adoption state: one episode in flight at a time, shared by parallel tool calls. */
+export type OrphanAdoptionState = { inflight?: Promise<boolean>; lastAt?: number }
+
+/**
+ * Asks the session layer for a turn, then waits for the channel's handlers to
+ * appear. Resolves false when there is no adopter, the request was aborted,
+ * or the turn never attached; parallel calls join the in-flight episode.
+ */
+export function adoptOrphanApproval(input: {
+  sessionID: string
+  toolName: string
+  adopt: OrphanAdopter | undefined
+  handlers: () => unknown
+  state: OrphanAdoptionState
+  signal?: AbortSignal
+  waitMs?: number
+}): Promise<boolean> {
+  if (!input.adopt || input.signal?.aborted) return Promise.resolve(false)
+  if (input.state.inflight) return input.state.inflight
+  const episode = (async () => {
+    const started = Date.now()
+    const sinceLast = input.state.lastAt === undefined ? undefined : started - input.state.lastAt
+    orphanAdoptionCount += 1
+    log.warn("adopting orphan approval into a new turn", {
+      sessionID: input.sessionID,
+      toolName: input.toolName,
+      adoptions: orphanAdoptionCount,
+      ...(sinceLast !== undefined && sinceLast < ORPHAN_ADOPTION_TRIPWIRE_MS
+        ? { tripwire: true, sinceLastMs: sinceLast }
+        : {}),
+    })
+    try {
+      await input.adopt!({ toolName: input.toolName })
+    } catch (error) {
+      log.error("orphan approval adoption failed", { sessionID: input.sessionID, error: String(error) })
+      return false
+    }
+    const deadline = Date.now() + (input.waitMs ?? ORPHAN_ADOPTION_WAIT_MS)
+    while (Date.now() < deadline) {
+      if (input.handlers()) return true
+      if (input.signal?.aborted) return false
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+    log.warn("orphan approval adoption timed out waiting for a turn", { sessionID: input.sessionID })
+    return false
+  })()
+  input.state.inflight = episode
+  void episode.finally(() => {
+    input.state.inflight = undefined
+    input.state.lastAt = Date.now()
+  })
+  return episode
+}
+
+/**
  * The process boundary for headless Claude Code. Everything SDK-specific lives
  * here so the driver only ever sees plain stream-json events; swapping to a raw
  * `claude -p --output-format stream-json` spawn means reimplementing this file
@@ -46,6 +124,13 @@ export type TransportOptions = {
    * their configured models instead of as Claude's own internal subagents.
    */
   delegate?: DelegateCapability
+  /**
+   * Opens a real turn on the session when the CLI asks for an approval with
+   * no turn attached (a peer-message wake of an idle session). Kept by the
+   * persistent channel after the turn ends, so it is bound to this turn's
+   * instance context.
+   */
+  adoptOrphan?: OrphanAdopter
   signal?: AbortSignal
   /**
    * Keys a persistent per-session query channel (normally the daemon session
@@ -68,6 +153,8 @@ export type TurnHandlers = {
   ) => Promise<{ behavior: "allow"; updatedInput: Record<string, unknown> } | { behavior: "deny"; message: string }>
   delegate?: DelegateCapability
   correlator: DelegateCorrelator
+  /** Opens a real turn on this session when a gated call arrives with no turn attached (OpencodeX-sxp). */
+  adoptOrphan?: OrphanAdopter
 }
 
 export type DelegateCapability = {
@@ -251,6 +338,7 @@ export function createSdkTransport(): ClaudeTransport {
     return {
       canUseTool: (toolName, input, extra) => resolveToolPermission(options, toolName, input, extra, correlator),
       ...(options.delegate ? { delegate: options.delegate } : {}),
+      ...(options.adoptOrphan ? { adoptOrphan: options.adoptOrphan } : {}),
       correlator,
     }
   }
@@ -269,6 +357,7 @@ export function createSdkTransport(): ClaudeTransport {
 
       const createQuery: CreateQuery<TurnHandlers> = async (input) => {
         const controller = new AbortController()
+        const adoption: OrphanAdoptionState = {}
         const delegation = options.delegate
           ? delegateServer(sdk, options.delegate.roles, () => {
               const handlers = input.handlers()
@@ -283,12 +372,25 @@ export function createSdkTransport(): ClaudeTransport {
             includePartialMessages: true,
             forwardSubagentText: true,
             permissionMode: "default",
-            canUseTool: (
+            canUseTool: async (
               toolName: string,
               toolInput: Record<string, unknown>,
               extra: { toolUseID?: string; signal?: AbortSignal },
             ) => {
-              const handlers = input.handlers()
+              let handlers = input.handlers()
+              if (
+                !handlers &&
+                (await adoptOrphanApproval({
+                  sessionID: channelKey,
+                  toolName,
+                  adopt: input.lastHandlers()?.adoptOrphan,
+                  handlers: input.handlers,
+                  state: adoption,
+                  ...(extra.signal ? { signal: extra.signal } : {}),
+                }))
+              ) {
+                handlers = input.handlers()
+              }
               if (!handlers) {
                 // The CLI is asking for an approval while the daemon has no
                 // turn attached: proof the two turn lifecycles are desynced
@@ -298,7 +400,7 @@ export function createSdkTransport(): ClaudeTransport {
                 // "the repo is broken" for days while this path emitted no
                 // log at all. Count every occurrence.
                 log.warn("denied approval with no active turn", { channelKey, toolName })
-                return Promise.resolve({ behavior: "deny" as const, message: "No turn is active for this session." })
+                return { behavior: "deny" as const, message: "No turn is active for this session." }
               }
               return handlers.canUseTool(toolName, toolInput, extra)
             },

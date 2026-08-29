@@ -131,6 +131,12 @@ export interface Interface {
     sidechain?: {
       spawn: (input: { title: string; prompt: string }) => Effect.Effect<{ sessionID: string; userMessageID: string }>
     }
+    /**
+     * Opens a real turn on this session when its CLI asks for an approval
+     * with no turn attached (OpencodeX-sxp). Supplied by the session loop,
+     * which owns turns; the driver only bridges it.
+     */
+    adoptOrphan?: (input: { toolName: string }) => Effect.Effect<void>
   }) => Effect.Effect<SessionLegacy.WithParts>
 }
 
@@ -166,6 +172,7 @@ export function makeLayer(options: LayerOptions = {}) {
             prompt: string
           }) => Effect.Effect<{ sessionID: string; userMessageID: string }>
         }
+        adoptOrphan?: (input: { toolName: string }) => Effect.Effect<void>
       }) {
         const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
         // Resolved per turn rather than per layer: `Agent.defaultInfo` re-reads
@@ -332,6 +339,9 @@ export function makeLayer(options: LayerOptions = {}) {
             ? {
                 delegate: delegateCapability(bridge, input.delegate, delegatedCallIDs) satisfies DelegateCapability,
               }
+            : {}),
+          ...(input.adoptOrphan
+            ? { adoptOrphan: (orphan: { toolName: string }) => bridge.promise(input.adoptOrphan!(orphan)) }
             : {}),
           canUseTool: (toolName, toolInput, toolUseID, signal) => {
             logPermission(toolName, toolUseID)

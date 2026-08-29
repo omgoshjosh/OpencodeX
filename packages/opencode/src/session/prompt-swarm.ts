@@ -50,6 +50,8 @@ export interface Deps {
   readonly sessions: Context.Service.Shape<typeof Session.Service>
   readonly skills: Context.Service.Shape<typeof Skill.Service>
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionLegacy.WithParts, Image.Error>
+  /** Queues a prompt without waiting for its turn; absent (tests), orphan approvals are not adopted. */
+  readonly promptAsync?: (input: PromptInput) => Effect.Effect<void, Image.Error>
   readonly loop: (input: { sessionID: SessionID; messageID?: MessageID }) => Effect.Effect<SessionLegacy.WithParts>
   /**
    * Runs a background delegation's role fiber and owns its lifetime. Absent
@@ -579,11 +581,17 @@ export function make(deps: Deps) {
     const attachments = prepareImages(last.parts)
     if (attachments.skipped.length > 0)
       log.warn("skipped unsupported swarm attachments", { reasons: attachments.skipped })
+    // The title comes from what the human wrote: synthetic parts (the swarm
+    // briefing, an orphan-adoption reminder) are for the model, not the list.
+    const titleText = last.parts
+      .flatMap((part) => (part.type === "text" && !part.synthetic && part.text.trim() ? [part.text] : []))
+      .join("\n")
+      .trim()
     // An image-only message has no text but is still a real turn.
     if (!promptText) {
       if (!attachments.hasImages) return undefined
       yield* ensureClaudeTitle(session, attachments.title)
-    } else yield* ensureClaudeTitle(session, promptText)
+    } else if (titleText) yield* ensureClaudeTitle(session, titleText)
     const specialists = swarm?.roles.slice(1) ?? []
     // Attribute the turn to the route the reader picked, so a swarm session
     // stays labelled with the team rather than the orchestrator's model. The
@@ -603,6 +611,33 @@ export function make(deps: Deps) {
       parentMessageID: last.info.id,
       text: promptText,
       ...(attachments.images.length > 0 ? { images: attachments.images } : {}),
+      // OpencodeX-sxp: the CLI child of an idle session, woken by a peer
+      // message, asks for an approval with no turn attached. Open a real,
+      // visibly marked turn for it. The marker is load-bearing: the approval
+      // prompt appears in a turn the human never started, so the transcript
+      // has to say why; `synthetic` keeps it out of titles and summaries.
+      // Delivered through the ordinary prompt path (not "immediate"), so it
+      // never interrupts the in-flight work it is adopting.
+      ...(deps.promptAsync
+        ? {
+            adoptOrphan: (orphan: { toolName: string }) =>
+              deps.promptAsync!({
+                sessionID,
+                parts: [
+                  {
+                    type: "text",
+                    synthetic: true,
+                    text: [
+                      "<system-reminder>",
+                      `OpencodeX adopted work this session started outside a turn (a peer message woke it; first gated tool: ${orphan.toolName}).`,
+                      "Finish that work, then reply briefly with what was done. Approvals you see here belong to that work.",
+                      "</system-reminder>",
+                    ].join("\n"),
+                  },
+                ],
+              }).pipe(Effect.orDie),
+          }
+        : {}),
       directory: session.directory,
       providerID: turnProviderID,
       modelID: turnModelID,

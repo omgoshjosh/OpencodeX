@@ -740,6 +740,7 @@ export const layer = Layer.effect(
       background,
       status,
       prompt: (input) => prompt(input),
+      promptAsync: (input) => promptAsync(input),
       loop: (input) => loop(input),
     })
 

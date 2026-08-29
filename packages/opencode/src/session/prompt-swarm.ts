@@ -83,7 +83,7 @@ export interface Deps {
 export const DELEGATION_COMPLETE_MARKER = "<delegation-complete/>"
 const DELEGATION_COMPLETE_FOOTER = [
   "When your work is finished, end your final message with the line",
-  `${DELEGATION_COMPLETE_MARKER}`,
+  DELEGATION_COMPLETE_MARKER,
   "If you end a turn while still waiting on something (CI, a poller, a monitor), do not include it: the delegation stays open until a later turn ends with it.",
 ].join("\n")
 const DEFAULT_BACKGROUND_COMPLETION_GRACE_MS = 30 * 60_000

@@ -3,7 +3,6 @@ import { SessionLegacy } from "@opencode-ai/core/session/legacy"
 import { PermissionID } from "@/permission/schema"
 
 import { Session } from "@/session/session"
-import { MessageV2 } from "@/session/message-v2"
 import { SessionPrompt } from "@/session/prompt"
 import { SessionRevert } from "@/session/revert"
 import { SessionStatus } from "@/session/status"

@@ -1,3 +1,7 @@
 {
-  "warnings": 2335
+  "warnings": {
+    "darwin": 2304,
+    "linux": 2338,
+    "default": 2338
+  }
 }

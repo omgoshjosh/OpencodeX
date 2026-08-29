@@ -908,19 +908,19 @@ export function fromError(
 export function truncateToolOutputs(items: readonly WithParts[], budget: number): WithParts[] {
   return items.map((item) => {
     let changed = false
-    const parts = item.parts.map((part) => {
-      if (part.type !== "tool") return part
-      const state = part.state as { output?: unknown; metadata?: Record<string, unknown> }
-      if (typeof state.output !== "string" || state.output.length <= budget) return part
+    const parts = item.parts.map((part): Part => {
+      if (part.type !== "tool" || part.state.status !== "completed") return part
+      const output = part.state.output
+      if (output.length <= budget) return part
       changed = true
       return {
         ...part,
         state: {
           ...part.state,
-          output: `${state.output.slice(0, budget)}\n[... output truncated: ${state.output.length} chars total; re-fetch without partBudget for the rest]`,
-          metadata: { ...state.metadata, outputTruncated: true, outputLength: state.output.length },
+          output: `${output.slice(0, budget)}\n[... output truncated: ${output.length} chars total; re-fetch without partBudget for the rest]`,
+          metadata: { ...part.state.metadata, outputTruncated: true, outputLength: output.length },
         },
-      } as Part
+      }
     })
     return changed ? { ...item, parts } : item
   })

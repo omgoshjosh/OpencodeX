@@ -27,8 +27,8 @@ function toolMessage(output: string): SessionLegacy.WithParts {
 describe("MessageV2.truncateToolOutputs", () => {
   const toolState = (item: SessionLegacy.WithParts | undefined) => {
     const part = item?.parts[1]
-    if (part?.type !== "tool") throw new Error("expected a tool part")
-    return part.state as unknown as { output: string; metadata: Record<string, unknown> }
+    if (part?.type !== "tool" || part.state.status !== "completed") throw new Error("expected a completed tool part")
+    return part.state
   }
 
   test("caps oversized tool output, marks it, and leaves everything else alone", () => {

@@ -37,6 +37,18 @@ export interface TaskPromptOps {
   resolvePromptParts(template: string): Effect.Effect<SessionPrompt.PromptInput["parts"]>
   prompt(input: SessionPrompt.PromptInput): Effect.Effect<SessionLegacy.WithParts>
   loop(input: SessionPrompt.LoopInput): Effect.Effect<SessionLegacy.WithParts>
+  /**
+   * Publishes a background subtask on the parent's session status, so a
+   * client sees "N working" while the parent itself reads idle. Absent
+   * (tests), the status is simply not published.
+   */
+  backgroundStatus?: {
+    start(
+      parentSessionID: SessionID,
+      task: { sessionID: string; title: string; role?: string; since: number },
+    ): Effect.Effect<unknown>
+    end(parentSessionID: SessionID, childSessionID: string): Effect.Effect<unknown>
+  }
 }
 
 const id = "task"
@@ -581,37 +593,54 @@ export const TaskTool = Tool.define(
         })
 
         if (runInBackground) {
-          const info = yield* background.start({
-            id: nextSession.id,
-            type: id,
-            title: params.description,
-            metadata,
-            run: runTask().pipe(
-              // One all-exit boundary settles the record: clean return,
-              // subagent error, defect, or interruption - nothing leaves the
-              // child stamped `running` short of the process dying.
-              Effect.onExit((exit) =>
-                Exit.isSuccess(exit)
-                  ? settleResult(exit.value)
-                  : Cause.hasInterruptsOnly(exit.cause)
-                    ? settle("cancelled")
-                    : settle("errored", errorText(Cause.squash(exit.cause))),
+          // Published before the job starts so the status never lags the work,
+          // and dropped on every exit - the same contract as swarm delegations.
+          const status = ops.backgroundStatus
+          if (status)
+            yield* status
+              .start(ctx.sessionID, {
+                sessionID: nextSession.id,
+                title: params.description,
+                ...(params.subagent_type ? { role: params.subagent_type } : {}),
+                since: Date.now(),
+              })
+              .pipe(Effect.ignore)
+          const unpublish = status ? status.end(ctx.sessionID, nextSession.id).pipe(Effect.ignore) : Effect.void
+          const info = yield* background
+            .start({
+              id: nextSession.id,
+              type: id,
+              title: params.description,
+              metadata,
+              run: runTask().pipe(
+                Effect.ensuring(unpublish),
+                // One all-exit boundary settles the record: clean return,
+                // subagent error, defect, or interruption - nothing leaves the
+                // child stamped `running` short of the process dying.
+                Effect.onExit((exit) =>
+                  Exit.isSuccess(exit)
+                    ? settleResult(exit.value)
+                    : Cause.hasInterruptsOnly(exit.cause)
+                      ? settle("cancelled")
+                      : settle("errored", errorText(Cause.squash(exit.cause))),
+                ),
+                // A subagent that finished on an assistant error is a failed
+                // job, not a completed one: the job state, the notification, and
+                // the child's stamp must tell the same story.
+                Effect.matchCauseEffect({
+                  onSuccess: (result) =>
+                    result.state === "error"
+                      ? inject("error", result.text).pipe(Effect.andThen(Effect.fail(new Error(result.text))))
+                      : inject("completed", result.text).pipe(Effect.as(result.text)),
+                  onFailure: (cause) =>
+                    (Cause.hasInterruptsOnly(cause)
+                      ? Effect.void
+                      : inject("error", errorText(Cause.squash(cause)))
+                    ).pipe(Effect.andThen(Effect.failCause(cause))),
+                }),
               ),
-              // A subagent that finished on an assistant error is a failed
-              // job, not a completed one: the job state, the notification, and
-              // the child's stamp must tell the same story.
-              Effect.matchCauseEffect({
-                onSuccess: (result) =>
-                  result.state === "error"
-                    ? inject("error", result.text).pipe(Effect.andThen(Effect.fail(new Error(result.text))))
-                    : inject("completed", result.text).pipe(Effect.as(result.text)),
-                onFailure: (cause) =>
-                  (Cause.hasInterruptsOnly(cause) ? Effect.void : inject("error", errorText(Cause.squash(cause)))).pipe(
-                    Effect.andThen(Effect.failCause(cause)),
-                  ),
-              }),
-            ),
-          })
+            })
+            .pipe(Effect.onExit((exit) => (Exit.isFailure(exit) ? unpublish : Effect.void)))
 
           return {
             title: params.description,

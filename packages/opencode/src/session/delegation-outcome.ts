@@ -49,6 +49,15 @@ export type DelegationRecord = {
   /** Whether the parent workflow durably received the report. */
   deliveryOutcome?: DelegationDelivery
   deliveredAt?: number
+  /**
+   * A background delegation: the parent was told to carry on and expects the
+   * report as a wake message. Together with `role`/`title` this is what lets
+   * a restarted daemon pick the delivery back up (the in-memory job that
+   * would have delivered it died with the old process).
+   */
+  background?: true
+  role?: string
+  title?: string
 }
 
 /**
@@ -142,9 +151,7 @@ function isDelivery(value: unknown): value is DelegationDelivery {
  * unknown version, a missing identity, or a malformed field reads as no
  * record at all - consumers must degrade to "unknown", never guess success.
  */
-export function delegationRecord(
-  metadata: Record<string, unknown> | undefined | null,
-): DelegationRecord | undefined {
+export function delegationRecord(metadata: Record<string, unknown> | undefined | null): DelegationRecord | undefined {
   const raw = rawDelegation(metadata)
   if (!raw) return undefined
   if (raw.version !== DELEGATION_RECORD_VERSION) return undefined
@@ -173,6 +180,9 @@ export function delegationRecord(
     ...(typeof raw.deliveredAt === "number" && Number.isFinite(raw.deliveredAt)
       ? { deliveredAt: raw.deliveredAt }
       : {}),
+    ...(raw.background === true ? { background: true as const } : {}),
+    ...(typeof raw.role === "string" && raw.role ? { role: raw.role } : {}),
+    ...(typeof raw.title === "string" && raw.title ? { title: raw.title } : {}),
   }
 }
 
@@ -191,9 +201,7 @@ export function legacyDelegationOutcome(
  * legacy stamps normalized (`succeeded` -> `completed`, `failed` ->
  * `errored`). A record still `running` has no outcome yet.
  */
-export function delegationOutcome(
-  metadata: Record<string, unknown> | undefined | null,
-): DelegationOutcome | undefined {
+export function delegationOutcome(metadata: Record<string, unknown> | undefined | null): DelegationOutcome | undefined {
   const record = delegationRecord(metadata)
   if (record) return record.phase === "settled" ? record.outcome : undefined
   const legacy = legacyDelegationOutcome(metadata)
@@ -203,9 +211,7 @@ export function delegationOutcome(
 }
 
 /** Reads the recorded report summary, whichever record shape carried it. */
-export function delegationSummary(
-  metadata: Record<string, unknown> | undefined | null,
-): string | undefined {
+export function delegationSummary(metadata: Record<string, unknown> | undefined | null): string | undefined {
   const raw = rawDelegation(metadata)
   if (!raw) return undefined
   const summary = raw.summary

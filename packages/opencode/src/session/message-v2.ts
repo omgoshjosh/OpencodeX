@@ -492,7 +492,10 @@ export const messageWithChildren = Effect.fn("MessageV2.messageWithChildren")(fu
     .where(
       and(
         eq(MessageTable.session_id, input.sessionID),
-        or(eq(MessageTable.id, input.messageID), eq(sql`json_extract(${MessageTable.data}, '$.parentID')`, input.messageID)),
+        or(
+          eq(MessageTable.id, input.messageID),
+          eq(sql`json_extract(${MessageTable.data}, '$.parentID')`, input.messageID),
+        ),
       ),
     )
     .orderBy(MessageTable.time_created, MessageTable.id)
@@ -603,10 +606,19 @@ function valueWeight(value: unknown, cap: number): number {
   if (typeof value === "string") return textWeight(value, cap)
   if (typeof value === "number" || typeof value === "boolean") return 24
   if (Array.isArray(value)) {
-    return Math.min(cap, value.reduce((total, item) => total + valueWeight(item, Math.max(400, cap - total)), 0))
+    return Math.min(
+      cap,
+      value.reduce((total, item) => total + valueWeight(item, Math.max(400, cap - total)), 0),
+    )
   }
   if (typeof value === "object" && value !== null) {
-    return Math.min(cap, Object.values(value as Record<string, unknown>).reduce((total: number, item) => total + valueWeight(item, Math.max(400, cap - total)), 0))
+    return Math.min(
+      cap,
+      Object.values(value as Record<string, unknown>).reduce(
+        (total: number, item) => total + valueWeight(item, Math.max(400, cap - total)),
+        0,
+      ),
+    )
   }
   return 8
 }
@@ -618,8 +630,9 @@ export function stream(sessionID: SessionID) {
     let before: string | undefined
     while (true) {
       const next = yield* page({ sessionID, limit: size, before }).pipe(
-        Effect.catchIf((error): error is NotFoundError => NotFoundError.isInstance(error), () =>
-          Effect.succeed({ items: [] as WithParts[], more: false, cursor: undefined }),
+        Effect.catchIf(
+          (error): error is NotFoundError => NotFoundError.isInstance(error),
+          () => Effect.succeed({ items: [] as WithParts[], more: false, cursor: undefined }),
         ),
       )
       if (next.items.length === 0) break
@@ -882,6 +895,35 @@ export function fromError(
       if (e instanceof Error) return new NamedError.Unknown({ message: errorMessage(e) }, { cause: e }).toObject()
       return new NamedError.Unknown({ message: JSON.stringify(e) }, { cause: e }).toObject()
   }
+}
+
+/**
+ * Caps each tool part's inline output at `budget` characters (transport-size
+ * control for mobile transcripts; see MessagesQuery.partBudget). Truncation is
+ * marked on the part's metadata (`outputTruncated`, `outputLength`) so a
+ * client can offer "show full output" and re-fetch the message uncapped.
+ * Pure: parts are copied, never mutated - the same hydrated objects may be
+ * serving an uncapped request concurrently.
+ */
+export function truncateToolOutputs(items: readonly WithParts[], budget: number): WithParts[] {
+  return items.map((item) => {
+    let changed = false
+    const parts = item.parts.map((part) => {
+      if (part.type !== "tool") return part
+      const state = part.state as { output?: unknown; metadata?: Record<string, unknown> }
+      if (typeof state.output !== "string" || state.output.length <= budget) return part
+      changed = true
+      return {
+        ...part,
+        state: {
+          ...part.state,
+          output: `${state.output.slice(0, budget)}\n[... output truncated: ${state.output.length} chars total; re-fetch without partBudget for the rest]`,
+          metadata: { ...state.metadata, outputTruncated: true, outputLength: state.output.length },
+        },
+      } as Part
+    })
+    return changed ? { ...item, parts } : item
+  })
 }
 
 export * as MessageV2 from "./message-v2"

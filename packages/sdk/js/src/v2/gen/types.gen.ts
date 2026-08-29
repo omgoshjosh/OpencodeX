@@ -631,15 +631,45 @@ export type Part =
 export type SessionStatus =
   | {
       type: "idle"
+      background?: {
+        running: number
+        jobs: Array<{
+          sessionID: string
+          title: string
+          role?: string
+          since: number
+          owner: string
+        }>
+      }
     }
   | {
       type: "retry"
       attempt: number
       message: string
       next: number
+      background?: {
+        running: number
+        jobs: Array<{
+          sessionID: string
+          title: string
+          role?: string
+          since: number
+          owner: string
+        }>
+      }
     }
   | {
       type: "busy"
+      background?: {
+        running: number
+        jobs: Array<{
+          sessionID: string
+          title: string
+          role?: string
+          since: number
+          owner: string
+        }>
+      }
     }
 
 export type QuestionOption = {

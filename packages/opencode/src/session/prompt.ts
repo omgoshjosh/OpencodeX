@@ -738,6 +738,7 @@ export const layer = Layer.effect(
       sessions,
       skills,
       background,
+      status,
       prompt: (input) => prompt(input),
       loop: (input) => loop(input),
     })

@@ -6,6 +6,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { OpencodeXSwarmRoleTable, OpencodeXSwarmTable } from "@opencode-ai/core/opencodex/sql"
 import { Image } from "@/image/image"
 import { OpencodeXClaudeDriver } from "@/opencodex/claude-driver"
+import { delegationTitle } from "@/opencodex/claude-mapper"
 import { ClaudeDelegate } from "@/opencodex/claude-delegate"
 import { SwarmBriefing } from "@/opencodex/swarm-briefing"
 import type { BackgroundJob } from "@/background/job"
@@ -55,6 +56,11 @@ export interface Deps {
    * (older callers, tests), `background: true` delegations run inline.
    */
   readonly background?: Pick<Context.Service.Shape<typeof BackgroundJob.Service>, "start">
+  /**
+   * Publishes background delegations on the parent's session status, so a
+   * client sees "N working" while the parent itself reads idle.
+   */
+  readonly status?: Pick<SessionStatus.Interface, "backgroundStart" | "backgroundEnd">
 }
 
 /**
@@ -486,38 +492,59 @@ export function make(deps: Deps) {
                 .pipe(Effect.ignore, Effect.andThen(Effect.fail(new Error("Delegation report was not delivered")))),
           }),
         )
-      yield* deps.background.start({
-        id: child.id,
-        type: "swarm-delegate",
-        title: `${role.name} (swarm role)`,
-        // The keys every BackgroundJob consumer reads: cancel-on-abort,
-        // cancel-on-delete, and the parent loop's unfinished-work accounting.
-        metadata: {
-          parentSessionId: input.sessionID,
-          sessionId: child.id,
-          runID,
-          swarmID: input.swarmID,
-          role: role.name,
-          background: true,
-        },
-        run: runRole.pipe(
-          // Every exit wakes the parent: clean report, structured failure,
-          // defect. Only an interruption stays silent (the parent asked for
-          // it). Mirrors task.ts's matchCauseEffect around inject().
-          Effect.matchCauseEffect({
-            onSuccess: (result) =>
-              result.ok
-                ? wake("completed", result.text).pipe(Effect.as(result.text))
-                : wake("error", ClaudeDelegate.failureMessage(result)).pipe(
-                    Effect.andThen(Effect.fail(new Error(ClaudeDelegate.failureMessage(result)))),
-                  ),
-            onFailure: (cause) =>
-              (Cause.hasInterruptsOnly(cause) ? Effect.void : wake("error", errorMessageOf(Cause.squash(cause)))).pipe(
-                Effect.andThen(Effect.failCause(cause)),
-              ),
-          }),
-        ),
-      })
+      // Published before the job starts so the status never lags the work,
+      // and dropped on every exit (the parent's wake is a separate concern).
+      const published = deps.status
+      if (published)
+        yield* published
+          .backgroundStart(input.sessionID, {
+            sessionID: child.id,
+            role: role.name,
+            title: delegationTitle("task", { role: role.name, prompt: input.prompt }) ?? `Task ${role.name}`,
+            since: Date.now(),
+          })
+          .pipe(Effect.ignore)
+      const unpublish = published ? published.backgroundEnd(input.sessionID, child.id).pipe(Effect.ignore) : Effect.void
+      yield* deps.background
+        .start({
+          id: child.id,
+          type: "swarm-delegate",
+          title: `${role.name} (swarm role)`,
+          // The keys every BackgroundJob consumer reads: cancel-on-abort,
+          // cancel-on-delete, and the parent loop's unfinished-work accounting.
+          metadata: {
+            parentSessionId: input.sessionID,
+            sessionId: child.id,
+            runID,
+            swarmID: input.swarmID,
+            role: role.name,
+            background: true,
+          },
+          run: runRole.pipe(
+            // Every exit wakes the parent: clean report, structured failure,
+            // defect. Only an interruption stays silent (the parent asked for
+            // it). Mirrors task.ts's matchCauseEffect around inject().
+            Effect.matchCauseEffect({
+              onSuccess: (result) =>
+                result.ok
+                  ? wake("completed", result.text).pipe(Effect.as(result.text))
+                  : wake("error", ClaudeDelegate.failureMessage(result)).pipe(
+                      Effect.andThen(Effect.fail(new Error(ClaudeDelegate.failureMessage(result)))),
+                    ),
+              onFailure: (cause) =>
+                (Cause.hasInterruptsOnly(cause)
+                  ? Effect.void
+                  : wake("error", errorMessageOf(Cause.squash(cause)))
+                ).pipe(Effect.andThen(Effect.failCause(cause))),
+            }),
+            Effect.ensuring(unpublish),
+          ),
+        })
+        .pipe(
+          // The job's own `ensuring` only exists once the job started; a defect
+          // or interrupt before that would leave the published entry orphaned.
+          Effect.onExit((exit) => (Exit.isFailure(exit) ? unpublish : Effect.void)),
+        )
       return { ok: true as const, text: backgroundDelegationStarted(child.id, role.name) }
     }
     return yield* runRole

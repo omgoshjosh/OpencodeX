@@ -152,7 +152,10 @@ it.instance("rejects stale status writes after a newer execution generation clai
         .from(SessionExecutionTable)
         .where(eq(SessionExecutionTable.session_id, sessionID))
         .get()
-        .pipe(Effect.orDie, Effect.map((row) => (row?.generation === 2 ? true : undefined))),
+        .pipe(
+          Effect.orDie,
+          Effect.map((row) => (row?.generation === 2 ? true : undefined)),
+        ),
       "new execution generation never claimed",
     )
     yield* Fiber.join(firstFiber)
@@ -181,6 +184,53 @@ it.instance("rejects active status writes after their execution generation relea
       }),
     ).toBe(false)
     expect(yield* graph.status.get(sessionID)).toEqual({ type: "idle" })
+  }),
+)
+
+it.instance("carries background delegations across status changes and lists an idle parent", () =>
+  Effect.gen(function* () {
+    const graph = yield* buildRunGraph()
+    const task = { sessionID: "ses_child", role: "QA", title: "Task QA: run the suite", since: 1 }
+
+    // Published while the parent is idle (the common case: its turn ended
+    // right after starting the delegation), so no execution gate applies.
+    expect(yield* graph.status.backgroundStart(sessionID, task)).toBe(true)
+    expect(yield* graph.status.get(sessionID)).toMatchObject({
+      type: "idle",
+      background: { running: 1, jobs: [{ ...task, owner: expect.stringMatching(/^local:\d+:/) }] },
+    })
+    expect(Array.from((yield* graph.status.list()).keys())).toEqual([sessionID])
+
+    // A turn starting and ending keeps the jobs; re-publishing the same
+    // child does not duplicate it.
+    yield* graph.status.set(sessionID, { type: "busy" })
+    expect(yield* graph.status.get(sessionID)).toMatchObject({ type: "busy", background: { running: 1 } })
+    yield* graph.status.set(sessionID, { type: "idle" })
+    expect(yield* graph.status.get(sessionID)).toMatchObject({ type: "idle", background: { running: 1 } })
+    expect(yield* graph.status.backgroundStart(sessionID, { ...task, title: "Task QA: rerun" })).toBe(true)
+    expect(yield* graph.status.get(sessionID)).toMatchObject({
+      type: "idle",
+      background: { running: 1, jobs: [{ sessionID: "ses_child", title: "Task QA: rerun" }] },
+    })
+
+    // Ending an unknown child is a no-op; ending the last one clears the field.
+    expect(yield* graph.status.backgroundEnd(sessionID, "ses_other")).toBe(false)
+    expect(yield* graph.status.backgroundEnd(sessionID, "ses_child")).toBe(true)
+    expect(yield* graph.status.get(sessionID)).toEqual({ type: "idle" })
+    expect((yield* graph.status.list()).size).toBe(0)
+
+    // A job published by a process that no longer exists is pruned on read:
+    // jobs live in memory, so the row it left behind is a phantom.
+    const { db } = yield* Database.Service
+    const dead = { ...task, owner: "local:2147483000:gone:background:ses_child" }
+    yield* db
+      .update(SessionStatusTable)
+      .set({ status: { type: "idle", background: { running: 1, jobs: [dead] } } })
+      .where(eq(SessionStatusTable.session_id, sessionID))
+      .run()
+      .pipe(Effect.orDie)
+    expect(yield* graph.status.get(sessionID)).toEqual({ type: "idle" })
+    expect((yield* graph.status.list()).size).toBe(0)
   }),
 )
 
@@ -332,10 +382,7 @@ it.instance("shares permission requests, replies once, and persists always grant
       "permission was not visible across graphs",
     )
 
-    yield* Effect.all([
-      first.reply({ requestID, reply: "always" }),
-      second.reply({ requestID, reply: "reject" }),
-    ])
+    yield* Effect.all([first.reply({ requestID, reply: "always" }), second.reply({ requestID, reply: "reject" })])
     yield* Fiber.await(ask)
     expect(yield* Ref.get(replies)).toBe(1)
 
@@ -425,10 +472,7 @@ it.instance("shares questions and settles the owning Deferred from a remote repl
         : Effect.void,
     )
     yield* Effect.addFinalizer(() => unsubscribe)
-    yield* Effect.all([
-      first.reply({ requestID: pending.id, answers: [["Yes"]] }),
-      second.reject(pending.id),
-    ])
+    yield* Effect.all([first.reply({ requestID: pending.id, answers: [["Yes"]] }), second.reject(pending.id)])
     const exit = yield* Fiber.await(ask)
     expect(Exit.isSuccess(exit) ? exit.value : exit.cause).toBeDefined()
     expect(yield* Ref.get(replies)).toBe(1)

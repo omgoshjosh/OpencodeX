@@ -1,9 +1,11 @@
-import { asc, eq } from "drizzle-orm"
+import { and, asc, eq, inArray, isNotNull } from "drizzle-orm"
 import { Cause, Context, Effect, Exit, Option } from "effect"
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
 import { Database } from "@opencode-ai/core/database/database"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { OpencodeXSwarmRoleTable, OpencodeXSwarmTable } from "@opencode-ai/core/opencodex/sql"
+import { SessionCommandTable, SessionTable } from "@opencode-ai/core/session/sql"
+import { InstanceState } from "@/effect/instance-state"
 import { Image } from "@/image/image"
 import { OpencodeXClaudeDriver } from "@/opencodex/claude-driver"
 import { delegationTitle } from "@/opencodex/claude-mapper"
@@ -17,6 +19,7 @@ import { MessageID, PartID, SessionID } from "./schema"
 import type { PromptInput } from "./prompt-schema"
 import {
   DELEGATION_RECORD_VERSION,
+  delegationRecord,
   settleDelegation,
   type DelegationOutcome,
   type DelegationRecord,
@@ -68,6 +71,35 @@ export interface Deps {
    * client sees "N working" while the parent itself reads idle.
    */
   readonly status?: Pick<SessionStatus.Interface, "backgroundStart" | "backgroundEnd">
+  /**
+   * How long a background child that ended its turn without the completion
+   * marker is given to produce another turn before its last report is
+   * delivered anyway. Defaults to 30 minutes; tests set 0.
+   */
+  readonly backgroundCompletionGraceMs?: number
+}
+
+/**
+ * A background role ends its final report with this line; a turn that ends
+ * without it (the role started a poller or is waiting on CI) is still work in
+ * progress, and the parent must not be told the delegation completed
+ * (OpencodeX-3m9). Stripped from the report before delivery.
+ */
+export const DELEGATION_COMPLETE_MARKER = "<delegation-complete/>"
+const DELEGATION_COMPLETE_FOOTER = [
+  "When your work is finished, end your final message with the line",
+  `${DELEGATION_COMPLETE_MARKER}`,
+  "If you end a turn while still waiting on something (CI, a poller, a monitor), do not include it: the delegation stays open until a later turn ends with it.",
+].join("\n")
+const DEFAULT_BACKGROUND_COMPLETION_GRACE_MS = 30 * 60_000
+const RECOVERY_QUIET_LIMIT_MS = 2 * 60 * 60_000
+
+export function hasCompletionMarker(text: string) {
+  return text.includes(DELEGATION_COMPLETE_MARKER)
+}
+
+export function stripCompletionMarker(text: string) {
+  return text.replaceAll(DELEGATION_COMPLETE_MARKER, "").trim()
 }
 
 /**
@@ -204,6 +236,245 @@ export function make(deps: Deps) {
   })
 
   /**
+   * Wakes the parent with a background report and stamps the delivery. The
+   * parent is prompted through the ordinary session loop, which for a
+   * Claude-hosted orchestrator opens a real turn on its persistent channel.
+   * Attributed to the parent's own agent, as the native task tool does: an
+   * unattributed prompt would resolve the default agent's model and could
+   * knock the orchestrator off the swarm facade. A report that never reached
+   * the parent is a failed job, not a completed one.
+   */
+  const deliverReport = (input: {
+    parentSessionID: SessionID
+    childSessionID: SessionID
+    runID: string
+    role: string
+    state: "completed" | "error"
+    text: string
+  }) =>
+    Effect.gen(function* () {
+      const parent = yield* sessions.get(input.parentSessionID).pipe(Effect.orDie)
+      const wakeID = MessageID.ascending()
+      yield* deps.prompt({
+        sessionID: input.parentSessionID,
+        messageID: wakeID,
+        // Deferred: the default "immediate" delivery interrupts an in-flight
+        // turn to steer it, which would abort whatever the orchestrator is
+        // doing right now. A report queues behind the current turn.
+        delivery: "deferred",
+        ...(parent.agent ? { agent: parent.agent } : {}),
+        parts: [
+          {
+            type: "text",
+            synthetic: true,
+            text: backgroundDelegationMessage({
+              childSessionID: input.childSessionID,
+              role: input.role,
+              state: input.state,
+              text: input.text,
+            }),
+          },
+        ],
+      })
+      // If the parent was mid-turn, prompt() only awaited that run and the
+      // wake message sat unanswered in the transcript; run its turn now so
+      // the report is never silently orphaned.
+      const answered = yield* sessions
+        .messageWithChildren({ sessionID: input.parentSessionID, messageID: wakeID })
+        .pipe(
+          Effect.map((turn) =>
+            turn.some((message) => message.info.role === "assistant" && message.info.parentID === wakeID),
+          ),
+          Effect.orElseSucceed(() => true),
+        )
+      if (!answered) yield* deps.loop({ sessionID: input.parentSessionID, messageID: wakeID })
+    }).pipe(
+      Effect.matchCauseEffect({
+        onSuccess: () =>
+          sessions
+            .stampDelegationDelivery({ sessionID: input.childSessionID, runID: input.runID, outcome: "delivered" })
+            .pipe(Effect.ignore),
+        onFailure: () =>
+          sessions
+            .stampDelegationDelivery({ sessionID: input.childSessionID, runID: input.runID, outcome: "failed" })
+            .pipe(Effect.ignore, Effect.andThen(Effect.fail(new Error("Delegation report was not delivered")))),
+      }),
+    )
+
+  /**
+   * Waits for a background child that ended a turn without the completion
+   * marker to end a later turn with it. Polls the transcript: each new
+   * assistant message re-reads the report; the grace period bounds the wait
+   * so a role that forgot the marker still reports.
+   */
+  const awaitCompletionMarker = Effect.fnUntraced(function* (
+    childSessionID: SessionID,
+    lastAssistantID: string,
+    report: string,
+  ) {
+    if (hasCompletionMarker(report)) return report
+    const grace = deps.backgroundCompletionGraceMs ?? DEFAULT_BACKGROUND_COMPLETION_GRACE_MS
+    if (grace <= 0) return report
+    log.info("background delegation ended a turn without the completion marker; waiting", {
+      sessionID: childSessionID,
+      graceMs: grace,
+    })
+    const deadline = Date.now() + grace
+    let latestID = lastAssistantID
+    let latest = report
+    while (Date.now() < deadline) {
+      yield* Effect.sleep("10 seconds")
+      const messages = yield* sessions.messages({ sessionID: childSessionID }).pipe(Effect.orElseSucceed(() => []))
+      const last = messages.findLast((message) => message.info.role === "assistant" && message.info.id > latestID)
+      if (!last || last.info.role !== "assistant" || last.info.error) continue
+      const text = last.parts
+        .flatMap((part) => (part.type === "text" && !part.synthetic && part.text.trim() ? [part.text.trim()] : []))
+        .join("\n")
+      if (!text) continue
+      latestID = last.info.id
+      latest = text
+      if (hasCompletionMarker(text)) return text
+    }
+    log.warn("background delegation never sent the completion marker; delivering the last report", {
+      sessionID: childSessionID,
+    })
+    return latest
+  })
+
+  /**
+   * The report a finished child produced, read back from its transcript: the
+   * last assistant message's visible text, or its error. Undefined while the
+   * child has not answered at all.
+   */
+  const childReport = Effect.fnUntraced(function* (childSessionID: SessionID) {
+    const messages = yield* sessions.messages({ sessionID: childSessionID }).pipe(Effect.orElseSucceed(() => []))
+    const last = messages.findLast((message) => message.info.role === "assistant")
+    if (!last || last.info.role !== "assistant") return undefined
+    if (last.info.error)
+      return { state: "error" as const, text: ClaudeDelegate.failureMessage(ClaudeDelegate.failure("errored")) }
+    const text = last.parts
+      .flatMap((part) => (part.type === "text" && !part.synthetic && part.text.trim() ? [part.text.trim()] : []))
+      .join("\n")
+    return text
+      ? { state: "completed" as const, text }
+      : { state: "error" as const, text: "The delegated role produced no report." }
+  })
+
+  /**
+   * After a restart, background delegations whose report was never delivered
+   * are picked back up (OpencodeX-3m9). The child's own turn is replayed by
+   * the command recovery that runs first, so this only has to wait for the
+   * child to go quiet, read its report, and wake the parent - the same
+   * delivery the lost in-memory job would have made. A record still
+   * `running` is settled from the transcript; a settled record with delivery
+   * `pending` is delivered as is.
+   */
+  const recoverBackgroundDelegations = Effect.fn("PromptSwarm.recoverBackgroundDelegations")(function* () {
+    if (!deps.background) return
+    const ctx = yield* InstanceState.context
+    const rows = yield* db
+      .select({ id: SessionTable.id, parentID: SessionTable.parent_id, metadata: SessionTable.metadata })
+      .from(SessionTable)
+      .where(and(eq(SessionTable.directory, ctx.directory), isNotNull(SessionTable.parent_id)))
+      .all()
+      .pipe(Effect.orElseSucceed(() => []))
+    for (const row of rows) {
+      const record = delegationRecord(row.metadata)
+      if (!record?.background || !row.parentID) continue
+      const undelivered = record.phase === "running" || record.deliveryOutcome === "pending"
+      if (!undelivered) continue
+      const childID = row.id
+      const parentID = row.parentID
+      const role = record.role ?? "delegate"
+      log.warn("recovering background delegation after restart", {
+        childSessionID: childID,
+        parentSessionID: parentID,
+        runID: record.runID,
+        phase: record.phase,
+      })
+      const published = deps.status
+      if (published)
+        yield* published
+          .backgroundStart(parentID, {
+            sessionID: childID,
+            role,
+            title: record.title ?? `Task ${role}`,
+            since: record.startedAt,
+          })
+          .pipe(Effect.ignore)
+      const unpublish = published ? published.backgroundEnd(parentID, childID).pipe(Effect.ignore) : Effect.void
+      const quiet = Effect.gen(function* () {
+        // Quiet: no queued or running command on the child (its replayed
+        // turn has finished) - polled, since the replay was forked by the
+        // command recovery before this handler ran. Bounded: a running row
+        // whose lease nobody ever reclaims must not pin this job forever.
+        const deadline = Date.now() + RECOVERY_QUIET_LIMIT_MS
+        while (Date.now() < deadline) {
+          const pending = yield* db
+            .select({ id: SessionCommandTable.id })
+            .from(SessionCommandTable)
+            .where(
+              and(
+                eq(SessionCommandTable.session_id, childID),
+                inArray(SessionCommandTable.status, ["queued", "running"]),
+              ),
+            )
+            .all()
+            .pipe(Effect.orElseSucceed(() => []))
+          if (pending.length === 0) return
+          yield* Effect.sleep("2 seconds")
+        }
+        log.warn("recovered background delegation never went quiet; delivering what there is", {
+          childSessionID: childID,
+        })
+      })
+      yield* deps.background
+        .start({
+          id: childID,
+          type: "swarm-delegate",
+          title: `${role} (swarm role)`,
+          metadata: {
+            parentSessionId: parentID,
+            sessionId: childID,
+            runID: record.runID,
+            role,
+            background: true,
+            recovered: true,
+          },
+          run: Effect.gen(function* () {
+            yield* quiet
+            const report = (yield* childReport(childID)) ?? {
+              state: "error" as const,
+              text: "The delegated role never answered (daemon restarted).",
+            }
+            if (record.phase === "running")
+              yield* sessions
+                .stampDelegation({
+                  sessionID: childID,
+                  record: settleDelegation(record, {
+                    outcome: report.state === "completed" ? "completed" : "errored",
+                    summary: report.text,
+                    deliveryOutcome: "pending",
+                  }),
+                  expectRunID: record.runID,
+                })
+                .pipe(Effect.ignore)
+            yield* deliverReport({
+              parentSessionID: parentID,
+              childSessionID: childID,
+              runID: record.runID,
+              role,
+              state: report.state,
+              text: report.text,
+            })
+            return report.text
+          }).pipe(Effect.ensuring(unpublish)),
+        })
+        .pipe(Effect.onExit((exit) => (Exit.isFailure(exit) ? unpublish : Effect.void)))
+    }
+  })
+
+  /**
    * Records the delegated child on the orchestrator's own tool part, the way
    * the task tool does for a native subagent (src/tool/task.ts): the GUI's
    * transcript link reads `metadata.sessionId` off that part, so this stamp is
@@ -320,6 +591,7 @@ export function make(deps: Deps) {
     // all-exit boundary settles it, so a defect or interruption can no longer
     // slip out without a terminal record.
     const runID = Identifier.ascending("run")
+    const title = delegationTitle("task", { role: role.name, prompt: input.prompt }) ?? `Task ${role.name}`
     const started: DelegationRecord = {
       version: DELEGATION_RECORD_VERSION,
       runID,
@@ -327,6 +599,9 @@ export function make(deps: Deps) {
       attempt: 1,
       phase: "running",
       startedAt: Date.now(),
+      // A restart loses the in-memory job that delivers a background report;
+      // these let `recoverBackgroundDelegations` pick the delivery back up.
+      ...(input.background ? { background: true as const, role: role.name, title } : {}),
     }
     const stamp = (record: DelegationRecord, expectRunID?: string) =>
       sessions.stampDelegation({ sessionID: child.id, record, ...(expectRunID ? { expectRunID } : {}) }).pipe(
@@ -356,7 +631,12 @@ export function make(deps: Deps) {
       // skill tool's inventory - so the body is delivered here, ahead of the
       // per-role instructions and the task.
       const roleSkill = role.skill ? yield* skills.get(role.skill) : undefined
-      const text = [roleSkill?.content.trim(), role.instructions?.trim(), input.prompt.trim()]
+      const text = [
+        roleSkill?.content.trim(),
+        role.instructions?.trim(),
+        input.prompt.trim(),
+        ...(input.background ? [DELEGATION_COMPLETE_FOOTER] : []),
+      ]
         .filter(Boolean)
         .join("\n\n")
       const models = yield* availableModelAttempts(
@@ -424,7 +704,12 @@ export function make(deps: Deps) {
         .flatMap((part) => (part.type === "text" && !part.synthetic && part.text.trim() ? [part.text.trim()] : []))
         .join("\n")
       if (!report) return { ok: false as const, reason: "empty-output" as const }
-      return { ok: true as const, text: report }
+      if (!input.background) return { ok: true as const, text: report }
+      // A background role that ended its turn without the marker is still
+      // working (a poller will re-invoke it). Wait for a later turn that
+      // carries the marker, up to the grace period, then deliver what there is.
+      const settled = yield* awaitCompletionMarker(child.id, result.info.id, report)
+      return { ok: true as const, text: stripCompletionMarker(settled) }
     }).pipe(
       // Every exit settles the record: clean return, subagent error, typed
       // failure, defect, and interruption alike.
@@ -454,65 +739,21 @@ export function make(deps: Deps) {
       // real turn on its persistent channel - the same path that re-invokes
       // background pollers, and the reason a blocked tool call was never
       // needed to get a result back.
-      const notify = Effect.fnUntraced(function* (state: "completed" | "error", text: string) {
-        // Attributed to the parent's own agent, as the native task tool does:
-        // an unattributed prompt would resolve the default agent's model and
-        // could knock the orchestrator off the swarm facade.
-        const currentParent = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
-        const wakeID = MessageID.ascending()
-        yield* deps.prompt({
-          sessionID: input.sessionID,
-          messageID: wakeID,
-          // Deferred: the default "immediate" delivery interrupts an in-flight
-          // turn to steer it, which would abort whatever the orchestrator is
-          // doing right now. A report queues behind the current turn.
-          delivery: "deferred",
-          ...(currentParent.agent ? { agent: currentParent.agent } : {}),
-          parts: [
-            {
-              type: "text",
-              synthetic: true,
-              text: backgroundDelegationMessage({ childSessionID: child.id, role: role.name, state, text }),
-            },
-          ],
-        })
-        // If the parent was mid-turn, prompt() only awaited that run and the
-        // wake message sat unanswered in the transcript; run its turn now so
-        // the report is never silently orphaned.
-        const answered = yield* sessions.messageWithChildren({ sessionID: input.sessionID, messageID: wakeID }).pipe(
-          Effect.map((turn) =>
-            turn.some((message) => message.info.role === "assistant" && message.info.parentID === wakeID),
-          ),
-          Effect.orElseSucceed(() => true),
-        )
-        if (!answered) yield* deps.loop({ sessionID: input.sessionID, messageID: wakeID })
-      })
       const wake = (state: "completed" | "error", text: string) =>
-        notify(state, text).pipe(
-          Effect.matchCauseEffect({
-            onSuccess: () =>
-              sessions
-                .stampDelegationDelivery({ sessionID: child.id, runID, outcome: "delivered" })
-                .pipe(Effect.ignore),
-            // A report that never reached the parent is a failed job, not a
-            // completed one; the job status must not say otherwise.
-            onFailure: () =>
-              sessions
-                .stampDelegationDelivery({ sessionID: child.id, runID, outcome: "failed" })
-                .pipe(Effect.ignore, Effect.andThen(Effect.fail(new Error("Delegation report was not delivered")))),
-          }),
-        )
+        deliverReport({
+          parentSessionID: input.sessionID,
+          childSessionID: child.id,
+          runID,
+          role: role.name,
+          state,
+          text,
+        })
       // Published before the job starts so the status never lags the work,
       // and dropped on every exit (the parent's wake is a separate concern).
       const published = deps.status
       if (published)
         yield* published
-          .backgroundStart(input.sessionID, {
-            sessionID: child.id,
-            role: role.name,
-            title: delegationTitle("task", { role: role.name, prompt: input.prompt }) ?? `Task ${role.name}`,
-            since: Date.now(),
-          })
+          .backgroundStart(input.sessionID, { sessionID: child.id, role: role.name, title, since: Date.now() })
           .pipe(Effect.ignore)
       const unpublish = published ? published.backgroundEnd(input.sessionID, child.id).pipe(Effect.ignore) : Effect.void
       yield* deps.background
@@ -741,6 +982,7 @@ export function make(deps: Deps) {
     ensureSwarmBriefing,
     swarmContext,
     runSwarmRole,
+    recoverBackgroundDelegations,
     claudeCodeTurn,
     ensureClaudeTitle,
     modelIdentifier,

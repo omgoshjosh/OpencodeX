@@ -1144,6 +1144,9 @@ describe("tool.task", () => {
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
       const def = yield* tool.init()
+      // The parent's status is told about the subtask before the job starts
+      // and again when it ends (same contract as swarm delegations).
+      const published: string[] = []
 
       const result = yield* def.execute(
         {
@@ -1162,6 +1165,11 @@ describe("tool.task", () => {
             promptOps: {
               ...stubOps(),
               prompt: () => Effect.never,
+              backgroundStatus: {
+                start: (parent, task) =>
+                  Effect.sync(() => published.push(`start ${parent} ${task.sessionID} ${task.role} ${task.title}`)),
+                end: (parent, child) => Effect.sync(() => published.push(`end ${parent} ${child}`)),
+              },
             } satisfies TaskPromptOps,
           },
           messages: [],
@@ -1174,6 +1182,9 @@ describe("tool.task", () => {
       expect(result.metadata.background).toBe(true)
       expect(result.output).toContain(`state="running"`)
       expect(job?.status).toBe("running")
+      expect(published).toEqual([`start ${chat.id} ${result.metadata.sessionId} general inspect bug`])
+      yield* jobs.cancel(result.metadata.sessionId)
+      expect(published.at(-1)).toBe(`end ${chat.id} ${result.metadata.sessionId}`)
     }),
   )
 

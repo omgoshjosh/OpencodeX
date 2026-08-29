@@ -154,11 +154,15 @@ describe("swarm role model fallback", () => {
 
 describe("background swarm delegation", () => {
   test("returns at once, runs the role under BackgroundJob, and wakes the parent with the report", async () => {
-    const { runSwarmRole, prompts, started, runJob } = harness({ skills: {}, background: true })
+    const { runSwarmRole, prompts, started, stamps, runJob } = harness({ skills: {}, background: true })
 
     const result = await Effect.runPromise(run(runSwarmRole, { background: true }))
     expect(result.ok).toBe(true)
     if (result.ok) expect(result.text).toContain('state="running"')
+    // The running record carries what a restarted daemon needs to redeliver
+    // the report: that it is background work, the role, and the row title.
+    expect(stamps[0]?.record).toMatchObject({ phase: "running", background: true, role: "Specialist" })
+    expect(stamps[0]?.record.title).toMatch(/^Task Specialist: /)
     // Nothing has been prompted to the child yet: the role runs in the job.
     expect(started).toHaveLength(1)
     expect(started[0]?.id).toBe("ses_child")
@@ -186,6 +190,29 @@ describe("background swarm delegation", () => {
     expect(result).toMatchObject({ ok: false, reason: "rejected" })
     expect(prompts).toHaveLength(0)
     expect(stamps.at(-1)?.record.phase).toBe("settled")
+  })
+
+  test("tells the child how to mark completion and strips the marker from the report", async () => {
+    const { runSwarmRole, prompts, runJob } = harness({
+      skills: {},
+      background: true,
+      promptResult: Effect.succeed({
+        info: { role: "assistant", error: undefined },
+        parts: [{ type: "text", text: `All green.\n${PromptSwarm.DELEGATION_COMPLETE_MARKER}`, synthetic: false }],
+      } as never),
+    })
+    await Effect.runPromise(run(runSwarmRole, { background: true }))
+    await Effect.runPromise(runJob())
+    expect(prompts[0]).toContain(PromptSwarm.DELEGATION_COMPLETE_MARKER)
+    const wake = prompts.find((text) => text.includes("Delegation completed"))
+    expect(wake).toContain("All green.")
+    expect(wake).not.toContain(PromptSwarm.DELEGATION_COMPLETE_MARKER)
+  })
+
+  test("a foreground delegation is not told about the marker", async () => {
+    const { runSwarmRole, prompts } = harness({ skills: {} })
+    await Effect.runPromise(run(runSwarmRole))
+    expect(prompts[0]).not.toContain(PromptSwarm.DELEGATION_COMPLETE_MARKER)
   })
 
   test("wakes the parent with an error when the role itself fails", async () => {
@@ -550,6 +577,7 @@ function harness(input: {
   unavailableModels?: string[]
   /** Provide a fake BackgroundJob so background delegations can be exercised. */
   background?: boolean
+  backgroundCompletionGraceMs?: number
 }) {
   const started: Array<{ id?: string; metadata?: Record<string, unknown>; run: Effect.Effect<string, unknown> }> = []
   const prompts: string[] = []
@@ -646,6 +674,9 @@ function harness(input: {
       loopCount++
       return Effect.succeed(record(input.promptResults?.shift() ?? success("done"), loopInput.messageID ?? "msg_user"))
     },
+    // Background children here answer without the completion marker; do not
+    // wait the production grace period for one.
+    backgroundCompletionGraceMs: input.backgroundCompletionGraceMs ?? 0,
   }
   const { runSwarmRole } = PromptSwarm.make(deps as never)
   return {

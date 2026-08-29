@@ -41,6 +41,22 @@ describe("delegation record metadata", () => {
     expect(delegationOutcome(stamped)).toBeUndefined()
   })
 
+  test("round-trips the background facts a restart needs to redeliver the report", () => {
+    const stamped = withDelegationRecord(undefined, {
+      ...running(),
+      background: true,
+      role: "QA Engineer",
+      title: "Task QA Engineer: run the suite",
+    })
+    expect(delegationRecord(stamped)).toMatchObject({
+      background: true,
+      role: "QA Engineer",
+      title: "Task QA Engineer: run the suite",
+    })
+    // A foreground record carries none of them.
+    expect(delegationRecord(withDelegationRecord(undefined, running()))).not.toHaveProperty("background")
+  })
+
   test("stamps onto empty or missing metadata without inventing anything else", () => {
     const settled = settleDelegation(running(), { outcome: "errored", completedAt: 5 })
     expect(delegationOutcome(withDelegationRecord(undefined, settled))).toBe("errored")
@@ -71,10 +87,7 @@ describe("delegation record metadata", () => {
   test("a later run's record replaces the previous one and renumbers the attempt", () => {
     const first = withDelegationRecord(undefined, settleDelegation(running(), { outcome: "errored" }))
     expect(delegationAttempts(first)).toBe(1)
-    const second = withDelegationRecord(
-      first,
-      running({ runID: "run_2", attempt: delegationAttempts(first) + 1 }),
-    )
+    const second = withDelegationRecord(first, running({ runID: "run_2", attempt: delegationAttempts(first) + 1 }))
     expect(delegationRecord(second)).toMatchObject({ runID: "run_2", attempt: 2, phase: "running" })
     // The old terminal outcome no longer shows while the new run works.
     expect(delegationOutcome(second)).toBeUndefined()
@@ -106,9 +119,7 @@ describe("delegation record metadata", () => {
       delegationRecord({ opencodex: { delegation: { ...running(), phase: "settled", outcome: "maybe" } } }),
     ).toBeUndefined()
     // Malformed timestamps are rejected rather than tolerated.
-    expect(
-      delegationRecord(withDelegationRecord(undefined, running({ startedAt: Number.NaN }))),
-    ).toBeUndefined()
+    expect(delegationRecord(withDelegationRecord(undefined, running({ startedAt: Number.NaN })))).toBeUndefined()
     expect(
       delegationRecord(
         withDelegationRecord(undefined, settleDelegation(running(), { outcome: "completed", completedAt: Number.NaN })),
@@ -124,9 +135,7 @@ describe("delegation record metadata", () => {
     expect(delegationSummary(legacy)).toBe("old report")
     expect(delegationAttempts(legacy)).toBe(1)
     expect(delegationOutcome({ opencodex: { delegation: { outcome: "failed", completedAt: 5 } } })).toBe("errored")
-    expect(delegationOutcome({ opencodex: { delegation: { outcome: "cancelled", completedAt: 5 } } })).toBe(
-      "cancelled",
-    )
+    expect(delegationOutcome({ opencodex: { delegation: { outcome: "cancelled", completedAt: 5 } } })).toBe("cancelled")
     expect(delegationOutcome({ opencodex: { delegation: { outcome: "maybe" } } })).toBeUndefined()
   })
 
@@ -149,13 +158,26 @@ describe("delegation record metadata", () => {
     expect(erased.note).toBe("changed")
     // The caller sends its own delegation object: the stored record wins.
     const forged = preserveDelegationRecord(stored, {
-      opencodex: { delegation: { version: 2, runID: "run_evil", parentSessionID: "x", attempt: 1, phase: "settled", outcome: "completed", startedAt: 1 } },
+      opencodex: {
+        delegation: {
+          version: 2,
+          runID: "run_evil",
+          parentSessionID: "x",
+          attempt: 1,
+          phase: "settled",
+          outcome: "completed",
+          startedAt: 1,
+        },
+      },
     })
     expect(delegationRecord(forged)?.runID).toBe("run_1")
     // No stored record: the caller cannot introduce one.
-    const invented = preserveDelegationRecord({}, {
-      opencodex: { delegation: { outcome: "succeeded", completedAt: 1 } },
-    })
+    const invented = preserveDelegationRecord(
+      {},
+      {
+        opencodex: { delegation: { outcome: "succeeded", completedAt: 1 } },
+      },
+    )
     expect(delegationOutcome(invented)).toBeUndefined()
   })
 })

@@ -55,6 +55,7 @@ import { OpencodeXClaudeDriver } from "@/opencodex/claude-driver"
 import { PromptInput, LoopInput, ShellInput, CommandInput } from "./prompt-schema"
 import { STRUCTURED_OUTPUT_SYSTEM_PROMPT, createStructuredOutputTool } from "./prompt-structured-output"
 import * as PromptClaim from "./prompt-claim"
+import { SessionPromptRecovery } from "./prompt-recovery"
 import * as PromptShell from "./prompt-shell"
 import * as PromptSubtask from "./prompt-subtask"
 import * as PromptSwarm from "./prompt-swarm"
@@ -203,6 +204,10 @@ export const layer = Layer.effect(
             .pipe(Effect.catchIf(Provider.ModelNotFoundError.isInstance, () => Effect.succeed(undefined))),
         prompt: (input: PromptInput) => prompt(input).pipe(Effect.catch(Effect.die)),
         loop: (input: LoopInput) => loop(input),
+        backgroundStatus: {
+          start: (parentSessionID, task) => status.backgroundStart(parentSessionID, task),
+          end: (parentSessionID, childSessionID) => status.backgroundEnd(parentSessionID, childSessionID),
+        },
       } satisfies TaskPromptOps
     })
 
@@ -738,7 +743,7 @@ export const layer = Layer.effect(
       },
     )
 
-    const { ensureSwarmBriefing, claudeCodeTurn } = PromptSwarm.make({
+    const { ensureSwarmBriefing, claudeCodeTurn, recoverBackgroundDelegations } = PromptSwarm.make({
       claudeDriver,
       database,
       sessions,
@@ -775,6 +780,16 @@ export const layer = Layer.effect(
       reconcileToolParts: (input) => sessions.reconcileToolParts(input),
       loop: (input) => loop(input),
     })
+
+    // Registered after PromptClaim's handler (registration order is run
+    // order), so the children's replayed turns are launched before their
+    // reports are waited on.
+    const unregisterDelegationRecovery = SessionPromptRecovery.register(() =>
+      recoverBackgroundDelegations().pipe(
+        Effect.catchCause((cause) => Effect.logWarning("background delegation recovery failed", { cause })),
+      ),
+    )
+    yield* Effect.addFinalizer(() => Effect.sync(unregisterDelegationRecovery))
 
     const promptAsync = Effect.fn("SessionPrompt.promptAsync")(function* (input: PromptInput) {
       if (input.messageID) {

@@ -23,6 +23,7 @@ let transportOptions: TransportOptions | undefined
 let metadata: Record<string, unknown> = {}
 let history: SessionLegacy.WithParts[] = []
 let persistedMetadata: Record<string, unknown> | undefined
+let removedMessages: string[] = []
 
 const transport: ClaudeTransport = {
   run(nextPrompt, nextOptions) {
@@ -61,6 +62,12 @@ const sessions = Layer.mock(Session.Service)({
       return next
     }),
   getPart: ({ partID }) => Effect.sync(() => parts.find((part) => part.id === partID)),
+  removeMessage: ({ messageID }) =>
+    Effect.sync(() => {
+      removedMessages.push(messageID)
+      if (message?.id === messageID) message = undefined
+      return messageID
+    }),
   findMessage: (_sessionID, predicate) =>
     Effect.sync(() => {
       if (!message) return Option.none()
@@ -80,8 +87,17 @@ const dependencies = Layer.mergeAll(
 const driver = OpencodeXClaudeDriver.makeLayer({
   transport,
   resolveExecutable: async () => "/test/claude",
+  // The startup auth retry is exercised by its own suite below.
+  startupAuthRetryWindowSeconds: 0,
 }).pipe(Layer.provide(dependencies))
 const it = testEffect(driver)
+const retryingDriver = OpencodeXClaudeDriver.makeLayer({
+  transport,
+  resolveExecutable: async () => "/test/claude",
+  startupAuthRetryWindowSeconds: 3600,
+  startupAuthRetryDelayMillis: 0,
+}).pipe(Layer.provide(dependencies))
+const retrying = testEffect(retryingDriver)
 
 function reset(
   next: () => AsyncIterable<ClaudeMapper.ClaudeEvent>,
@@ -97,12 +113,14 @@ function reset(
   metadata = options?.metadata ?? {}
   history = options?.history ?? []
   persistedMetadata = undefined
+  removedMessages = []
 }
 
 function runTurn(input?: {
   text?: string
   images?: ClaudeImage[]
   delegate?: OpencodeXClaudeDriver.SwarmDelegate
+  directory?: string
 }) {
   return Effect.gen(function* () {
     const service = yield* OpencodeXClaudeDriver.Service
@@ -112,7 +130,8 @@ function runTurn(input?: {
       text: input?.text ?? "hello",
       ...(input?.images ? { images: input.images } : {}),
       ...(input?.delegate ? { delegate: input.delegate } : {}),
-      directory: "/test",
+      // The driver refuses to spawn into a directory that does not exist.
+      directory: input?.directory ?? process.cwd(),
       providerID: "claude-code",
       modelID: "sonnet",
     })
@@ -178,7 +197,8 @@ describe("Claude driver delivery finalization", () => {
     Effect.gen(function* () {
       reset(() => ({
         [Symbol.asyncIterator]: () => ({
-          next: () => Promise.reject(new Error("Failed to authenticate: OAuth session expired and could not be refreshed")),
+          next: () =>
+            Promise.reject(new Error("Failed to authenticate: OAuth session expired and could not be refreshed")),
         }),
       }))
 
@@ -192,6 +212,50 @@ describe("Claude driver delivery finalization", () => {
       const message = (assistantInfo(result).error?.data as { message?: string } | undefined)?.message
       expect(message).not.toBe("Claude response delivery failed before the turn completed.")
       expect(persistedMetadata).toMatchObject({ claudeCode: { authState: "needs-login" } })
+    }),
+  )
+
+  // OpencodeX-zx2: right after a daemon restart the CLI can report "not
+  // logged in" once and be fine a moment later.
+  retrying.effect("retries a startup-window auth failure once and drops the failed message", () =>
+    Effect.gen(function* () {
+      let attempt = 0
+      reset(() => {
+        attempt += 1
+        if (attempt === 1)
+          return {
+            [Symbol.asyncIterator]: () => ({
+              next: () => Promise.reject(new Error("Failed to authenticate: OAuth session expired")),
+            }),
+          }
+        return success()
+      })
+
+      const result = yield* runTurn()
+
+      expect(attempt).toBe(2)
+      expect(assistantInfo(result).error).toBeUndefined()
+      expect(removedMessages).toHaveLength(1)
+      expect(persistedMetadata).toMatchObject({ claudeCode: { authState: "ready" } })
+    }),
+  )
+
+  retrying.effect("does not retry a second auth failure", () =>
+    Effect.gen(function* () {
+      let attempt = 0
+      reset(() => {
+        attempt += 1
+        return {
+          [Symbol.asyncIterator]: () => ({
+            next: () => Promise.reject(new Error("Failed to authenticate: OAuth session expired")),
+          }),
+        }
+      })
+
+      const result = yield* runTurn()
+
+      expect(attempt).toBe(2)
+      expect(assistantInfo(result).error?.name).toBe("ProviderAuthError")
     }),
   )
 
@@ -220,6 +284,20 @@ describe("Claude driver delivery finalization", () => {
       expect(interrupts).toBe(1)
       expect(result.parts.find((part) => part.type === "text")).toMatchObject({ text: "Partial answer" })
       expect(assistantInfo(result).error?.name).toBe("UnknownError")
+    }),
+  )
+
+  it.effect("fails a turn whose session directory is gone without spawning", () =>
+    Effect.gen(function* () {
+      reset(success)
+
+      const result = yield* runTurn({ directory: "/nonexistent/opencodex-driver-test" })
+
+      expect(prompt).toBeUndefined()
+      expect(assistantInfo(result).error).toMatchObject({
+        name: "UnknownError",
+        data: { message: expect.stringContaining("/nonexistent/opencodex-driver-test does not exist") },
+      })
     }),
   )
 
@@ -288,7 +366,12 @@ const toolUse = () => ({
   message: {
     id: "m1",
     content: [
-      { type: "tool_use", id: "toolu_1", name: "mcp__opencodex_swarm__delegate", input: { role: "Coder", prompt: "Ship it" } },
+      {
+        type: "tool_use",
+        id: "toolu_1",
+        name: "mcp__opencodex_swarm__delegate",
+        input: { role: "Coder", prompt: "Ship it" },
+      },
     ],
   },
 })

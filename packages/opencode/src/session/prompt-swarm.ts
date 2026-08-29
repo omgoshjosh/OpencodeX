@@ -772,6 +772,13 @@ export function make(deps: Deps) {
             background: true,
           },
           run: runRole.pipe(
+            // The status chip reports the ROLE working, so it clears the
+            // moment the role's work settles - not when the report lands.
+            // Delivery can trail by many minutes when the parent camps in a
+            // long turn (live 2026-08-29: chip showed "1 working" ~20 min
+            // after the child finished), and backgroundEnd is a no-op the
+            // second time, so the ensuring below stays as the failsafe.
+            Effect.onExit(() => unpublish),
             // Every exit wakes the parent: clean report, structured failure,
             // defect. Only an interruption stays silent (the parent asked for
             // it). Mirrors task.ts's matchCauseEffect around inject().

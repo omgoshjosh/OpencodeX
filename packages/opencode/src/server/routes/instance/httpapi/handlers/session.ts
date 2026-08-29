@@ -137,8 +137,10 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
         })
       }
       yield* requireSession(ctx.params.sessionID)
+      const capParts = (items: readonly SessionLegacy.WithParts[]) =>
+        ctx.query.partBudget === undefined ? [...items] : MessageV2.truncateToolOutputs(items, ctx.query.partBudget)
       if (ctx.query.limit === undefined || ctx.query.limit === 0) {
-        return yield* SessionError.mapStorageNotFound(session.messages({ sessionID: ctx.params.sessionID }))
+        return capParts(yield* SessionError.mapStorageNotFound(session.messages({ sessionID: ctx.params.sessionID })))
       }
 
       const page = yield* SessionError.mapStorageNotFound(
@@ -155,7 +157,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
             before: ctx.query.before,
           }),
       )
-      if (!page.cursor) return page.items
+      if (!page.cursor) return capParts(page.items)
 
       const request = yield* HttpServerRequest.HttpServerRequest
       // toURL() honors the Host + x-forwarded-proto headers, so the Link
@@ -164,7 +166,8 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       url.searchParams.set("limit", ctx.query.limit.toString())
       if (ctx.query.renderBudget !== undefined) url.searchParams.set("renderBudget", ctx.query.renderBudget.toString())
       url.searchParams.set("before", page.cursor)
-      return HttpServerResponse.jsonUnsafe(page.items, {
+      if (ctx.query.partBudget !== undefined) url.searchParams.set("partBudget", ctx.query.partBudget.toString())
+      return HttpServerResponse.jsonUnsafe(capParts(page.items), {
         headers: {
           "Access-Control-Expose-Headers": "Link, X-Next-Cursor",
           Link: `<${url.toString()}>; rel="next"`,

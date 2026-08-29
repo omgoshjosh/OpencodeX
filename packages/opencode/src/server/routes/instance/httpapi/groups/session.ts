@@ -43,6 +43,15 @@ export const MessagesQuery = Schema.Struct({
   ...WorkspaceRoutingQueryFields,
   limit: Schema.optional(Schema.NumberFromString.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(0))),
   renderBudget: Schema.optional(Schema.NumberFromString.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(0))),
+  /**
+   * Caps each tool part's inline output at this many characters.
+   * `renderBudget` bounds how many messages fit a page, but a single tool
+   * part still ships its whole output - multi-MB for a big file read - and
+   * that is what makes a mobile transcript fetch read as "slow". Truncated
+   * parts carry `state.metadata.outputTruncated`; the full part comes from
+   * re-fetching the message without the cap.
+   */
+  partBudget: Schema.optional(Schema.NumberFromString.check(Schema.isInt(), Schema.isGreaterThan(0))),
   before: Schema.optional(Schema.String),
 })
 export const StatusMap = Schema.Record(Schema.String, SessionStatus.Info)

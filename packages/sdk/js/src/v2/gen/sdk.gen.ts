@@ -6266,6 +6266,7 @@ export class Session3 extends HeyApiClient {
       workspace?: string
       limit?: number
       renderBudget?: number
+      partBudget?: string
       before?: string
     },
     options?: Options<never, ThrowOnError>,
@@ -6280,6 +6281,7 @@ export class Session3 extends HeyApiClient {
             { in: "query", key: "workspace" },
             { in: "query", key: "limit" },
             { in: "query", key: "renderBudget" },
+            { in: "query", key: "partBudget" },
             { in: "query", key: "before" },
           ],
         },

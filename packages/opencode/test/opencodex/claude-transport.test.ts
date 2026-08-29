@@ -1,12 +1,14 @@
-import { describe, expect, test } from "bun:test"
+import { describe, expect, it, test } from "bun:test"
 import { Deferred, Effect } from "effect"
 import { EffectBridge } from "../../src/effect/bridge"
 import { ClaudeDelegate } from "../../src/opencodex/claude-delegate"
 import {
+  adoptOrphanApproval,
   createDelegateCorrelator,
   DELEGATE_SERVER,
   DELEGATE_TOOL,
   delegateServer as delegateServerWith,
+  orphanApprovalAdoptions,
   resolveToolPermission,
   sdkPrompt,
   type TransportOptions,
@@ -389,5 +391,95 @@ describe("sdkPrompt", () => {
         parent_tool_use_id: null,
       },
     ])
+  })
+})
+
+// OpencodeX-sxp: an approval arriving with no turn attached asks the session
+// layer for a turn instead of being denied.
+describe("adoptOrphanApproval", () => {
+  it("stays a deny when the channel has no adopter", async () => {
+    expect(
+      await adoptOrphanApproval({
+        sessionID: "ses_o1",
+        toolName: "Bash",
+        adopt: undefined,
+        handlers: () => undefined,
+        state: {},
+        waitMs: 50,
+      }),
+    ).toBe(false)
+  })
+
+  it("opens a turn through the adopter and waits for its handlers", async () => {
+    const asked: string[] = []
+    let handlers: object | undefined
+    const before = orphanApprovalAdoptions()
+    const adopt = async (input: { toolName: string }) => {
+      asked.push(input.toolName)
+      setTimeout(() => (handlers = {}), 30)
+    }
+    const state = {}
+    expect(
+      await adoptOrphanApproval({
+        sessionID: "ses_o2",
+        toolName: "Bash",
+        adopt,
+        handlers: () => handlers,
+        state,
+        waitMs: 1_000,
+      }),
+    ).toBe(true)
+    expect(asked).toEqual(["Bash"])
+    expect(orphanApprovalAdoptions()).toBe(before + 1)
+  })
+
+  it("gives up when the turn never attaches", async () => {
+    expect(
+      await adoptOrphanApproval({
+        sessionID: "ses_o3",
+        toolName: "Read",
+        adopt: async () => undefined,
+        handlers: () => undefined,
+        state: {},
+        waitMs: 60,
+      }),
+    ).toBe(false)
+  })
+
+  it("lets parallel tool calls share one adoption episode", async () => {
+    let calls = 0
+    let handlers: object | undefined
+    const adopt = async () => {
+      calls += 1
+      setTimeout(() => (handlers = {}), 30)
+    }
+    const state = {}
+    const results = await Promise.all(
+      ["Bash", "Read", "Edit"].map((toolName) =>
+        adoptOrphanApproval({ sessionID: "ses_o4", toolName, adopt, handlers: () => handlers, state, waitMs: 1_000 }),
+      ),
+    )
+    expect(results).toEqual([true, true, true])
+    expect(calls).toBe(1)
+  })
+
+  it("does not adopt for an already-aborted request", async () => {
+    let calls = 0
+    const controller = new AbortController()
+    controller.abort()
+    expect(
+      await adoptOrphanApproval({
+        sessionID: "ses_o5",
+        toolName: "Bash",
+        adopt: async () => {
+          calls += 1
+        },
+        handlers: () => ({}),
+        state: {},
+        signal: controller.signal,
+        waitMs: 50,
+      }),
+    ).toBe(false)
+    expect(calls).toBe(0)
   })
 })

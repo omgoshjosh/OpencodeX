@@ -750,6 +750,7 @@ export const layer = Layer.effect(
           .getModel(ProviderV2.ID.make(model.providerID), ProviderV2.ModelID.make(model.modelID))
           .pipe(Effect.catchIf(Provider.ModelNotFoundError.isInstance, () => Effect.succeed(undefined))),
       prompt: (input) => prompt(input),
+      promptAsync: (input) => promptAsync(input),
       loop: (input) => loop(input),
     })
 

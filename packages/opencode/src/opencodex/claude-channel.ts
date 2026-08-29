@@ -43,6 +43,8 @@ export type ChannelQuery = {
 export type CreateQuery<H> = (input: {
   prompt: AsyncIterable<SDKUserMessage>
   handlers: () => H | undefined
+  /** The most recent turn's handlers, kept after that turn detached (orphan adoption, OpencodeX-sxp). */
+  lastHandlers: () => H | undefined
   /** Conversation to resume, present only when the channel picks up an old one. */
   resumeID?: string
 }) => Promise<ChannelQuery>
@@ -108,6 +110,7 @@ export class Channel<H> {
   private queryPromise: Promise<ChannelQuery>
   private input = createPushable<SDKUserMessage>()
   private handlers: H | undefined
+  private lastHandlers: H | undefined
   /**
    * True until the first assistant output after a resume spawn: only inside
    * this window can the CLI's close-out result for a previous dangling turn
@@ -141,6 +144,7 @@ export class Channel<H> {
     this.queryPromise = createQuery({
       prompt: this.input.iterable,
       handlers: () => this.handlers,
+      lastHandlers: () => this.lastHandlers,
       ...(options?.resumeID ? { resumeID: options.resumeID } : {}),
     })
     void this.pump()
@@ -246,6 +250,7 @@ export class Channel<H> {
     if (this.retiring) throw new Error("The Claude channel is retiring.")
     if (this.sink) throw new Error("A turn is already active on this Claude channel.")
     this.handlers = handlers
+    this.lastHandlers = handlers
 
     const buffered: ClaudeEvent[] = []
     let notify: (() => void) | undefined

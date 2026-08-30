@@ -421,6 +421,13 @@ export class Channel<H> {
     }
   }
 
+  /** Adds input to the attached turn without replacing its sink or handlers. */
+  offer(messages: SDKUserMessage[]) {
+    if (this.dead || this.retiring || !this.sink) return false
+    for (const message of messages) this.input.push(message)
+    return true
+  }
+
   async close() {
     this.dead = true
     this.clearCloseOutWatchdog()
@@ -543,6 +550,8 @@ export function createChannelRegistry<H>(options?: { idleTtlMs?: number; sweepMs
 
   return {
     get: (sessionKey: string) => channels.get(sessionKey)?.channel,
+    /** Adds input only when the session still has an attached live turn. */
+    offer: (sessionKey: string, messages: SDKUserMessage[]) => channels.get(sessionKey)?.channel.offer(messages) ?? false,
     /** Live channel count; the reaper's observable surface for tests. */
     size: () => channels.size,
     /**

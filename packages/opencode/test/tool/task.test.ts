@@ -1,4 +1,4 @@
-import { afterEach, describe, expect } from "bun:test"
+import { afterEach, describe, expect, test } from "bun:test"
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
 import { Database } from "@opencode-ai/core/database/database"
 import { Effect, Exit, Fiber, Layer } from "effect"
@@ -13,7 +13,7 @@ import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
 
-import { MAX_SWARM_DELEGATION_DEPTH, TaskTool, type TaskPromptOps } from "../../src/tool/task"
+import { MAX_SWARM_DELEGATION_DEPTH, TaskTool, providerFailure, type TaskPromptOps } from "../../src/tool/task"
 import { delegationOutcome, delegationRecord } from "../../src/session/delegation-outcome"
 import { Truncate } from "@/tool/truncate"
 import { ToolRegistry } from "@/tool/registry"
@@ -820,6 +820,29 @@ describe("tool.task", () => {
     }),
   )
 
+  test("normalizes structured terminal provider failures without retaining credentials", () => {
+    const failure = providerFailure(
+      {
+        name: "APIError",
+        data: {
+          message: "Monthly quota exhausted; authorization=Bearer super-secret",
+          statusCode: 429,
+          retryAfterMs: 1_000,
+          metadata: { code: "insufficient_quota", requestId: "req_123" },
+        },
+      },
+      { providerID: "test", modelID: "test-model" },
+    )
+
+    expect(failure?.message).toContain("Provider test/test-model")
+    expect(failure?.message).toContain("code=insufficient_quota")
+    expect(failure?.message).toContain("status=429")
+    expect(failure?.message).toContain("requestId=req_123")
+    expect(failure?.message).toContain("[redacted]")
+    expect(failure?.message).not.toContain("super-secret")
+    expect(failure?.retryAt).toBeGreaterThan(Date.now())
+  })
+
   it.instance("labels an empty report instead of returning an empty string", () =>
     Effect.gen(function* () {
       const { chat, assistant } = yield* seed()
@@ -1186,10 +1209,11 @@ describe("tool.task", () => {
     }),
   )
 
-  it.instance("execute stamps the child with a failed delegation outcome on subagent error", () =>
+  it.instance("blocks the parent and durably stamps a terminal child failure", () =>
     Effect.gen(function* () {
       const { chat, assistant } = yield* seed()
       const sessions = yield* Session.Service
+      const status = yield* SessionStatus.Service
       const tool = yield* TaskTool
       const def = yield* tool.init()
       // The subagent's turn completes, but the assistant message carries an
@@ -1201,11 +1225,23 @@ describe("tool.task", () => {
             const message = reply(input, "partial output")
             return {
               ...message,
-              info: { ...message.info, error: { name: "UnknownError", data: { message: "boom" } } },
+              info: {
+                ...message.info,
+                error: {
+                  name: "APIError",
+                  data: {
+                    message: "quota exhausted, token=child-secret",
+                    statusCode: 429,
+                    retryAfterMs: 1_000,
+                    metadata: { code: "insufficient_quota" },
+                  },
+                },
+              },
             } as SessionLegacy.WithParts
           }),
       }
 
+      yield* status.set(chat.id, { type: "busy" })
       const result = yield* def.execute(
         { description: "do work", prompt: "do it", subagent_type: "general" },
         {
@@ -1223,6 +1259,13 @@ describe("tool.task", () => {
 
       const child = yield* sessions.get(SessionID.make(result.metadata.sessionId))
       expect(delegationOutcome(child.metadata)).toBe("errored")
+      expect(delegationRecord(child.metadata)?.error).toContain("code=insufficient_quota")
+      expect(delegationRecord(child.metadata)?.error).not.toContain("child-secret")
+      expect(yield* status.get(chat.id)).toMatchObject({
+        type: "blocked",
+        childSessionID: child.id,
+        attemptedModels: ["test/test-model"],
+      })
       // The stamp must ride alongside the swarm bookkeeping, never replace it.
       expect(result.output).toContain("failed")
     }),

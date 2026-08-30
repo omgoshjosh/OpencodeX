@@ -1108,7 +1108,7 @@ it.instance("command heartbeat extends its lease from the current clock", () =>
   }),
 )
 
-it.instance("reclaims an unoffered live-Claude reservation but never replays an offered one", () =>
+it.instance("preserves live reservations and fences stale Claude offers", () =>
   Effect.gen(function* () {
     const prompt = yield* SessionPrompt.Service
     const sessions = yield* Session.Service
@@ -1122,10 +1122,32 @@ it.instance("reclaims an unoffered live-Claude reservation but never replays an 
       noReply: true,
       parts: [{ type: "text", text: "durable steering" }],
     })
-    const session = yield* database.db.select().from(SessionTable).where(eq(SessionTable.id, chat.id)).get().pipe(Effect.orDie)
+    const session = yield* database.db
+      .select()
+      .from(SessionTable)
+      .where(eq(SessionTable.id, chat.id))
+      .get()
+      .pipe(Effect.orDie)
     if (!session) return yield* Effect.die(new Error("missing session row"))
     const claim = yield* PromptClaim.make({ database, events, scope, loop: () => Effect.never })
     const now = Date.now()
+    yield* database.db
+      .insert(SessionCommandTable)
+      .values({
+        id: "sec_live_parent",
+        session_id: chat.id,
+        message_id: MessageID.ascending(),
+        project_id: session.project_id,
+        directory: session.directory,
+        status: "running",
+        owner_id: "remote:live-parent",
+        claim_generation: 1,
+        lease_expires_at: now + 60_000,
+        time_created: now - 1,
+        time_updated: now,
+      })
+      .run()
+      .pipe(Effect.orDie)
     yield* database.db
       .insert(SessionCommandTable)
       .values({
@@ -1135,8 +1157,8 @@ it.instance("reclaims an unoffered live-Claude reservation but never replays an 
         project_id: session.project_id,
         directory: session.directory,
         status: "queued",
-        adopted_by: "local:dead:prompt",
-        adopted_generation: 4,
+        adopted_by: "sec_live_parent",
+        adopted_generation: 1,
         offer_ordinal: 2,
         time_created: now,
         time_updated: now,
@@ -1144,20 +1166,69 @@ it.instance("reclaims an unoffered live-Claude reservation but never replays an 
       .run()
       .pipe(Effect.orDie)
 
-    expect(yield* claim.claimCommandTurn("sec_unoffered_live")).toEqual({ state: "waiting" })
+    expect(yield* claim.claimCommandTurn("sec_unoffered_live")).toEqual({ state: "occupied" })
     expect(
       yield* database.db
-        .select({ status: SessionCommandTable.status, owner: SessionCommandTable.adopted_by, offeredAt: SessionCommandTable.offered_at })
+        .select({ owner: SessionCommandTable.adopted_by, generation: SessionCommandTable.adopted_generation })
         .from(SessionCommandTable)
         .where(eq(SessionCommandTable.id, "sec_unoffered_live"))
         .get()
         .pipe(Effect.orDie),
-    ).toEqual({ status: "queued", owner: null, offeredAt: null })
+    ).toEqual({ owner: "sec_live_parent", generation: 1 })
 
     yield* database.db
       .update(SessionCommandTable)
-      .set({ adopted_by: "local:dead:prompt", adopted_generation: 4, offer_ordinal: 2, offered_at: now })
+      .set({ adopted_generation: 2 })
       .where(eq(SessionCommandTable.id, "sec_unoffered_live"))
+      .run()
+      .pipe(Effect.orDie)
+    // A reservation from a different parent generation is stale.
+    expect(yield* claim.claimCommandTurn("sec_unoffered_live")).toEqual({ state: "waiting" })
+    expect(
+      yield* database.db
+        .select({ owner: SessionCommandTable.adopted_by, generation: SessionCommandTable.adopted_generation })
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.id, "sec_unoffered_live"))
+        .get()
+        .pipe(Effect.orDie),
+    ).toEqual({ owner: null, generation: null })
+
+    yield* database.db
+      .update(SessionCommandTable)
+      .set({ adopted_by: "sec_missing_parent", adopted_generation: 1 })
+      .where(eq(SessionCommandTable.id, "sec_unoffered_live"))
+      .run()
+      .pipe(Effect.orDie)
+    expect(yield* claim.claimCommandTurn("sec_unoffered_live")).toEqual({ state: "waiting" })
+    expect(
+      yield* database.db
+        .select({ owner: SessionCommandTable.adopted_by, generation: SessionCommandTable.adopted_generation })
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.id, "sec_unoffered_live"))
+        .get()
+        .pipe(Effect.orDie),
+    ).toEqual({ owner: null, generation: null })
+
+    yield* database.db
+      .update(SessionCommandTable)
+      .set({ adopted_by: "sec_live_parent", adopted_generation: 1, offer_ordinal: 2, offered_at: now })
+      .where(eq(SessionCommandTable.id, "sec_unoffered_live"))
+      .run()
+      .pipe(Effect.orDie)
+    expect(yield* claim.claimCommandTurn("sec_unoffered_live")).toEqual({ state: "occupied" })
+    expect(
+      yield* database.db
+        .select({ status: SessionCommandTable.status, offeredAt: SessionCommandTable.offered_at })
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.id, "sec_unoffered_live"))
+        .get()
+        .pipe(Effect.orDie),
+    ).toEqual({ status: "queued", offeredAt: now })
+
+    yield* database.db
+      .update(SessionCommandTable)
+      .set({ lease_expires_at: now - 1 })
+      .where(eq(SessionCommandTable.id, "sec_live_parent"))
       .run()
       .pipe(Effect.orDie)
     expect(yield* claim.claimCommandTurn("sec_unoffered_live")).toEqual({ state: "done" })
@@ -1186,7 +1257,12 @@ it.instance("allows cancellation through a live reservation only before its offe
       noReply: true,
       parts: [{ type: "text", text: "cancel durable steering" }],
     })
-    const session = yield* database.db.select().from(SessionTable).where(eq(SessionTable.id, chat.id)).get().pipe(Effect.orDie)
+    const session = yield* database.db
+      .select()
+      .from(SessionTable)
+      .where(eq(SessionTable.id, chat.id))
+      .get()
+      .pipe(Effect.orDie)
     if (!session) return yield* Effect.die(new Error("missing session row"))
     const claim = yield* PromptClaim.make({ database, events, scope, loop: () => Effect.never })
     const now = Date.now()
@@ -1216,6 +1292,16 @@ it.instance("allows cancellation through a live reservation only before its offe
       .run()
       .pipe(Effect.orDie)
     expect(yield* claim.cancelCommand({ sessionID: chat.id, messageID: message.info.id })).toBe("running")
+
+    for (const status of ["succeeded", "failed", "cancelled"] as const) {
+      yield* database.db
+        .update(SessionCommandTable)
+        .set({ status, completed_at: now })
+        .where(eq(SessionCommandTable.id, "sec_cancellable_live"))
+        .run()
+        .pipe(Effect.orDie)
+      expect(yield* claim.cancelCommand({ sessionID: chat.id, messageID: message.info.id })).toBe("settled")
+    }
   }),
 )
 

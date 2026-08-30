@@ -407,7 +407,7 @@ describe("claude channel", () => {
 
     emit(assistant)
     const iterator = turn.events[Symbol.asyncIterator]()
-    expect(typeOf((await iterator.next()).value!)).toBe("assistant")
+    expect(typeOf((await iterator.next()).value)).toBe("assistant")
     expect(state.handlers?.()).toEqual({ name: "t1" })
     await iterator.return?.(undefined)
   })

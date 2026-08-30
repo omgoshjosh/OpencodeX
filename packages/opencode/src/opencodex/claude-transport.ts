@@ -330,6 +330,16 @@ export function closePersistentChannel(sessionKey: string) {
   return persistentChannels.close(sessionKey)
 }
 
+/**
+ * Pushes a human follow-up into an already-attached persistent Claude turn.
+ * This is intentionally opt-in until session-level adoption can make the
+ * delivery durable.
+ */
+export function offerPersistentChannel(sessionKey: string, prompt: ClaudePrompt) {
+  if (process.env.OPENCODE_CLAUDE_LIVE_QUEUE !== "1") return false
+  return persistentChannels.offer(sessionKey, [userMessage(prompt)])
+}
+
 export function createSdkTransport(): ClaudeTransport {
   const registry = persistentChannels
 

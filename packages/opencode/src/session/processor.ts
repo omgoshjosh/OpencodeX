@@ -672,6 +672,9 @@ export const layer = Layer.effect(
             Effect.retry(
               SessionRetry.policy({
                 parse,
+                // Retrying a stream after text or a tool call risks duplicate
+                // user-visible output and duplicate side effects.
+                canRetry: () => !ctx.currentText && Object.keys(ctx.toolcalls).length === 0,
                 set: (info) =>
                   status.set(ctx.sessionID, {
                     type: "retry",

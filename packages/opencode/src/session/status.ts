@@ -23,6 +23,17 @@ export const Info = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("busy"),
   }),
+  Schema.Struct({
+    type: Schema.Literal("blocked"),
+    childSessionID: SessionID,
+    attemptedModels: Schema.Array(Schema.String),
+    error: Schema.String,
+    retryAt: Schema.optional(NonNegativeInt),
+  }),
+  Schema.Struct({
+    type: Schema.Literal("monitoring"),
+    childSessionID: Schema.optional(SessionID),
+  }),
 ]).annotate({ identifier: "SessionStatus" })
 export type Info = Schema.Schema.Type<typeof Info>
 
@@ -184,6 +195,18 @@ export const layer = Layer.effect(
                   .get()
                 if (execution?.generation !== generation) return undefined
                 if (status.type !== "idle" && execution.state !== "running") return undefined
+              }
+              // A blocked child and external monitoring are independently
+              // owned states. Releasing the local execution must not erase
+              // either state after it has been persisted.
+              if (status.type === "idle") {
+                const current = yield* transaction
+                  .select({ status: SessionStatusTable.status })
+                  .from(SessionStatusTable)
+                  .where(eq(SessionStatusTable.session_id, sessionID))
+                  .get()
+                const existing = current && Option.getOrUndefined(decode(current.status))
+                if (existing?.type === "blocked" || existing?.type === "monitoring") return undefined
               }
               yield* transaction
                 .insert(SessionStatusTable)

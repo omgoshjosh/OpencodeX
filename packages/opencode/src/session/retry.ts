@@ -14,7 +14,10 @@ export type Retryable = {
 export const RETRY_INITIAL_DELAY = 2000
 export const RETRY_BACKOFF_FACTOR = 2
 export const RETRY_MAX_DELAY_NO_HEADERS = 30_000 // 30 seconds
-export const RETRY_MAX_DELAY = 2_147_483_647 // max 32-bit signed integer for setTimeout
+/** A provider hint must never park an interactive session indefinitely. */
+export const RETRY_MAX_DELAY = 30_000
+export const RETRY_MAX_ATTEMPTS = 3
+export const RETRY_MAX_ELAPSED = 30_000
 
 function cap(ms: number) {
   return Math.min(ms, RETRY_MAX_DELAY)
@@ -107,15 +110,21 @@ function parseJSON(value: unknown) {
 export function policy(opts: {
   parse: (error: unknown) => Err
   set: (input: { attempt: number; message: string; next: number }) => Effect.Effect<void>
+  /** A stream with visible output cannot safely be replayed. */
+  canRetry?: () => boolean
 }) {
+  let startedAt: number | undefined
   return Schedule.fromStepWithMetadata(
     Effect.succeed((meta: Schedule.InputMetadata<unknown>) => {
       const error = opts.parse(meta.input)
       const retry = retryable(error)
-      if (!retry) return Cause.done(meta.attempt)
+      if (!retry || (opts.canRetry && !opts.canRetry()) || meta.attempt >= RETRY_MAX_ATTEMPTS) return Cause.done(meta.attempt)
       return Effect.gen(function* () {
-        const wait = delay(meta.attempt, SessionLegacy.APIError.isInstance(error) ? error : undefined)
         const now = yield* Clock.currentTimeMillis
+        startedAt ??= now
+        const remaining = RETRY_MAX_ELAPSED - (now - startedAt)
+        if (remaining <= 0) return Cause.done(meta.attempt)
+        const wait = Math.min(delay(meta.attempt, SessionLegacy.APIError.isInstance(error) ? error : undefined), remaining)
         yield* opts.set({
           attempt: meta.attempt,
           message: retry.message,

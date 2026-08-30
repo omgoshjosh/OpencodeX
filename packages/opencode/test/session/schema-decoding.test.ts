@@ -238,6 +238,21 @@ describe("SessionStatus.Info", () => {
     expect(decode(input)).toEqual(input)
   })
 
+  test("blocked and monitoring are additive states", () => {
+    const blocked = {
+      type: "blocked" as const,
+      childSessionID: sessionID,
+      attemptedModels: ["provider/model"],
+      error: "Provider provider/model: quota exceeded",
+      retryAt: 500,
+    }
+    expect(decode(blocked)).toEqual(blocked)
+    expect(decode({ type: "monitoring", childSessionID: sessionID })).toEqual({
+      type: "monitoring",
+      childSessionID: sessionID,
+    })
+  })
+
   test("rejects unknown type", () => {
     expect(() => decode({ type: "bogus" })).toThrow()
   })

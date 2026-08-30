@@ -126,14 +126,15 @@ export function deriveUiState(input: {
   questions: readonly Question.Request[]
   state?: Info
 }): UiState {
-  const active = input.status?.type === "busy" || input.status?.type === "retry"
+  const active =
+    input.status?.type === "busy" || input.status?.type === "retry" || input.status?.type === "monitoring"
   // Review is a root-session concept (mirroring the unseen-review query in
   // session-card): a delegated child's report is consumed by its parent, so
   // nothing ever marks the child reviewed and it would read "needs review"
   // forever. A finished child settles to idle instead.
   const reviewable = !input.session.parentID
   const displayStatus =
-    input.permissions.length > 0 || input.questions.length > 0
+    input.permissions.length > 0 || input.questions.length > 0 || input.status?.type === "blocked"
       ? "input_needed"
       : active
         ? "in_progress"

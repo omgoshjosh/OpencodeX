@@ -45,6 +45,7 @@ export class LoopInput extends Schema.Class<LoopInput>("SessionPrompt.LoopInput"
   messageID: Schema.optional(MessageID),
   commandID: Schema.optional(Schema.String),
   claimGeneration: Schema.optional(Schema.Number),
+  claimOwner: Schema.optional(Schema.String),
 }) {}
 
 export const ShellInput = Schema.Struct({

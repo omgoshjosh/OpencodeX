@@ -171,9 +171,24 @@ describe("Claude driver delivery finalization", () => {
       const previous = process.env.OPENCODE_CLAUDE_LIVE_QUEUE
       process.env.OPENCODE_CLAUDE_LIVE_QUEUE = "1"
       reset(async function* () {
-        yield { type: "result" as const, subtype: "success", total_cost_usd: 0, usage: { input_tokens: 1, output_tokens: 0 } }
-        yield { type: "result" as const, subtype: "success", total_cost_usd: 0, usage: { input_tokens: 1, output_tokens: 0 } }
-        yield { type: "result" as const, subtype: "success", total_cost_usd: 0, usage: { input_tokens: 1, output_tokens: 0 } }
+        yield {
+          type: "result" as const,
+          subtype: "success",
+          total_cost_usd: 0,
+          usage: { input_tokens: 1, output_tokens: 0 },
+        }
+        yield {
+          type: "result" as const,
+          subtype: "success",
+          total_cost_usd: 0,
+          usage: { input_tokens: 1, output_tokens: 0 },
+        }
+        yield {
+          type: "result" as const,
+          subtype: "success",
+          total_cost_usd: 0,
+          usage: { input_tokens: 1, output_tokens: 0 },
+        }
       })
       const offers = [
         { commandID: "sec_1", messageID: "msg_follow_1" as never, ordinal: 1 },
@@ -197,6 +212,83 @@ describe("Claude driver delivery finalization", () => {
 
         expect(offeredPrompts).toEqual(["follow up", "follow up"])
         expect(settled).toEqual(["sec_1", "sec_2"])
+      } finally {
+        if (previous === undefined) delete process.env.OPENCODE_CLAUDE_LIVE_QUEUE
+        else process.env.OPENCODE_CLAUDE_LIVE_QUEUE = previous
+      }
+    }),
+  )
+
+  it.effect("fails an offered command when its mapped assistant result has an error", () =>
+    Effect.gen(function* () {
+      const previous = process.env.OPENCODE_CLAUDE_LIVE_QUEUE
+      process.env.OPENCODE_CLAUDE_LIVE_QUEUE = "1"
+      reset(async function* () {
+        yield {
+          type: "result" as const,
+          subtype: "success",
+          total_cost_usd: 0,
+          usage: { input_tokens: 1, output_tokens: 0 },
+        }
+        yield {
+          type: "result" as const,
+          subtype: "error_max_turns",
+          is_error: true,
+          total_cost_usd: 0,
+          usage: { input_tokens: 1, output_tokens: 0 },
+        }
+      })
+      queuedMessages = [historyMessage("msg_follow_error", "user", "follow up")]
+      const settled: Array<{ commandID: string; error?: string }> = []
+      try {
+        yield* runTurn({
+          liveQueue: {
+            reserve: () =>
+              Effect.succeed({ commandID: "sec_error", messageID: "msg_follow_error" as never, ordinal: 1 }),
+            offer: () => Effect.succeed(true),
+            requeue: () => Effect.void,
+            settle: (offer, error) => Effect.sync(() => settled.push({ commandID: offer.commandID, error })),
+            failOffered: () => Effect.void,
+          },
+        })
+
+        expect(settled).toEqual([{ commandID: "sec_error", error: expect.stringContaining("UnknownError") }])
+      } finally {
+        if (previous === undefined) delete process.env.OPENCODE_CLAUDE_LIVE_QUEUE
+        else process.env.OPENCODE_CLAUDE_LIVE_QUEUE = previous
+      }
+    }),
+  )
+
+  it.effect("requeues a fence-rejected offer without pushing it to Claude", () =>
+    Effect.gen(function* () {
+      const previous = process.env.OPENCODE_CLAUDE_LIVE_QUEUE
+      process.env.OPENCODE_CLAUDE_LIVE_QUEUE = "1"
+      reset(async function* () {
+        yield {
+          type: "result" as const,
+          subtype: "success",
+          total_cost_usd: 0,
+          usage: { input_tokens: 1, output_tokens: 0 },
+        }
+      })
+      queuedMessages = [historyMessage("msg_rejected", "user", "must not reach Claude")]
+      const rejected = { commandID: "sec_rejected", messageID: "msg_rejected" as never, ordinal: 1 }
+      const requeued: string[] = []
+      let reserved = false
+      try {
+        yield* runTurn({
+          liveQueue: {
+            reserve: () => Effect.sync(() => (reserved ? undefined : ((reserved = true), rejected))),
+            offer: () => Effect.succeed(false),
+            requeue: (offer) => Effect.sync(() => requeued.push(offer.commandID)),
+            settle: () => Effect.void,
+            failOffered: () => Effect.void,
+          },
+        })
+
+        expect(requeued).toEqual(["sec_rejected"])
+        expect(offeredPrompts).toEqual([])
       } finally {
         if (previous === undefined) delete process.env.OPENCODE_CLAUDE_LIVE_QUEUE
         else process.env.OPENCODE_CLAUDE_LIVE_QUEUE = previous

@@ -318,6 +318,7 @@ export function make(deps: Deps) {
             messageID: command.message_id,
             commandID,
             claimGeneration: command.claim_generation,
+            claimOwner: commandOwner,
           })
         }),
         Deferred.await(ownershipLost).pipe(Effect.andThen(Effect.interrupt)),

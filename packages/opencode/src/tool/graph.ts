@@ -373,7 +373,7 @@ function projectForSession(
     const longest = matching[0]?.folder.path.length
     const folderMatches = matching.filter((match) => match.folder.path.length === longest)
     const inferred = folderMatches.length === 1 ? folderMatches[0]?.project : all.length === 1 ? all[0] : undefined
-    if (!inferred) return
+    if (!inferred) return undefined
 
     const projectID = yield* projects.assignSessionIfUnassigned({ projectID: inferred.id, sessionID })
     return all.find((project) => project.id === projectID)

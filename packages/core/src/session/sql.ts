@@ -181,6 +181,12 @@ export const SessionCommandTable = sqliteTable(
     status: text().$type<"queued" | "running" | "succeeded" | "failed" | "cancelled">().notNull(),
     owner_id: text(),
     claim_generation: integer().notNull().default(0),
+    /** Parent command ID and claim generation that reserved this command. */
+    adopted_by: text(),
+    adopted_generation: integer(),
+    /** Monotonic per-source-turn order, and the durable offer linearization point. */
+    offer_ordinal: integer(),
+    offered_at: integer(),
     lease_expires_at: integer(),
     error: text(),
     started_at: integer(),

@@ -145,6 +145,11 @@ function autoContinueText(reason: NonNullable<ReturnType<typeof autoContinueReas
 
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
+  /** Withdraws a message still waiting in the queue; running turns need abort. */
+  readonly cancelQueued: (input: {
+    sessionID: SessionID
+    messageID: MessageID
+  }) => Effect.Effect<"cancelled" | "running" | "settled" | "missing">
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionLegacy.WithParts, Image.Error>
   readonly promptAsync: (input: PromptInput) => Effect.Effect<void, Image.Error>
   readonly recover: () => Effect.Effect<void>
@@ -772,7 +777,7 @@ export const layer = Layer.effect(
     )
 
     const drain = yield* DeploymentDrain.Service
-    const { wakeSession, recover } = yield* PromptClaim.make({
+    const { wakeSession, recover, cancelCommand } = yield* PromptClaim.make({
       database,
       events,
       scope,
@@ -1017,6 +1022,24 @@ export const layer = Layer.effect(
 
     return Service.of({
       cancel,
+      cancelQueued: (input) =>
+        Effect.gen(function* () {
+          const outcome = yield* cancelCommand(input)
+          // A withdrawn instruction must not steer the next turn either: the
+          // parts stay in the transcript (the human should see what they
+          // cancelled) but are marked ignored so no model acts on them.
+          if (outcome === "cancelled") {
+            const message = yield* sessions
+              .messageWithChildren({ sessionID: input.sessionID, messageID: input.messageID })
+              .pipe(Effect.orElseSucceed(() => []))
+            const target = message.find((entry) => entry.info.id === input.messageID)
+            for (const part of target?.parts ?? []) {
+              if (part.type !== "text") continue
+              yield* sessions.updatePart({ ...part, ignored: true }).pipe(Effect.ignore)
+            }
+          }
+          return outcome
+        }),
       prompt,
       promptAsync,
       recover,

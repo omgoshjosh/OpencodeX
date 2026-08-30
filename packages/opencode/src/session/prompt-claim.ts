@@ -392,7 +392,49 @@ export function make(deps: Deps) {
     const unregisterRecovery = SessionPromptRecovery.register(() => recover())
     yield* Effect.addFinalizer(() => Effect.sync(unregisterRecovery))
 
+    /**
+     * Cancels a message that is still waiting in the queue (OpencodeX-8vq).
+     * A human who queued a prompt behind a long turn could not take it back:
+     * the only lever was abort, which kills the turn that is actually
+     * working. Only a `queued` row can be withdrawn - once a command is
+     * running its turn owns it, and stopping that is what abort is for.
+     */
+    const cancelCommand = Effect.fn("SessionPrompt.cancelCommand")(function* (input: {
+      sessionID: SessionID
+      messageID: MessageID
+    }) {
+      const now = clock()
+      return yield* db
+        .transaction(
+          (transaction) =>
+            Effect.gen(function* () {
+              const current = yield* transaction
+                .select()
+                .from(SessionCommandTable)
+                .where(
+                  and(
+                    eq(SessionCommandTable.session_id, input.sessionID),
+                    eq(SessionCommandTable.message_id, input.messageID),
+                  ),
+                )
+                .get()
+              if (!current) return "missing" as const
+              if (current.status === "running") return "running" as const
+              if (current.status !== "queued") return "settled" as const
+              yield* transaction
+                .update(SessionCommandTable)
+                .set({ status: "cancelled", completed_at: now, time_updated: now })
+                .where(and(eq(SessionCommandTable.id, current.id), eq(SessionCommandTable.status, "queued")))
+                .run()
+              return "cancelled" as const
+            }),
+          { behavior: "immediate" },
+        )
+        .pipe(Effect.orDie)
+    })
+
     return {
+      cancelCommand,
       commandOwner,
       commandLeaseMillis,
       claimCommandTurn,

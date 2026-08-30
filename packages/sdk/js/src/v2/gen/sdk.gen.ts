@@ -372,6 +372,8 @@ import type {
   QuestionReplyResponses,
   SessionAbortErrors,
   SessionAbortResponses,
+  SessionCancelQueuedErrors,
+  SessionCancelQueuedResponses,
   SessionChildrenErrors,
   SessionChildrenResponses,
   SessionCommandErrors,
@@ -6569,6 +6571,42 @@ export class Session3 extends HeyApiClient {
       ...options,
       ...params,
     })
+  }
+
+  /**
+   * Cancel a queued message
+   *
+   * Withdraw a message that is still waiting in this session's queue. Returns `running` when its turn already started (use abort instead) and `settled` when it already ran.
+   */
+  public cancelQueued<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      messageID: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "path", key: "messageID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<SessionCancelQueuedResponses, SessionCancelQueuedErrors, ThrowOnError>(
+      {
+        url: "/session/{sessionID}/message/{messageID}/cancel",
+        ...options,
+        ...params,
+      },
+    )
   }
 
   /**

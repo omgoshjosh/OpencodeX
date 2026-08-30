@@ -604,6 +604,46 @@ it.instance("promptAsync persists its message and execution intent before return
   }),
 )
 
+it.instance("cancelQueued withdraws a waiting message and leaves running turns to abort", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const { db } = yield* Database.Service
+    const chat = yield* sessions.create({})
+    yield* llm.hang
+
+    // First message occupies the session; the second waits behind it.
+    yield* prompt.promptAsync({ sessionID: chat.id, model: ref, parts: [{ type: "text", text: "running one" }] })
+    yield* llm.wait(1)
+    const queuedID = MessageID.ascending()
+    yield* prompt.promptAsync({
+      sessionID: chat.id,
+      messageID: queuedID,
+      model: ref,
+      parts: [{ type: "text", text: "please ignore me" }],
+    })
+
+    expect(yield* prompt.cancelQueued({ sessionID: chat.id, messageID: queuedID })).toBe("cancelled")
+    const cancelled = yield* db
+      .select()
+      .from(SessionCommandTable)
+      .where(eq(SessionCommandTable.message_id, queuedID))
+      .get()
+      .pipe(Effect.orDie)
+    expect(cancelled?.status).toBe("cancelled")
+    // The text stays in the transcript but is marked ignored, so no later
+    // turn acts on an instruction the human took back.
+    const withdrawn = (yield* sessions.messages({ sessionID: chat.id })).find((message) => message.info.id === queuedID)
+    expect(withdrawn?.parts.every((part) => part.type !== "text" || part.ignored === true)).toBe(true)
+    // Cancelling twice is not an error, and a message nobody queued is missing.
+    expect(yield* prompt.cancelQueued({ sessionID: chat.id, messageID: queuedID })).toBe("settled")
+    expect(yield* prompt.cancelQueued({ sessionID: chat.id, messageID: MessageID.ascending() })).toBe("missing")
+
+    yield* prompt.cancel(chat.id)
+  }),
+)
+
 it.instance("promptAsync marks its durable command failed when the assistant returns an error", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)

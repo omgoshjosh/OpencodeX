@@ -10603,6 +10603,43 @@ export type SessionAbortResponses = {
 
 export type SessionAbortResponse = SessionAbortResponses[keyof SessionAbortResponses]
 
+export type SessionCancelQueuedData = {
+  body?: never
+  path: {
+    sessionID: string
+    messageID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/message/{messageID}/cancel"
+}
+
+export type SessionCancelQueuedErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionCancelQueuedError = SessionCancelQueuedErrors[keyof SessionCancelQueuedErrors]
+
+export type SessionCancelQueuedResponses = {
+  /**
+   * Queued message cancellation outcome
+   */
+  200: {
+    outcome: "cancelled" | "running" | "settled" | "missing"
+  }
+}
+
+export type SessionCancelQueuedResponse = SessionCancelQueuedResponses[keyof SessionCancelQueuedResponses]
+
 export type SessionInitData = {
   body?: {
     modelID: string

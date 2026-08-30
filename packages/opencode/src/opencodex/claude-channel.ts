@@ -304,6 +304,7 @@ export class Channel<H> {
 
     return {
       events: turnEvents(state),
+      offer: (messages: SDKUserMessage[]) => this.offer(messages),
       interrupt: async () => {
         // Interrupt the turn, not the channel: the child survives for the
         // session's next turn. But a child too wedged to acknowledge the

@@ -138,7 +138,23 @@ export interface Interface {
      * which owns turns; the driver only bridges it.
      */
     adoptOrphan?: (input: { toolName: string }) => Effect.Effect<void>
+    liveQueue?: LiveQueue
   }) => Effect.Effect<SessionLegacy.WithParts>
+}
+
+/** Durable command ownership remains in SessionPrompt; the driver only sequences its live delivery. */
+export type LiveQueue = {
+  reserve: () => Effect.Effect<LiveQueueOffer | undefined>
+  offer: (offer: LiveQueueOffer) => Effect.Effect<boolean>
+  requeue: (offer: LiveQueueOffer) => Effect.Effect<void>
+  settle: (offer: LiveQueueOffer, error?: string) => Effect.Effect<void>
+  failOffered: (error: string) => Effect.Effect<void>
+}
+
+export type LiveQueueOffer = {
+  commandID: string
+  messageID: typeof SessionLegacy.MessageID.Type
+  ordinal: number
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/OpencodeXClaudeDriver") {}
@@ -174,6 +190,7 @@ export function makeLayer(options: LayerOptions = {}) {
           }) => Effect.Effect<{ sessionID: string; userMessageID: string }>
         }
         adoptOrphan?: (input: { toolName: string }) => Effect.Effect<void>
+        liveQueue?: LiveQueue
       }) {
         const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
         // Resolved per turn rather than per layer: `Agent.defaultInfo` re-reads
@@ -207,7 +224,7 @@ export function makeLayer(options: LayerOptions = {}) {
         // mapper rebuilds that part from the tool_result alone - so these are the
         // calls whose stamp has to be carried across a rewrite.
         const delegatedCallIDs = new Set<string>()
-        const context: MapperContext = {
+        let context: MapperContext = {
           sessionID: input.sessionID,
           parentMessageID: input.parentMessageID,
           directory: input.directory,
@@ -412,6 +429,8 @@ export function makeLayer(options: LayerOptions = {}) {
         // SDK auth failures reject the iterator rather than emitting a result
         // event, so retain their text for the auth classifier below.
         let deliveryFailure: string | undefined
+        let offered: LiveQueueOffer | undefined
+        let initialResult: SessionLegacy.WithParts | undefined
         const consume = Effect.gen(function* () {
           while (true) {
             const result = yield* Effect.promise(() => nextClaudeEvent(iterator))
@@ -430,7 +449,54 @@ export function makeLayer(options: LayerOptions = {}) {
             const mapped = ClaudeMapper.mapEvent(next.value, live, context)
             live = mapped.state
             yield* applyWrites(mapped.writes, input.sessionID, { delegatedCallIDs })
-            if (live.finished) break
+            if (!live.finished) continue
+            const turnResult = yield* readTurn(input.sessionID, live.messageID)
+            const error =
+              turnResult.info.role === "assistant" &&
+              turnResult.info.error &&
+              turnResult.info.error.name !== "MessageAbortedError"
+                ? JSON.stringify(turnResult.info.error)
+                : undefined
+            if (offered) {
+              if (input.liveQueue) yield* input.liveQueue.settle(offered, error)
+              offered = undefined
+            } else initialResult = turnResult
+            if (!input.liveQueue || process.env.OPENCODE_CLAUDE_LIVE_QUEUE !== "1") break
+            const reserved = yield* input.liveQueue.reserve()
+            if (!reserved) break
+            const message = yield* sessions
+              .findMessage(input.sessionID, (entry) => entry.info.id === reserved.messageID)
+              .pipe(Effect.orDie)
+            const text = Option.match(message, {
+              onNone: () => "",
+              onSome: (entry) =>
+                entry.parts
+                  .flatMap((part) => (part.type === "text" && !part.synthetic && !part.ignored ? [part.text] : []))
+                  .join("\n"),
+            })
+            if (!text.trim()) {
+              yield* input.liveQueue.requeue(reserved)
+              continue
+            }
+            // The offer timestamp is the delivery linearization point. Keep the
+            // old sink attached until both it and the SDK push succeed.
+            if (!(yield* input.liveQueue.offer(reserved))) {
+              yield* input.liveQueue.requeue(reserved)
+              continue
+            }
+            if (!turn.offer?.(text)) {
+              yield* input.liveQueue.failOffered(DELIVERY_FAILURE)
+              deliveryFailed = true
+              deliveryFailure = DELIVERY_FAILURE
+              break
+            }
+            offered = reserved
+            context = { ...context, parentMessageID: reserved.messageID }
+            live = ClaudeMapper.initialState({
+              modelID: live.modelID,
+              billed: live.billed,
+              tasks: [...live.tasks].map(([id, task]) => ({ id, ...task })),
+            })
           }
           log.info("claude turn events ended", {
             sessionID: input.sessionID,
@@ -468,6 +534,7 @@ export function makeLayer(options: LayerOptions = {}) {
               yield* finalize("delivery-failed", reported)
               if (sidechain) yield* interpretSidechainActions(sidechain.finalizeAll(reported))
               yield* saveConversation()
+              if (input.liveQueue) yield* input.liveQueue.failOffered(reported)
               return yield* readTurn(input.sessionID, live.messageID)
             }),
           )
@@ -481,7 +548,13 @@ export function makeLayer(options: LayerOptions = {}) {
 
         yield* saveConversation()
 
-        return yield* readTurn(input.sessionID, live.messageID)
+        const result = initialResult ?? (yield* readTurn(input.sessionID, live.messageID))
+        const error =
+          result.info.role === "assistant" && result.info.error && result.info.error.name !== "MessageAbortedError"
+            ? JSON.stringify(result.info.error)
+            : undefined
+        if (offered && input.liveQueue) yield* input.liveQueue.settle(offered, error)
+        return result
       })
 
       /**

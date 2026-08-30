@@ -42,7 +42,7 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { Reference } from "@/reference/reference"
-import { and, eq } from "drizzle-orm"
+import { and, asc, eq, exists, gt, inArray, isNotNull, isNull } from "drizzle-orm"
 import { SessionCommandTable, SessionExecutionTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
@@ -198,6 +198,138 @@ export const layer = Layer.effect(
     const background = yield* BackgroundJob.Service
     const todo = yield* Todo.Service
     const { db } = database
+
+    const liveQueue = (input: {
+      sessionID: SessionID
+      commandID?: string
+      claimGeneration?: number
+      claimOwner?: string
+      route: { providerID: string; modelID: string; variant?: string }
+    }) => {
+      if (
+        process.env.OPENCODE_CLAUDE_LIVE_QUEUE !== "1" ||
+        !input.commandID ||
+        input.claimGeneration === undefined ||
+        !input.claimOwner
+      )
+        return undefined
+      let ordinal = 0
+      const parentLive = () =>
+        exists(
+          db
+            .select({ id: SessionCommandTable.id })
+            .from(SessionCommandTable)
+            .where(
+              and(
+                eq(SessionCommandTable.id, input.commandID!),
+                eq(SessionCommandTable.status, "running"),
+                eq(SessionCommandTable.claim_generation, input.claimGeneration!),
+                eq(SessionCommandTable.owner_id, input.claimOwner!),
+                gt(SessionCommandTable.lease_expires_at, Date.now()),
+              ),
+            ),
+        )
+      const fence = (offer: OpencodeXClaudeDriver.LiveQueueOffer) =>
+        and(
+          eq(SessionCommandTable.id, offer.commandID),
+          eq(SessionCommandTable.status, "queued"),
+          eq(SessionCommandTable.adopted_by, input.commandID!),
+          eq(SessionCommandTable.adopted_generation, input.claimGeneration!),
+          eq(SessionCommandTable.offer_ordinal, offer.ordinal),
+        )
+      return {
+        reserve: Effect.fnUntraced(function* () {
+          const candidate = yield* db
+            .select({ id: SessionCommandTable.id, messageID: SessionCommandTable.message_id })
+            .from(SessionCommandTable)
+            .where(and(eq(SessionCommandTable.session_id, input.sessionID), eq(SessionCommandTable.status, "queued")))
+            .orderBy(asc(SessionCommandTable.time_created), asc(SessionCommandTable.id))
+            .get()
+            .pipe(Effect.orDie)
+          if (!candidate) return undefined
+          const message = yield* sessions.messageWithChildren({
+            sessionID: input.sessionID,
+            messageID: candidate.messageID,
+          })
+          const user = message.find((entry) => entry.info.id === candidate.messageID)
+          // Live offers preserve only ordinary text turns on this exact Claude route.
+          if (
+            user?.info.role !== "user" ||
+            user.info.model?.providerID !== input.route.providerID ||
+            user.info.model?.modelID !== input.route.modelID ||
+            (user.info.model?.variant === "default" ? undefined : user.info.model?.variant) !== input.route.variant ||
+            user.parts.length === 0 ||
+            user.parts.some((part) => part.type !== "text" || part.synthetic || part.ignored) ||
+            !user.parts.some((part) => part.type === "text" && part.text.trim())
+          )
+            return undefined
+          const next = ++ordinal
+          const claimed = yield* db
+            .update(SessionCommandTable)
+            .set({
+              adopted_by: input.commandID!,
+              adopted_generation: input.claimGeneration!,
+              offer_ordinal: next,
+              time_updated: Date.now(),
+            })
+            .where(
+              and(
+                eq(SessionCommandTable.id, candidate.id),
+                eq(SessionCommandTable.status, "queued"),
+                isNull(SessionCommandTable.adopted_by),
+                isNull(SessionCommandTable.offered_at),
+                parentLive(),
+              ),
+            )
+            .returning({ id: SessionCommandTable.id })
+            .get()
+            .pipe(Effect.orDie)
+          return claimed ? { commandID: candidate.id, messageID: candidate.messageID, ordinal: next } : undefined
+        }),
+        offer: (offer: OpencodeXClaudeDriver.LiveQueueOffer) =>
+          db
+            .update(SessionCommandTable)
+            .set({ offered_at: Date.now(), time_updated: Date.now() })
+            .where(and(fence(offer), isNull(SessionCommandTable.offered_at), parentLive()))
+            .returning({ id: SessionCommandTable.id })
+            .get()
+            .pipe(Effect.map(Boolean), Effect.orDie),
+        requeue: (offer: OpencodeXClaudeDriver.LiveQueueOffer) =>
+          db
+            .update(SessionCommandTable)
+            .set({ adopted_by: null, adopted_generation: null, offer_ordinal: null, time_updated: Date.now() })
+            .where(and(fence(offer), isNull(SessionCommandTable.offered_at)))
+            .run()
+            .pipe(Effect.asVoid, Effect.orDie),
+        settle: (offer: OpencodeXClaudeDriver.LiveQueueOffer, error?: string) =>
+          db
+            .update(SessionCommandTable)
+            .set({
+              status: error ? "failed" : "succeeded",
+              error: error ?? null,
+              completed_at: Date.now(),
+              time_updated: Date.now(),
+            })
+            .where(and(fence(offer), isNotNull(SessionCommandTable.offered_at)))
+            .run()
+            .pipe(Effect.asVoid, Effect.orDie),
+        failOffered: (error: string) =>
+          db
+            .update(SessionCommandTable)
+            .set({ status: "failed", error, completed_at: Date.now(), time_updated: Date.now() })
+            .where(
+              and(
+                eq(SessionCommandTable.session_id, input.sessionID),
+                eq(SessionCommandTable.status, "queued"),
+                eq(SessionCommandTable.adopted_by, input.commandID!),
+                eq(SessionCommandTable.adopted_generation, input.claimGeneration!),
+                isNotNull(SessionCommandTable.offered_at),
+              ),
+            )
+            .run()
+            .pipe(Effect.asVoid, Effect.orDie),
+      } satisfies OpencodeXClaudeDriver.LiveQueue
+    }
 
     const ops = Effect.fn("SessionPrompt.ops")(function* () {
       return {
@@ -762,6 +894,7 @@ export const layer = Layer.effect(
       prompt: (input) => prompt(input),
       promptAsync: (input) => promptAsync(input),
       loop: (input) => loop(input),
+      liveQueue,
     })
 
     const loop: (input: LoopInput) => Effect.Effect<SessionLegacy.WithParts> = Effect.fn("SessionPrompt.loop")(
@@ -769,9 +902,13 @@ export const layer = Layer.effect(
         // Every prompt entry point funnels through here, so this is the one
         // place that has to know a turn may belong to an external driver.
         yield* ensureSwarmBriefing(input.sessionID, input.messageID).pipe(Effect.ignore)
-        const work = claudeCodeTurn(input.sessionID, input.messageID).pipe(
-          Effect.flatMap((turn) => turn ?? runLoop(input.sessionID)),
-        )
+        const work = claudeCodeTurn(
+          input.sessionID,
+          input.messageID,
+          input.commandID,
+          input.claimGeneration,
+          input.claimOwner,
+        ).pipe(Effect.flatMap((turn) => turn ?? runLoop(input.sessionID)))
         return yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), work)
       },
     )

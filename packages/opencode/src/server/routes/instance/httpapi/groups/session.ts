@@ -99,6 +99,7 @@ export const SessionPaths = {
   update: `${root}/:sessionID`,
   fork: `${root}/:sessionID/fork`,
   abort: `${root}/:sessionID/abort`,
+  cancelQueued: `${root}/:sessionID/message/:messageID/cancel`,
   init: `${root}/:sessionID/init`,
   summarize: `${root}/:sessionID/summarize`,
   prompt: `${root}/:sessionID/message`,
@@ -269,6 +270,22 @@ export const SessionApi = HttpApi.make("session")
             identifier: "session.abort",
             summary: "Abort session",
             description: "Abort an active session and stop any ongoing AI processing or command execution.",
+          }),
+        ),
+        HttpApiEndpoint.post("cancelQueued", SessionPaths.cancelQueued, {
+          params: { sessionID: SessionID, messageID: MessageID },
+          query: WorkspaceRoutingQuery,
+          success: described(
+            Schema.Struct({ outcome: Schema.Literals(["cancelled", "running", "settled", "missing"]) }),
+            "Queued message cancellation outcome",
+          ),
+          error: [HttpApiError.BadRequest, ApiNotFoundError],
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "session.cancelQueued",
+            summary: "Cancel a queued message",
+            description:
+              "Withdraw a message that is still waiting in this session's queue. Returns `running` when its turn already started (use abort instead) and `settled` when it already ran.",
           }),
         ),
         HttpApiEndpoint.post("init", SessionPaths.init, {

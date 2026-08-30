@@ -280,6 +280,17 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       return true
     })
 
+    const cancelQueued = Effect.fn("SessionHttpApi.cancelQueued")(function* (ctx: {
+      params: { sessionID: SessionID; messageID: MessageID }
+    }) {
+      yield* requireSession(ctx.params.sessionID)
+      const outcome = yield* promptSvc.cancelQueued({
+        sessionID: ctx.params.sessionID,
+        messageID: ctx.params.messageID,
+      })
+      return { outcome }
+    })
+
     const init = Effect.fn("SessionHttpApi.init")(function* (ctx: {
       params: { sessionID: SessionID }
       payload: typeof InitPayload.Type
@@ -442,6 +453,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       .handle("update", update)
       .handleRaw("fork", forkRaw)
       .handle("abort", abort)
+      .handle("cancelQueued", cancelQueued)
       .handle("init", init)
       .handle("summarize", summarize)
       .handle("prompt", prompt)

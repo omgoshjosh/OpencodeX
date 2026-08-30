@@ -60,11 +60,14 @@ export interface Deps {
     messageID?: MessageID
     commandID?: string
     claimGeneration?: number
+    claimOwner?: string
   }) => Effect.Effect<SessionLegacy.WithParts>
   readonly liveQueue?: (input: {
     sessionID: SessionID
     commandID?: string
     claimGeneration?: number
+    claimOwner?: string
+    route: { providerID: string; modelID: string }
   }) => OpencodeXClaudeDriver.LiveQueue | undefined
   /**
    * Runs a background delegation's role fiber and owns its lifetime. Absent
@@ -820,6 +823,7 @@ export function make(deps: Deps) {
     messageID?: MessageID,
     commandID?: string,
     claimGeneration?: number,
+    claimOwner?: string,
   ) {
     const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
     const last = messageID ? yield* userMessage(sessionID, messageID) : yield* lastUserMessage(sessionID)
@@ -872,7 +876,17 @@ export function make(deps: Deps) {
     return claudeDriver.runTurn({
       sessionID,
       parentMessageID: last.info.id,
-      ...(deps.liveQueue ? { liveQueue: deps.liveQueue({ sessionID, commandID, claimGeneration }) } : {}),
+      ...(deps.liveQueue
+        ? {
+            liveQueue: deps.liveQueue({
+              sessionID,
+              commandID,
+              claimGeneration,
+              claimOwner,
+              route: { providerID: turnProviderID, modelID: turnModelID },
+            }),
+          }
+        : {}),
       text: promptText,
       ...(attachments.images.length > 0 ? { images: attachments.images } : {}),
       // OpencodeX-sxp: the CLI child of an idle session, woken by a peer

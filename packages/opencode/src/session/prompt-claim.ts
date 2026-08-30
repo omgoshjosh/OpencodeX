@@ -270,6 +270,7 @@ export function make(deps: Deps) {
           messageID: command.message_id,
           commandID,
           claimGeneration: command.claim_generation,
+          claimOwner: commandOwner,
         })
       }).pipe(Effect.exit, Effect.ensuring(Fiber.interrupt(heartbeat)))
       const completedAt = clock()

@@ -445,10 +445,17 @@ export function makeLayer(options: LayerOptions = {}) {
             live = mapped.state
             yield* applyWrites(mapped.writes, input.sessionID, { delegatedCallIDs })
             if (!live.finished) continue
+            const turnResult = yield* readTurn(input.sessionID, live.messageID)
+            const error =
+              turnResult.info.role === "assistant" &&
+              turnResult.info.error &&
+              turnResult.info.error.name !== "MessageAbortedError"
+                ? JSON.stringify(turnResult.info.error)
+                : undefined
             if (offered) {
-              if (input.liveQueue) yield* input.liveQueue.settle(offered)
+              if (input.liveQueue) yield* input.liveQueue.settle(offered, error)
               offered = undefined
-            } else initialResult = yield* readTurn(input.sessionID, live.messageID)
+            } else initialResult = turnResult
             if (!input.liveQueue || process.env.OPENCODE_CLAUDE_LIVE_QUEUE !== "1") break
             const reserved = yield* input.liveQueue.reserve()
             if (!reserved) break
@@ -534,8 +541,13 @@ export function makeLayer(options: LayerOptions = {}) {
 
         yield* saveConversation()
 
-        if (offered && input.liveQueue) yield* input.liveQueue.settle(offered)
-        return initialResult ?? (yield* readTurn(input.sessionID, live.messageID))
+        const result = initialResult ?? (yield* readTurn(input.sessionID, live.messageID))
+        const error =
+          result.info.role === "assistant" && result.info.error && result.info.error.name !== "MessageAbortedError"
+            ? JSON.stringify(result.info.error)
+            : undefined
+        if (offered && input.liveQueue) yield* input.liveQueue.settle(offered, error)
+        return result
       })
 
       /**

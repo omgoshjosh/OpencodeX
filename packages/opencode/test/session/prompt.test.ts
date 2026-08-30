@@ -3767,6 +3767,116 @@ const claimingDriver = Layer.succeed(
 )
 const claimDriverIt = testEffect(Layer.mergeAll(TestLLMServer.layer, makePrompt({ claudeDriver: claimingDriver })))
 
+const routeFenceReservations: Array<OpencodeXClaudeDriver.LiveQueueOffer | undefined> = []
+const routeFenceDriver = Layer.succeed(
+  OpencodeXClaudeDriver.Service,
+  OpencodeXClaudeDriver.Service.of({
+    runTurn: (input) =>
+      Effect.gen(function* () {
+        routeFenceReservations.push(input.liveQueue ? yield* input.liveQueue.reserve() : undefined)
+        return { info: { id: input.parentMessageID, sessionID: input.sessionID }, parts: [] } as never
+      }),
+  }),
+)
+const routeFenceIt = testEffect(Layer.mergeAll(TestLLMServer.layer, makePrompt({ claudeDriver: routeFenceDriver })))
+
+routeFenceIt.instance("leaves a differently configured Claude effort at the FIFO head", () =>
+  Effect.gen(function* () {
+    const previous = process.env.OPENCODE_CLAUDE_LIVE_QUEUE
+    process.env.OPENCODE_CLAUDE_LIVE_QUEUE = "1"
+    try {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const { db } = yield* Database.Service
+      const chat = yield* sessions.create({})
+      const parent = yield* prompt.prompt({
+        sessionID: chat.id,
+        model: { providerID: ProviderV2.ID.make("claude-code"), modelID: ProviderV2.ModelID.make("sonnet") },
+        variant: "low",
+        noReply: true,
+        parts: [{ type: "text", text: "parent" }],
+      })
+      const incompatible = yield* prompt.prompt({
+        sessionID: chat.id,
+        model: { providerID: ProviderV2.ID.make("claude-code"), modelID: ProviderV2.ModelID.make("sonnet") },
+        variant: "high",
+        noReply: true,
+        parts: [{ type: "text", text: "high effort" }],
+      })
+      const compatible = yield* prompt.prompt({
+        sessionID: chat.id,
+        model: { providerID: ProviderV2.ID.make("claude-code"), modelID: ProviderV2.ModelID.make("sonnet") },
+        variant: "low",
+        noReply: true,
+        parts: [{ type: "text", text: "low effort" }],
+      })
+      const session = yield* db.select().from(SessionTable).where(eq(SessionTable.id, chat.id)).get().pipe(Effect.orDie)
+      if (!session) return yield* Effect.die(new Error("missing session row"))
+      const now = Date.now()
+      yield* db
+        .insert(SessionCommandTable)
+        .values([
+          {
+            id: "sec_variant_parent",
+            session_id: chat.id,
+            message_id: parent.info.id,
+            project_id: session.project_id,
+            directory: session.directory,
+            status: "running",
+            owner_id: "remote:variant-parent",
+            claim_generation: 1,
+            lease_expires_at: now + 60_000,
+            time_created: now,
+            time_updated: now,
+          },
+          {
+            id: "sec_variant_incompatible",
+            session_id: chat.id,
+            message_id: incompatible.info.id,
+            project_id: session.project_id,
+            directory: session.directory,
+            status: "queued",
+            time_created: now + 1,
+            time_updated: now + 1,
+          },
+          {
+            id: "sec_variant_compatible",
+            session_id: chat.id,
+            message_id: compatible.info.id,
+            project_id: session.project_id,
+            directory: session.directory,
+            status: "queued",
+            time_created: now + 2,
+            time_updated: now + 2,
+          },
+        ])
+        .run()
+        .pipe(Effect.orDie)
+
+      yield* prompt.loop({
+        sessionID: chat.id,
+        messageID: parent.info.id,
+        commandID: "sec_variant_parent",
+        claimGeneration: 1,
+        claimOwner: "remote:variant-parent",
+      })
+
+      expect(routeFenceReservations.at(-1)).toBeUndefined()
+      expect(
+        yield* db
+          .select({ id: SessionCommandTable.id, adoptedBy: SessionCommandTable.adopted_by })
+          .from(SessionCommandTable)
+          .where(eq(SessionCommandTable.id, "sec_variant_compatible"))
+          .get()
+          .pipe(Effect.orDie),
+      ).toEqual({ id: "sec_variant_compatible", adoptedBy: null })
+    } finally {
+      if (previous === undefined) delete process.env.OPENCODE_CLAUDE_LIVE_QUEUE
+      else process.env.OPENCODE_CLAUDE_LIVE_QUEUE = previous
+    }
+  }),
+)
+
 claimDriverIt.instance("a fresh Claude turn receives its claimed execution generation", () =>
   Effect.gen(function* () {
     const prompt = yield* SessionPrompt.Service

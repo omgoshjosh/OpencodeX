@@ -48,6 +48,45 @@ export function make(deps: Deps) {
               if (!current || ["succeeded", "failed", "cancelled"].includes(current.status)) {
                 return { state: "done" as const }
               }
+              // A process can die after reserving an ordinary human command
+              // but before writing it to Claude's streaming input. That is not
+              // an offer, so clear the fence and let normal FIFO recovery run.
+              if (current.status === "queued" && current.adopted_by && !current.offered_at) {
+                yield* transaction
+                  .update(SessionCommandTable)
+                  .set({ adopted_by: null, adopted_generation: null, offer_ordinal: null, time_updated: now })
+                  .where(
+                    and(
+                      eq(SessionCommandTable.id, commandID),
+                      eq(SessionCommandTable.status, "queued"),
+                      eq(SessionCommandTable.adopted_by, current.adopted_by),
+                      isNull(SessionCommandTable.offered_at),
+                    ),
+                  )
+                  .run()
+                return { state: "waiting" as const }
+              }
+              // An offered input may have reached Claude even if this process
+              // died before observing its result. Never replay it on recovery.
+              if (current.status === "queued" && current.offered_at) {
+                yield* transaction
+                  .update(SessionCommandTable)
+                  .set({
+                    status: "failed",
+                    error: "Live Claude offer outcome is unknown after recovery.",
+                    completed_at: now,
+                    time_updated: now,
+                  })
+                  .where(
+                    and(
+                      eq(SessionCommandTable.id, commandID),
+                      eq(SessionCommandTable.status, "queued"),
+                      eq(SessionCommandTable.offered_at, current.offered_at),
+                    ),
+                  )
+                  .run()
+                return { state: "done" as const }
+              }
               if (current.status === "running" && current.lease_expires_at && current.lease_expires_at > now) {
                 return { state: "occupied" as const }
               }
@@ -323,7 +362,7 @@ export function make(deps: Deps) {
                 )
                 .get()
               if (!current) return "missing" as const
-              if (current.status === "running") return "running" as const
+               if (current.status === "running" || current.offered_at) return "running" as const
               if (current.status !== "queued") return "settled" as const
               yield* transaction
                 .update(SessionCommandTable)

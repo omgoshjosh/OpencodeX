@@ -265,7 +265,12 @@ export function make(deps: Deps) {
           .get()
           .pipe(Effect.orDie)
         if (!admitted) return
-        return yield* loop({ sessionID: command.session_id, messageID: command.message_id })
+        return yield* loop({
+          sessionID: command.session_id,
+          messageID: command.message_id,
+          commandID,
+          claimGeneration: command.claim_generation,
+        })
       }).pipe(Effect.exit, Effect.ensuring(Fiber.interrupt(heartbeat)))
       const completedAt = clock()
       const error = Exit.isFailure(exit)

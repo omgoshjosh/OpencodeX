@@ -353,9 +353,12 @@ export function make(deps: Deps) {
       )
       const exit = yield* Effect.uninterruptibleMask((restore) =>
         restore(
-          loop({ sessionID: command.session_id, messageID: command.message_id }).pipe(
-            Effect.onInterrupt(() => requeue()),
-          ),
+          loop({
+            sessionID: command.session_id,
+            messageID: command.message_id,
+            commandID,
+            claimGeneration: command.claim_generation,
+          }).pipe(Effect.onInterrupt(() => requeue())),
         ).pipe(Effect.exit, Effect.ensuring(Fiber.interrupt(heartbeat))),
       )
       const completedAt = clock()

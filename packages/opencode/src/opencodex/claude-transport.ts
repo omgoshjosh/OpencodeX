@@ -238,6 +238,8 @@ export type TransportTurn = {
   /** Ordered stream-json events for one prompt. */
   events: AsyncIterable<ClaudeEvent>
   interrupt: () => Promise<void>
+  /** Adds a follow-up to this exact attached persistent turn. */
+  offer?: (prompt: ClaudePrompt) => boolean
 }
 
 export type ClaudeImage = {
@@ -480,6 +482,7 @@ export function createSdkTransport(): ClaudeTransport {
         cancelled = true
         await active?.interrupt()
       },
+      offer: (next) => active?.offer([userMessage(next)]) ?? false,
     }
   }
 
@@ -540,6 +543,7 @@ export function createSdkTransport(): ClaudeTransport {
           controller.abort()
           await query?.interrupt?.().catch(() => undefined)
         },
+        offer: undefined,
       }
     },
   }

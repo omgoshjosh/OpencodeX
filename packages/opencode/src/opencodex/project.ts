@@ -174,6 +174,9 @@ export interface Interface {
   readonly moveSession: (
     input: MoveSessionInput,
   ) => Effect.Effect<Session.Info, Project.NotFoundError | Session.NotFound>
+  readonly assignSessionIfUnassigned: (
+    input: MoveSessionInput,
+  ) => Effect.Effect<string, Project.NotFoundError | Session.NotFound>
   readonly removeProject: (projectID: string) => Effect.Effect<boolean>
   readonly removeSession: (sessionID: SessionID) => Effect.Effect<boolean, Session.NotFound>
 }
@@ -637,6 +640,19 @@ export const layer = Layer.effect(
       return yield* mutationLock.withPermits(1)(moveSessionUnlocked(input))
     })
 
+    const assignSessionIfUnassignedUnlocked = Effect.fnUntraced(function* (input: MoveSessionInput) {
+      const current = yield* OpencodeXProjectFolder.getSessionProject(db, input.sessionID)
+      if (current) return current.opencodex_project_id
+      yield* moveSessionUnlocked(input)
+      return input.projectID
+    })
+
+    const assignSessionIfUnassigned = Effect.fn("OpencodeXProject.assignSessionIfUnassigned")(function* (
+      input: MoveSessionInput,
+    ) {
+      return yield* mutationLock.withPermits(1)(assignSessionIfUnassignedUnlocked(input))
+    })
+
     const removeProjectUnlocked = Effect.fnUntraced(function* (projectID: string) {
       const event = yield* events.barrier(
         db.transaction(
@@ -675,6 +691,7 @@ export const layer = Layer.effect(
       reorder,
       createSession,
       moveSession,
+      assignSessionIfUnassigned,
       removeProject,
       removeSession,
     })

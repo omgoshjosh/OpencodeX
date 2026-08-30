@@ -67,7 +67,7 @@ export interface Deps {
     commandID?: string
     claimGeneration?: number
     claimOwner?: string
-    route: { providerID: string; modelID: string }
+    route: { providerID: string; modelID: string; variant?: string }
   }) => OpencodeXClaudeDriver.LiveQueue | undefined
   /**
    * Runs a background delegation's role fiber and owns its lifetime. Absent
@@ -883,7 +883,11 @@ export function make(deps: Deps) {
               commandID,
               claimGeneration,
               claimOwner,
-              route: { providerID: turnProviderID, modelID: turnModelID },
+              route: {
+                providerID: turnProviderID,
+                modelID: turnModelID,
+                ...(selected?.variant && selected.variant !== "default" ? { variant: selected.variant } : {}),
+              },
             }),
           }
         : {}),

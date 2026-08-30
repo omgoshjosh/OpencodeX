@@ -58,6 +58,8 @@ export type DelegationRecord = {
   completedAt?: number
   /** Display-only report opening; bounded, but still free-form model text. */
   summary?: string
+  /** Safe provider failure evidence, kept separate from the model's report. */
+  error?: string
   /** Whether the parent workflow durably received the report. */
   deliveryOutcome?: DelegationDelivery
   deliveryClaimedAt?: number
@@ -92,6 +94,11 @@ export function summarizeDelegationReport(text: string | undefined): string | un
   return `${(boundary > DELEGATION_SUMMARY_LIMIT / 2 ? clipped.slice(0, boundary) : clipped).trimEnd()}...`
 }
 
+/** Provider failure evidence is machine-generated, bounded, and whitespace-stable. */
+export function summarizeDelegationError(text: string | undefined): string | undefined {
+  return summarizeDelegationReport(text)
+}
+
 /**
  * The metadata with the delegation record stamped in, preserving everything
  * else `metadata.opencodex` already carries (swarm id, role, depth). The
@@ -105,12 +112,13 @@ export function withDelegationRecord(
 ): Record<string, unknown> {
   const opencodex = isRecord(metadata?.opencodex) ? metadata.opencodex : {}
   const trimmed = summarizeDelegationReport(record.summary)
-  const { summary: _untrimmed, ...rest } = record
+  const error = summarizeDelegationError(record.error)
+  const { summary: _untrimmed, error: _untrimmedError, ...rest } = record
   return {
     ...metadata,
     opencodex: {
       ...opencodex,
-      delegation: { ...rest, ...(trimmed ? { summary: trimmed } : {}) },
+      delegation: { ...rest, ...(trimmed ? { summary: trimmed } : {}), ...(error ? { error } : {}) },
     },
   }
 }
@@ -121,6 +129,7 @@ export function settleDelegation(
   input: {
     outcome: DelegationOutcome
     summary?: string
+    error?: string
     completedAt?: number
     deliveryOutcome?: DelegationDelivery
   },
@@ -131,6 +140,7 @@ export function settleDelegation(
     outcome: input.outcome,
     completedAt: input.completedAt ?? Date.now(),
     ...(input.summary !== undefined ? { summary: input.summary } : {}),
+    ...(input.error !== undefined ? { error: input.error } : {}),
     ...(input.deliveryOutcome ? { deliveryOutcome: input.deliveryOutcome } : {}),
   }
 }
@@ -204,6 +214,7 @@ export function delegationRecord(metadata: Record<string, unknown> | undefined |
     startedAt: raw.startedAt,
     ...(raw.completedAt !== undefined ? { completedAt: raw.completedAt } : {}),
     ...(typeof raw.summary === "string" && raw.summary ? { summary: raw.summary } : {}),
+    ...(typeof raw.error === "string" && raw.error ? { error: raw.error } : {}),
     ...(raw.deliveryOutcome !== undefined ? { deliveryOutcome: raw.deliveryOutcome } : {}),
     ...(typeof raw.deliveryClaimedAt === "number" && Number.isFinite(raw.deliveryClaimedAt)
       ? { deliveryClaimedAt: raw.deliveryClaimedAt }

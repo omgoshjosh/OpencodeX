@@ -122,13 +122,104 @@ function backgroundMessage(input: {
   ].join("\n")
 }
 
+function record(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined
+}
+
+function string(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined
+}
+
+function safeErrorText(error: unknown) {
+  const root = record(error)
+  const data = record(root?.data)
+  const reason = record(root?.reason)
+  const message =
+    string(data?.message) ??
+    string(reason?.message) ??
+    (error instanceof Error ? error.message : undefined) ??
+    "request failed"
+  return message
+    .replace(/\b(bearer)\s+\S+/gi, "$1 [redacted]")
+    .replace(/\b(api[_ -]?key|authorization|token|secret|password)\s*[:=]\s*[^\s,;]+/gi, "$1=[redacted]")
+    .replace(/([?&](?:api[_-]?key|token|access_token|authorization)=)[^&\s]+/gi, "$1[redacted]")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 500)
+}
+
+type ProviderFailure = { message: string; retryAt?: number }
+
+export function providerFailure(
+  error: unknown,
+  model: { providerID: string; modelID: string },
+): ProviderFailure | undefined {
+  const root = record(error)
+  const data = record(root?.data)
+  const reason = record(root?.reason)
+  const http = record(data?.http) ?? record(reason?.http)
+  const response = record(http?.response)
+  const metadata = record(data?.metadata) ?? record(reason?.providerMetadata)
+  const headers = record(data?.responseHeaders) ?? record(response?.headers)
+  const name = string(root?.name)
+  const kind = string(data?._tag) ?? string(reason?._tag)
+  const code = string(data?.code) ?? string(reason?.code) ?? string(metadata?.code)
+  const status =
+    typeof data?.statusCode === "number"
+      ? data.statusCode
+      : typeof response?.status === "number"
+        ? response.status
+        : undefined
+  const structured = [name, kind, code, status].filter((value) => value !== undefined).join(" ")
+  const terminal =
+    name === "ProviderAuthError" ||
+    kind === "Authentication" ||
+    kind === "QuotaExceeded" ||
+    status === 401 ||
+    status === 403 ||
+    /(?:insufficient_quota|quota_exceeded|monthly.*quota|provider.*budget|budget_exceeded|invalid_api_key|authentication|unauthorized|forbidden)/i.test(
+      structured,
+    ) ||
+    (!structured &&
+      /(?:quota|insufficient.?credit|billing|unauthori[sz]ed|authentication|forbidden|provider.?budget)/i.test(
+        safeErrorText(error),
+      ))
+  if (!terminal) return undefined
+  const retryAfter =
+    typeof data?.retryAfterMs === "number"
+      ? data.retryAfterMs
+      : typeof reason?.retryAfterMs === "number"
+        ? reason.retryAfterMs
+        : undefined
+  const retryHeader = Object.entries(headers ?? {}).find(([key]) => key.toLowerCase() === "retry-after")?.[1]
+  const retryAt =
+    retryAfter !== undefined
+      ? Date.now() + Math.max(0, retryAfter)
+      : retryHeader && Number.isFinite(Number(retryHeader))
+        ? Date.now() + Math.max(0, Number(retryHeader) * 1000)
+        : undefined
+  const requestID = string(http?.requestId) ?? string(metadata?.requestId) ?? string(headers?.["x-request-id"])
+  const details = [
+    kind && `kind=${kind}`,
+    code && `code=${code}`,
+    status !== undefined && `status=${status}`,
+    retryAt !== undefined && `retryAt=${retryAt}`,
+    requestID && `requestId=${requestID}`,
+  ].filter(Boolean)
+  return {
+    message: `Provider ${model.providerID}/${model.modelID}${details.length ? ` (${details.join(", ")})` : ""}: ${safeErrorText(error)}`,
+    ...(retryAt !== undefined ? { retryAt } : {}),
+  }
+}
+
 function errorText(error: unknown) {
-  if (error instanceof Error) return error.message
-  return String(error)
+  return safeErrorText(error)
 }
 
 /** What one child run produced, before it is folded into the tool result. */
-type TaskRunResult = { state: "completed" | "error" | "cancelled"; text: string }
+type TaskRunResult = { state: "completed" | "error" | "cancelled"; text: string; failure?: unknown }
 
 /**
  * How many delegation hops a swarm may nest.
@@ -220,6 +311,7 @@ export const TaskTool = Tool.define(
     const scope = yield* Scope.Scope
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
+    const status = yield* SessionStatus.Service
 
     /**
      * The swarm role a delegation runs as, resolved against the swarm's own
@@ -371,15 +463,17 @@ export const TaskTool = Tool.define(
       // completed child rendered as unknown - so failures are logged, not
       // silently ignored.
       const stamp = (record: DelegationRecord, expectRunID?: string) =>
-        sessions.stampDelegation({ sessionID: nextSession.id, record, ...(expectRunID ? { expectRunID } : {}) }).pipe(
-          Effect.catchCause((cause) =>
-            Effect.sync(() => {
-              log.error("delegation stamp failed", { sessionID: nextSession.id, runID, cause })
-              return false
-            }),
-          ),
-        )
-      const settle = (outcome: DelegationOutcome, summary?: string) =>
+        sessions
+          .stampDelegation({ sessionID: nextSession.id, record, ...(expectRunID ? { expectRunID } : {}) })
+          .pipe(
+            Effect.catchCause((cause) =>
+              Effect.sync(() => {
+                log.error("delegation stamp failed", { sessionID: nextSession.id, runID, cause })
+                return false
+              }),
+            ),
+          )
+      const settle = (outcome: DelegationOutcome, summary?: string, error?: string) =>
         stamp(
           settleDelegation(started, {
             outcome,
@@ -387,16 +481,12 @@ export const TaskTool = Tool.define(
             // Delivery is separate from execution settlement for both modes:
             // the parent part can be lost after the child has already stopped.
             deliveryOutcome: "pending" as const,
+            ...(error ? { error } : {}),
           }),
           runID,
         ).pipe(Effect.andThen(status ? status.refresh(ctx.sessionID) : Effect.void), Effect.asVoid)
       // An observed cancellation request wins over a late clean return.
       const cancelState = { requested: false }
-      const settleResult = (result: TaskRunResult) =>
-        cancelState.requested
-          ? settle("cancelled", result.text)
-          : settle(result.state === "error" ? "errored" : result.state, result.text)
-
       yield* stamp(started).pipe(Effect.andThen(status ? status.refresh(ctx.sessionID) : Effect.void))
 
       return yield* Effect.gen(function* () {
@@ -548,10 +638,10 @@ export const TaskTool = Tool.define(
               )
               .at(-1) ?? ""
           if (persisted.info.role === "assistant" && persisted.info.error) {
-            const failure = [`The subagent failed: ${JSON.stringify(persisted.info.error)}`, report]
+            const failure = [`The subagent failed: ${safeErrorText(persisted.info.error)}`, report]
               .filter(Boolean)
               .join("\n")
-            return { state: "error", text: failure } satisfies TaskRunResult
+            return { state: "error", text: failure, failure: persisted.info.error } satisfies TaskRunResult
           }
           if (!report)
             return {
@@ -563,6 +653,38 @@ export const TaskTool = Tool.define(
             text: report,
           } satisfies TaskRunResult
         })
+
+        const settleResult = (result: TaskRunResult) =>
+          Effect.gen(function* () {
+            const failure = result.state === "error" ? providerFailure(result.failure ?? result.text, model) : undefined
+            if (cancelState.requested) return yield* settle("cancelled", result.text)
+            yield* settle(result.state === "error" ? "errored" : "completed", result.text, failure?.message)
+            if (!failure) return
+            // This durable parent-owned state survives local execution release.
+            yield* status.set(ctx.sessionID, {
+              type: "blocked",
+              childSessionID: nextSession.id,
+              attemptedModels: [`${model.providerID}/${model.modelID}`],
+              error: failure.message,
+              ...(failure.retryAt !== undefined ? { retryAt: failure.retryAt } : {}),
+            })
+          })
+        const settleFailure = (error: unknown) => {
+          const failure = providerFailure(error, model)
+          return settle("errored", errorText(error), failure?.message).pipe(
+            Effect.andThen(
+              failure
+                ? status.set(ctx.sessionID, {
+                    type: "blocked",
+                    childSessionID: nextSession.id,
+                    attemptedModels: [`${model.providerID}/${model.modelID}`],
+                    error: failure.message,
+                    ...(failure.retryAt !== undefined ? { retryAt: failure.retryAt } : {}),
+                  })
+                : Effect.void,
+            ),
+          )
+        }
 
         const inject = Effect.fn("TaskTool.injectBackgroundResult")(function* (
           state: "completed" | "error",
@@ -627,7 +749,7 @@ export const TaskTool = Tool.define(
                     ? settleResult(exit.value)
                     : Cause.hasInterruptsOnly(exit.cause)
                       ? settle("cancelled")
-                      : settle("errored", errorText(Cause.squash(exit.cause))),
+                      : settleFailure(Cause.squash(exit.cause)),
                 ),
                 // A subagent that finished on an assistant error is a failed
                 // job, not a completed one: the job state, the notification, and

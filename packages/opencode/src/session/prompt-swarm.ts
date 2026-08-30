@@ -60,7 +60,17 @@ export interface Deps {
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionLegacy.WithParts, Image.Error>
   /** Queues a prompt without waiting for its turn; absent (tests), orphan approvals are not adopted. */
   readonly promptAsync?: (input: PromptInput) => Effect.Effect<void, Image.Error>
-  readonly loop: (input: { sessionID: SessionID; messageID?: MessageID }) => Effect.Effect<SessionLegacy.WithParts>
+  readonly loop: (input: {
+    sessionID: SessionID
+    messageID?: MessageID
+    commandID?: string
+    claimGeneration?: number
+  }) => Effect.Effect<SessionLegacy.WithParts>
+  readonly liveQueue?: (input: {
+    sessionID: SessionID
+    commandID?: string
+    claimGeneration?: number
+  }) => OpencodeXClaudeDriver.LiveQueue | undefined
   /**
    * Runs a background delegation's role fiber and owns its lifetime. Absent
    * (older callers, tests), `background: true` delegations run inline.
@@ -813,7 +823,12 @@ export function make(deps: Deps) {
    * Claude Code CLI instead of a provider API. Returns the work effect for
    * such a turn, or undefined for an ordinary session.
    */
-  const claudeCodeTurn = Effect.fnUntraced(function* (sessionID: SessionID, messageID?: MessageID) {
+  const claudeCodeTurn = Effect.fnUntraced(function* (
+    sessionID: SessionID,
+    messageID?: MessageID,
+    commandID?: string,
+    claimGeneration?: number,
+  ) {
     const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
     const last = messageID ? yield* userMessage(sessionID, messageID) : yield* lastUserMessage(sessionID)
     const selected = last?.info.role === "user" ? last.info.model : session.model
@@ -865,6 +880,7 @@ export function make(deps: Deps) {
     return claudeDriver.runTurn({
       sessionID,
       parentMessageID: last.info.id,
+      ...(deps.liveQueue ? { liveQueue: deps.liveQueue({ sessionID, commandID, claimGeneration }) } : {}),
       text: promptText,
       ...(attachments.images.length > 0 ? { images: attachments.images } : {}),
       // OpencodeX-sxp: the CLI child of an idle session, woken by a peer

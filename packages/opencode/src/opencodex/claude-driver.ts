@@ -482,7 +482,6 @@ export function makeLayer(options: LayerOptions = {}) {
             if (!turn.offer?.(text)) {
               yield* input.liveQueue.failOffered(DELIVERY_FAILURE)
               deliveryFailed = true
-              deliveryFailure = DELIVERY_FAILURE
               break
             }
             offered = reserved

@@ -24,6 +24,8 @@ let metadata: Record<string, unknown> = {}
 let history: SessionLegacy.WithParts[] = []
 let persistedMetadata: Record<string, unknown> | undefined
 let removedMessages: string[] = []
+let offeredPrompts: ClaudePrompt[] = []
+let queuedMessages: SessionLegacy.WithParts[] = []
 
 const transport: ClaudeTransport = {
   run(nextPrompt, nextOptions) {
@@ -34,6 +36,10 @@ const transport: ClaudeTransport = {
       interrupt: async () => {
         interrupts += 1
         if (!interruptSettles) await new Promise(() => undefined)
+      },
+      offer: (next) => {
+        offeredPrompts.push(next)
+        return true
       },
     }
   },
@@ -70,9 +76,9 @@ const sessions = Layer.mock(Session.Service)({
     }),
   findMessage: (_sessionID, predicate) =>
     Effect.sync(() => {
-      if (!message) return Option.none()
-      const found = { info: message, parts }
-      return predicate(found) ? Option.some(found) : Option.none()
+      const found = message ? ({ info: message, parts } as SessionLegacy.WithParts) : undefined
+      const matched = [found, ...queuedMessages].find((entry) => entry && predicate(entry))
+      return matched ? Option.some(matched) : Option.none()
     }),
 })
 const dependencies = Layer.mergeAll(
@@ -114,6 +120,8 @@ function reset(
   history = options?.history ?? []
   persistedMetadata = undefined
   removedMessages = []
+  offeredPrompts = []
+  queuedMessages = []
 }
 
 function runTurn(input?: {
@@ -121,6 +129,7 @@ function runTurn(input?: {
   images?: ClaudeImage[]
   delegate?: OpencodeXClaudeDriver.SwarmDelegate
   directory?: string
+  liveQueue?: OpencodeXClaudeDriver.LiveQueue
 }) {
   return Effect.gen(function* () {
     const service = yield* OpencodeXClaudeDriver.Service
@@ -130,6 +139,7 @@ function runTurn(input?: {
       text: input?.text ?? "hello",
       ...(input?.images ? { images: input.images } : {}),
       ...(input?.delegate ? { delegate: input.delegate } : {}),
+      ...(input?.liveQueue ? { liveQueue: input.liveQueue } : {}),
       // The driver refuses to spawn into a directory that does not exist.
       directory: input?.directory ?? process.cwd(),
       providerID: "claude-code",
@@ -167,6 +177,44 @@ function assistantInfo(result: SessionLegacy.WithParts) {
 }
 
 describe("Claude driver delivery finalization", () => {
+  it.effect("offers queued Claude follow-ups FIFO without detaching after the first result", () =>
+    Effect.gen(function* () {
+      const previous = process.env.OPENCODE_CLAUDE_LIVE_QUEUE
+      process.env.OPENCODE_CLAUDE_LIVE_QUEUE = "1"
+      reset(async function* () {
+        yield { type: "result" as const, subtype: "success", total_cost_usd: 0, usage: { input_tokens: 1, output_tokens: 0 } }
+        yield { type: "result" as const, subtype: "success", total_cost_usd: 0, usage: { input_tokens: 1, output_tokens: 0 } }
+        yield { type: "result" as const, subtype: "success", total_cost_usd: 0, usage: { input_tokens: 1, output_tokens: 0 } }
+      })
+      const offers = [
+        { commandID: "sec_1", messageID: "msg_follow_1" as never, ordinal: 1 },
+        { commandID: "sec_2", messageID: "msg_follow_2" as never, ordinal: 2 },
+      ]
+      const settled: string[] = []
+      queuedMessages = [
+        historyMessage("msg_follow_1", "user", "follow up"),
+        historyMessage("msg_follow_2", "user", "follow up"),
+      ]
+      try {
+        yield* runTurn({
+          liveQueue: {
+            reserve: () => Effect.sync(() => offers.shift()),
+            offer: () => Effect.succeed(true),
+            requeue: () => Effect.void,
+            settle: (offer) => Effect.sync(() => settled.push(offer.commandID)),
+            failOffered: () => Effect.void,
+          },
+        })
+
+        expect(offeredPrompts).toEqual(["follow up", "follow up"])
+        expect(settled).toEqual(["sec_1", "sec_2"])
+      } finally {
+        if (previous === undefined) delete process.env.OPENCODE_CLAUDE_LIVE_QUEUE
+        else process.env.OPENCODE_CLAUDE_LIVE_QUEUE = previous
+      }
+    }),
+  )
+
   it.effect("persists one failed assistant when the stream closes without events", () =>
     Effect.gen(function* () {
       reset(async function* () {})

@@ -9,6 +9,7 @@ import {
   DELEGATE_TOOL,
   delegateServer as delegateServerWith,
   orphanApprovalAdoptions,
+  offerPersistentChannel,
   resolveToolPermission,
   sdkPrompt,
   type TransportOptions,
@@ -194,6 +195,19 @@ describe("sdkPrompt", () => {
         parent_tool_use_id: null,
       },
     ])
+  })
+})
+
+describe("offerPersistentChannel", () => {
+  test("does not offer unless the live queue flag is enabled", () => {
+    const previous = process.env.OPENCODE_CLAUDE_LIVE_QUEUE
+    process.env.OPENCODE_CLAUDE_LIVE_QUEUE = "0"
+    try {
+      expect(offerPersistentChannel("ses_disabled", "follow up")).toBe(false)
+    } finally {
+      if (previous === undefined) delete process.env.OPENCODE_CLAUDE_LIVE_QUEUE
+      else process.env.OPENCODE_CLAUDE_LIVE_QUEUE = previous
+    }
   })
 })
 

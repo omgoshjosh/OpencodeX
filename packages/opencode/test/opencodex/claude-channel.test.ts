@@ -394,6 +394,37 @@ describe("claude channel", () => {
     expect(state.prompts.map((message) => message.message.content)).toEqual(["one", "two"])
   })
 
+  test("offers follow-ups FIFO into an attached turn without replacing its handlers or sink", async () => {
+    const { create, emit, state } = fakeQuery()
+    const channel = new Channel<Handlers>("s1", create)
+    const turn = channel.turn([user("one")], { name: "t1" })
+
+    expect(channel.offer([user("two"), user("three")])).toBe(true)
+    await settled()
+    expect(state.prompts.map((message) => message.message.content)).toEqual(["one", "two", "three"])
+    expect(state.handlers?.()).toEqual({ name: "t1" })
+    expect(state.interrupts).toBe(0)
+
+    emit(assistant)
+    const iterator = turn.events[Symbol.asyncIterator]()
+    expect(typeOf((await iterator.next()).value!)).toBe("assistant")
+    expect(state.handlers?.()).toEqual({ name: "t1" })
+    await iterator.return?.(undefined)
+  })
+
+  test("rejects offers when the channel is idle, dead, or retiring", async () => {
+    const { create, endStream } = fakeQuery()
+    const channel = new Channel<Handlers>("s1", create)
+    expect(channel.offer([user("idle")])).toBe(false)
+
+    channel.turn([user("image")], { name: "image" }, { closeInput: true })
+    expect(channel.offer([user("retiring")])).toBe(false)
+
+    endStream()
+    await waitFor(() => channel.dead)
+    expect(channel.offer([user("dead")])).toBe(false)
+  })
+
   test("an image turn without closeInput keeps the channel open for tool approvals", async () => {
     // Regression for the 2026-08-28 capture: closing input after an image
     // message (the CLI 2.1.228 EOF workaround) also closed stdin, which is the
@@ -522,6 +553,19 @@ describe("claude channel", () => {
 })
 
 describe("channel registry", () => {
+  test("offers only to a live attached session", async () => {
+    const registry = createChannelRegistry<Handlers>()
+    const query = fakeQuery()
+    const channel = await registry.acquire("s1", "c", query.create)
+    expect(registry.offer("s1", [user("idle")])).toBe(false)
+
+    channel.turn([user("one")], { name: "t1" })
+    expect(registry.offer("s1", [user("two")])).toBe(true)
+    await settled()
+    expect(query.state.prompts.map((message) => message.message.content)).toEqual(["one", "two"])
+    await registry.closeAll()
+  })
+
   test("reuses a live channel with the same config and recycles on change", async () => {
     const registry = createChannelRegistry<Handlers>()
     const first = fakeQuery()

@@ -472,10 +472,9 @@ export function makeLayer(options: LayerOptions = {}) {
               onSome: (entry) =>
                 entry.parts
                   .flatMap((part) => (part.type === "text" && !part.synthetic && !part.ignored ? [part.text] : []))
-                  .join("\n")
-                  .trim(),
+                  .join("\n"),
             })
-            if (!text) {
+            if (!text.trim()) {
               yield* input.liveQueue.requeue(reserved)
               continue
             }

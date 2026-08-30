@@ -219,6 +219,51 @@ describe("Claude driver delivery finalization", () => {
     }),
   )
 
+  it.effect("offers persisted follow-up text without trimming it", () =>
+    Effect.gen(function* () {
+      const previous = process.env.OPENCODE_CLAUDE_LIVE_QUEUE
+      process.env.OPENCODE_CLAUDE_LIVE_QUEUE = "1"
+      reset(async function* () {
+        yield {
+          type: "result" as const,
+          subtype: "success",
+          total_cost_usd: 0,
+          usage: { input_tokens: 1, output_tokens: 0 },
+        }
+        yield {
+          type: "result" as const,
+          subtype: "success",
+          total_cost_usd: 0,
+          usage: { input_tokens: 1, output_tokens: 0 },
+        }
+      })
+      queuedMessages = [historyMessage("msg_exact_payload", "user", "  first line\nsecond line  ")]
+      let reserved = false
+      try {
+        yield* runTurn({
+          liveQueue: {
+            reserve: () =>
+              Effect.sync(() =>
+                reserved
+                  ? undefined
+                  : ((reserved = true),
+                    { commandID: "sec_exact", messageID: "msg_exact_payload" as never, ordinal: 1 }),
+              ),
+            offer: () => Effect.succeed(true),
+            requeue: () => Effect.void,
+            settle: () => Effect.void,
+            failOffered: () => Effect.void,
+          },
+        })
+
+        expect(offeredPrompts).toEqual(["  first line\nsecond line  "])
+      } finally {
+        if (previous === undefined) delete process.env.OPENCODE_CLAUDE_LIVE_QUEUE
+        else process.env.OPENCODE_CLAUDE_LIVE_QUEUE = previous
+      }
+    }),
+  )
+
   it.effect("fails an offered command when its mapped assistant result has an error", () =>
     Effect.gen(function* () {
       const previous = process.env.OPENCODE_CLAUDE_LIVE_QUEUE

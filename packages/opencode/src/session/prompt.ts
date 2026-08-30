@@ -233,7 +233,7 @@ export const layer = Layer.effect(
       commandID?: string
       claimGeneration?: number
       claimOwner?: string
-      route: { providerID: string; modelID: string }
+      route: { providerID: string; modelID: string; variant?: string }
     }) => {
       if (
         process.env.OPENCODE_CLAUDE_LIVE_QUEUE !== "1" ||
@@ -286,6 +286,7 @@ export const layer = Layer.effect(
             user?.info.role !== "user" ||
             user.info.model?.providerID !== input.route.providerID ||
             user.info.model?.modelID !== input.route.modelID ||
+            (user.info.model?.variant === "default" ? undefined : user.info.model?.variant) !== input.route.variant ||
             user.parts.length === 0 ||
             user.parts.some((part) => part.type !== "text" || part.synthetic || part.ignored) ||
             !user.parts.some((part) => part.type === "text" && part.text.trim())

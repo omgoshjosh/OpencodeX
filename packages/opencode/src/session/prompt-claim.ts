@@ -9,6 +9,8 @@ import { InstanceState } from "@/effect/instance-state"
 import { MessageID, SessionID } from "./schema"
 import type { LoopInput } from "./prompt-schema"
 import { SessionPromptRecovery } from "./prompt-recovery"
+import { ensureRunID } from "@opencode-ai/core/util/opencode-process"
+import { SessionExecutionOwner } from "./execution-owner"
 import * as Session from "./session"
 
 export interface Deps {
@@ -30,7 +32,8 @@ export function make(deps: Deps) {
   return Effect.gen(function* () {
     const { database, events, scope, loop } = deps
     const { db } = database
-    const commandOwner = `local:${process.pid}:prompt:${crypto.randomUUID()}`
+    const processRunID = ensureRunID()
+    const commandOwner = `local:${process.pid}:${processRunID}:prompt:${crypto.randomUUID()}`
     const commandLeaseMillis = deps.commandLeaseMillis ?? 30_000
     const clock = deps.clock ?? Date.now
 
@@ -48,10 +51,28 @@ export function make(deps: Deps) {
               if (!current || ["succeeded", "failed", "cancelled"].includes(current.status)) {
                 return { state: "done" as const }
               }
+              const parent = current.adopted_by
+                ? yield* transaction
+                    .select()
+                    .from(SessionCommandTable)
+                    .where(eq(SessionCommandTable.id, current.adopted_by))
+                    .get()
+                : undefined
+              const parentLive =
+                parent?.status === "running" &&
+                parent.claim_generation === current.adopted_generation &&
+                !!parent.owner_id &&
+                parent.lease_expires_at !== null &&
+                parent.lease_expires_at > now &&
+                SessionExecutionOwner.alive(parent.owner_id, processRunID)
+              // An adopted command belongs to a specific live parent claim.
+              // Never let recovery clear or replay it while that claim holds
+              // a valid lease, whether Claude has received the offer or not.
+              if (parentLive) return { state: "occupied" as const }
               // A process can die after reserving an ordinary human command
-              // but before writing it to Claude's streaming input. That is not
-              // an offer, so clear the fence and let normal FIFO recovery run.
-              if (current.status === "queued" && current.adopted_by && !current.offered_at) {
+              // but before writing it to Claude's streaming input. Once its
+              // parent claim is stale, clear the fence and recover FIFO.
+              if (current.status === "queued" && current.adopted_by && current.offered_at === null) {
                 yield* transaction
                   .update(SessionCommandTable)
                   .set({ adopted_by: null, adopted_generation: null, offer_ordinal: null, time_updated: now })
@@ -60,6 +81,9 @@ export function make(deps: Deps) {
                       eq(SessionCommandTable.id, commandID),
                       eq(SessionCommandTable.status, "queued"),
                       eq(SessionCommandTable.adopted_by, current.adopted_by),
+                      current.adopted_generation === null
+                        ? isNull(SessionCommandTable.adopted_generation)
+                        : eq(SessionCommandTable.adopted_generation, current.adopted_generation),
                       isNull(SessionCommandTable.offered_at),
                     ),
                   )
@@ -68,7 +92,7 @@ export function make(deps: Deps) {
               }
               // An offered input may have reached Claude even if this process
               // died before observing its result. Never replay it on recovery.
-              if (current.status === "queued" && current.offered_at) {
+              if (current.status === "queued" && current.offered_at !== null) {
                 yield* transaction
                   .update(SessionCommandTable)
                   .set({
@@ -81,13 +105,29 @@ export function make(deps: Deps) {
                     and(
                       eq(SessionCommandTable.id, commandID),
                       eq(SessionCommandTable.status, "queued"),
+                      current.adopted_by
+                        ? eq(SessionCommandTable.adopted_by, current.adopted_by)
+                        : isNull(SessionCommandTable.adopted_by),
+                      current.adopted_generation === null
+                        ? isNull(SessionCommandTable.adopted_generation)
+                        : eq(SessionCommandTable.adopted_generation, current.adopted_generation),
                       eq(SessionCommandTable.offered_at, current.offered_at),
                     ),
                   )
                   .run()
                 return { state: "done" as const }
               }
-              if (current.status === "running" && current.lease_expires_at && current.lease_expires_at > now) {
+              const reclaimDeadOwner =
+                current.status === "running" &&
+                !!current.owner_id &&
+                /^local:\d+:[^:]+:prompt:/.test(current.owner_id) &&
+                !SessionExecutionOwner.alive(current.owner_id, processRunID)
+              if (
+                current.status === "running" &&
+                current.lease_expires_at &&
+                current.lease_expires_at > now &&
+                !reclaimDeadOwner
+              ) {
                 return { state: "occupied" as const }
               }
               const active = yield* transaction
@@ -362,8 +402,8 @@ export function make(deps: Deps) {
                 )
                 .get()
               if (!current) return "missing" as const
-               if (current.status === "running" || current.offered_at) return "running" as const
               if (current.status !== "queued") return "settled" as const
+              if (current.offered_at !== null) return "running" as const
               yield* transaction
                 .update(SessionCommandTable)
                 .set({ status: "cancelled", completed_at: now, time_updated: now })

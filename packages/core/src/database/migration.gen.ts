@@ -51,5 +51,6 @@ export const migrations = (
     import("./migration/20260731170815_mute_flatman"),
     import("./migration/20260731171735_gigantic_piledriver"),
     import("./migration/20260821043607_dashing_ikaris"),
+    import("./migration/20260829000000_durable_adaptive_steering"),
   ])
 ).map((module) => module.default) satisfies DatabaseMigration.Migration[]

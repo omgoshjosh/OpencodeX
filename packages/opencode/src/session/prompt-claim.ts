@@ -250,7 +250,7 @@ export function make(deps: Deps) {
         Effect.forkIn(scope),
       )
       const exit = yield* Effect.gen(function* () {
-        if (!(yield* waitForExecutionTurn(commandID, command.session_id))) return
+        if (!(yield* waitForExecutionTurn(commandID, command.session_id))) return undefined
         const admitted = yield* db
           .select({ id: SessionCommandTable.id })
           .from(SessionCommandTable)
@@ -264,7 +264,7 @@ export function make(deps: Deps) {
           )
           .get()
           .pipe(Effect.orDie)
-        if (!admitted) return
+        if (!admitted) return undefined
         return yield* loop({
           sessionID: command.session_id,
           messageID: command.message_id,

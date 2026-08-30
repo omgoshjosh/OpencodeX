@@ -51,6 +51,7 @@ export const migrations = (
     import("./migration/20260731170815_mute_flatman"),
     import("./migration/20260731171735_gigantic_piledriver"),
     import("./migration/20260821043607_dashing_ikaris"),
+    import("./migration/20260829000000_durable_adaptive_steering"),
     import("./migration/20260831161557_clean_johnny_blaze"),
     import("./migration/20260901192259_mute_risque"),
     import("./migration/20260901192300_event_cursor_backfill"),

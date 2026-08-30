@@ -131,6 +131,7 @@ export function deriveUiState(input: {
   const active =
     input.status?.type === "busy" ||
     input.status?.type === "retry" ||
+    input.status?.type === "monitoring" ||
     (input.status?.background?.jobs.length ?? 0) > 0
   // Review is a root-session concept (mirroring the unseen-review query in
   // session-card): a delegated child's report is consumed by its parent, so
@@ -138,7 +139,7 @@ export function deriveUiState(input: {
   // forever. A finished child settles to idle instead.
   const reviewable = !input.session.parentID
   const displayStatus =
-    input.permissions.length > 0 || input.questions.length > 0
+    input.permissions.length > 0 || input.questions.length > 0 || input.status?.type === "blocked"
       ? "input_needed"
       : active
         ? "in_progress"

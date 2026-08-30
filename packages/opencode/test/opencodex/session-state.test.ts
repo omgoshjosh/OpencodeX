@@ -45,4 +45,28 @@ describe("deriveUiState", () => {
     })
     expect(state.displayStatus).toBe("input_needed")
   })
+
+  test("blocked is actionable while monitoring remains active", () => {
+    expect(
+      deriveUiState({
+        session: session({ id: "ses_child", parentID: "ses_root" }),
+        status: {
+          type: "blocked",
+          childSessionID: "ses_child",
+          attemptedModels: ["provider/model"],
+          error: "Provider provider/model: quota exceeded",
+        } as never,
+        permissions: [],
+        questions: [],
+      }).displayStatus,
+    ).toBe("input_needed")
+    expect(
+      deriveUiState({
+        session: session({ id: "ses_child", parentID: "ses_root" }),
+        status: { type: "monitoring", childSessionID: "ses_child" } as never,
+        permissions: [],
+        questions: [],
+      }).displayStatus,
+    ).toBe("in_progress")
+  })
 })

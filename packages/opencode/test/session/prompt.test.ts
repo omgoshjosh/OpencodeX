@@ -956,7 +956,7 @@ it.instance("recover launches an accepted queued prompt intent", () =>
       parts: [{ type: "text", text: "recover async" }],
     })
     const session = yield* db.select().from(SessionTable).where(eq(SessionTable.id, chat.id)).get().pipe(Effect.orDie)
-    if (!session) return yield* Effect.die(new Error("missing session row"))
+    if (!session) throw new Error("missing session row")
     const now = Date.now()
     yield* db
       .transaction(
@@ -1026,7 +1026,7 @@ it.instance("command heartbeat extends its lease from the current clock", () =>
       .where(eq(SessionTable.id, chat.id))
       .get()
       .pipe(Effect.orDie)
-    if (!session) return yield* Effect.die(new Error("missing session row"))
+    if (!session) throw new Error("missing session row")
     const clock = { current: 1_000 }
     const claim = yield* PromptClaim.make({
       database,
@@ -1103,7 +1103,7 @@ it.instance("preserves live reservations and fences stale Claude offers", () =>
       .where(eq(SessionTable.id, chat.id))
       .get()
       .pipe(Effect.orDie)
-    if (!session) return yield* Effect.die(new Error("missing session row"))
+    if (!session) throw new Error("missing session row")
     const claim = yield* PromptClaim.make({ database, events, scope, loop: () => Effect.never })
     const now = Date.now()
     yield* database.db
@@ -1238,7 +1238,7 @@ it.instance("allows cancellation through a live reservation only before its offe
       .where(eq(SessionTable.id, chat.id))
       .get()
       .pipe(Effect.orDie)
-    if (!session) return yield* Effect.die(new Error("missing session row"))
+    if (!session) throw new Error("missing session row")
     const claim = yield* PromptClaim.make({ database, events, scope, loop: () => Effect.never })
     const now = Date.now()
     yield* database.db
@@ -3699,6 +3699,8 @@ it.instance("a swarm with a Claude Code orchestrator routes to the CLI driver, n
 )
 
 const claimedClaudeTurns: Array<{ input?: number; context?: number }> = []
+const claudeDriverResult = (input: { parentMessageID: string; sessionID: string }) =>
+  ({ info: { id: input.parentMessageID, sessionID: input.sessionID }, parts: [] }) as never
 const claimingDriver = Layer.succeed(
   OpencodeXClaudeDriver.Service,
   OpencodeXClaudeDriver.Service.of({
@@ -3706,7 +3708,7 @@ const claimingDriver = Layer.succeed(
       Effect.gen(function* () {
         const execution = yield* SessionStatus.ExecutionGeneration
         claimedClaudeTurns.push({ input: input.executionGeneration, context: execution?.generation })
-        return { info: { id: input.parentMessageID, sessionID: input.sessionID }, parts: [] } as never
+        return claudeDriverResult(input)
       }),
   }),
 )
@@ -3719,7 +3721,7 @@ const routeFenceDriver = Layer.succeed(
     runTurn: (input) =>
       Effect.gen(function* () {
         routeFenceReservations.push(input.liveQueue ? yield* input.liveQueue.reserve() : undefined)
-        return { info: { id: input.parentMessageID, sessionID: input.sessionID }, parts: [] } as never
+        return claudeDriverResult(input)
       }),
   }),
 )
@@ -3756,7 +3758,7 @@ routeFenceIt.instance("leaves a differently configured Claude effort at the FIFO
         parts: [{ type: "text", text: "low effort" }],
       })
       const session = yield* db.select().from(SessionTable).where(eq(SessionTable.id, chat.id)).get().pipe(Effect.orDie)
-      if (!session) return yield* Effect.die(new Error("missing session row"))
+      if (!session) throw new Error("missing session row")
       const now = Date.now()
       yield* db
         .insert(SessionCommandTable)
@@ -3860,7 +3862,7 @@ const spawningDriver = Layer.succeed(
       Effect.gen(function* () {
         const child = yield* input.sidechain!.spawn({ title: "probe subagent", prompt: "child work" })
         sidechainSpawns.push(child)
-        return { info: { id: input.parentMessageID, sessionID: input.sessionID }, parts: [] } as never
+        return claudeDriverResult(input)
       }),
   }),
 )

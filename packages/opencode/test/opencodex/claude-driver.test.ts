@@ -202,8 +202,8 @@ describe("Claude driver delivery finalization", () => {
         }
       })
       const offers = [
-        { commandID: "sec_1", messageID: "msg_follow_1" as never, ordinal: 1 },
-        { commandID: "sec_2", messageID: "msg_follow_2" as never, ordinal: 2 },
+        { commandID: "sec_1", messageID: SessionLegacy.MessageID.make("msg_follow_1"), ordinal: 1 },
+        { commandID: "sec_2", messageID: SessionLegacy.MessageID.make("msg_follow_2"), ordinal: 2 },
       ]
       const settled: string[] = []
       queuedMessages = [
@@ -258,7 +258,11 @@ describe("Claude driver delivery finalization", () => {
                 reserved
                   ? undefined
                   : ((reserved = true),
-                    { commandID: "sec_exact", messageID: "msg_exact_payload" as never, ordinal: 1 }),
+                    {
+                      commandID: "sec_exact",
+                      messageID: SessionLegacy.MessageID.make("msg_exact_payload"),
+                      ordinal: 1,
+                    }),
               ),
             offer: () => Effect.succeed(true),
             requeue: () => Effect.void,
@@ -300,7 +304,11 @@ describe("Claude driver delivery finalization", () => {
         yield* runTurn({
           liveQueue: {
             reserve: () =>
-              Effect.succeed({ commandID: "sec_error", messageID: "msg_follow_error" as never, ordinal: 1 }),
+              Effect.succeed({
+                commandID: "sec_error",
+                messageID: SessionLegacy.MessageID.make("msg_follow_error"),
+                ordinal: 1,
+              }),
             offer: () => Effect.succeed(true),
             requeue: () => Effect.void,
             settle: (offer, error) => Effect.sync(() => settled.push({ commandID: offer.commandID, error })),
@@ -329,7 +337,11 @@ describe("Claude driver delivery finalization", () => {
         }
       })
       queuedMessages = [historyMessage("msg_rejected", "user", "must not reach Claude")]
-      const rejected = { commandID: "sec_rejected", messageID: "msg_rejected" as never, ordinal: 1 }
+      const rejected = {
+        commandID: "sec_rejected",
+        messageID: SessionLegacy.MessageID.make("msg_rejected"),
+        ordinal: 1,
+      }
       const requeued: string[] = []
       let reserved = false
       try {

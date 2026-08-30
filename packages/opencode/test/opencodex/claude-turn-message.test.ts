@@ -44,7 +44,7 @@ describe("§2b message threading is wired end to end (source-level pin)", () => 
 
   test("prompt.ts threads a turn's messageID into claudeCodeTurn's selection", async () => {
     const source = await Bun.file(path.join(import.meta.dirname, "../../src/session/prompt.ts")).text()
-    expect(source).toContain("claudeCodeTurn(input.sessionID, input.messageID)")
+    expect(source).toMatch(/claudeCodeTurn\(\s*input\.sessionID,\s*input\.messageID,/)
   })
 
   test("prompt-swarm.ts' claudeCodeTurn picks the message by id when given one, else the last user message", async () => {

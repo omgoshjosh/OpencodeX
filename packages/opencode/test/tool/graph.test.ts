@@ -1,10 +1,13 @@
-import { describe, expect } from "bun:test"
+import { beforeEach, describe, expect } from "bun:test"
+import { ProjectV2 } from "@opencode-ai/core/project"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
 import { Agent } from "@/agent/agent"
 import { OpencodeXGoal } from "@/opencodex/goal"
 import { OpencodeXProject } from "@/opencodex/project"
+import { Project } from "@/project/project"
 import { MessageID, SessionID } from "@/session/schema"
+import { NotFoundError } from "@/storage/storage"
 import { GraphPlanTool } from "@/tool/graph"
 import { Tool } from "@/tool/tool"
 import { Truncate } from "@/tool/truncate"
@@ -17,7 +20,11 @@ const created: OpencodeXGoal.CreateInput[] = []
 const planned: OpencodeXGoal.PlanInput[] = []
 const contexts: ({ swarmID?: string | null; directory?: string } | undefined)[] = []
 const started: string[] = []
+const moved: OpencodeXProject.MoveSessionInput[] = []
 let listed: OpencodeXGoal.Info[] = []
+let projectList: OpencodeXProject.Info[] = []
+let assignmentWinner: string | undefined
+let assignmentFailure: Project.NotFoundError | NotFoundError | undefined
 
 const goal = (
   status: OpencodeXGoal.Status = "draft",
@@ -47,18 +54,24 @@ const goals = Layer.mock(OpencodeXGoal.Service)({
     Effect.sync(() => (planned.push(input), contexts.push(context), goal("planned"))),
   start: (goalID) => Effect.sync(() => (started.push(goalID), goal("running"))),
 })
+const projectInfo = (input?: { id?: string; folders?: string[]; assigned?: boolean }) =>
+  // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- projectForSession only reads these fields
+  ({
+    id: input?.id ?? "project-1",
+    project: { id: input?.id ?? "project-1", worktree: directory, vcs: "git", time: { created: 1, updated: 1 } },
+    folders: (input?.folders ?? []).map((path) => ({ path })),
+    sessions: input?.assigned === false ? [] : [{ id: sessionID }],
+    terminalSessions: [],
+  }) as unknown as OpencodeXProject.Info
+
 const projects = Layer.mock(OpencodeXProject.Service)({
-  list: () =>
-    Effect.succeed([
-      // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- projectForSession only reads these fields
-      {
-        id: "project-1",
-        project: { id: "project-1", worktree: directory, vcs: "git", time: { created: 1, updated: 1 } },
-        folders: [],
-        sessions: [{ id: sessionID }],
-        terminalSessions: [],
-      } as unknown as OpencodeXProject.Info,
-    ]),
+  list: () => Effect.sync(() => projectList),
+  assignSessionIfUnassigned: (input) =>
+    Effect.gen(function* () {
+      moved.push(input)
+      if (assignmentFailure) return yield* assignmentFailure
+      return assignmentWinner ?? input.projectID
+    }),
 })
 const agents = Layer.mock(Agent.Service)({
   get: () => Effect.succeed({ name: "build", mode: "primary", permission: [], options: {} }),
@@ -67,6 +80,11 @@ const truncate = Layer.mock(Truncate.Service)({
   output: (text) => Effect.succeed({ content: text, truncated: false }),
 })
 const it = testEffect(Layer.mergeAll(goals, projects, agents, truncate))
+
+beforeEach(() => {
+  assignmentWinner = undefined
+  assignmentFailure = undefined
+})
 
 function userMessage(id: string, providerID: string, modelID: string): SessionLegacy.WithParts {
   return {
@@ -125,7 +143,9 @@ describe("graph_plan", () => {
       planned.length = 0
       contexts.length = 0
       started.length = 0
+      moved.length = 0
       listed = []
+      projectList = [projectInfo()]
       const tool = yield* Tool.init(yield* GraphPlanTool)
 
       yield* tool.execute(
@@ -145,6 +165,7 @@ describe("graph_plan", () => {
       ])
       expect(started).toEqual(["goal-1"])
       expect(contexts).toEqual([{ swarmID: "direct-swarm", directory }])
+      expect(moved).toHaveLength(0)
     }),
   )
 
@@ -152,6 +173,7 @@ describe("graph_plan", () => {
     Effect.gen(function* () {
       created.length = 0
       listed = []
+      projectList = [projectInfo()]
       const tool = yield* Tool.init(yield* GraphPlanTool)
 
       yield* tool.execute(params, context([userMessage("msg_002", "swarm", "persisted-swarm")]))
@@ -169,12 +191,102 @@ describe("graph_plan", () => {
       created.length = 0
       contexts.length = 0
       listed = [goal("planned", { swarmID: "stale-swarm", directory: "/tmp/stale" })]
+      projectList = [projectInfo()]
       const tool = yield* Tool.init(yield* GraphPlanTool)
 
       yield* tool.execute(params, context([userMessage("msg_002", "swarm", "current-swarm")]))
 
       expect(created).toHaveLength(0)
       expect(contexts).toEqual([{ swarmID: "current-swarm", directory }])
+    }),
+  )
+
+  it.effect("attaches an unassigned session to its single unambiguous project", () =>
+    Effect.gen(function* () {
+      created.length = 0
+      moved.length = 0
+      listed = []
+      projectList = [projectInfo({ assigned: false })]
+      const tool = yield* Tool.init(yield* GraphPlanTool)
+
+      yield* tool.execute(params, context([]))
+
+      expect(moved).toEqual([{ projectID: "project-1", sessionID }])
+      expect(created).toHaveLength(1)
+    }),
+  )
+
+  it.effect("attaches by the longest unique matching project folder", () =>
+    Effect.gen(function* () {
+      created.length = 0
+      moved.length = 0
+      listed = []
+      projectList = [
+        projectInfo({ id: "project-parent", folders: ["/tmp"], assigned: false }),
+        projectInfo({ id: "project-1", folders: [directory], assigned: false }),
+      ]
+      const tool = yield* Tool.init(yield* GraphPlanTool)
+
+      yield* tool.execute(params, context([]))
+
+      expect(moved).toEqual([{ projectID: "project-1", sessionID }])
+      expect(created).toHaveLength(1)
+    }),
+  )
+
+  it.effect("leaves an unassigned session unattached when project routing is ambiguous", () =>
+    Effect.gen(function* () {
+      created.length = 0
+      moved.length = 0
+      listed = []
+      projectList = [
+        projectInfo({ id: "project-1", assigned: false }),
+        projectInfo({ id: "project-2", assigned: false }),
+      ]
+      const tool = yield* Tool.init(yield* GraphPlanTool)
+
+      const result = yield* tool.execute(params, context([]))
+
+      expect(result.title).toBe("No project")
+      expect(moved).toHaveLength(0)
+      expect(created).toHaveLength(0)
+    }),
+  )
+
+  it.effect("uses a concurrent durable assignment winner instead of stale inference", () =>
+    Effect.gen(function* () {
+      created.length = 0
+      moved.length = 0
+      listed = []
+      assignmentWinner = "project-2"
+      projectList = [
+        projectInfo({ id: "project-1", folders: [directory], assigned: false }),
+        projectInfo({ id: "project-2", folders: ["/tmp/other"], assigned: false }),
+      ]
+      const tool = yield* Tool.init(yield* GraphPlanTool)
+
+      yield* tool.execute(params, context([]))
+
+      expect(moved).toEqual([{ projectID: "project-1", sessionID }])
+      expect(created[0]?.projectID).toBe("project-2")
+    }),
+  )
+
+  it.effect("propagates project and session assignment failures", () =>
+    Effect.gen(function* () {
+      created.length = 0
+      listed = []
+      projectList = [projectInfo({ assigned: false })]
+      const tool = yield* Tool.init(yield* GraphPlanTool)
+
+      assignmentFailure = new Project.NotFoundError({ projectID: ProjectV2.ID.make("missing") })
+      const projectError = yield* tool.execute(params, context([])).pipe(Effect.flip)
+      expect(projectError).toMatchObject({ _tag: "Project.NotFoundError" })
+
+      assignmentFailure = new NotFoundError({ message: "Session not found" })
+      const sessionError = yield* tool.execute(params, context([])).pipe(Effect.flip)
+      expect(sessionError).toMatchObject({ _tag: "NotFoundError" })
+      expect(created).toHaveLength(0)
     }),
   )
 })

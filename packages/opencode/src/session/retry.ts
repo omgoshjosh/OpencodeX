@@ -108,15 +108,18 @@ function parseJSON(value: unknown) {
 export function policy(opts: {
   parse: (error: unknown) => Err
   set: (input: { attempt: number; message: string; next: number }) => Effect.Effect<void>
+  /** A stream with visible output cannot safely be replayed. */
+  canRetry?: () => boolean
 }) {
+  let startedAt: number | undefined
   return Schedule.fromStepWithMetadata(
     Effect.succeed((meta: Schedule.InputMetadata<unknown>) => {
       const error = opts.parse(meta.input)
       const retry = retryable(error)
       if (!retry || meta.attempt >= RETRY_MAX_ATTEMPTS) return Cause.done(meta.attempt)
       return Effect.gen(function* () {
-        const wait = delay(meta.attempt, SessionLegacy.APIError.isInstance(error) ? error : undefined)
         const now = yield* Clock.currentTimeMillis
+        const wait = delay(meta.attempt, SessionLegacy.APIError.isInstance(error) ? error : undefined)
         yield* opts.set({
           attempt: meta.attempt,
           message: retry.message,

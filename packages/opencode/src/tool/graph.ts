@@ -1,5 +1,6 @@
 import { OpencodeXGoal } from "@/opencodex/goal"
 import { OpencodeXProject } from "@/opencodex/project"
+import { OpencodeXProjectFolder } from "@/opencodex/project-folder"
 import { MessageV2 } from "@/session/message-v2"
 import { Effect, Schema } from "effect"
 import { Tool } from "./tool"
@@ -100,7 +101,7 @@ export const GraphPlanTool = Tool.define<
       execute: (params: Schema.Schema.Type<typeof PlanParameters>, ctx: Tool.Context) =>
         Effect.gen(function* () {
           yield* ctx.ask({ permission: "graph_plan", patterns: ["*"], always: ["*"], metadata: {} })
-          const project = yield* projectForSession(projects, ctx.sessionID)
+          const project = yield* projectForSession(projects, ctx.sessionID, ctx.directory)
           if (!project) {
             return {
               title: "No project",
@@ -350,10 +351,31 @@ function sessionModel(value: unknown): { providerID?: string; modelID?: string }
   }
 }
 
-function projectForSession(projects: OpencodeXProject.Interface, sessionID: string) {
-  return projects
-    .list()
-    .pipe(Effect.map((all) => all.find((project) => project.sessions.some((session) => session.id === sessionID))))
+function projectForSession(
+  projects: OpencodeXProject.Interface,
+  sessionID: Tool.Context["sessionID"],
+  directory: string,
+) {
+  return Effect.gen(function* () {
+    const all = yield* projects.list()
+    const assigned = all.find((project) => project.sessions.some((session) => session.id === sessionID))
+    if (assigned) return assigned
+
+    const matching = all
+      .flatMap((project) =>
+        project.folders
+          .filter((folder) => OpencodeXProjectFolder.containsFolder(folder.path, directory))
+          .map((folder) => ({ project, folder })),
+      )
+      .toSorted((a, b) => b.folder.path.length - a.folder.path.length)
+    const longest = matching[0]?.folder.path.length
+    const folderMatches = matching.filter((match) => match.folder.path.length === longest)
+    const inferred = folderMatches.length === 1 ? folderMatches[0]?.project : all.length === 1 ? all[0] : undefined
+    if (!inferred) return
+
+    const projectID = yield* projects.assignSessionIfUnassigned({ projectID: inferred.id, sessionID })
+    return all.find((project) => project.id === projectID)
+  })
 }
 
 /** Polls until the goal settles. The graph runs in jobs, not in this fiber. */

@@ -105,4 +105,34 @@ describe("OpencodeXProject", () => {
       )
     }),
   )
+
+  it.live("assigns an unassigned session only once under concurrency", () =>
+    Effect.gen(function* () {
+      const directory = yield* tmpdirScoped({ git: true })
+      const projects = yield* OpencodeXProject.Service
+      const left = yield* projects.create({ name: "left", folders: [directory] })
+      const right = yield* projects.create({ name: "right", folders: [directory] })
+      const session = yield* projects.createSession({ projectID: left.id, directory, hidden: true })
+
+      const assigned = yield* Effect.all(
+        Array.from({ length: 20 }, (_, index) =>
+          projects.assignSessionIfUnassigned({
+            projectID: index % 2 === 0 ? left.id : right.id,
+            sessionID: session.id,
+          }),
+        ),
+        { concurrency: "unbounded" },
+      )
+
+      expect(new Set(assigned).size).toBe(1)
+      const { db } = yield* Database.Service
+      const assignment = yield* db
+        .select()
+        .from(OpencodeXProjectSessionTable)
+        .where(eq(OpencodeXProjectSessionTable.session_id, session.id))
+        .get()
+        .pipe(Effect.orDie)
+      expect(assignment?.opencodex_project_id).toBe(assigned[0])
+    }),
+  )
 })

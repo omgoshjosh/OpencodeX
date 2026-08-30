@@ -787,6 +787,26 @@ const scenarios: Scenario[] = [
       check(body === true, "missing session abort should remain a no-op success")
     }),
   http.protected
+    .post("/session/{sessionID}/message/{messageID}/cancel", "session.cancelQueued")
+    .seeded((ctx) =>
+      Effect.gen(function* () {
+        const session = yield* ctx.session({ title: "Cancel queued message session" })
+        const message = yield* ctx.message(session.id, { text: "already settled" })
+        return { session, message }
+      }),
+    )
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/message/{messageID}/cancel", {
+        sessionID: ctx.state.session.id,
+        messageID: ctx.state.message.info.id,
+      }),
+      headers: ctx.headers(),
+    }))
+    .json(200, (body) => {
+      object(body)
+      check(body.outcome === "missing", "message without a queued command should be missing")
+    }),
+  http.protected
     .post("/session/{sessionID}/init", "session.init")
     .preserveDatabase()
     .withLlm()

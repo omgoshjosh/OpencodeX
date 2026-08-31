@@ -93,7 +93,7 @@ async function* promptParts(text: string, images: ClaudeImage[]): AsyncGenerator
   const content: Array<
     | { type: "text"; text: string }
     | { type: "image"; source: { type: "base64"; media_type: "image/jpeg" | "image/png" | "image/gif" | "image/webp"; data: string } }
-  > = text ? [{ type: "text", text }] : []
+  > = []
   for (const image of images) {
     const parsed = image.url.match(/^data:(image\/(?:jpeg|png|gif|webp));base64,([A-Za-z0-9+/]+={0,2})$/)
     const data = parsed?.[2]
@@ -103,6 +103,9 @@ async function* promptParts(text: string, images: ClaudeImage[]): AsyncGenerator
     }
     content.push({ type: "text", text: `[Unsupported image attachment: ${image.mime}]` })
   }
+  // Long leading text, including a swarm briefing, can make Claude ignore a
+  // trailing image even though the SDK transcript contains it.
+  if (text) content.push({ type: "text", text })
   yield { type: "user", parent_tool_use_id: null, message: { role: "user", content } }
 }
 

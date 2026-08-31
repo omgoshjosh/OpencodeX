@@ -632,12 +632,10 @@ export type SessionStatus =
   | {
       type: "idle"
       background?: {
-        running: number
+        running: boolean
         jobs: Array<{
-          sessionID: string
+          role: string
           title: string
-          role?: string
-          since: number
           owner: string
         }>
       }
@@ -648,12 +646,10 @@ export type SessionStatus =
       message: string
       next: number
       background?: {
-        running: number
+        running: boolean
         jobs: Array<{
-          sessionID: string
+          role: string
           title: string
-          role?: string
-          since: number
           owner: string
         }>
       }
@@ -661,12 +657,10 @@ export type SessionStatus =
   | {
       type: "busy"
       background?: {
-        running: number
+        running: boolean
         jobs: Array<{
-          sessionID: string
+          role: string
           title: string
-          role?: string
-          since: number
           owner: string
         }>
       }

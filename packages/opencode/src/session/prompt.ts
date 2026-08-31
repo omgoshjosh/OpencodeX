@@ -205,10 +205,6 @@ export const layer = Layer.effect(
         resolvePromptParts: (template: string) => resolvePromptParts(template),
         prompt: (input: PromptInput) => prompt(input).pipe(Effect.catch(Effect.die)),
         loop: (input: LoopInput) => loop(input),
-        backgroundStatus: {
-          start: (parentSessionID, task) => status.backgroundStart(parentSessionID, task),
-          end: (parentSessionID, childSessionID) => status.backgroundEnd(parentSessionID, childSessionID),
-        },
       } satisfies TaskPromptOps
     })
 
@@ -900,6 +896,7 @@ export const layer = Layer.effect(
           parts: [{ type: "text", synthetic: true, text: input.text }],
           noReply: input.noReply,
         }).pipe(Effect.orDie),
+      refresh: status.refresh,
     })
     const unregisterRecovery = SessionPromptRecovery.register(() =>
       delegationRecovery.recover().pipe(Effect.andThen(recover)),

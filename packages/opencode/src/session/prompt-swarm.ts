@@ -26,6 +26,7 @@ import {
   type DelegationRecord,
 } from "./delegation-outcome"
 import { Identifier } from "@/id/id"
+import { ensureRunID } from "@opencode-ai/core/util/opencode-process"
 import * as Log from "@opencode-ai/core/util/log"
 import * as Session from "./session"
 import { prepareImages } from "./swarm-attachments"
@@ -63,10 +64,11 @@ export interface Deps {
    */
   readonly background?: Pick<Context.Service.Shape<typeof BackgroundJob.Service>, "start">
   /**
-   * Publishes background delegations on the parent's session status, so a
-   * client sees "N working" while the parent itself reads idle.
+   * Republishes the parent's session status. Background jobs are DERIVED on
+   * read from the children's delegation records, so nothing is written here -
+   * a refresh just re-broadcasts what the records now say.
    */
-  readonly status?: Pick<SessionStatus.Interface, "backgroundStart" | "backgroundEnd">
+  readonly status?: Pick<SessionStatus.Interface, "refresh">
   /**
    * How long a background child that ended its turn without the completion
    * marker is given to produce another turn before its last report is
@@ -389,16 +391,9 @@ export function make(deps: Deps) {
         phase: record.phase,
       })
       const published = deps.status
-      if (published)
-        yield* published
-          .backgroundStart(parentID, {
-            sessionID: childID,
-            role,
-            title: record.title ?? `Task ${role}`,
-            since: record.startedAt,
-          })
-          .pipe(Effect.ignore)
-      const unpublish = published ? published.backgroundEnd(parentID, childID).pipe(Effect.ignore) : Effect.void
+      const refresh = published ? published.refresh(SessionID.make(parentID)).pipe(Effect.ignore) : Effect.void
+      yield* refresh
+      const unpublish = refresh
       const quiet = Effect.gen(function* () {
         // Quiet: no queued or running command on the child (its replayed
         // turn has finished) - polled, since the replay was forked by the
@@ -594,12 +589,24 @@ export function make(deps: Deps) {
       version: DELEGATION_RECORD_VERSION,
       runID,
       parentSessionID: input.sessionID,
+      role: role.name,
+      title: child.title,
       attempt: 1,
       phase: "running",
       startedAt: Date.now(),
       // A restart loses the in-memory job that delivers a background report;
       // these let `recoverBackgroundDelegations` pick the delivery back up.
-      ...(input.background ? { background: true as const, role: role.name, title } : {}),
+      // `mode`/`ownerID` are what the derived session status reads to show
+      // this role as running work on the parent while the parent reads idle.
+      ...(input.background
+        ? {
+            background: true as const,
+            mode: "background" as const,
+            ownerID: `local:${process.pid}:${ensureRunID()}:${runID}`,
+            role: role.name,
+            title,
+          }
+        : {}),
     }
     const stamp = (record: DelegationRecord, expectRunID?: string) =>
       sessions.stampDelegation({ sessionID: child.id, record, ...(expectRunID ? { expectRunID } : {}) }).pipe(
@@ -752,14 +759,14 @@ export function make(deps: Deps) {
           state,
           text,
         })
-      // Published before the job starts so the status never lags the work,
-      // and dropped on every exit (the parent's wake is a separate concern).
+      // Republished before the job starts so the status never lags the work,
+      // and again on every exit (the parent's wake is a separate concern).
+      // The job itself is derived from the child's delegation record, so a
+      // refresh only rebroadcasts; there is no row to write or prune.
       const published = deps.status
-      if (published)
-        yield* published
-          .backgroundStart(input.sessionID, { sessionID: child.id, role: role.name, title, since: Date.now() })
-          .pipe(Effect.ignore)
-      const unpublish = published ? published.backgroundEnd(input.sessionID, child.id).pipe(Effect.ignore) : Effect.void
+      const refresh = published ? published.refresh(input.sessionID).pipe(Effect.ignore) : Effect.void
+      yield* refresh
+      const unpublish = refresh
       yield* deps.background
         .start({
           id: child.id,
@@ -780,8 +787,8 @@ export function make(deps: Deps) {
             // moment the role's work settles - not when the report lands.
             // Delivery can trail by many minutes when the parent camps in a
             // long turn (live 2026-08-29: chip showed "1 working" ~20 min
-            // after the child finished), and backgroundEnd is a no-op the
-            // second time, so the ensuring below stays as the failsafe.
+            // after the child finished), and a refresh is idempotent, so the
+            // ensuring below stays as the failsafe.
             Effect.onExit(() => unpublish),
             // Every exit wakes the parent: clean report, structured failure,
             // defect. Only an interruption stays silent (the parent asked for

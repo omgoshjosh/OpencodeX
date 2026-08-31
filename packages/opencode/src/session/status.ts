@@ -129,7 +129,7 @@ export const layer = Layer.effect(
                   const status = Option.getOrUndefined(decode(row.status))
                   return status?.type === "busy" || status?.type === "retry"
                 })
-                if (statuses.length === 0) return [] as EventV2.Payload[]
+                if (statuses.length === 0) return [] as { sessionID: SessionID; idle: EventV2.Payload }[]
                 const executionQuery = transaction.select().from(SessionExecutionTable)
                 const executions = new Map(
                   (yield* (
@@ -143,7 +143,7 @@ export const layer = Layer.effect(
                   if (!execution.lease_expires_at || execution.lease_expires_at <= now) return true
                   return !SessionExecutionOwner.alive(execution.owner_id, processRunID)
                 })
-                const result: EventV2.Payload[] = []
+                const result: { sessionID: SessionID; idle: EventV2.Payload }[] = []
                 for (const row of stale) {
                   const execution = executions.get(row.session_id)
                   if (execution) {
@@ -169,10 +169,11 @@ export const layer = Layer.effect(
                     .set({ status: { type: "idle" }, time_updated: now })
                     .where(eq(SessionStatusTable.session_id, row.session_id))
                     .run()
-                  result.push(
-                    yield* events.commit(Event.Status, { sessionID: row.session_id, status: { type: "idle" } }),
-                    yield* events.commit(Event.Idle, { sessionID: row.session_id }),
-                  )
+                  yield* events.commit(Event.Status, { sessionID: row.session_id, status: { type: "idle" } })
+                  result.push({
+                    sessionID: row.session_id,
+                    idle: yield* events.commit(Event.Idle, { sessionID: row.session_id }),
+                  })
                 }
                 return result
               }),
@@ -180,7 +181,18 @@ export const layer = Layer.effect(
           )
           .pipe(Effect.orDie),
       )
-      yield* Effect.forEach(broadcasts, events.broadcast, { discard: true })
+      yield* Effect.forEach(
+        broadcasts,
+        (event) =>
+          Effect.gen(function* () {
+            yield* events.publish(Event.Status, {
+              sessionID: event.sessionID,
+              status: withBackground({ type: "idle" }, (yield* backgrounds()).get(event.sessionID)),
+            })
+            yield* events.broadcast(event.idle)
+          }),
+        { discard: true },
+      )
     })
 
     const get = Effect.fn("SessionStatus.get")(function* (sessionID: SessionID) {
@@ -254,17 +266,18 @@ export const layer = Layer.effect(
                     },
                   })
                   .run()
-                return {
-                  status: yield* events.commit(Event.Status, { sessionID, status: persisted }),
-                  idle: status.type === "idle" ? yield* events.commit(Event.Idle, { sessionID }) : undefined,
-                }
+                yield* events.commit(Event.Status, { sessionID, status: persisted })
+                return { idle: status.type === "idle" ? yield* events.commit(Event.Idle, { sessionID }) : undefined }
               }),
             { behavior: "immediate" },
           )
           .pipe(Effect.orDie),
       )
       if (!committed) return false
-      yield* events.broadcast(committed.status)
+      yield* events.publish(Event.Status, {
+        sessionID,
+        status: withBackground(persisted, (yield* backgrounds()).get(sessionID)),
+      })
       if (committed.idle) yield* events.broadcast(committed.idle)
       return true
     })

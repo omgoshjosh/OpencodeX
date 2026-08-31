@@ -3,7 +3,6 @@ import DESCRIPTION from "./task.txt"
 import { ToolJsonSchema } from "./json-schema"
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
 import { BackgroundJob } from "@/background/job"
-import { EffectBridge } from "@/effect/bridge"
 import { Session } from "@/session/session"
 import { SessionID, MessageID } from "../session/schema"
 import { MessageV2 } from "../session/message-v2"
@@ -12,12 +11,13 @@ import { deriveSubagentSessionPermission } from "../agent/subagent-permissions"
 import type { SessionPrompt } from "../session/prompt"
 import { Config } from "@/config/config"
 import { ProviderV2 } from "@opencode-ai/core/provider"
-import { Cause, Effect, Exit, Option, Schema, Scope } from "effect"
+import { Cause, Deferred, Effect, Exit, Schema, Scope } from "effect"
 import { asc, eq } from "drizzle-orm"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import {
   DELEGATION_RECORD_VERSION,
   delegationAttempts,
+  monitorDelegation,
   settleDelegation,
   type DelegationOutcome,
   type DelegationRecord,
@@ -28,9 +28,6 @@ import { Database } from "@opencode-ai/core/database/database"
 import { OpencodeXSwarmRoleTable } from "@opencode-ai/core/opencodex/sql"
 import { SwarmBriefing } from "@/opencodex/swarm-briefing"
 import { isSwarmProvider } from "@/provider/swarm-provider"
-import { hydrateFallbackModels } from "@/opencodex/swarm-model"
-import { shouldAdvanceModelFallback } from "@/session/model-fallback"
-import { ensureRunID } from "@opencode-ai/core/util/opencode-process"
 import { SessionStatus } from "@/session/status"
 
 const log = Log.create({ service: "tool.task" })
@@ -38,8 +35,7 @@ const log = Log.create({ service: "tool.task" })
 export interface TaskPromptOps {
   cancel(sessionID: SessionID): Effect.Effect<void>
   resolvePromptParts(template: string): Effect.Effect<SessionPrompt.PromptInput["parts"]>
-  prompt(input: SessionPrompt.PromptInput): Effect.Effect<SessionLegacy.WithParts, never, Session.Service>
-  loop(input: SessionPrompt.LoopInput): Effect.Effect<SessionLegacy.WithParts>
+  prompt(input: SessionPrompt.PromptInput): Effect.Effect<SessionLegacy.WithParts>
 }
 
 const id = "task"
@@ -82,11 +78,19 @@ export const Parameters = Schema.Struct({
   }),
 })
 
-function output(sessionID: SessionID, result: TaskRunResult) {
-  const tag = result.state === "completed" ? "task_result" : "task_error"
-  return [`<task id="${sessionID}" state="${result.state}">`, `<${tag}>`, result.text, `</${tag}>`, "</task>"].join(
-    "\n",
-  )
+function output(sessionID: SessionID, text: string) {
+  return [`<task id="${sessionID}" state="completed">`, "<task_result>", text, "</task_result>", "</task>"].join("\n")
+}
+
+function monitoringOutput(input: { sessionID: SessionID; monitorID: string; checkAfter?: number }) {
+  return [
+    `<task id="${input.sessionID}" state="monitoring" monitor_id="${input.monitorID}">`,
+    "<summary>Subagent local work returned; external work is still being monitored</summary>",
+    "<task_result>",
+    `Monitoring ${input.monitorID}.${input.checkAfter ? ` Next check after ${input.checkAfter}.` : ""}`,
+    "</task_result>",
+    "</task>",
+  ].join("\n")
 }
 
 function backgroundOutput(sessionID: SessionID) {
@@ -219,7 +223,7 @@ function errorText(error: unknown) {
 }
 
 /** What one child run produced, before it is folded into the tool result. */
-type TaskRunResult = { state: "completed" | "error" | "cancelled"; text: string; failure?: unknown }
+type TaskRunResult = { state: "completed" | "error"; text: string; failure?: unknown }
 
 /**
  * How many delegation hops a swarm may nest.
@@ -257,33 +261,6 @@ function swarmRoleModel(role: { provider_id: string | null; model_id: string | n
   return { providerID: ProviderV2.ID.make(role.provider_id), modelID: ProviderV2.ModelID.make(role.model_id) }
 }
 
-function swarmRoleModels(
-  role:
-    | {
-        provider_id: string | null
-        model_id: string | null
-        variant: string | null
-        fallback_models: string
-        sort_order: number
-      }
-    | undefined,
-) {
-  if (!role?.provider_id || !role.model_id) return []
-  return [
-    {
-      providerID: ProviderV2.ID.make(role.provider_id),
-      modelID: ProviderV2.ModelID.make(role.model_id),
-      ...(role.variant && role.variant !== "default" ? { variant: role.variant } : {}),
-    },
-    ...(role.sort_order === 0
-      ? []
-      : hydrateFallbackModels(role.fallback_models, {
-          providerID: role.provider_id,
-          modelID: role.model_id,
-        })),
-  ]
-}
-
 /**
  * Parses a "providerID/modelID" override. Malformed values fall back to the
  * agent default rather than failing the delegation; a wrong-but-well-formed
@@ -307,7 +284,6 @@ export const TaskTool = Tool.define(
     const background = yield* BackgroundJob.Service
     const config = yield* Config.Service
     const sessions = yield* Session.Service
-    const status = Option.getOrUndefined(yield* Effect.serviceOption(SessionStatus.Service))
     const scope = yield* Scope.Scope
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
@@ -325,9 +301,6 @@ export const TaskTool = Tool.define(
           name: OpencodeXSwarmRoleTable.name,
           provider_id: OpencodeXSwarmRoleTable.provider_id,
           model_id: OpencodeXSwarmRoleTable.model_id,
-          variant: OpencodeXSwarmRoleTable.variant,
-          fallback_models: OpencodeXSwarmRoleTable.fallback_models,
-          sort_order: OpencodeXSwarmRoleTable.sort_order,
         })
         .from(OpencodeXSwarmRoleTable)
         .where(eq(OpencodeXSwarmRoleTable.swarm_id, swarmID))
@@ -440,21 +413,12 @@ export const TaskTool = Tool.define(
       // previous outcome, and every later write compare-and-sets on the runID
       // so a stale run can never overwrite a newer one.
       const runID = Identifier.ascending("run")
-      // This is the exact child *user* message boundary. Its assistant reply
-      // has `parentID === childMessageID`, which restart recovery uses instead
-      // of guessing from a reused child session's latest transcript entry.
-      const childMessageID = MessageID.ascending()
       const started: DelegationRecord = {
         version: DELEGATION_RECORD_VERSION,
         runID,
         parentSessionID: ctx.sessionID,
         parentMessageID: ctx.messageID,
         ...(ctx.callID ? { toolCallID: ctx.callID } : {}),
-        role: swarmRole?.name ?? next.name,
-        title: params.description,
-        mode: runInBackground ? "background" : "foreground",
-        ownerID: `local:${process.pid}:${ensureRunID()}:${runID}`,
-        childMessageID,
         attempt: delegationAttempts(nextSession.metadata) + 1,
         phase: "running",
         startedAt: Date.now(),
@@ -463,31 +427,32 @@ export const TaskTool = Tool.define(
       // completed child rendered as unknown - so failures are logged, not
       // silently ignored.
       const stamp = (record: DelegationRecord, expectRunID?: string) =>
-        sessions
-          .stampDelegation({ sessionID: nextSession.id, record, ...(expectRunID ? { expectRunID } : {}) })
-          .pipe(
-            Effect.catchCause((cause) =>
-              Effect.sync(() => {
-                log.error("delegation stamp failed", { sessionID: nextSession.id, runID, cause })
-                return false
-              }),
-            ),
-          )
+        sessions.stampDelegation({ sessionID: nextSession.id, record, ...(expectRunID ? { expectRunID } : {}) }).pipe(
+          Effect.catchCause((cause) =>
+            Effect.sync(() => {
+              log.error("delegation stamp failed", { sessionID: nextSession.id, runID, cause })
+              return false
+            }),
+          ),
+        )
       const settle = (outcome: DelegationOutcome, summary?: string, error?: string) =>
         stamp(
           settleDelegation(started, {
             outcome,
             summary,
-            // Delivery is separate from execution settlement for both modes:
-            // the parent part can be lost after the child has already stopped.
-            deliveryOutcome: "pending" as const,
             ...(error ? { error } : {}),
+            // Delivery starts pending only for a clean completion the parent
+            // still has to durably receive; errors surface through their own
+            // channels.
+            ...(outcome === "completed" ? { deliveryOutcome: "pending" as const } : {}),
           }),
           runID,
-        ).pipe(Effect.andThen(status ? status.refresh(ctx.sessionID) : Effect.void), Effect.asVoid)
-      // An observed cancellation request wins over a late clean return.
+        ).pipe(Effect.asVoid)
+      // An observed cancellation request wins over a late clean return: the
+      // stamp records user intent, even though the report text still flows
+      // back to the parent.
       const cancelState = { requested: false }
-      yield* stamp(started).pipe(Effect.andThen(status ? status.refresh(ctx.sessionID) : Effect.void))
+      yield* stamp(started)
 
       return yield* Effect.gen(function* () {
         const msg = yield* MessageV2.get({ sessionID: ctx.sessionID, messageID: ctx.messageID }).pipe(
@@ -502,9 +467,8 @@ export const TaskTool = Tool.define(
         // model comes next: a role spawning helpers of itself should run them on
         // what it is running, not on whatever its agent happens to configure.
         // Outside a swarm the agent's model keeps priority, as it always has.
-        const override = parseModelOverride(params.model)
         const requested =
-          override ??
+          parseModelOverride(params.model) ??
           swarmRoleModel(swarmRole) ??
           (swarm && !isSwarmProvider(caller.providerID) ? caller : undefined) ??
           next.model ??
@@ -526,21 +490,6 @@ export const TaskTool = Tool.define(
                 `Give its orchestrator role a model, or pass one on the task call.`,
             ),
           )
-        // The chain is built from the role's raw configuration, so its primary
-        // can still be the swarm facade the guard above just resolved away. A
-        // child on the facade would be handed a briefing and a team and start
-        // delegating recursively, so any facade entry routes to the resolved
-        // concrete model instead.
-        const configuredModels = swarmRoleModels(swarmRole).map((entry) =>
-          isSwarmProvider(entry.providerID) ? { ...model, variant: undefined } : entry,
-        )
-        const models =
-          configuredModels.length > 0 &&
-          (!override ||
-            (override.providerID === configuredModels[0].providerID &&
-              override.modelID === configuredModels[0].modelID))
-            ? configuredModels
-            : [{ ...model, variant: undefined }]
         const metadata = {
           parentSessionId: ctx.sessionID,
           sessionId: nextSession.id,
@@ -564,17 +513,20 @@ export const TaskTool = Tool.define(
 
         const runTask = Effect.fn("TaskTool.runTask")(function* () {
           const parts = yield* ops.resolvePromptParts(params.prompt)
-          const userMessageID = childMessageID
-          const first = models[0]
-          metadata.model = { providerID: first.providerID, modelID: first.modelID }
-          const initial = yield* ops.prompt({
-            messageID: userMessageID,
+          const result = yield* ops.prompt({
+            messageID: MessageID.ascending(),
             sessionID: nextSession.id,
-            model: { modelID: first.modelID, providerID: first.providerID },
-            ...(first.variant ? { variant: first.variant } : {}),
+            model: {
+              modelID: model.modelID,
+              providerID: model.providerID,
+            },
             agent: next.name,
             tools: {
               ...(next.permission.some((rule) => rule.permission === "todowrite") ? {} : { todowrite: false }),
+              // A swarm role must be able to fan its own work out and to hand it
+              // to the next layer, so a swarm member keeps the task tool even
+              // when its agent does not grant it explicitly - up to the depth cap,
+              // past which delegation stops rather than recursing forever.
               ...((swarm && childDepth < MAX_SWARM_DELEGATION_DEPTH) ||
               next.permission.some((rule) => rule.permission === id)
                 ? {}
@@ -582,75 +534,25 @@ export const TaskTool = Tool.define(
               ...Object.fromEntries((cfg.experimental?.primary_tools ?? []).map((item) => [item, false])),
             },
             parts,
-          }).pipe(Effect.provideService(Session.Service, sessions))
-          // `undefined` marks a turn that completed as something other than
-          // this task's assistant reply; a bare throw here would become an
-          // unhandled defect and kill the fiber past the error handling below.
-          const advance = (
-            result: SessionLegacy.WithParts,
-            index: number,
-          ): Effect.Effect<SessionLegacy.WithParts | undefined> =>
-            Effect.gen(function* () {
-              const attempt = models[index]
-              if (!attempt) return result
-              const turn = yield* sessions.messageWithChildren({ sessionID: nextSession.id, messageID: userMessageID })
-              if (!shouldAdvanceModelFallback(turn, userMessageID)) return result
-              const user = turn.find(
-                (message): message is SessionLegacy.WithParts & { info: SessionLegacy.User } =>
-                  message.info.role === "user" && message.info.id === userMessageID,
-              )
-              if (!user) return result
-              metadata.model = { providerID: attempt.providerID, modelID: attempt.modelID }
-              yield* sessions.updateMessage({
-                ...user.info,
-                model: {
-                  providerID: attempt.providerID,
-                  modelID: attempt.modelID,
-                  ...(attempt.variant ? { variant: attempt.variant } : {}),
-                },
-              })
-              const next = yield* ops.loop({ sessionID: nextSession.id, messageID: userMessageID })
-              if (next.info.role !== "assistant" || next.info.parentID !== userMessageID) {
-                return undefined
-              }
-              return yield* advance(next, index + 1)
-            })
-          const result = yield* advance(initial, 1)
-          if (!result) {
-            return {
-              state: "error",
-              text: `Task ${nextSession.id} completed a different user turn.`,
-            } satisfies TaskRunResult
-          }
-          // Prompt returns a transport snapshot that can be stale if completion
-          // persistence races with its return. Classify the durable assistant turn.
-          const persisted = yield* MessageV2.get({ sessionID: nextSession.id, messageID: result.info.id }).pipe(
-            Effect.provideService(Database.Service, database),
-            Effect.orDie,
-          )
+          })
           // The report is the last real text part. Synthetic parts are injected
           // briefings, and a silent "" for a failed subagent reads as success to
           // the caller - that is exactly the "completed but empty" confusion.
           const report =
-            persisted.parts
+            result.parts
               .flatMap((part) =>
                 part.type === "text" && !part.synthetic && part.text.trim() ? [part.text.trim()] : [],
               )
               .at(-1) ?? ""
-          if (persisted.info.role === "assistant" && persisted.info.error) {
-            const failure = [`The subagent failed: ${safeErrorText(persisted.info.error)}`, report]
+          if (result.info.role === "assistant" && result.info.error) {
+            const failure = [`The subagent failed: ${safeErrorText(result.info.error)}`, report]
               .filter(Boolean)
               .join("\n")
-            return { state: "error", text: failure, failure: persisted.info.error } satisfies TaskRunResult
+            return { state: "error", text: failure, failure: result.info.error } satisfies TaskRunResult
           }
-          if (!report)
-            return {
-              state: "error",
-              text: "The subagent completed without producing a text report.",
-            } satisfies TaskRunResult
           return {
             state: "completed",
-            text: report,
+            text: report || "The subagent completed without producing a text report.",
           } satisfies TaskRunResult
         })
 
@@ -682,6 +584,84 @@ export const TaskTool = Tool.define(
               ...(failure.retryAt !== undefined ? { retryAt: failure.retryAt } : {}),
             })
           })
+        const monitoringJob = () =>
+          background
+            .list()
+            .pipe(
+              Effect.map((jobs) =>
+                jobs.find(
+                  (job) =>
+                    job.status === "running" &&
+                    job.id !== nextSession.id &&
+                    job.metadata?.parentSessionId === nextSession.id,
+                ),
+              ),
+            )
+        const monitor = Effect.fn("TaskTool.monitorBackgroundChild")(function* (job: BackgroundJob.Info) {
+          const since = Date.now()
+          const record = monitorDelegation(started, {
+            monitorID: job.id,
+            childSessionID: nextSession.id,
+            since,
+          })
+          if (!(yield* stamp(record, runID))) return false
+          yield* status.set(nextSession.id, {
+            type: "monitoring",
+            childSessionID: nextSession.id,
+            monitorID: job.id,
+            since,
+          })
+          yield* background.wait({ id: job.id }).pipe(
+            Effect.andThen((waited) => {
+              const info = waited.info
+              if (!info || info.status === "completed")
+                return status
+                  .settleMonitoring({ sessionID: nextSession.id, monitorID: job.id, status: { type: "idle" } })
+                  .pipe(Effect.andThen((won) => (won ? settle("completed") : Effect.void)))
+              if (info.status === "cancelled")
+                return status
+                  .settleMonitoring({ sessionID: nextSession.id, monitorID: job.id, status: { type: "idle" } })
+                  .pipe(Effect.andThen((won) => (won ? settle("cancelled") : Effect.void)))
+              const failure = providerFailure(info.error ?? "External monitor failed", model)
+              return status
+                .settleMonitoring({
+                  sessionID: nextSession.id,
+                  monitorID: job.id,
+                  status: failure
+                    ? {
+                        type: "blocked",
+                        childSessionID: nextSession.id,
+                        attemptedModels: [`${model.providerID}/${model.modelID}`],
+                        error: failure.message,
+                        ...(failure.retryAt !== undefined ? { retryAt: failure.retryAt } : {}),
+                      }
+                    : { type: "idle" },
+                })
+                .pipe(
+                  Effect.andThen((won) =>
+                    won
+                      ? failure
+                        ? settle("errored", info.error, failure.message).pipe(
+                            Effect.andThen(
+                              status.set(ctx.sessionID, {
+                                type: "blocked",
+                                childSessionID: nextSession.id,
+                                attemptedModels: [`${model.providerID}/${model.modelID}`],
+                                error: failure.message,
+                                ...(failure.retryAt !== undefined ? { retryAt: failure.retryAt } : {}),
+                              }),
+                            ),
+                          )
+                        : settle("errored", info.error)
+                      : Effect.void,
+                  ),
+                )
+            }),
+            Effect.catchCause((cause) => Effect.logWarning("background monitor wait failed", { cause, jobID: job.id })),
+            Effect.forkIn(scope, { startImmediately: true }),
+          )
+          return true
+        })
         const settleFailure = (error: unknown) => {
           const failure = providerFailure(error, model)
           const evidence = failure
@@ -727,9 +707,6 @@ export const TaskTool = Tool.define(
                 {
                   type: "text",
                   synthetic: true,
-                  // The prompt loop only answers a synthetic-only message it
-                  // recognises; this tag is how a report earns its turn.
-                  metadata: { task_report: true },
                   text: backgroundMessage({
                     sessionID: nextSession.id,
                     description: params.description,
@@ -740,7 +717,6 @@ export const TaskTool = Tool.define(
               ],
             })
             .pipe(
-              Effect.provideService(Session.Service, sessions),
               // The notification's durable persistence is what "delivered"
               // means for a background delegation; anything short of that must
               // not read as the parent having received the result.
@@ -759,42 +735,37 @@ export const TaskTool = Tool.define(
         })
 
         if (runInBackground) {
-          // Nothing is published here: a background job is DERIVED on read
-          // from the child's delegation record, and `settle` refreshes the
-          // parent's status on every terminal outcome.
-          const info = yield* background
-            .start({
-              id: nextSession.id,
-              type: id,
-              title: params.description,
-              metadata,
-              run: runTask().pipe(
-                // One all-exit boundary settles the record: clean return,
-                // subagent error, defect, or interruption - nothing leaves the
-                // child stamped `running` short of the process dying.
-                Effect.onExit((exit) =>
-                  Exit.isSuccess(exit)
-                    ? settleResult(exit.value)
-                    : Cause.hasInterruptsOnly(exit.cause)
-                      ? settle("cancelled")
-                      : settleFailure(Cause.squash(exit.cause)),
-                ),
-                // A subagent that finished on an assistant error is a failed
-                // job, not a completed one: the job state, the notification, and
-                // the child's stamp must tell the same story.
-                Effect.matchCauseEffect({
-                  onSuccess: (result) =>
-                    result.state === "error"
-                      ? inject("error", result.text).pipe(Effect.andThen(Effect.fail(new Error(result.text))))
-                      : inject("completed", result.text).pipe(Effect.as(result.text)),
-                  onFailure: (cause) =>
-                    (Cause.hasInterruptsOnly(cause)
-                      ? Effect.void
-                      : inject("error", errorText(Cause.squash(cause)))
-                    ).pipe(Effect.andThen(Effect.failCause(cause))),
-                }),
+          const info = yield* background.start({
+            id: nextSession.id,
+            type: id,
+            title: params.description,
+            metadata,
+            run: runTask().pipe(
+              // One all-exit boundary settles the record: clean return,
+              // subagent error, defect, or interruption - nothing leaves the
+              // child stamped `running` short of the process dying.
+              Effect.onExit((exit) =>
+                Exit.isSuccess(exit)
+                  ? settleResult(exit.value)
+                  : Cause.hasInterruptsOnly(exit.cause)
+                    ? settle("cancelled")
+                    : settleFailure(Cause.squash(exit.cause)),
               ),
-            })
+              // A subagent that finished on an assistant error is a failed
+              // job, not a completed one: the job state, the notification, and
+              // the child's stamp must tell the same story.
+              Effect.matchCauseEffect({
+                onSuccess: (result) =>
+                  result.state === "error"
+                    ? inject("error", result.text).pipe(Effect.andThen(Effect.fail(new Error(result.text))))
+                    : inject("completed", result.text).pipe(Effect.as(result.text)),
+                onFailure: (cause) =>
+                  (Cause.hasInterruptsOnly(cause) ? Effect.void : inject("error", errorText(Cause.squash(cause)))).pipe(
+                    Effect.andThen(Effect.failCause(cause)),
+                  ),
+              }),
+            ),
+          })
 
           return {
             title: params.description,
@@ -806,11 +777,11 @@ export const TaskTool = Tool.define(
           }
         }
 
-        const runCancel = yield* EffectBridge.make()
         const cancel = ops.cancel(nextSession.id)
+        const aborted = yield* Deferred.make<"aborted">()
         const onAbort = () => {
           cancelState.requested = true
-          runCancel.fork(cancel)
+          Deferred.doneUnsafe(aborted, Effect.succeed("aborted" as const))
         }
 
         return yield* Effect.acquireUseRelease(
@@ -820,34 +791,29 @@ export const TaskTool = Tool.define(
           }),
           () =>
             Effect.gen(function* () {
-              // Already aborted before the task started: cancel and settle
-              // without ever prompting the child. (Upstream 7eb4fedeb; a
-              // signal that fired before `addEventListener` never calls the
-              // listener, so the `acquire` above fires it by hand.) A
-              // cancellation raised MID-flight is different: that one lets
-              // `runTask` finish so the persisted outcome is delivered.
-              if (cancelState.requested) {
+              const result = yield* Deferred.await(aborted).pipe(Effect.raceFirst(runTask()))
+              if (result === "aborted") {
                 yield* cancel
-                const cancelled = {
-                  state: "cancelled",
-                  text: "The subagent was cancelled.",
-                } satisfies TaskRunResult
-                yield* settleResult(cancelled)
+                yield* settle("cancelled")
                 return {
                   title: params.description,
                   metadata,
-                  output: output(nextSession.id, cancelled),
+                  output: output(nextSession.id, "The subagent was cancelled."),
                 }
               }
-              const result = yield* runTask()
-              const final = cancelState.requested
-                ? ({ state: "cancelled", text: "The subagent was cancelled." } satisfies TaskRunResult)
-                : result
-              yield* settleResult(final)
+              const job = result.state === "completed" ? yield* monitoringJob() : undefined
+              if (job && (yield* monitor(job))) {
+                return {
+                  title: params.description,
+                  metadata: { ...metadata, monitorID: job.id },
+                  output: monitoringOutput({ sessionID: nextSession.id, monitorID: job.id }),
+                }
+              }
+              yield* settleResult(result)
               return {
                 title: params.description,
                 metadata,
-                output: output(nextSession.id, final),
+                output: output(nextSession.id, result.text),
               }
             }),
           (_, exit) =>

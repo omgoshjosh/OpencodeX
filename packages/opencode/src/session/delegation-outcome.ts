@@ -51,10 +51,15 @@ export type DelegationRecord = {
   childMessageID?: string
   /** 1-based; a reused `task_id` session increments across runs. */
   attempt: number
-  phase: "running" | "settled"
+  phase: "running" | "monitoring" | "settled"
   /** Present once settled. Execution settlement, never semantic verification. */
   outcome?: DelegationOutcome
   startedAt: number
+  /** The durable background operation still being monitored after local return. */
+  monitorID?: string
+  monitorChildSessionID?: string
+  monitoringSince?: number
+  checkAfter?: number
   completedAt?: number
   /** Display-only report opening; bounded, but still free-form model text. */
   summary?: string
@@ -175,6 +180,21 @@ export function settleDelegation(
   }
 }
 
+/** Records that local work returned but its durable external monitor is active. */
+export function monitorDelegation(
+  record: DelegationRecord,
+  input: { monitorID: string; childSessionID: string; since?: number; checkAfter?: number },
+): DelegationRecord {
+  return {
+    ...record,
+    phase: "monitoring",
+    monitorID: input.monitorID,
+    monitorChildSessionID: input.childSessionID,
+    monitoringSince: input.since ?? Date.now(),
+    ...(input.checkAfter !== undefined ? { checkAfter: input.checkAfter } : {}),
+  }
+}
+
 /**
  * Narrowing by predicate rather than assertion: metadata arrives as free-form
  * JSON, and every reader here has to prove an object before indexing it.
@@ -210,7 +230,7 @@ export function delegationRecord(metadata: Record<string, unknown> | undefined |
   if (typeof raw.runID !== "string" || !raw.runID) return undefined
   if (typeof raw.parentSessionID !== "string" || !raw.parentSessionID) return undefined
   if (typeof raw.attempt !== "number" || !Number.isFinite(raw.attempt) || raw.attempt < 1) return undefined
-  if (raw.phase !== "running" && raw.phase !== "settled") return undefined
+  if (raw.phase !== "running" && raw.phase !== "monitoring" && raw.phase !== "settled") return undefined
   if (typeof raw.startedAt !== "number" || !Number.isFinite(raw.startedAt)) return undefined
   if (raw.outcome !== undefined && !isOutcome(raw.outcome)) return undefined
   if (raw.completedAt !== undefined && (typeof raw.completedAt !== "number" || !Number.isFinite(raw.completedAt)))
@@ -242,6 +262,14 @@ export function delegationRecord(metadata: Record<string, unknown> | undefined |
     phase: raw.phase,
     ...(raw.outcome !== undefined ? { outcome: raw.outcome } : {}),
     startedAt: raw.startedAt,
+    ...(typeof raw.monitorID === "string" && raw.monitorID ? { monitorID: raw.monitorID } : {}),
+    ...(typeof raw.monitorChildSessionID === "string" && raw.monitorChildSessionID
+      ? { monitorChildSessionID: raw.monitorChildSessionID }
+      : {}),
+    ...(typeof raw.monitoringSince === "number" && Number.isFinite(raw.monitoringSince)
+      ? { monitoringSince: raw.monitoringSince }
+      : {}),
+    ...(typeof raw.checkAfter === "number" && Number.isFinite(raw.checkAfter) ? { checkAfter: raw.checkAfter } : {}),
     ...(raw.completedAt !== undefined ? { completedAt: raw.completedAt } : {}),
     ...(typeof raw.summary === "string" && raw.summary ? { summary: raw.summary } : {}),
     ...(typeof raw.error === "string" && raw.error ? { error: raw.error } : {}),

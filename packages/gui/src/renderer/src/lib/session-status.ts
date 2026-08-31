@@ -18,7 +18,7 @@ import type { GuiSnapshot } from "./session-api"
  * table and the rest of the renderer already say; it is a rename at the
  * boundary, not a second derivation.
  */
-export type DerivedSessionStatus = "dormant" | "in_progress" | "input_needed" | "ready_for_review"
+export type DerivedSessionStatus = "dormant" | "in_progress" | "monitoring" | "input_needed" | "ready_for_review"
 
 export type SessionStatusOptions = {
   /** The session's transcript, when the caller has it, for the activity heuristic. */
@@ -58,20 +58,23 @@ export function reconcileSessionUiState(snapshot: GuiSnapshot, sessionID: string
 export function markSessionViewedInSnapshot(snapshot: GuiSnapshot, sessionID: string, time: number): GuiSnapshot {
   const state = snapshot.sessionUiState[sessionID]
   if ((state?.seenAt ?? 0) >= time && (state?.reviewedAt ?? 0) >= time) return snapshot
-  return reconcileSessionUiState({
-    ...snapshot,
-    sessionUiState: {
-      ...snapshot.sessionUiState,
-      [sessionID]: {
-        sessionID,
-        seenAt: Math.max(time, state?.seenAt ?? 0),
-        reviewedAt: Math.max(time, state?.reviewedAt ?? 0),
-        reviewedFiles: state?.reviewedFiles ?? [],
-        displayStatus: state?.displayStatus ?? "idle",
-        updated: state?.updated ?? false,
+  return reconcileSessionUiState(
+    {
+      ...snapshot,
+      sessionUiState: {
+        ...snapshot.sessionUiState,
+        [sessionID]: {
+          sessionID,
+          seenAt: Math.max(time, state?.seenAt ?? 0),
+          reviewedAt: Math.max(time, state?.reviewedAt ?? 0),
+          reviewedFiles: state?.reviewedFiles ?? [],
+          displayStatus: state?.displayStatus ?? "idle",
+          updated: state?.updated ?? false,
+        },
       },
     },
-  }, sessionID)
+    sessionID,
+  )
 }
 
 export function deriveSessionUiState(snapshot: GuiSnapshot, session: Session): OpencodeXSessionUiState {
@@ -145,7 +148,9 @@ function clientStatusName(status: DerivedSessionStatus): ClientDerivedSessionSta
 }
 
 function sessionNeedsInput(snapshot: GuiSnapshot | undefined, sessionID: string) {
-  return hasSessionRequest(snapshot?.permissions ?? [], sessionID) || hasSessionRequest(snapshot?.questions ?? [], sessionID)
+  return (
+    hasSessionRequest(snapshot?.permissions ?? [], sessionID) || hasSessionRequest(snapshot?.questions ?? [], sessionID)
+  )
 }
 
 function hasSessionRequest(requests: readonly { sessionID: string }[], sessionID: string) {

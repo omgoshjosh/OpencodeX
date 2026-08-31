@@ -304,7 +304,7 @@ export const layer = Layer.effect(
     })
 
     const refresh = Effect.fn("SessionStatus.refresh")(function* (sessionID: SessionID) {
-      yield* events.publish(Event.Status, { sessionID, status: yield* get(sessionID) })
+      yield* events.broadcast(yield* events.payload(Event.Status, { sessionID, status: yield* get(sessionID) }))
     })
 
     // Recovery reconciles rows whose owning execution died. It used to run on

@@ -1061,9 +1061,10 @@ describe("tool.task", () => {
         return Effect.void
       })
       yield* status.set(parent.id, { type: "busy" })
+      yield* status.refresh(parent.id)
       yield* off
-      expect(published).toEqual([
-        {
+      expect(published).toEqual(
+        Array(2).fill({
           type: "busy",
           background: {
             running: true,
@@ -1072,14 +1073,15 @@ describe("tool.task", () => {
               { role: "general", title: "zeta", owner: expect.any(String) },
             ],
           },
-        },
-      ])
+        }),
+      )
       const database = yield* Database.Service
       expect(
         (yield* database.db.select().from(EventTable).all().pipe(Effect.orDie))
           .filter(
             (event) =>
-              event.aggregate_id === parent.id && event.type === EventV2.versionedType(SessionStatus.Event.Status.type, 1),
+              event.aggregate_id === parent.id &&
+              event.type === EventV2.versionedType(SessionStatus.Event.Status.type, 1),
           )
           .map((event) => event.data),
       ).toEqual([{ sessionID: parent.id, status: { type: "busy" } }])

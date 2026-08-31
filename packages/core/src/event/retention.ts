@@ -50,11 +50,32 @@ const COMPACTABLE = [PART_UPDATED, MESSAGE_UPDATED, SESSION_UPDATED]
  * part, a message revises a message, and `session.updated` revises the
  * aggregate itself so its key is constant.
  */
-const ENTITY = sql`CASE type
-  WHEN ${PART_UPDATED} THEN json_extract(data, '$.part.id')
-  WHEN ${MESSAGE_UPDATED} THEN json_extract(data, '$.info.id')
+const entity = (alias: ReturnType<typeof sql.raw>) => sql`CASE ${alias}.type
+  WHEN ${sql.raw(`'${PART_UPDATED}'`)} THEN json_extract(${alias}.data, '$.part.id')
+  WHEN ${sql.raw(`'${MESSAGE_UPDATED}'`)} THEN json_extract(${alias}.data, '$.info.id')
   ELSE ''
 END`
+
+export const supersededQuery = (aggregates: string[], batchSize: number) =>
+  sql`SELECT candidate.id
+      FROM event AS candidate
+      WHERE candidate.aggregate_id IN ${aggregates}
+        AND candidate.type IN ${COMPACTABLE}
+        AND EXISTS (
+          SELECT 1 FROM event AS older
+          WHERE older.aggregate_id = candidate.aggregate_id
+            AND older.type = candidate.type
+            AND older.seq < candidate.seq
+            AND ${entity(sql.raw("older"))} = ${entity(sql.raw("candidate"))}
+        )
+        AND EXISTS (
+          SELECT 1 FROM event AS newer
+          WHERE newer.aggregate_id = candidate.aggregate_id
+            AND newer.type = candidate.type
+            AND newer.seq > candidate.seq
+            AND ${entity(sql.raw("newer"))} = ${entity(sql.raw("candidate"))}
+        )
+      LIMIT ${batchSize}`
 
 export type RetentionOptions = {
   maintenanceIntervalMs?: number
@@ -103,30 +124,14 @@ export const make = Effect.fn("EventRetention.make")(function* (
     cursor = aggregates.length < settings.aggregatesPerPass ? "" : (aggregates.at(-1) ?? "")
   }
 
-  /**
-   * Rows in the window that are neither the first nor the last revision of
-   * their entity. Both `ROW_NUMBER`s partition over the entity's full history
-   * inside the window's aggregates, so the two survivors are the true global
-   * first and last even when the batch limit leaves losers behind for a later
-   * pass - which is also what makes the pass idempotent.
+  /** Rows with an older and newer revision of the same entity. Correlated
+   * existence checks keep the query's memory bounded; window functions made
+   * SQLite materialize and sort every revision in the aggregate window before
+   * applying the output limit.
    */
   const superseded = (aggregates: string[]) =>
     db
-      .all<{ id: string }>(
-        sql`SELECT id FROM (
-              SELECT id,
-                ROW_NUMBER() OVER (
-                  PARTITION BY aggregate_id, type, ${ENTITY} ORDER BY seq DESC
-                ) AS newest,
-                ROW_NUMBER() OVER (
-                  PARTITION BY aggregate_id, type, ${ENTITY} ORDER BY seq ASC
-                ) AS oldest
-              FROM event
-              WHERE aggregate_id IN ${aggregates} AND type IN ${COMPACTABLE}
-            )
-            WHERE newest > 1 AND oldest > 1
-            LIMIT ${settings.maintenanceBatchSize}`,
-      )
+      .all<{ id: string }>(supersededQuery(aggregates, settings.maintenanceBatchSize))
       .pipe(Effect.orDie)
 
   const compact = Effect.fn("EventRetention.compact")(function* () {

@@ -13,21 +13,21 @@ type CallOptions = {
 
 export function call(scenario: ActiveScenario, ctx: SeededContext<unknown>, options: CallOptions = {}) {
   return Effect.promise(async () =>
-    capture(await app(await runtime(), options).request(toRequest(scenario, ctx)), scenario.capture),
+    capture(await app(await runtime(), ctx, options).request(toRequest(scenario, ctx)), scenario.capture),
   )
 }
 
 export function callAuthProbe(
   scenario: ActiveScenario,
-  headers: Record<string, string>,
+  ctx: SeededContext<unknown>,
   credentials: "missing" | "valid" = "missing",
 ) {
   return Effect.promise(async () => {
     const controller = new AbortController()
     return Promise.race([
       Promise.resolve(
-        app(await runtime(), { auth: { password: "secret" } }).request(
-          toAuthProbeRequest(scenario, headers, credentials, controller.signal),
+        app(await runtime(), ctx, { auth: { password: "secret" } }).request(
+          toAuthProbeRequest(scenario, ctx.headers(), credentials, controller.signal),
         ),
       ).then((response) => capture(response, scenario.capture)),
       Bun.sleep(1_000).then(() => {
@@ -44,15 +44,13 @@ export function callAuthProbe(
   })
 }
 
-const appCache: Partial<Record<string, BackendApp>> = {}
-
-function app(modules: Runtime, options: CallOptions) {
+function app(modules: Runtime, ctx: SeededContext<unknown>, options: CallOptions) {
   const username = options.auth?.username
   const password = options.auth?.password
   const cacheKey = `${username ?? ""}:${password ?? ""}`
-  if (appCache[cacheKey]) return appCache[cacheKey]
-
-  const handler = HttpRouter.toWebHandler(
+  const cached = ctx.apps[cacheKey]
+  if (cached) return cached
+  const web = HttpRouter.toWebHandler(
     modules.HttpApiApp.routes.pipe(
       Layer.provide(
         ConfigProvider.layer(
@@ -60,15 +58,17 @@ function app(modules: Runtime, options: CallOptions) {
         ),
       ),
     ),
-    { disableLogger: true, memoMap: modules.memoMap },
-  ).handler
-  return (appCache[cacheKey] = {
+    { disableLogger: true, memoMap: ctx.memoMap },
+  )
+  const handler = web.handler
+  return (ctx.apps[cacheKey] = {
     request(input: string | URL | Request, init?: RequestInit) {
       return handler(
         input instanceof Request ? input : new Request(new URL(input, "http://localhost"), init),
         modules.HttpApiApp.context,
       )
     },
+    dispose: web.dispose,
   })
 }
 

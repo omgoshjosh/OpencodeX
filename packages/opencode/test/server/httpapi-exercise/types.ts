@@ -1,4 +1,4 @@
-import type { Duration, Effect } from "effect"
+import type { Duration, Effect, Layer } from "effect"
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
 import type { Config } from "../../../src/config/config"
 import type { Project } from "../../../src/project/project"
@@ -47,10 +47,13 @@ export type CallResult = {
 
 export type BackendApp = {
   request(input: string | URL | Request, init?: RequestInit): Response | Promise<Response>
+  dispose(): Promise<void>
 }
 
 /** Effect-native helpers available while setting up and asserting a scenario. */
 export type ScenarioContext = {
+  memoMap: ReturnType<typeof Layer.makeMemoMapUnsafe>
+  apps: Record<string, BackendApp>
   directory: string | undefined
   headers: (extra?: Record<string, string>) => Record<string, string>
   file: (name: string, content: string) => Effect.Effect<void>

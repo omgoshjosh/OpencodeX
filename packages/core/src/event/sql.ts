@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm"
 import { sqliteTable, text, integer, index } from "drizzle-orm/sqlite-core"
 import type { EventV2 } from "../event"
 
@@ -18,8 +19,21 @@ export const EventTable = sqliteTable(
     type: text().notNull(),
     data: text({ mode: "json" }).$type<Record<string, unknown>>().notNull(),
   },
-  // Every read of this table is "one aggregate, in sequence order", and the
-  // cascade delete resolves by aggregate too. Without this the journal is
-  // scanned end to end each time, which gets worse as it grows.
-  (table) => [index("event_aggregate_seq_idx").on(table.aggregate_id, table.seq)],
+  (table) => [
+    // Journal replay and cascade deletion are aggregate-local.
+    index("event_aggregate_seq_idx").on(table.aggregate_id, table.seq),
+    // Retention asks whether a revision has an older and newer sibling. This
+    // expression keeps that lookup indexed without coupling the generic event
+    // row to session-specific entity columns.
+    index("event_compaction_entity_idx").on(
+      table.aggregate_id,
+      table.type,
+      sql`CASE ${table.type}
+        WHEN 'message.part.updated.1' THEN json_extract(${table.data}, '$.part.id')
+        WHEN 'message.updated.1' THEN json_extract(${table.data}, '$.info.id')
+        ELSE ''
+      END`,
+      table.seq,
+    ),
+  ],
 )

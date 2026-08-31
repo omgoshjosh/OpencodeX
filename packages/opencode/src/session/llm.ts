@@ -4,7 +4,7 @@ import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import * as Log from "@opencode-ai/core/util/log"
 import { Context, Effect, Layer } from "effect"
 import * as Stream from "effect/Stream"
-import { streamText, wrapLanguageModel, type ModelMessage, type Tool } from "ai"
+import { APICallError, streamText, wrapLanguageModel, type ModelMessage, type Tool } from "ai"
 import type { LLMEvent } from "@opencode-ai/llm"
 import { LLMClient, RequestExecutor, WebSocketExecutor } from "@opencode-ai/llm/route"
 import type { LLMClientService } from "@opencode-ai/llm/route"
@@ -31,6 +31,33 @@ import { LLMRequestPrep } from "./llm/request"
 
 const log = Log.create({ service: "llm" })
 export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
+
+export function sanitizeStreamError(input: { error: unknown }) {
+  try {
+    if (!APICallError.isInstance(input.error)) return { name: "UnknownStreamError" as const }
+
+    const output: {
+      name: "AI_APICallError"
+      statusCode?: number
+      isRetryable: boolean
+      url?: string
+    } = {
+      name: "AI_APICallError",
+      isRetryable: input.error.isRetryable === true,
+    }
+    const statusCode = input.error.statusCode
+    if (typeof statusCode === "number" && Number.isInteger(statusCode) && statusCode >= 100 && statusCode <= 599) {
+      output.statusCode = statusCode
+    }
+    if (typeof input.error.url === "string") {
+      const url = new URL(input.error.url)
+      if ((url.protocol === "http:" || url.protocol === "https:") && url.origin.length <= 256) output.url = url.origin
+    }
+    return output
+  } catch {
+    return { name: "UnknownStreamError" as const }
+  }
+}
 
 export type StreamInput = {
   user: SessionLegacy.User
@@ -285,7 +312,7 @@ const live: Layer.Layer<
         result: streamText({
           onError(error) {
             l.error("stream error", {
-              error,
+              error: sanitizeStreamError(error),
             })
           },
           async experimental_repairToolCall(failed) {

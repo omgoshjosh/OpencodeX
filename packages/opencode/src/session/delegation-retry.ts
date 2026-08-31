@@ -3,7 +3,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { Identifier } from "@opencode-ai/core/util/identifier"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
-import { Effect } from "effect"
+import { Effect, Schema } from "effect"
 import { eq, and } from "drizzle-orm"
 import { BackgroundJob } from "@/background/job"
 import { Session } from "./session"
@@ -20,7 +20,9 @@ export type Result = {
   status: "busy"
 }
 
-export class RetryError extends Error {}
+export class RetryError extends Schema.TaggedErrorClass<RetryError>()("DelegationRetry.RetryError", {
+  message: Schema.String,
+}) {}
 
 export const retryBlockedChild = Effect.fn("DelegationRetry.retryBlockedChild")(function* (input: {
   parentSessionID: SessionID
@@ -29,29 +31,25 @@ export const retryBlockedChild = Effect.fn("DelegationRetry.retryBlockedChild")(
   const sessions = yield* Session.Service
   const status = yield* SessionStatus.Service
   const prompt = yield* SessionPrompt.Service
-  const background = yield* BackgroundJob.Service
   const { db } = yield* Database.Service
   const [parent, child] = yield* Effect.all([sessions.get(input.parentSessionID), sessions.get(input.childSessionID)])
   if (child.parentID !== parent.id || delegationRecord(child.metadata)?.parentSessionID !== parent.id) {
-    return yield* Effect.fail(new RetryError("Child does not belong to this parent."))
+    return yield* new RetryError({ message: "Child does not belong to this parent." })
   }
   const blocked = yield* status.get(parent.id)
   if (blocked.type !== "blocked" || blocked.childSessionID !== child.id) {
-    return yield* Effect.fail(new RetryError("Child is not blocked by a provider failure."))
-  }
-  if ((yield* background.get(child.id))?.status === "running") {
-    return yield* Effect.fail(new RetryError("Child is already running."))
+    return yield* new RetryError({ message: "Child is not blocked by a provider failure." })
   }
   const messages = yield* sessions.messages({ sessionID: child.id })
   if (hasUnsafeRetryOutput(messages)) {
-    return yield* Effect.fail(new RetryError("Child produced output or tool activity and cannot be safely retried."))
+    return yield* new RetryError({ message: "Child produced output or tool activity and cannot be safely retried." })
   }
   const user = messages.findLast((message) => message.info.role === "user")
   const parts = user?.parts.filter((part) => part.type === "text" || part.type === "file")
-  if (!user || !parts?.length) return yield* Effect.fail(new RetryError("Child has no durable prompt to retry."))
+  if (!user || !parts?.length) return yield* new RetryError({ message: "Child has no durable prompt to retry." })
   const opencodex = child.metadata?.opencodex
   if (!isRecord(opencodex) || typeof opencodex.swarmID !== "string" || typeof opencodex.swarmRole !== "string") {
-    return yield* Effect.fail(new RetryError("Child has no swarm role to retry."))
+    return yield* new RetryError({ message: "Child has no swarm role to retry." })
   }
   const role = yield* db
     .select({
@@ -65,12 +63,20 @@ export const retryBlockedChild = Effect.fn("DelegationRetry.retryBlockedChild")(
     .where(and(eq(OpencodeXSwarmRoleTable.swarm_id, opencodex.swarmID), eq(OpencodeXSwarmRoleTable.name, opencodex.swarmRole)))
     .get()
     .pipe(Effect.orDie)
-  if (!role?.providerID || !role.modelID) return yield* Effect.fail(new RetryError("Swarm role has no current primary model."))
+  if (!role?.providerID || !role.modelID)
+    return yield* new RetryError({ message: "Swarm role has no current primary model." })
   const routes = [{ providerID: role.providerID, modelID: role.modelID }, ...(role.fallbackModels ?? [])]
   const selected = selectUntriedRoute(routes, blocked.attemptedModels)
-  if (!selected) return yield* Effect.fail(new RetryError("No untried model route remains. Update the role or add a fallback model."))
+  if (!selected)
+    return yield* new RetryError({
+      message: "No untried model route remains. Update the role or add a fallback model.",
+    })
+  const background = yield* BackgroundJob.Service
+  if ((yield* background.get(child.id))?.status === "running") {
+    return yield* new RetryError({ message: "Child is already running." })
+  }
   if (!(yield* status.claimBlockedRetry({ sessionID: parent.id, childSessionID: child.id }))) {
-    return yield* Effect.fail(new RetryError("Child retry is already in progress."))
+    return yield* new RetryError({ message: "Child retry is already in progress." })
   }
   const attempt = delegationAttempts(child.metadata) + 1
   const runID = Identifier.ascending()

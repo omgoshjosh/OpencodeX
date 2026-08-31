@@ -364,7 +364,12 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       return yield* DelegationRetry.retryBlockedChild({
         parentSessionID: ctx.params.sessionID,
         childSessionID: ctx.params.childSessionID,
-      }).pipe(Effect.mapError(() => new HttpApiError.BadRequest({})))
+      }).pipe(
+        Effect.catchTags({
+          "DelegationRetry.RetryError": () => Effect.fail(new HttpApiError.BadRequest({})),
+          NotFoundError: () => Effect.fail(new HttpApiError.BadRequest({})),
+        }),
+      )
     })
 
     const command = Effect.fn("SessionHttpApi.command")(function* (ctx: {

@@ -6,6 +6,7 @@ import type { Config } from "../../../src/config/config"
 
 import type { MessageV2 } from "../../../src/session/message-v2"
 import { MessageID, PartID } from "../../../src/session/schema"
+import { DELEGATION_RECORD_VERSION } from "../../../src/session/delegation-outcome"
 import { call, callAuthProbe } from "./backend"
 import { original, resetExerciseDatabase } from "./environment"
 import { runtime } from "./runtime"
@@ -29,13 +30,19 @@ export function runScenario(options: Options) {
 }
 
 function runActive(options: Options, scenario: ActiveScenario) {
-  if (options.mode === "auth") return withContext(options, scenario, "auth", (ctx) => runAuth(scenario, ctx), false)
+  if (options.mode === "auth")
+    return withContext(options, scenario, "auth", (ctx) => runAuth(scenario, ctx), scenario.authParity)
 
   return withContext(options, scenario, "shared", (ctx) =>
     Effect.gen(function* () {
       yield* trace(options, scenario, "request start")
       const result = yield* call(scenario, ctx)
       yield* trace(options, scenario, `response ${result.status}`)
+      if (scenario.authParity) {
+        const authenticated = yield* call(scenario, ctx, { auth: { password: "secret" } })
+        if (authenticated.status !== result.status || authenticated.text !== result.text)
+          return yield* Effect.die(new Error("authenticated response differs from Effect response"))
+      }
       yield* trace(options, scenario, "expect start")
       yield* scenario.expect(ctx, ctx.state, result)
       yield* trace(options, scenario, "expect done")
@@ -50,6 +57,8 @@ function runAuth(scenario: ActiveScenario, ctx: SeededContext<unknown>) {
       if (result.status !== 401) throw new Error(`auth expected 401, got ${result.status}`)
       const authed = yield* callAuthProbe(scenario, ctx, "valid")
       if (authed.status === 401) throw new Error("auth rejected valid credentials")
+      if (scenario.authParity)
+        yield* scenario.expect(ctx, ctx.state, yield* call(scenario, ctx, { auth: { password: "secret" } }))
       return
     }
 
@@ -186,6 +195,98 @@ function withContext<A, E>(
           llmText: (value) => Effect.suspend(() => llm().text(value)),
           llmWait: (count) => Effect.suspend(() => llm().wait(count)),
           tuiRequest: (request) => Effect.sync(() => modules.Tui.submitTuiRequest(request)),
+          retryChild: (input) =>
+            Effect.gen(function* () {
+              const parent = yield* run(modules.Session.Service.use((svc) => svc.create({ title: "retry parent" })))
+              const child = yield* run(
+                modules.Session.Service.use((svc) => svc.create({ title: "retry child", parentID: parent.id })),
+              )
+              yield* run(
+                modules.Session.Service.use((svc) =>
+                  Effect.gen(function* () {
+                    yield* svc.setMetadata({
+                      sessionID: child.id,
+                      metadata: { opencodex: { swarmID: "missing", swarmRole: "missing" } },
+                    })
+                    yield* svc.stampDelegation({
+                      sessionID: child.id,
+                      record: {
+                        version: DELEGATION_RECORD_VERSION,
+                        runID: "run_httpapi_retry",
+                        parentSessionID: parent.id,
+                        attempt: 1,
+                        phase: "running",
+                        startedAt: Date.now(),
+                      },
+                    })
+                  }),
+                ),
+              )
+              if (input?.blocked)
+                yield* run(
+                  modules.SessionStatus.Service.use((svc) =>
+                    svc.set(parent.id, {
+                      type: "blocked",
+                      childSessionID: child.id,
+                      attemptedModels: [],
+                      error: "provider failed",
+                    }),
+                  ),
+                )
+              const user = yield* run(
+                modules.Session.Service.use((svc) =>
+                  Effect.gen(function* () {
+                    const info: SessionLegacy.User = {
+                      id: MessageID.ascending(),
+                      sessionID: child.id,
+                      role: "user",
+                      time: { created: Date.now() },
+                      agent: "build",
+                      model: { providerID: ProviderV2.ID.opencode, modelID: ProviderV2.ModelID.make("test") },
+                    }
+                    yield* svc.updateMessage(info)
+                    yield* svc.updatePart({
+                      id: PartID.ascending(),
+                      sessionID: child.id,
+                      messageID: info.id,
+                      type: "text",
+                      text: "hello",
+                    })
+                    return info
+                  }),
+                ),
+              )
+              if (input?.partialOutput)
+                yield* run(
+                  modules.Session.Service.use((svc) =>
+                    Effect.gen(function* () {
+                      const assistant: SessionLegacy.Assistant = {
+                        id: MessageID.ascending(),
+                        sessionID: child.id,
+                        role: "assistant",
+                        parentID: user.id,
+                        time: { created: Date.now() },
+                        agent: "build",
+                        providerID: ProviderV2.ID.opencode,
+                        modelID: ProviderV2.ModelID.make("test"),
+                        mode: "build",
+                        path: { cwd: "/tmp", root: "/tmp" },
+                        cost: 0,
+                        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+                      }
+                      yield* svc.updateMessage(assistant)
+                      yield* svc.updatePart({
+                        id: PartID.ascending(),
+                        sessionID: child.id,
+                        messageID: assistant.id,
+                        type: "text",
+                        text: "partial",
+                      })
+                    }),
+                  ),
+                )
+              return { parent, child }
+            }),
         }
         yield* Effect.addFinalizer(() =>
           Effect.forEach(Object.values(base.apps), (app) => Effect.promise(() => app.dispose()).pipe(Effect.ignore)),

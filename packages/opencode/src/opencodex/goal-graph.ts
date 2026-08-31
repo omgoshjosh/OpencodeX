@@ -87,9 +87,10 @@ export function indexGraph(graph: GraphView): GraphIndex {
     outgoing.get(edge.fromNodeID)!.push(edge)
   }
   for (const node of graph.nodes) {
-    if (!node.parentNodeID) continue
-    if (!body.has(node.parentNodeID)) body.set(node.parentNodeID, [])
-    body.get(node.parentNodeID)!.push(node)
+    const parent = parentID(node)
+    if (!parent) continue
+    if (!body.has(parent)) body.set(parent, [])
+    body.get(parent)!.push(node)
   }
   return { byID, incoming, outgoing, body }
 }
@@ -112,8 +113,9 @@ export function readyNodeIDs(graph: GraphView): string[] {
   const ready: string[] = []
   for (const node of graph.nodes) {
     if (node.status !== "planned") continue
-    if (node.parentNodeID) {
-      const loop = index.byID.get(node.parentNodeID)
+    const parent = parentID(node)
+    if (parent) {
+      const loop = index.byID.get(parent)
       // Body work only exists while its loop is iterating.
       if (!loop || loop.status !== "running") continue
       if (loop.loop?.exitCheckNodeID === node.id) {
@@ -159,7 +161,7 @@ export function cascadeSkipIDs(graph: GraphView): string[] {
         }) ||
         // Body membership is not an edge, so a loop that will never iterate
         // again has to settle its body explicitly or it would sit forever.
-        (node.parentNodeID !== undefined && isTerminal(status.get(node.parentNodeID) ?? "failed"))
+        (!!parentID(node) && isTerminal(status.get(parentID(node)!) ?? "failed"))
       if (!poisoned) continue
       skipped.add(node.id)
       status.set(node.id, "skipped")
@@ -208,7 +210,7 @@ export function failingCheckIDs(graph: GraphView): FailingCheck[] {
   for (const node of graph.nodes) {
     if (node.kind !== "check" || node.status !== "done") continue
     if (!node.verdict || node.verdict.pass) continue
-    const parent = node.parentNodeID ? index.byID.get(node.parentNodeID) : undefined
+    const parent = parentID(node) ? index.byID.get(parentID(node)!) : undefined
     if (parent?.loop?.exitCheckNodeID === node.id) continue
     failing.push({ nodeID: node.id, reason: checkReport(node.verdict) })
   }
@@ -237,7 +239,10 @@ export function loopOutcome(graph: GraphView, loopID: string): LoopOutcome {
   const check = index.byID.get(loop.loop.exitCheckNodeID)
   const failed = members.find((node) => node.id !== check?.id && node.status === "failed")
   if (failed) {
-    return advance(loop.loop, `Body node "${failed.title ?? failed.id}" failed: ${failed.failureReason ?? "no reason recorded"}`)
+    return advance(
+      loop.loop,
+      `Body node "${failed.title ?? failed.id}" failed: ${failed.failureReason ?? "no reason recorded"}`,
+    )
   }
   if (!check) return { type: "exhausted", report: "Loop has no exit check." }
   if (!isTerminal(check.status)) return { type: "waiting" }
@@ -365,7 +370,12 @@ function executorIssues(node: NodeInput, context: ValidationContext): string[] {
   if (executor.type === "swarm_role") {
     if (!executor.role.trim()) return [`Node "${node.id}" names an empty swarm role.`]
     if (!context.roles) return []
-    if (!SwarmBriefing.matchSwarmRole(context.roles.map((name) => ({ name })), executor.role)) {
+    if (
+      !SwarmBriefing.matchSwarmRole(
+        context.roles.map((name) => ({ name })),
+        executor.role,
+      )
+    ) {
       return [`Node "${node.id}" names unknown swarm role "${executor.role}". Available: ${context.roles.join(", ")}.`]
     }
     return []
@@ -385,11 +395,13 @@ function executorIssues(node: NodeInput, context: ValidationContext): string[] {
 }
 
 function parentIssues(node: NodeInput, byID: ReadonlyMap<string, NodeInput>): string[] {
-  if (!node.parentNodeID) return []
-  const parent = byID.get(node.parentNodeID)
-  if (!parent) return [`Node "${node.id}" belongs to unknown loop "${node.parentNodeID}".`]
+  const parentID = parentIDOf(node)
+  if (!parentID) return []
+  const parent = byID.get(parentID)
+  if (!parent) return [`Node "${node.id}" belongs to unknown loop "${parentID}".`]
   if ((parent.kind ?? "task") !== "loop") return [`Node "${node.id}" belongs to "${parent.id}", which is not a loop.`]
-  if ((node.kind ?? "task") === "loop") return [`Loop "${node.id}" is nested inside "${parent.id}"; nested loops are not supported.`]
+  if ((node.kind ?? "task") === "loop")
+    return [`Loop "${node.id}" is nested inside "${parent.id}"; nested loops are not supported.`]
   return []
 }
 
@@ -401,13 +413,15 @@ function loopIssues(byID: ReadonlyMap<string, NodeInput>): string[] {
       issues.push(`Loop "${node.id}" needs a loop configuration naming its exit check.`)
       continue
     }
-    const members = [...byID.values()].filter((item) => item.parentNodeID === node.id)
+    const members = [...byID.values()].filter((item) => parentIDOf(item) === node.id)
     const check = byID.get(node.loop.exitCheckNodeID)
     if (!check) {
       issues.push(`Loop "${node.id}" names unknown exit check "${node.loop.exitCheckNodeID}".`)
     } else if ((check.kind ?? "task") !== "check") {
-      issues.push(`Loop "${node.id}" names exit check "${check.id}", which is a ${check.kind ?? "task"} and not a check.`)
-    } else if (check.parentNodeID !== node.id) {
+      issues.push(
+        `Loop "${node.id}" names exit check "${check.id}", which is a ${check.kind ?? "task"} and not a check.`,
+      )
+    } else if (parentIDOf(check) !== node.id) {
       issues.push(`Loop "${node.id}" names exit check "${check.id}", which is not one of its body nodes.`)
     }
     if (members.filter((item) => item.id !== node.loop!.exitCheckNodeID).length === 0) {
@@ -441,7 +455,7 @@ function edgeIssues(edges: readonly EdgeInput[], byID: ReadonlyMap<string, NodeI
  * one legal repetition is the loop's own iteration.
  */
 function cycleIssues(nodes: readonly NodeInput[], edges: readonly EdgeInput[]): string[] {
-  const quotient = new Map(nodes.map((node) => [node.id, node.parentNodeID ?? node.id]))
+  const quotient = new Map(nodes.map((node) => [node.id, parentIDOf(node) ?? node.id]))
   const collapsed = edges
     .map((edge) => ({ from: quotient.get(edge.from)!, to: quotient.get(edge.to)! }))
     .filter((edge) => edge.from !== edge.to)
@@ -450,9 +464,9 @@ function cycleIssues(nodes: readonly NodeInput[], edges: readonly EdgeInput[]): 
     collapsed,
   )
   if (cycle) return [`Plan has a dependency cycle: ${cycle.join(" -> ")}.`]
-  const loops = new Set(nodes.flatMap((node) => (node.parentNodeID ? [node.parentNodeID] : [])))
+  const loops = new Set(nodes.flatMap((node) => (parentIDOf(node) ? [parentIDOf(node)!] : [])))
   for (const loopID of loops) {
-    const members = nodes.filter((node) => node.parentNodeID === loopID).map((node) => node.id)
+    const members = nodes.filter((node) => parentIDOf(node) === loopID).map((node) => node.id)
     const memberSet = new Set(members)
     const inner = edges.filter((edge) => memberSet.has(edge.from) && memberSet.has(edge.to))
     const innerCycle = findCycle(members, inner)
@@ -496,7 +510,7 @@ function findCycle(nodeIDs: readonly string[], edges: readonly { from: string; t
  */
 function boundaryIssues(nodes: readonly NodeInput[], edges: readonly EdgeInput[]): string[] {
   const issues: string[] = []
-  const parentOf = new Map(nodes.map((node) => [node.id, node.parentNodeID]))
+  const parentOf = new Map(nodes.map((node) => [node.id, parentIDOf(node)]))
   const ancestors = transitiveDependencies(nodes, edges)
   for (const edge of edges) {
     const fromLoop = parentOf.get(edge.from)
@@ -539,6 +553,14 @@ function transitiveDependencies(nodes: readonly NodeInput[], edges: readonly Edg
   }
   for (const node of nodes) walk(node.id, new Set())
   return resolved
+}
+
+function parentID(node: NodeView) {
+  return node.parentNodeID?.trim() || undefined
+}
+
+function parentIDOf(node: NodeInput) {
+  return node.parentNodeID?.trim() || undefined
 }
 
 export type ExecutorView = Executor

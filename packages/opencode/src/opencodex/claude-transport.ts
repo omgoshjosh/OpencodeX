@@ -1,5 +1,6 @@
 import { stat } from "node:fs/promises"
 import path from "node:path"
+import type { SDKUserMessage } from "@anthropic-ai/claude-agent-sdk"
 import z from "zod"
 import type { ClaudeEvent } from "./claude-mapper"
 
@@ -38,6 +39,10 @@ export type TransportOptions = {
   signal?: AbortSignal
 }
 
+export type ClaudeImage = { mime: string; url: string }
+
+export type ClaudePrompt = string | AsyncIterable<SDKUserMessage>
+
 export type DelegateCapability = {
   roles: Array<{ name: string; description?: string }>
   run: (input: { role: string; prompt: string }) => Promise<string>
@@ -68,7 +73,7 @@ export type TransportTurn = {
 
 export interface ClaudeTransport {
   /** Runs one prompt to completion, yielding events as they arrive. */
-  run: (prompt: string, options: TransportOptions) => TransportTurn
+  run: (prompt: ClaudePrompt, options: TransportOptions) => TransportTurn
 }
 
 export class ClaudeNotInstalledError extends Error {
@@ -77,6 +82,29 @@ export class ClaudeNotInstalledError extends Error {
 
 /** The CLI's own "leave it alone" row; never forwarded as an explicit model. */
 export const DEFAULT_MODEL_VALUE = "default"
+
+/** A text-only turn stays on the SDK's simple prompt path. */
+export function claudePrompt(text: string, images: ClaudeImage[]): ClaudePrompt {
+  if (images.length === 0) return text
+  return promptParts(text, images)
+}
+
+async function* promptParts(text: string, images: ClaudeImage[]): AsyncGenerator<SDKUserMessage> {
+  const content: Array<
+    | { type: "text"; text: string }
+    | { type: "image"; source: { type: "base64"; media_type: "image/jpeg" | "image/png" | "image/gif" | "image/webp"; data: string } }
+  > = text ? [{ type: "text", text }] : []
+  for (const image of images) {
+    const parsed = image.url.match(/^data:(image\/(?:jpeg|png|gif|webp));base64,([A-Za-z0-9+/]+={0,2})$/)
+    const data = parsed?.[2]
+    if (parsed && data && data.length % 4 === 0 && Buffer.from(data, "base64").toString("base64") === data) {
+      content.push({ type: "image", source: { type: "base64", media_type: parsed[1] as "image/jpeg" | "image/png" | "image/gif" | "image/webp", data } })
+      continue
+    }
+    content.push({ type: "text", text: `[Unsupported image attachment: ${image.mime}]` })
+  }
+  yield { type: "user", parent_tool_use_id: null, message: { role: "user", content } }
+}
 
 /**
  * Asks the installed CLI which models this account may use. The menu is

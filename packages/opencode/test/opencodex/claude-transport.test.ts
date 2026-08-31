@@ -1,6 +1,8 @@
 import { describe, expect, mock, test } from "bun:test"
 import { DELEGATE_SERVER, DELEGATE_TOOL, claudePrompt, createSdkTransport, delegateServer } from "../../src/opencodex/claude-transport"
 
+const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+
 function fakeSdk() {
   const calls: { tool?: { name: string; description: string; extras?: Record<string, unknown> }; server?: Record<string, unknown> } = {}
   return {
@@ -45,13 +47,14 @@ describe("claudePrompt", () => {
   })
 
   test("sends mixed, image-only, and multiple persisted images as native blocks", async () => {
-    const mixed = claudePrompt("Describe these.", [
-      { mime: "image/png", url: "data:image/png;base64,aGVsbG8=" },
+    const briefing = "Swarm briefing. ".repeat(300)
+    const mixed = claudePrompt(briefing, [
+      { mime: "image/png", url: `data:image/png;base64,${png}` },
       { mime: "image/gif", url: "data:image/gif;base64,d29ybGQ=" },
     ])
     const imageOnly = claudePrompt("", [{ mime: "image/webp", url: "data:image/webp;base64,aGVsbG8=" }])
     expect(await first(mixed)).toMatchObject({
-      message: { content: [{ type: "text", text: "Describe these." }, { type: "image" }, { type: "image" }] },
+      message: { content: [{ type: "image" }, { type: "image" }, { type: "text", text: briefing }] },
     })
     expect(await first(imageOnly)).toMatchObject({ message: { content: [{ type: "image" }] } })
   })
@@ -81,7 +84,7 @@ describe("claudePrompt", () => {
         }
       },
     }))
-    const turn = createSdkTransport().run(claudePrompt("Inspect this.", [{ mime: "image/png", url: "data:image/png;base64,aGVsbG8=" }]), {
+    const turn = createSdkTransport().run(claudePrompt("Inspect this.", [{ mime: "image/png", url: `data:image/png;base64,${png}` }]), {
       cwd: process.cwd(),
       executable: "claude",
       canUseTool: async () => ({ allow: true }),
@@ -96,8 +99,8 @@ describe("claudePrompt", () => {
       message: {
         role: "user",
         content: [
+          { type: "image", source: { type: "base64", media_type: "image/png", data: png } },
           { type: "text", text: "Inspect this." },
-          { type: "image", source: { type: "base64", media_type: "image/png", data: "aGVsbG8=" } },
         ],
       },
     })

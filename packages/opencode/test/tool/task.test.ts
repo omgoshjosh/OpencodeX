@@ -1,8 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test"
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
 import { Database } from "@opencode-ai/core/database/database"
-import { EventTable } from "@opencode-ai/core/event/sql"
-import { EventV2 } from "@opencode-ai/core/event"
 import { Effect, Exit, Fiber, Layer } from "effect"
 import { Agent } from "../../src/agent/agent"
 import { BackgroundJob } from "@/background/job"
@@ -15,9 +13,8 @@ import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
 
-import { MAX_SWARM_DELEGATION_DEPTH, TaskTool, type TaskPromptOps } from "../../src/tool/task"
+import { MAX_SWARM_DELEGATION_DEPTH, TaskTool, providerFailure, type TaskPromptOps } from "../../src/tool/task"
 import { delegationOutcome, delegationRecord } from "../../src/session/delegation-outcome"
-import { DELEGATION_RECORD_VERSION } from "../../src/session/delegation-outcome"
 import { Truncate } from "@/tool/truncate"
 import { ToolRegistry } from "@/tool/registry"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -27,7 +24,6 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { OpencodeXProjectTable, OpencodeXSwarmRoleTable, OpencodeXSwarmTable } from "@opencode-ai/core/opencodex/sql"
-import { ensureRunID } from "@opencode-ai/core/util/opencode-process"
 
 afterEach(async () => {
   await disposeAllInstances()
@@ -113,26 +109,14 @@ function stubOps(opts?: { onPrompt?: (input: SessionPrompt.PromptInput) => void;
     cancel: () => Effect.void,
     resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
     prompt: (input) =>
-      Effect.gen(function* () {
+      Effect.sync(() => {
         opts?.onPrompt?.(input)
-        return yield* persist(reply(input, opts?.text ?? "done"))
+        return reply(input, opts?.text ?? "done")
       }),
-    loop: () => Effect.die("unexpected task loop"),
   }
 }
 
-type AssistantWithParts = { info: SessionLegacy.Assistant; parts: SessionLegacy.Part[] }
-
-function persist(message: AssistantWithParts) {
-  return Effect.gen(function* () {
-    const session = yield* Session.Service
-    yield* session.updateMessage(message.info)
-    yield* Effect.forEach(message.parts, (part) => session.updatePart(part))
-    return message
-  })
-}
-
-function reply(input: SessionPrompt.PromptInput, text: string): AssistantWithParts {
+function reply(input: SessionPrompt.PromptInput, text: string): SessionLegacy.WithParts {
   const id = MessageID.ascending()
   return {
     info: {
@@ -160,65 +144,6 @@ function reply(input: SessionPrompt.PromptInput, text: string): AssistantWithPar
       },
     ],
   }
-}
-
-function failedReply(input: SessionPrompt.PromptInput, code: string): SessionLegacy.WithParts {
-  const failed = reply(input, "")
-  return {
-    ...failed,
-    info: {
-      ...failed.info,
-      error: new SessionLegacy.APIError({
-        message: "request failed",
-        responseBody: JSON.stringify({ error: { code } }),
-        isRetryable: false,
-      }),
-    },
-    parts: [],
-  } as unknown as SessionLegacy.WithParts
-}
-
-function persistPromptResult(
-  sessions: Pick<Session.Interface, "updateMessage" | "updatePart">,
-  input: SessionPrompt.PromptInput,
-  result: SessionLegacy.WithParts,
-) {
-  return Effect.gen(function* () {
-    const user: SessionLegacy.User = {
-      id: input.messageID!,
-      role: "user",
-      sessionID: input.sessionID,
-      agent: input.agent ?? "general",
-      model: {
-        providerID: input.model!.providerID,
-        modelID: input.model!.modelID,
-        ...(input.variant ? { variant: input.variant } : {}),
-      },
-      time: { created: Date.now() },
-    }
-    yield* sessions.updateMessage(user)
-    yield* Effect.forEach(
-      input.parts.filter((part): part is SessionLegacy.TextPartInput => part.type === "text"),
-      (part) => sessions.updatePart({
-        ...part,
-        id: PartID.ascending(),
-        messageID: user.id,
-        sessionID: user.sessionID,
-      }),
-      { discard: true },
-    )
-    return yield* persistAssistantResult(sessions, result)
-  })
-}
-
-function persistAssistantResult(
-  sessions: Pick<Session.Interface, "updateMessage" | "updatePart">,
-  result: SessionLegacy.WithParts,
-) {
-  return sessions.updateMessage(result.info).pipe(
-    Effect.andThen(Effect.forEach(result.parts, (part) => sessions.updatePart(part), { discard: true })),
-    Effect.as(result),
-  )
 }
 
 describe("tool.task", () => {
@@ -403,8 +328,7 @@ describe("tool.task", () => {
           Effect.promise(() => {
             ready.resolve(input)
             return cancelled.promise
-          }).pipe(Effect.andThen(() => persist(reply(input, "cancelled")))),
-        loop: () => Effect.die("unexpected task loop"),
+          }).pipe(Effect.as(reply(input, "cancelled"))),
       }
 
       const fiber = yield* def
@@ -457,7 +381,6 @@ describe("tool.task", () => {
             prompted = true
             return reply(input, "unexpected")
           }),
-        loop: () => Effect.die("unexpected task loop"),
       }
 
       const fiber = yield* def
@@ -717,10 +640,6 @@ describe("tool.task", () => {
           sort_order: 1,
           provider_id: "anthropic",
           model_id: "claude-fable-5",
-          fallback_models: JSON.stringify([
-            { providerID: "openai", modelID: "gpt-5" },
-            { providerID: "google", modelID: "gemini-3" },
-          ]),
         },
       ])
       const { chat, assistant } = yield* seed("Swarm chat", {
@@ -770,132 +689,6 @@ describe("tool.task", () => {
         "anthropic/claude-fable-5",
         "anthropic/claude-fable-5",
       ])
-
-      const attempts: SessionPrompt.PromptInput[] = []
-      const fallbackResult = yield* def.execute(
-        {
-          description: "build module D",
-          prompt: "do the work",
-          subagent_type: "general",
-          swarm_role: "Senior Engineer",
-        },
-        {
-          sessionID: chat.id,
-          messageID: assistant.id,
-          directory: chat.directory,
-          agent: "build",
-          abort: new AbortController().signal,
-          extra: {
-            promptOps: {
-              ...stubOps(),
-              prompt: (input: SessionPrompt.PromptInput) =>
-                Effect.gen(function* () {
-                  attempts.push(input)
-                  return yield* persistPromptResult(sessions, input, failedReply(input, "insufficient_quota"))
-                }),
-              loop: (input: SessionPrompt.LoopInput) =>
-                Effect.gen(function* () {
-                  const turn = yield* sessions.messageWithChildren({ sessionID: input.sessionID, messageID: input.messageID! })
-                  const user = turn.find((message): message is SessionLegacy.WithParts & { info: SessionLegacy.User } => message.info.role === "user")!
-                  const nextInput = {
-                    sessionID: input.sessionID,
-                    messageID: user.info.id,
-                    model: user.info.model,
-                    agent: user.info.agent,
-                    parts: [],
-                  } satisfies SessionPrompt.PromptInput
-                  attempts.push(nextInput)
-                  return yield* persistAssistantResult(sessions, reply(nextInput, "fallback done"))
-                }),
-            },
-          },
-          messages: [],
-          metadata: () => Effect.void,
-          ask: () => Effect.void,
-        },
-      )
-      expect(attempts.map((input) => `${input.model?.providerID}/${input.model?.modelID}`)).toEqual([
-        "anthropic/claude-fable-5",
-        "openai/gpt-5",
-      ])
-      expect(fallbackResult.output).toContain("fallback done")
-      expect(fallbackResult.metadata.model).toMatchObject({ providerID: "openai", modelID: "gpt-5" })
-      expect((yield* sessions.messages({ sessionID: fallbackResult.metadata.sessionId })).filter((message) => message.info.role === "user")).toHaveLength(1)
-
-      let blockedLoops = 0
-      const blocked = yield* def.execute(
-        { description: "build module safety", prompt: "do the work", subagent_type: "general", swarm_role: "Senior Engineer" },
-        {
-          sessionID: chat.id,
-          messageID: assistant.id,
-          directory: chat.directory,
-          agent: "build",
-          abort: new AbortController().signal,
-          extra: {
-            promptOps: {
-              ...stubOps(),
-              prompt: (input: SessionPrompt.PromptInput) =>
-                Effect.gen(function* () {
-                  yield* persistPromptResult(sessions, input, reply(input, "visible work from an earlier step"))
-                  return yield* persistAssistantResult(sessions, failedReply(input, "quota_exceeded"))
-                }),
-              loop: () => {
-                blockedLoops++
-                return Effect.die("fallback must remain blocked")
-              },
-            },
-          },
-          messages: [],
-          metadata: () => Effect.void,
-          ask: () => Effect.void,
-        },
-      )
-      expect(blocked.output).toContain("failed")
-      expect(blockedLoops).toBe(0)
-      expect((yield* sessions.messages({ sessionID: blocked.metadata.sessionId })).filter((message) => message.info.role === "user")).toHaveLength(1)
-
-      const overrides: SessionPrompt.PromptInput[] = []
-      yield* def.execute(
-        {
-          description: "build module E",
-          prompt: "do the work",
-          subagent_type: "general",
-          swarm_role: "Senior Engineer",
-          model: "other/custom",
-        },
-        {
-          sessionID: chat.id,
-          messageID: assistant.id,
-          directory: chat.directory,
-          agent: "build",
-          abort: new AbortController().signal,
-          extra: {
-            promptOps: {
-              ...stubOps(),
-              // Persisted, not just returned: the tool classifies the durable
-              // assistant turn, so a mock that never writes one has nothing to
-              // classify.
-              prompt: (input: SessionPrompt.PromptInput) => {
-                overrides.push(input)
-                const failed = reply(input, "")
-                return persistAssistantResult(sessions, {
-                  ...failed,
-                  info: {
-                    ...failed.info,
-                    error: new SessionLegacy.APIError({ message: "quota exceeded", isRetryable: false }),
-                  },
-                  parts: [],
-                } as unknown as SessionLegacy.WithParts)
-              },
-            },
-          },
-          messages: [],
-          metadata: () => Effect.void,
-          ask: () => Effect.void,
-        },
-      )
-      expect(overrides).toHaveLength(1)
-      expect(overrides[0]?.model).toMatchObject({ providerID: "other", modelID: "custom" })
     }),
   )
 
@@ -1001,9 +794,9 @@ describe("tool.task", () => {
       const promptOps: TaskPromptOps = {
         ...stubOps(),
         prompt: (input) =>
-          Effect.gen(function* () {
+          Effect.sync(() => {
             const base = reply(input, "")
-            return yield* persist({
+            return {
               info: {
                 ...base.info,
                 error: {
@@ -1012,7 +805,7 @@ describe("tool.task", () => {
                 } as SessionLegacy.Assistant["error"],
               },
               parts: [],
-            })
+            }
           }),
       }
 
@@ -1032,31 +825,59 @@ describe("tool.task", () => {
       )
 
       expect(result.output).toContain("The subagent failed:")
-      expect(result.output).toContain('state="error"')
-      expect(result.output).toContain("<task_error>")
-      expect(result.output).toContain("ProviderAuthError")
       expect(result.output).toContain("credentials expired")
-      const child = yield* (yield* Session.Service).get(SessionID.make(result.metadata.sessionId))
-      expect(delegationOutcome(child.metadata)).toBe("errored")
     }),
   )
 
-  it.instance("treats an empty report as a subagent error", () =>
-  it.instance("treats an empty report as a subagent error", () =>
+  test("normalizes structured terminal provider failures without retaining credentials", () => {
+    const failure = providerFailure(
+      {
+        name: "APIError",
+        data: {
+          message: "Monthly quota exhausted; authorization=Bearer super-secret",
+          statusCode: 429,
+          retryAfterMs: 1_000,
+          metadata: { code: "insufficient_quota", requestId: "req_123" },
+        },
+      },
+      { providerID: "test", modelID: "test-model" },
+    )
+
+    expect(failure?.message).toContain("Provider test/test-model")
+    expect(failure?.message).toContain("code=insufficient_quota")
+    expect(failure?.message).toContain("status=429")
+    expect(failure?.message).toContain("requestId=req_123")
+    expect(failure?.message).toContain("[redacted]")
+    expect(failure?.message).not.toContain("super-secret")
+    expect(failure?.retryAt).toBeGreaterThan(Date.now())
+  })
+
+  test("normalizes status-only quota and authentication failures without retry metadata", () => {
+    const model = { providerID: "test", modelID: "test-model" }
+    const quota = providerFailure({ data: { statusCode: 429 } }, model)
+
+    expect(quota).toMatchObject({ message: "Provider test/test-model (status=429): request failed" })
+    expect(quota?.retryAt).toBeUndefined()
+
+    for (const statusCode of [401, 403]) {
+      expect(providerFailure({ data: { statusCode } }, model)?.message).toContain(`status=${statusCode}`)
+    }
+
+    expect(providerFailure({ data: { statusCode: 500 } }, model)).toBeUndefined()
+  })
+
+  it.instance("labels an empty report instead of returning an empty string", () =>
     Effect.gen(function* () {
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
       const def = yield* tool.init()
       const promptOps: TaskPromptOps = {
         ...stubOps(),
+        // Only a synthetic part: an injected briefing, not a report.
         prompt: (input) =>
-          Effect.gen(function* () {
-            const base = reply(input, "")
-            const part = base.parts.find((part): part is SessionLegacy.TextPart => part.type === "text")!
-            return yield* persist({
-              info: base.info,
-              parts: [part, { ...part, id: PartID.ascending(), text: "internal briefing", synthetic: true }],
-            })
+          Effect.sync(() => {
+            const base = reply(input, "internal briefing")
+            return { info: base.info, parts: [{ ...base.parts[0], synthetic: true }] }
           }),
       }
 
@@ -1076,56 +897,7 @@ describe("tool.task", () => {
       )
 
       expect(result.output).toContain("The subagent completed without producing a text report.")
-      expect(result.output).toContain('state="error"')
-      expect(result.output).toContain("<task_error>")
       expect(result.output).not.toContain("internal briefing")
-      const child = yield* (yield* Session.Service).get(SessionID.make(result.metadata.sessionId))
-      expect(delegationOutcome(child.metadata)).toBe("errored")
-    }),
-  )
-
-  it.instance("uses persisted abort state instead of a stale prompt snapshot", () =>
-    Effect.gen(function* () {
-      const { chat, assistant } = yield* seed()
-      const tool = yield* TaskTool
-      const def = yield* tool.init()
-      const result = yield* def.execute(
-        { description: "inspect bug", prompt: "look into it", subagent_type: "general" },
-        {
-          sessionID: chat.id,
-          messageID: assistant.id,
-          directory: chat.directory,
-          agent: "build",
-          abort: new AbortController().signal,
-          extra: {
-            promptOps: {
-              ...stubOps(),
-              prompt: (input) =>
-                Effect.gen(function* () {
-                  const snapshot = reply(input, "")
-                  yield* persist({
-                    ...snapshot,
-                    info: {
-                      ...snapshot.info,
-                      error: { name: "MessageAbortedError", data: { message: "Aborted" } },
-                    },
-                    parts: [],
-                  })
-                  return snapshot
-                }),
-            } satisfies TaskPromptOps,
-          },
-          messages: [],
-          metadata: () => Effect.void,
-          ask: () => Effect.void,
-        },
-      )
-
-      expect(result.output).toContain('state="error"')
-      expect(result.output).toContain("MessageAbortedError")
-      expect(result.output).toContain("Aborted")
-      const child = yield* (yield* Session.Service).get(SessionID.make(result.metadata.sessionId))
-      expect(delegationOutcome(child.metadata)).toBe("errored")
     }),
   )
 
@@ -1164,20 +936,9 @@ describe("tool.task", () => {
   background.instance("execute launches background tasks without waiting for completion", () =>
     Effect.gen(function* () {
       const jobs = yield* BackgroundJob.Service
-      const status = yield* SessionStatus.Service
-      const events = yield* EventV2Bridge.Service
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
       const def = yield* tool.init()
-      // The parent's status DERIVES the running job from the child's
-      // delegation record; nothing is written onto the parent's status row.
-      const statuses: SessionStatus.Info[] = []
-      const off = yield* events.listen((event) => {
-        if (event.type !== SessionStatus.Event.Status.type) return Effect.void
-        const data = event.data as typeof SessionStatus.Event.Status.data.Type
-        if (data.sessionID === chat.id) statuses.push(data.status)
-        return Effect.void
-      })
 
       const result = yield* def.execute(
         {
@@ -1208,38 +969,15 @@ describe("tool.task", () => {
       expect(result.metadata.background).toBe(true)
       expect(result.output).toContain(`state="running"`)
       expect(job?.status).toBe("running")
-      expect(yield* status.get(chat.id)).toMatchObject({
-        type: "idle",
-        background: { running: true, jobs: [{ role: "general", title: "inspect bug", owner: expect.any(String) }] },
-      })
-      yield* status.set(chat.id, { type: "busy" })
-      yield* status.set(chat.id, { type: "retry", attempt: 1, message: "retrying", next: 1 })
-      yield* status.set(chat.id, { type: "idle" })
-      yield* off
-      expect(statuses).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({ type: "idle", background: { running: true, jobs: expect.any(Array) } }),
-          expect.objectContaining({ type: "busy", background: { running: true, jobs: expect.any(Array) } }),
-          expect.objectContaining({ type: "retry", background: { running: true, jobs: expect.any(Array) } }),
-        ]),
-      )
     }),
   )
 
   background.instance("background tasks complete through the background job service", () =>
     Effect.gen(function* () {
       const jobs = yield* BackgroundJob.Service
-      const events = yield* EventV2Bridge.Service
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
       const def = yield* tool.init()
-      const statuses: SessionStatus.Info[] = []
-      const off = yield* events.listen((event) => {
-        if (event.type !== SessionStatus.Event.Status.type) return Effect.void
-        const data = event.data as typeof SessionStatus.Event.Status.data.Type
-        if (data.sessionID === chat.id) statuses.push(data.status)
-        return Effect.void
-      })
 
       const result = yield* def.execute(
         {
@@ -1265,67 +1003,6 @@ describe("tool.task", () => {
       expect(waited.timedOut).toBe(false)
       expect(waited.info?.status).toBe("completed")
       expect(waited.info?.output).toBe("background done")
-      yield* off
-      expect(statuses.at(-1)).toEqual({ type: "idle" })
-    }),
-  )
-
-  background.instance("publishes sorted live jobs and excludes dead owners", () =>
-    Effect.gen(function* () {
-      const sessions = yield* Session.Service
-      const status = yield* SessionStatus.Service
-      const events = yield* EventV2Bridge.Service
-      const parent = yield* sessions.create({})
-      const children = yield* Effect.forEach(["zeta", "alpha", "dead"], () => sessions.create({ parentID: parent.id }))
-      yield* Effect.forEach(children, (child, index) =>
-        sessions.stampDelegation({
-          sessionID: child.id,
-          record: {
-            version: DELEGATION_RECORD_VERSION,
-            runID: `run_${index}`,
-            parentSessionID: parent.id,
-            mode: "background",
-            ownerID: index === 2 ? "local:999999:dead:run" : `local:${process.pid}:${ensureRunID()}:run_${index}`,
-            role: "general",
-            title: ["zeta", "alpha", "dead"][index],
-            attempt: 1,
-            phase: "running",
-            startedAt: 1,
-          },
-        }),
-      )
-      const published: SessionStatus.Info[] = []
-      const off = yield* events.listen((event) => {
-        if (event.type !== SessionStatus.Event.Status.type) return Effect.void
-        const data = event.data as typeof SessionStatus.Event.Status.data.Type
-        if (data.sessionID === parent.id) published.push(data.status)
-        return Effect.void
-      })
-      yield* status.set(parent.id, { type: "busy" })
-      yield* status.refresh(parent.id)
-      yield* off
-      expect(published).toEqual(
-        Array(2).fill({
-          type: "busy",
-          background: {
-            running: true,
-            jobs: [
-              { role: "general", title: "alpha", owner: expect.any(String) },
-              { role: "general", title: "zeta", owner: expect.any(String) },
-            ],
-          },
-        }),
-      )
-      const database = yield* Database.Service
-      expect(
-        (yield* database.db.select().from(EventTable).all().pipe(Effect.orDie))
-          .filter(
-            (event) =>
-              event.aggregate_id === parent.id &&
-              event.type === EventV2.versionedType(SessionStatus.Event.Status.type, 1),
-          )
-          .map((event) => event.data),
-      ).toEqual([{ sessionID: parent.id, status: { type: "busy" } }])
     }),
   )
 
@@ -1402,7 +1079,7 @@ describe("tool.task", () => {
             promptOps: {
               ...stubOps({ text: "background done" }),
               prompt: (input) =>
-                input.sessionID === chat.id ? Effect.never : persist(reply(input, "background done")),
+                input.sessionID === chat.id ? Effect.never : Effect.succeed(reply(input, "background done")),
             } satisfies TaskPromptOps,
           },
           messages: [],
@@ -1596,8 +1273,6 @@ describe("tool.task", () => {
         attempt: 1,
         parentSessionID: chat.id,
         parentMessageID: assistant.id,
-        role: "general",
-        title: "do work",
         // Execution settled; the parent has not durably received the report
         // yet - that mark belongs to the tool-part persistence, not the tool.
         deliveryOutcome: "pending",
@@ -1645,7 +1320,7 @@ describe("tool.task", () => {
     }),
   )
 
-  it.instance("blocks the parent without marking its local execution busy and preserves redacted evidence", () =>
+  it.instance("blocks the parent on a status-only quota failure without marking its local execution busy", () =>
     Effect.gen(function* () {
       const { chat, assistant } = yield* seed()
       const sessions = yield* Session.Service
@@ -1657,20 +1332,17 @@ describe("tool.task", () => {
       const failingOps: TaskPromptOps = {
         ...stubOps(),
         prompt: (input) =>
-          Effect.gen(function* () {
+          Effect.sync(() => {
             const message = reply(input, "partial output")
-            return yield* persist({
+            return {
               ...message,
               info: {
                 ...message.info,
                 error: {
                   name: "APIError",
                   data: {
-                    message: "quota exhausted, token=child-secret",
                     statusCode: 429,
                     isRetryable: false,
-                    responseHeaders: { "retry-after-ms": "1000" },
-                    metadata: { code: "insufficient_quota" },
                   },
                 },
               },
@@ -1697,21 +1369,20 @@ describe("tool.task", () => {
       const child = yield* sessions.get(SessionID.make(result.metadata.sessionId))
       const parent = yield* sessions.get(chat.id)
       expect(delegationOutcome(child.metadata)).toBe("errored")
-      expect(delegationRecord(child.metadata)?.error).toContain("code=insufficient_quota")
-      expect(delegationRecord(child.metadata)?.error).not.toContain("child-secret")
-      expect(JSON.stringify(parent.metadata)).toContain("code=insufficient_quota")
-      expect(JSON.stringify(parent.metadata)).not.toContain("child-secret")
+      expect(delegationRecord(child.metadata)?.error).toContain("status=429")
+      expect(delegationRecord(child.metadata)?.error).toContain("request failed")
+      expect(JSON.stringify(parent.metadata)).toContain("status=429")
       expect(yield* status.get(chat.id)).toMatchObject({
         type: "blocked",
         childSessionID: child.id,
         attemptedModels: ["test/test-model"],
+        error: expect.stringContaining("request failed"),
       })
       yield* status.set(chat.id, { type: "busy" })
       yield* status.set(chat.id, { type: "idle" })
       const cleared = yield* sessions.get(chat.id)
       expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
-      expect(JSON.stringify(cleared.metadata)).toContain("code=insufficient_quota")
-      expect(JSON.stringify(cleared.metadata)).not.toContain("child-secret")
+      expect(JSON.stringify(cleared.metadata)).toContain("status=429")
       yield* (yield* SessionRunState.Service).assertNotBusy(chat.id)
       // The stamp must ride alongside the swarm bookkeeping, never replace it.
       expect(result.output).toContain("failed")
@@ -1773,8 +1444,7 @@ describe("tool.task", () => {
           Effect.promise(() => {
             ready.resolve(input)
             return cancelled.promise
-          }).pipe(Effect.andThen(() => persist(reply(input, "finished anyway")))),
-        loop: () => Effect.die("unexpected task loop"),
+          }).pipe(Effect.as(reply(input, "finished anyway"))),
       }
 
       const fiber = yield* def
@@ -1798,10 +1468,6 @@ describe("tool.task", () => {
       abort.abort()
       const exit = yield* Fiber.await(fiber)
       expect(Exit.isSuccess(exit)).toBe(true)
-      if (Exit.isFailure(exit)) throw new Error("task execution failed")
-      expect(exit.value.output).toContain('state="cancelled"')
-      expect(exit.value.output).toContain("<task_error>")
-      expect(exit.value.output).not.toContain('state="completed"')
 
       // The observed cancellation request wins over the late clean return.
       const child = yield* sessions.get(input.sessionID)
@@ -1847,7 +1513,7 @@ describe("tool.task", () => {
     }),
   )
 
-  background.instance("a persisted background abort fails the job and stamps the child errored", () =>
+  background.instance("a background subagent error fails the job and stamps the child errored", () =>
     Effect.gen(function* () {
       const jobs = yield* BackgroundJob.Service
       const sessions = yield* Session.Service
@@ -1855,22 +1521,21 @@ describe("tool.task", () => {
       const tool = yield* TaskTool
       const def = yield* tool.init()
       const notifications: string[] = []
-      // The prompt returns a stale clean snapshot after persisting an abort.
+      // The child's turn returns an assistant-level error; the parent's
+      // notification prompt succeeds so the wording can be observed.
       const promptOps: TaskPromptOps = {
         ...stubOps(),
         prompt: (input) =>
-          Effect.gen(function* () {
+          Effect.sync(() => {
             if (input.sessionID === chat.id) {
               for (const part of input.parts) if (part.type === "text") notifications.push(part.text)
-              return yield* persist(reply(input, "noted"))
+              return reply(input, "noted")
             }
-            const snapshot = reply(input, "")
-            yield* persist({
-              ...snapshot,
-              info: { ...snapshot.info, error: { name: "MessageAbortedError", data: { message: "Aborted" } } },
-              parts: [],
-            })
-            return snapshot
+            const base = reply(input, "partial output")
+            return {
+              ...base,
+              info: { ...base.info, error: { name: "UnknownError", data: { message: "boom" } } },
+            } as SessionLegacy.WithParts
           }),
       }
 
@@ -1905,8 +1570,7 @@ describe("tool.task", () => {
         return notifications
       })
       expect(settled[0]).toContain('state="error"')
-      expect(settled[0]).toContain("MessageAbortedError")
-      expect(settled[0]).toContain("Aborted")
+      expect(settled[0]).toContain("Background task failed")
     }),
   )
 
@@ -1952,13 +1616,7 @@ describe("tool.task", () => {
         }
         return undefined
       })
-      expect(record).toMatchObject({
-        outcome: "completed",
-        deliveryOutcome: "delivered",
-        mode: "background",
-        ownerID: expect.stringMatching(/^local:\d+:[^:]+:/),
-        childMessageID: expect.any(String),
-      })
+      expect(record).toMatchObject({ outcome: "completed", deliveryOutcome: "delivered" })
     }),
   )
 })

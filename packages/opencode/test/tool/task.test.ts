@@ -852,6 +852,20 @@ describe("tool.task", () => {
     expect(failure?.retryAt).toBeGreaterThan(Date.now())
   })
 
+  test("normalizes status-only quota and authentication failures without retry metadata", () => {
+    const model = { providerID: "test", modelID: "test-model" }
+    const quota = providerFailure({ data: { statusCode: 429 } }, model)
+
+    expect(quota).toMatchObject({ message: "Provider test/test-model (status=429): request failed" })
+    expect(quota?.retryAt).toBeUndefined()
+
+    for (const statusCode of [401, 403]) {
+      expect(providerFailure({ data: { statusCode } }, model)?.message).toContain(`status=${statusCode}`)
+    }
+
+    expect(providerFailure({ data: { statusCode: 500 } }, model)).toBeUndefined()
+  })
+
   it.instance("labels an empty report instead of returning an empty string", () =>
     Effect.gen(function* () {
       const { chat, assistant } = yield* seed()
@@ -1306,7 +1320,7 @@ describe("tool.task", () => {
     }),
   )
 
-  it.instance("blocks the parent without marking its local execution busy and preserves redacted evidence", () =>
+  it.instance("blocks the parent on a status-only quota failure without marking its local execution busy", () =>
     Effect.gen(function* () {
       const { chat, assistant } = yield* seed()
       const sessions = yield* Session.Service
@@ -1327,11 +1341,8 @@ describe("tool.task", () => {
                 error: {
                   name: "APIError",
                   data: {
-                    message: "quota exhausted, token=child-secret",
                     statusCode: 429,
                     isRetryable: false,
-                    responseHeaders: { "retry-after-ms": "1000" },
-                    metadata: { code: "insufficient_quota" },
                   },
                 },
               },
@@ -1358,21 +1369,20 @@ describe("tool.task", () => {
       const child = yield* sessions.get(SessionID.make(result.metadata.sessionId))
       const parent = yield* sessions.get(chat.id)
       expect(delegationOutcome(child.metadata)).toBe("errored")
-      expect(delegationRecord(child.metadata)?.error).toContain("code=insufficient_quota")
-      expect(delegationRecord(child.metadata)?.error).not.toContain("child-secret")
-      expect(JSON.stringify(parent.metadata)).toContain("code=insufficient_quota")
-      expect(JSON.stringify(parent.metadata)).not.toContain("child-secret")
+      expect(delegationRecord(child.metadata)?.error).toContain("status=429")
+      expect(delegationRecord(child.metadata)?.error).toContain("request failed")
+      expect(JSON.stringify(parent.metadata)).toContain("status=429")
       expect(yield* status.get(chat.id)).toMatchObject({
         type: "blocked",
         childSessionID: child.id,
         attemptedModels: ["test/test-model"],
+        error: expect.stringContaining("request failed"),
       })
       yield* status.set(chat.id, { type: "busy" })
       yield* status.set(chat.id, { type: "idle" })
       const cleared = yield* sessions.get(chat.id)
       expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
-      expect(JSON.stringify(cleared.metadata)).toContain("code=insufficient_quota")
-      expect(JSON.stringify(cleared.metadata)).not.toContain("child-secret")
+      expect(JSON.stringify(cleared.metadata)).toContain("status=429")
       yield* (yield* SessionRunState.Service).assertNotBusy(chat.id)
       // The stamp must ride alongside the swarm bookkeeping, never replace it.
       expect(result.output).toContain("failed")

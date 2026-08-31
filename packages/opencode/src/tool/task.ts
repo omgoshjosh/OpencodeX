@@ -181,6 +181,7 @@ export function providerFailure(
     name === "ProviderAuthError" ||
     kind === "Authentication" ||
     kind === "QuotaExceeded" ||
+    status === 429 ||
     status === 401 ||
     status === 403 ||
     /(?:insufficient_quota|quota_exceeded|monthly.*quota|provider.*budget|budget_exceeded|invalid_api_key|authentication|unauthorized|forbidden)/i.test(

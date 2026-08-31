@@ -1329,6 +1329,55 @@ describe("tool.task", () => {
     }),
   )
 
+  background.instance("reports a returned child as monitoring while its external job runs", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const sessions = yield* Session.Service
+      const status = yield* SessionStatus.Service
+      const { chat, assistant } = yield* seed()
+      const child = yield* sessions.create({ parentID: chat.id, title: "delegated child" })
+      yield* jobs.start({
+        id: "job_external",
+        type: "external",
+        metadata: { parentSessionId: child.id },
+        run: Effect.never,
+      })
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+
+      const result = yield* def.execute(
+        {
+          description: "inspect bug",
+          prompt: "look into the cache key path",
+          subagent_type: "general",
+          task_id: child.id,
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          directory: chat.directory,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps: stubOps({ text: "local work returned" }) },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      expect(result.output).toContain('state="monitoring"')
+      expect(result.output).toContain('monitor_id="job_external"')
+      expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
+      expect(yield* status.get(child.id)).toMatchObject({ type: "monitoring", monitorID: "job_external" })
+      expect(delegationRecord((yield* sessions.get(child.id)).metadata)).toMatchObject({
+        phase: "monitoring",
+        monitorID: "job_external",
+        monitorChildSessionID: child.id,
+      })
+      yield* jobs.cancel("job_external")
+    }),
+  )
+
   background.instance("background task completion does not wait for the parent async prompt", () =>
     Effect.gen(function* () {
       const jobs = yield* BackgroundJob.Service
@@ -1570,10 +1619,29 @@ describe("tool.task", () => {
       expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
       yield* runState.assertNotBusy(chat.id)
 
-      yield* status.set(child.id, { type: "monitoring", childSessionID: child.id })
-      expect(yield* status.get(child.id)).toEqual({ type: "monitoring", childSessionID: child.id })
+      yield* status.set(child.id, {
+        type: "monitoring",
+        childSessionID: child.id,
+        monitorID: "job_external",
+        since: 100,
+        checkAfter: 200,
+      })
+      expect(yield* status.get(child.id)).toEqual({
+        type: "monitoring",
+        childSessionID: child.id,
+        monitorID: "job_external",
+        since: 100,
+        checkAfter: 200,
+      })
       expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
       yield* runState.assertNotBusy(chat.id)
+      expect(
+        yield* status.settleMonitoring({ sessionID: child.id, monitorID: "stale", status: { type: "idle" } }),
+      ).toBe(false)
+      expect(
+        yield* status.settleMonitoring({ sessionID: child.id, monitorID: "job_external", status: { type: "idle" } }),
+      ).toBe(true)
+      expect(yield* status.get(child.id)).toEqual({ type: "idle" })
     }),
   )
 

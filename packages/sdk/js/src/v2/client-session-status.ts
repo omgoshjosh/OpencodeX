@@ -11,7 +11,7 @@
  */
 import type { Message, OpencodeXSessionUiState, Part, SessionStatus } from "./client.js"
 
-export type ClientDerivedSessionStatus = "dormant" | "in_progress" | "input_needed" | "needs_review"
+export type ClientDerivedSessionStatus = "dormant" | "in_progress" | "monitoring" | "input_needed" | "needs_review"
 
 /** Persisted vocabulary. Narrower than the derived one: it has no view-level rollup. */
 export type ClientSessionDisplayStatus = NonNullable<OpencodeXSessionUiState["displayStatus"]>
@@ -68,6 +68,7 @@ export const CLIENT_SESSION_ACTIVITY_WINDOW_MS = 15 * 60 * 1000
 export function deriveClientSessionStatus(input: ClientSessionStatusInput): ClientDerivedSessionStatus {
   const displayStatus = input.uiState?.displayStatus
   if (input.hasPendingInteraction || displayStatus === "input_needed") return "input_needed"
+  if (input.status?.type === "monitoring") return "monitoring"
   if (isClientSessionWorking(input) || displayStatus === "in_progress") return "in_progress"
   if (displayStatus === "needs_review" && input.uiState?.updated !== false) return "needs_review"
   return "dormant"
@@ -90,6 +91,7 @@ export function deriveClientSessionDisplayStatus(input: ClientSessionDisplayStat
 export function deriveClientViewStatus(statuses: readonly ClientDerivedSessionStatus[]): ClientDerivedSessionStatus {
   if (statuses.includes("input_needed")) return "input_needed"
   if (statuses.includes("in_progress")) return "in_progress"
+  if (statuses.includes("monitoring")) return "monitoring"
   if (statuses.includes("needs_review")) return "needs_review"
   return "dormant"
 }
@@ -103,6 +105,7 @@ export function isActiveClientSessionStatus(status: ClientDerivedSessionStatus) 
 export function clientSessionStatusLabel(status: ClientDerivedSessionStatus) {
   return {
     in_progress: "running",
+    monitoring: "monitoring",
     input_needed: "needs input",
     needs_review: "ready for review",
     dormant: "idle",

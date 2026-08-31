@@ -13,7 +13,13 @@ type Sync = ReturnType<typeof useSync>
 
 export type DerivedStatus = ClientDerivedSessionStatus
 
-export const DERIVED_STATUSES: DerivedStatus[] = ["input_needed", "needs_review", "in_progress", "dormant"]
+export const DERIVED_STATUSES: DerivedStatus[] = [
+  "input_needed",
+  "needs_review",
+  "in_progress",
+  "monitoring",
+  "dormant",
+]
 
 /**
  * Thin adapter: gathers the TUI's inputs and hands them to the shared

@@ -10,6 +10,7 @@ import { Image } from "@/image/image"
 import { OpencodeXClaudeDriver } from "@/opencodex/claude-driver"
 import { delegationTitle } from "@/opencodex/claude-mapper"
 import { ClaudeDelegate } from "@/opencodex/claude-delegate"
+import type { ClaudeImage } from "@/opencodex/claude-transport"
 import { SwarmBriefing } from "@/opencodex/swarm-briefing"
 import type { BackgroundJob } from "@/background/job"
 import { Skill } from "@/skill"
@@ -537,6 +538,8 @@ export function make(deps: Deps) {
      * the human can keep talking to it while the role works.
      */
     background?: boolean
+    /** Persisted images from the orchestrator's own turn, forwarded to the role. */
+    images?: readonly ClaudeImage[]
   }) {
     const role = SwarmBriefing.matchSwarmRole(input.roles, input.role)
     // Each rejection carries the reason the orchestrator can act on. The
@@ -654,7 +657,16 @@ export function make(deps: Deps) {
         },
         ...(role.agent ? { agent: role.agent } : {}),
         ...(primary.variant && primary.variant !== "default" ? { variant: primary.variant } : {}),
-        parts: [{ type: "text", text }],
+        parts: [
+          { type: "text", text },
+          // A delegated role never sees the orchestrator's transcript, so an
+          // image it was asked about has to be persisted onto its own turn.
+          ...(input.images ?? []).map((image) => ({
+            type: "file" as const,
+            mime: image.source.media_type,
+            url: `data:${image.source.media_type};base64,${image.source.data}`,
+          })),
+        ],
       })
       // `undefined` marks a turn that completed as something other than this
       // role's assistant reply; a bare throw here would become an unhandled
@@ -909,6 +921,7 @@ export function make(deps: Deps) {
                   prompt: delegated.prompt,
                   ...(delegated.toolUseID ? { toolUseID: delegated.toolUseID } : {}),
                   ...(delegated.background ? { background: true } : {}),
+                  ...(attachments.images.length > 0 ? { images: attachments.images } : {}),
                 }),
             },
           }

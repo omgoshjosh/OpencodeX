@@ -46,6 +46,23 @@ describe("swarm role delegation prompt", () => {
     })
   })
 
+  test("copies delegated images into the specialist's persisted prompt", async () => {
+    const { runSwarmRole, promptParts } = harness({ skills: {} })
+    await Effect.runPromise(
+      runSwarmRole({
+        sessionID: SessionID.make("ses_parent"),
+        swarmID: "swm_1",
+        roles: [role({ name: "Specialist", skill: null, instructions: "" })],
+        role: "Specialist",
+        prompt: "Inspect this.",
+        images: [
+          { type: "image", source: { type: "base64", media_type: "image/jpeg", data: "aGVsbG8=" } },
+        ],
+      }),
+    )
+    expect(promptParts[0]).toContainEqual({ type: "file", mime: "image/jpeg", url: "data:image/jpeg;base64,aGVsbG8=" })
+  })
+
   test("sends instructions and task alone when the role has no skill", async () => {
     const { runSwarmRole, prompts } = harness({ skills: {} })
 
@@ -566,6 +583,7 @@ function harness(input: {
   const started: Array<{ id?: string; metadata?: Record<string, unknown>; run: Effect.Effect<string, unknown> }> = []
   const prompts: string[] = []
   const models: string[] = []
+  const promptParts: Array<Array<{ type: string; text?: string; mime?: string; url?: string }>> = []
   const stamps: Array<{ record: DelegationRecord; expectRunID?: string }> = []
   const parts: Array<Record<string, unknown>> = []
   const parentMessage = { info: { id: "msg_1", role: "assistant" }, parts: input.parentParts ?? [] }
@@ -630,6 +648,7 @@ function harness(input: {
       parts: Array<{ type: string; text?: string }>
     }) => {
       input.onPrompt?.()
+      promptParts.push(promptInput.parts)
       if (promptInput.model) models.push(`${promptInput.model.providerID}/${promptInput.model.modelID}`)
       const messageID = promptInput.messageID ?? "msg_user"
       turn.push({
@@ -660,6 +679,7 @@ function harness(input: {
   return {
     runSwarmRole,
     prompts,
+    promptParts,
     models,
     stamps,
     parts,

@@ -41,6 +41,13 @@ describe("delegation record metadata", () => {
     expect(delegationOutcome(stamped)).toBeUndefined()
   })
 
+  test("preserves optional durable display labels without changing the record version", () => {
+    const record = delegationRecord(
+      withDelegationRecord(undefined, running({ role: "Researcher", title: "Inspect status" })),
+    )
+    expect(record).toMatchObject({ version: 2, role: "Researcher", title: "Inspect status" })
+  })
+
   test("stamps onto empty or missing metadata without inventing anything else", () => {
     const settled = settleDelegation(running(), { outcome: "errored", completedAt: 5 })
     expect(delegationOutcome(withDelegationRecord(undefined, settled))).toBe("errored")

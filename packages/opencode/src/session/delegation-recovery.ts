@@ -19,6 +19,7 @@ export interface Deps {
     text: string
     noReply: boolean
   }) => Effect.Effect<void>
+  readonly refresh: (sessionID: SessionID) => Effect.Effect<void>
 }
 
 export function make(deps: Deps) {
@@ -105,6 +106,7 @@ export function make(deps: Deps) {
                 record: settleDelegation(record, { outcome, summary, deliveryOutcome: "pending" }),
                 expectRunID: record.runID,
               })
+              yield* deps.refresh(SessionID.make(record.parentSessionID))
               if (parent._tag === "Some") {
                 if (parentPart) yield* finalizeDanglingPart(deps.sessions, parentPart)
               }
@@ -162,6 +164,7 @@ export function make(deps: Deps) {
               runID: settled.runID,
               outcome: delivered ? "delivered" : "failed",
             })
+            yield* deps.refresh(parent.value.id)
           }).pipe(
             Effect.catchCause((cause) => Effect.logWarning("delegation recovery failed", { child: row.id, cause })),
           ),

@@ -199,21 +199,21 @@ export function make(deps: Deps) {
       version: DELEGATION_RECORD_VERSION,
       runID,
       parentSessionID: input.sessionID,
+      role: role.name,
+      title: child.title,
       attempt: 1,
       phase: "running",
       startedAt: Date.now(),
     }
     const stamp = (record: DelegationRecord, expectRunID?: string) =>
-      sessions
-        .stampDelegation({ sessionID: child.id, record, ...(expectRunID ? { expectRunID } : {}) })
-        .pipe(
-          Effect.catchCause((cause) =>
-            Effect.sync(() => {
-              log.error("swarm delegation stamp failed", { sessionID: child.id, runID, cause })
-              return false
-            }),
-          ),
-        )
+      sessions.stampDelegation({ sessionID: child.id, record, ...(expectRunID ? { expectRunID } : {}) }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.sync(() => {
+            log.error("swarm delegation stamp failed", { sessionID: child.id, runID, cause })
+            return false
+          }),
+        ),
+      )
     const settle = (outcome: DelegationOutcome, summary?: string) =>
       stamp(settleDelegation(started, { outcome, summary }), runID).pipe(Effect.asVoid)
     yield* stamp(started)
@@ -343,7 +343,9 @@ export function make(deps: Deps) {
             // Avoid doubling up when the subagent's own title already says
             // "subagent" (e.g. "code-reviewer subagent"), which would otherwise
             // render as "code-reviewer subagent (@claude subagent)".
-            const title = /subagent/i.test(spawnInput.title) ? spawnInput.title : `${spawnInput.title} (@claude subagent)`
+            const title = /subagent/i.test(spawnInput.title)
+              ? spawnInput.title
+              : `${spawnInput.title} (@claude subagent)`
             const child = yield* sessions
               .create({
                 parentID: sessionID,

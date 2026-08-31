@@ -3,12 +3,7 @@ import { OpencodeXProject } from "@/opencodex/project"
 import { MessageV2 } from "@/session/message-v2"
 import { Effect, Schema } from "effect"
 import { Tool } from "./tool"
-import {
-  describeGoal,
-  goalOutcome,
-  resolveExecutorParam,
-  type ExecutorParam,
-} from "./graph-report"
+import { describeGoal, goalOutcome, resolveExecutorParam, type ExecutorParam } from "./graph-report"
 
 /**
  * The planner's tools. A model authors a task graph for a goal, the dispatcher
@@ -70,7 +65,7 @@ const Budget = Schema.Struct({
 export const PlanParameters = Schema.Struct({
   goal: Schema.String.annotate({ description: "What outcome the graph achieves, in one or two sentences" }),
   successCriteria: Schema.optional(Schema.Array(Schema.String)).annotate({
-    description: "Checkable claims that mean the goal is met, for example \"bun test passes\"",
+    description: 'Checkable claims that mean the goal is met, for example "bun test passes"',
   }),
   nodes: Schema.mutable(Schema.Array(NodeParam)).annotate({ description: "The units of work" }),
   edges: Schema.optional(Schema.mutable(Schema.Array(EdgeParam))).annotate({
@@ -84,7 +79,11 @@ export const PlanParameters = Schema.Struct({
 
 type PlanMetadata = { goalID?: string; nodeCount?: number; status?: string }
 
-export const GraphPlanTool = Tool.define<typeof PlanParameters, PlanMetadata, OpencodeXGoal.Service | OpencodeXProject.Service>(
+export const GraphPlanTool = Tool.define<
+  typeof PlanParameters,
+  PlanMetadata,
+  OpencodeXGoal.Service | OpencodeXProject.Service
+>(
   "graph_plan",
   Effect.gen(function* () {
     const goals = yield* OpencodeXGoal.Service
@@ -211,7 +210,7 @@ export const GraphUpdateTool = Tool.define<typeof UpdateParameters, UpdateMetada
 
     return {
       description: [
-        "Repair the graph: add remediation nodes, skip work that is no longer needed, re-queue a node with status \"planned\", or retarget a node's executor.",
+        'Repair the graph: add remediation nodes, skip work that is no longer needed, re-queue a node with status "planned", or retarget a node\'s executor.',
         "Use this instead of re-planning when the goal is already running - existing nodes and their results are kept.",
         "Works on a finished goal too: adding or re-queueing work reopens it, which is how you remediate a failure.",
       ].join("\n"),
@@ -250,8 +249,7 @@ export const GraphUpdateTool = Tool.define<typeof UpdateParameters, UpdateMetada
               metadata: { goalID: goal.id },
             }
           }
-          const settled =
-            params.wait === false ? updated.value : yield* awaitGoal(goals, updated.value.id, ctx.abort)
+          const settled = params.wait === false ? updated.value : yield* awaitGoal(goals, updated.value.id, ctx.abort)
           return {
             title: `${goalOutcome(settled)}: ${settled.title}`,
             output: describeGoal(settled, { includeResults: params.wait !== false }),

@@ -68,6 +68,10 @@ export type ScenarioContext = {
   llmText: (value: string) => Effect.Effect<void>
   llmWait: (count: number) => Effect.Effect<void>
   tuiRequest: (request: { path: string; body: unknown }) => Effect.Effect<void>
+  retryChild: (input?: {
+    blocked?: boolean
+    partialOutput?: boolean
+  }) => Effect.Effect<{ parent: SessionInfo; child: SessionInfo }>
 }
 
 /** Scenario context after `.seeded(...)`; `state` preserves the seed return type in the DSL. */
@@ -91,6 +95,7 @@ export type ActiveScenario = {
   mutates: boolean
   reset: boolean
   auth: AuthPolicy
+  authParity?: boolean
 }
 
 export type BuilderState<S> = {
@@ -105,6 +110,7 @@ export type BuilderState<S> = {
   mutates: boolean
   reset: boolean
   auth: AuthPolicy
+  authParity: boolean
 }
 
 export type TodoScenario = {

@@ -13,7 +13,7 @@ type CallOptions = {
 
 export function call(scenario: ActiveScenario, ctx: SeededContext<unknown>, options: CallOptions = {}) {
   return Effect.promise(async () =>
-    capture(await app(await runtime(), ctx, options).request(toRequest(scenario, ctx)), scenario.capture),
+    capture(await app(await runtime(), ctx, options).request(toRequest(scenario, ctx, options)), scenario.capture),
   )
 }
 
@@ -72,11 +72,17 @@ function app(modules: Runtime, ctx: SeededContext<unknown>, options: CallOptions
   })
 }
 
-function toRequest(scenario: ActiveScenario, ctx: SeededContext<unknown>) {
+function toRequest(scenario: ActiveScenario, ctx: SeededContext<unknown>, options: CallOptions) {
   const spec = scenario.request(ctx, ctx.state)
   return new Request(new URL(spec.path, "http://localhost"), {
     method: scenario.method,
-    headers: spec.body === undefined ? spec.headers : { "content-type": "application/json", ...spec.headers },
+    headers: {
+      ...(spec.body === undefined ? {} : { "content-type": "application/json" }),
+      ...spec.headers,
+      ...(options.auth?.password
+        ? { authorization: basic(options.auth.username ?? "opencode", options.auth.password) }
+        : {}),
+    },
     body: spec.body === undefined ? undefined : JSON.stringify(spec.body),
   })
 }

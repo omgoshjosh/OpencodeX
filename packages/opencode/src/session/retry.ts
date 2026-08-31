@@ -56,16 +56,29 @@ export function delay(attempt: number, error?: SessionLegacy.APIError) {
   return cap(Math.min(RETRY_INITIAL_DELAY * Math.pow(RETRY_BACKOFF_FACTOR, attempt - 1), RETRY_MAX_DELAY_NO_HEADERS))
 }
 
+export function remainingElapsed(startedAt: number, now: number) {
+  return Math.max(0, RETRY_MAX_ELAPSED - (now - startedAt))
+}
+
 export function retryable(error: Err) {
   // context overflow errors should not be retried
   if (SessionLegacy.ContextOverflowError.isInstance(error)) return undefined
   if (SessionLegacy.APIError.isInstance(error)) {
     const status = error.data.statusCode
+    const code = error.data.metadata?.code
+    if (
+      status === 401 ||
+      status === 403 ||
+      /(?:insufficient_quota|quota_exceeded|monthly.*quota|provider.*budget|budget_exceeded|invalid_api_key)/i.test(code ?? "")
+    )
+      return undefined
     // 5xx errors are transient server failures and should always be retried,
     // even when the provider SDK doesn't explicitly mark them as retryable.
     if (!error.data.isRetryable && !(status !== undefined && status >= 500)) return undefined
     return { message: error.data.message.includes("Overloaded") ? "Provider is overloaded" : error.data.message }
   }
+
+  if (error.name === "ProviderAuthError") return undefined
 
   // Check for rate limit patterns in plain text error messages
   const msg = isRecord(error.data) ? error.data.message : undefined
@@ -122,7 +135,7 @@ export function policy(opts: {
       return Effect.gen(function* () {
         const now = yield* Clock.currentTimeMillis
         startedAt ??= now
-        const remaining = RETRY_MAX_ELAPSED - (now - startedAt)
+        const remaining = remainingElapsed(startedAt, now)
         if (remaining <= 0) return Cause.done(meta.attempt)
         const wait = Math.min(delay(meta.attempt, SessionLegacy.APIError.isInstance(error) ? error : undefined), remaining)
         yield* opts.set({

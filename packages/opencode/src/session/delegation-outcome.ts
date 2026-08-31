@@ -53,6 +53,17 @@ export type DelegationRecord = {
   deliveredAt?: number
 }
 
+/** Parent-owned, durable evidence for a child failure. */
+export type DelegationFailure = {
+  version: 1
+  runID: string
+  childSessionID: string
+  model: string
+  error: string
+  occurredAt: number
+  retryAt?: number
+}
+
 /**
  * The shape stamped before records were versioned: `{ outcome, completedAt,
  * summary? }` with `succeeded`/`failed`/`cancelled` outcomes. Still readable
@@ -98,6 +109,25 @@ export function withDelegationRecord(
     opencodex: {
       ...opencodex,
       delegation: { ...rest, ...(trimmed ? { summary: trimmed } : {}), ...(error ? { error } : {}) },
+    },
+  }
+}
+
+/** Adds a child failure to the parent metadata without replacing sibling evidence. */
+export function withDelegationFailure(
+  metadata: Record<string, unknown> | undefined | null,
+  failure: DelegationFailure,
+): Record<string, unknown> {
+  const opencodex = isRecord(metadata?.opencodex) ? metadata.opencodex : {}
+  const failures = isRecord(opencodex.delegationFailures) ? opencodex.delegationFailures : {}
+  return {
+    ...metadata,
+    opencodex: {
+      ...opencodex,
+      delegationFailures: {
+        ...failures,
+        [failure.childSessionID]: { ...failure, error: summarizeDelegationError(failure.error) ?? "request failed" },
+      },
     },
   }
 }

@@ -84,6 +84,12 @@ describe("session.retry.delay", () => {
     expect(SessionRetry.delay(1, error)).toBe(SessionRetry.RETRY_MAX_DELAY)
   })
 
+  test("has a deterministic total elapsed-time budget", () => {
+    expect(SessionRetry.remainingElapsed(1_000, 1_000)).toBe(SessionRetry.RETRY_MAX_ELAPSED)
+    expect(SessionRetry.remainingElapsed(1_000, 31_000)).toBe(0)
+    expect(SessionRetry.remainingElapsed(1_000, 32_000)).toBe(0)
+  })
+
   it.instance("policy updates retry status and increments attempts", () =>
     Effect.gen(function* () {
       const sessionID = SessionID.make("session-retry-test")
@@ -112,6 +118,37 @@ describe("session.retry.delay", () => {
       })
     }),
   )
+
+  test("policy stops after its maximum attempts and never retries partial work", async () => {
+    const updates: number[] = []
+    const error = apiError({ "retry-after-ms": "0" })
+    const step = await Effect.runPromise(
+      Schedule.toStepWithMetadata(
+        SessionRetry.policy({
+          parse: Schema.decodeUnknownSync(SessionLegacy.APIError.Schema),
+          set: (info) => Effect.sync(() => updates.push(info.attempt)),
+        }),
+      ),
+    )
+    await Effect.runPromise(step(error))
+    await Effect.runPromise(step(error))
+    await Effect.runPromise(step(error))
+    await Effect.runPromise(step(error))
+    expect(updates).toEqual([1, 2, 3])
+
+    const partialUpdates: number[] = []
+    const partial = await Effect.runPromise(
+      Schedule.toStepWithMetadata(
+        SessionRetry.policy({
+          parse: Schema.decodeUnknownSync(SessionLegacy.APIError.Schema),
+          canRetry: () => false,
+          set: (info) => Effect.sync(() => partialUpdates.push(info.attempt)),
+        }),
+      ),
+    )
+    await Effect.runPromise(partial(error))
+    expect(partialUpdates).toEqual([])
+  })
 })
 
 describe("session.retry.retryable", () => {
@@ -235,6 +272,23 @@ describe("session.retry.retryable", () => {
     )
 
     expect(SessionRetry.retryable(error)).toBeUndefined()
+  })
+
+  test("fails quota and authentication errors fast even when marked retryable", () => {
+    const quota = Schema.decodeUnknownSync(SessionLegacy.APIError.Schema)(
+      new SessionLegacy.APIError({
+        message: "quota exhausted",
+        isRetryable: true,
+        statusCode: 429,
+        metadata: { code: "insufficient_quota" },
+      }).toObject(),
+    )
+    const auth = Schema.decodeUnknownSync(SessionLegacy.APIError.Schema)(
+      new SessionLegacy.APIError({ message: "unauthorized", isRetryable: true, statusCode: 401 }).toObject(),
+    )
+    expect(SessionRetry.retryable(quota)).toBeUndefined()
+    expect(SessionRetry.retryable(auth)).toBeUndefined()
+    expect(SessionRetry.retryable({ name: "ProviderAuthError", data: { message: "expired" } })).toBeUndefined()
   })
 
   test("retries ZlibError decompression failures", () => {

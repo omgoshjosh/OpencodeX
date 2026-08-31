@@ -547,6 +547,19 @@ export const TaskTool = Tool.define(
           Effect.gen(function* () {
             const failure = result.state === "error" ? providerFailure(result.failure ?? result.text, model) : undefined
             if (cancelState.requested) return yield* settle("cancelled", result.text)
+            if (failure)
+              yield* sessions.recordDelegationFailure({
+                sessionID: ctx.sessionID,
+                failure: {
+                  version: 1,
+                  runID,
+                  childSessionID: nextSession.id,
+                  model: `${model.providerID}/${model.modelID}`,
+                  error: failure.message,
+                  occurredAt: Date.now(),
+                  ...(failure.retryAt !== undefined ? { retryAt: failure.retryAt } : {}),
+                },
+              })
             yield* settle(result.state === "error" ? "errored" : "completed", result.text, failure?.message)
             if (!failure) return
             // This durable parent-owned state survives local execution release.
@@ -560,7 +573,22 @@ export const TaskTool = Tool.define(
           })
         const settleFailure = (error: unknown) => {
           const failure = providerFailure(error, model)
-          return settle("errored", errorText(error), failure?.message).pipe(
+          const evidence = failure
+            ? sessions.recordDelegationFailure({
+                sessionID: ctx.sessionID,
+                failure: {
+                  version: 1,
+                  runID,
+                  childSessionID: nextSession.id,
+                  model: `${model.providerID}/${model.modelID}`,
+                  error: failure.message,
+                  occurredAt: Date.now(),
+                  ...(failure.retryAt !== undefined ? { retryAt: failure.retryAt } : {}),
+                },
+              })
+            : Effect.void
+          return evidence.pipe(
+            Effect.andThen(settle("errored", errorText(error), failure?.message)),
             Effect.andThen(
               failure
                 ? status.set(ctx.sessionID, {

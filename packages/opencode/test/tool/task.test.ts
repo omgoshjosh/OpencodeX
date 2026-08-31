@@ -1,6 +1,8 @@
 import { afterEach, describe, expect } from "bun:test"
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
 import { Database } from "@opencode-ai/core/database/database"
+import { EventTable } from "@opencode-ai/core/event/sql"
+import { EventV2 } from "@opencode-ai/core/event"
 import { Effect, Exit, Fiber, Layer } from "effect"
 import { Agent } from "../../src/agent/agent"
 import { BackgroundJob } from "@/background/job"
@@ -1072,6 +1074,15 @@ describe("tool.task", () => {
           },
         },
       ])
+      const database = yield* Database.Service
+      expect(
+        (yield* database.db.select().from(EventTable).all().pipe(Effect.orDie))
+          .filter(
+            (event) =>
+              event.aggregate_id === parent.id && event.type === EventV2.versionedType(SessionStatus.Event.Status.type, 1),
+          )
+          .map((event) => event.data),
+      ).toEqual([{ sessionID: parent.id, status: { type: "busy" } }])
     }),
   )
 

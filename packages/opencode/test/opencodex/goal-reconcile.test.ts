@@ -35,6 +35,15 @@ describe("dispatch", () => {
     expect(plan.goal).toBeUndefined()
   })
 
+  test("treats a blank parent id as a root node", () => {
+    const plan = planReconcile({
+      goal: goal([node("a", "planned", { parentNodeID: "" }), node("b", "planned", { parentNodeID: "   " })]),
+      now: NOW,
+    })
+    expect(plan.skip).toEqual([])
+    expect(plan.dispatch).toEqual(["a", "b"])
+  })
+
   test("a finished dependency frees its dependents in the same pass", () => {
     // The fixpoint matters: without it a chain would need one reconcile tick
     // per level, and a ten-node chain would crawl.
@@ -107,8 +116,7 @@ describe("loops", () => {
     loopStatus: NodeStatus,
     body: ReconcileNode[],
     loop = { exitCheckNodeID: "tests", maxIterations: 3, iteration: 1 },
-  ) =>
-    goal([node("fix", loopStatus, { kind: "loop", loop }), ...body])
+  ) => goal([node("fix", loopStatus, { kind: "loop", loop }), ...body])
 
   test("a ready loop starts iterating and its body dispatches immediately", () => {
     const plan = planReconcile({
@@ -124,9 +132,7 @@ describe("loops", () => {
     })
     // The body is stamped with the iteration it belongs to, so each pass gets
     // its own job instead of colliding with the previous one's.
-    expect(plan.loops).toEqual([
-      { type: "start", nodeID: "fix", iteration: 1, resetNodeIDs: ["patch", "tests"] },
-    ])
+    expect(plan.loops).toEqual([{ type: "start", nodeID: "fix", iteration: 1, resetNodeIDs: ["patch", "tests"] }])
     expect(plan.dispatch).toEqual(["patch"])
   })
 

@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "OpencodeX",
+  "project_id": "0b2fb3d8-9046-46e8-a53d-699a7a218431"
+}

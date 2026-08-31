@@ -12,7 +12,7 @@ import { deriveSubagentSessionPermission } from "../agent/subagent-permissions"
 import type { SessionPrompt } from "../session/prompt"
 import { Config } from "@/config/config"
 import { ProviderV2 } from "@opencode-ai/core/provider"
-import { Cause, Effect, Exit, Schema, Scope } from "effect"
+import { Cause, Effect, Exit, Option, Schema, Scope } from "effect"
 import { asc, eq } from "drizzle-orm"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import {
@@ -31,6 +31,7 @@ import { isSwarmProvider } from "@/provider/swarm-provider"
 import { hydrateFallbackModels } from "@/opencodex/swarm-model"
 import { shouldAdvanceModelFallback } from "@/session/model-fallback"
 import { ensureRunID } from "@opencode-ai/core/util/opencode-process"
+import { SessionStatus } from "@/session/status"
 
 const log = Log.create({ service: "tool.task" })
 
@@ -39,18 +40,6 @@ export interface TaskPromptOps {
   resolvePromptParts(template: string): Effect.Effect<SessionPrompt.PromptInput["parts"]>
   prompt(input: SessionPrompt.PromptInput): Effect.Effect<SessionLegacy.WithParts, never, Session.Service>
   loop(input: SessionPrompt.LoopInput): Effect.Effect<SessionLegacy.WithParts>
-  /**
-   * Publishes a background subtask on the parent's session status, so a
-   * client sees "N working" while the parent itself reads idle. Absent
-   * (tests), the status is simply not published.
-   */
-  backgroundStatus?: {
-    start(
-      parentSessionID: SessionID,
-      task: { sessionID: string; title: string; role?: string; since: number },
-    ): Effect.Effect<unknown>
-    end(parentSessionID: SessionID, childSessionID: string): Effect.Effect<unknown>
-  }
 }
 
 const id = "task"
@@ -227,6 +216,7 @@ export const TaskTool = Tool.define(
     const background = yield* BackgroundJob.Service
     const config = yield* Config.Service
     const sessions = yield* Session.Service
+    const status = Option.getOrUndefined(yield* Effect.serviceOption(SessionStatus.Service))
     const scope = yield* Scope.Scope
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
@@ -368,6 +358,8 @@ export const TaskTool = Tool.define(
         parentSessionID: ctx.sessionID,
         parentMessageID: ctx.messageID,
         ...(ctx.callID ? { toolCallID: ctx.callID } : {}),
+        role: swarmRole?.name ?? next.name,
+        title: params.description,
         ...(runInBackground
           ? {
               mode: "background" as const,
@@ -400,7 +392,7 @@ export const TaskTool = Tool.define(
             ...(outcome === "completed" || runInBackground ? { deliveryOutcome: "pending" as const } : {}),
           }),
           runID,
-        ).pipe(Effect.asVoid)
+        ).pipe(Effect.andThen(status ? status.refresh(ctx.sessionID) : Effect.void), Effect.asVoid)
       // An observed cancellation request wins over a late clean return.
       const cancelState = { requested: false }
       const settleResult = (result: TaskRunResult) =>
@@ -408,7 +400,7 @@ export const TaskTool = Tool.define(
           ? settle("cancelled", result.text)
           : settle(result.state === "error" ? "errored" : result.state, result.text)
 
-      yield* stamp(started)
+      yield* stamp(started).pipe(Effect.andThen(status ? status.refresh(ctx.sessionID) : Effect.void))
 
       return yield* Effect.gen(function* () {
         const msg = yield* MessageV2.get({ sessionID: ctx.sessionID, messageID: ctx.messageID }).pipe(
@@ -617,19 +609,9 @@ export const TaskTool = Tool.define(
         })
 
         if (runInBackground) {
-          // Published before the job starts so the status never lags the work,
-          // and dropped on every exit - the same contract as swarm delegations.
-          const status = ops.backgroundStatus
-          if (status)
-            yield* status
-              .start(ctx.sessionID, {
-                sessionID: nextSession.id,
-                title: params.description,
-                ...(params.subagent_type ? { role: params.subagent_type } : {}),
-                since: Date.now(),
-              })
-              .pipe(Effect.ignore)
-          const unpublish = status ? status.end(ctx.sessionID, nextSession.id).pipe(Effect.ignore) : Effect.void
+          // Nothing is published here: a background job is DERIVED on read
+          // from the child's delegation record, and `settle` refreshes the
+          // parent's status on every terminal outcome.
           const info = yield* background
             .start({
               id: nextSession.id,
@@ -637,7 +619,6 @@ export const TaskTool = Tool.define(
               title: params.description,
               metadata,
               run: runTask().pipe(
-                Effect.ensuring(unpublish),
                 // One all-exit boundary settles the record: clean return,
                 // subagent error, defect, or interruption - nothing leaves the
                 // child stamped `running` short of the process dying.
@@ -664,7 +645,6 @@ export const TaskTool = Tool.define(
                 }),
               ),
             })
-            .pipe(Effect.onExit((exit) => (Exit.isFailure(exit) ? unpublish : Effect.void)))
 
           return {
             title: params.description,

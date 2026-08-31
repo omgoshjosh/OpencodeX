@@ -17,6 +17,10 @@ export interface Deps {
   readonly events: Context.Service.Shape<typeof EventV2Bridge.Service>
   readonly scope: Scope.Scope
   readonly loop: (input: LoopInput) => Effect.Effect<SessionLegacy.WithParts>
+  /** Test seam: how long a claimed command's lease lasts. */
+  readonly commandLeaseMillis?: number
+  /** Test seam: the wall clock every lease decision reads. */
+  readonly clock?: () => number
 }
 
 /**
@@ -31,10 +35,11 @@ export function make(deps: Deps) {
     const { db } = database
     const processRunID = ensureRunID()
     const commandOwner = `local:${process.pid}:${processRunID}:${crypto.randomUUID()}`
-    const commandLeaseMillis = 30_000
+    const commandLeaseMillis = deps.commandLeaseMillis ?? 30_000
+    const clock = deps.clock ?? Date.now
 
     const claimCommandTurn = Effect.fn("SessionPrompt.claimCommandTurn")(function* (commandID: string) {
-      const now = Date.now()
+      const now = clock()
       return yield* db
         .transaction(
           (transaction) =>
@@ -136,7 +141,7 @@ export function make(deps: Deps) {
           execution?.state !== "running" ||
           !execution.owner ||
           !execution.leaseExpiresAt ||
-          execution.leaseExpiresAt <= Date.now() ||
+          execution.leaseExpiresAt <= clock() ||
           !SessionExecutionOwner.alive(execution.owner, processRunID)
         ) {
           return true
@@ -173,7 +178,7 @@ export function make(deps: Deps) {
         Effect.andThen(
           db
             .update(SessionCommandTable)
-            .set({ lease_expires_at: Date.now() + commandLeaseMillis, time_updated: Date.now() })
+            .set({ lease_expires_at: clock() + commandLeaseMillis, time_updated: clock() })
             .where(
               and(
                 eq(SessionCommandTable.id, commandID),
@@ -189,7 +194,7 @@ export function make(deps: Deps) {
         Effect.forkIn(scope),
       )
       const requeue = Effect.fnUntraced(function* () {
-        const completedAt = Date.now()
+        const completedAt = clock()
         yield* db
           .update(SessionCommandTable)
           .set({
@@ -218,7 +223,7 @@ export function make(deps: Deps) {
           ),
         ).pipe(Effect.exit, Effect.ensuring(Fiber.interrupt(heartbeat))),
       )
-      const completedAt = Date.now()
+      const completedAt = clock()
       if (Exit.isSuccess(exit)) {
         yield* db
           .update(SessionCommandTable)
@@ -287,11 +292,11 @@ export function make(deps: Deps) {
     /**
      * Launches every command this session still owes work on: anything queued,
      * plus a `running` row whose lease has lapsed (its owner died). Pin-only
-     * entry point used by `promptAsync` so a newly queued or re-queued prompt
+     * entry point used by `promptAsync`, so a newly queued or re-queued prompt
      * starts without waiting for the next recovery sweep.
      */
     const wakeSession = Effect.fn("SessionPrompt.wakeSession")(function* (sessionID: SessionID) {
-      const now = Date.now()
+      const now = clock()
       const commands = yield* db
         .select({ id: SessionCommandTable.id })
         .from(SessionCommandTable)
@@ -336,7 +341,7 @@ export function make(deps: Deps) {
           lease_expires_at: null,
           error: null,
           completed_at: null,
-          time_updated: Date.now(),
+          time_updated: clock(),
         })
         .where(and(eq(SessionCommandTable.status, "running"), eq(SessionCommandTable.owner_id, commandOwner)))
         .run()
@@ -354,7 +359,7 @@ export function make(deps: Deps) {
       sessionID: SessionID
       messageID: MessageID
     }) {
-      const now = Date.now()
+      const now = clock()
       return yield* db
         .transaction(
           (transaction) =>

@@ -129,7 +129,9 @@ export function deriveUiState(input: {
   // A parent whose delegations run in the background reads idle itself but
   // is still working from the reader's point of view.
   const active =
-    input.status?.type === "busy" || input.status?.type === "retry" || (input.status?.background?.running ?? 0) > 0
+    input.status?.type === "busy" ||
+    input.status?.type === "retry" ||
+    (input.status?.background?.jobs.length ?? 0) > 0
   // Review is a root-session concept (mirroring the unseen-review query in
   // session-card): a delegated child's report is consumed by its parent, so
   // nothing ever marks the child reviewed and it would read "needs review"

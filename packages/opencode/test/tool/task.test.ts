@@ -1156,13 +1156,12 @@ describe("tool.task", () => {
   background.instance("execute launches background tasks without waiting for completion", () =>
     Effect.gen(function* () {
       const jobs = yield* BackgroundJob.Service
+      const status = yield* SessionStatus.Service
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
       const def = yield* tool.init()
-      // The parent's status is told about the subtask before the job starts
-      // and again when it ends (same contract as swarm delegations).
-      const published: string[] = []
-
+      // The parent's status DERIVES the running job from the child's
+      // delegation record; nothing is written onto the parent's status row.
       const result = yield* def.execute(
         {
           description: "inspect bug",
@@ -1180,11 +1179,6 @@ describe("tool.task", () => {
             promptOps: {
               ...stubOps(),
               prompt: () => Effect.never,
-              backgroundStatus: {
-                start: (parent, task) =>
-                  Effect.sync(() => published.push(`start ${parent} ${task.sessionID} ${task.role} ${task.title}`)),
-                end: (parent, child) => Effect.sync(() => published.push(`end ${parent} ${child}`)),
-              },
             } satisfies TaskPromptOps,
           },
           messages: [],
@@ -1197,9 +1191,10 @@ describe("tool.task", () => {
       expect(result.metadata.background).toBe(true)
       expect(result.output).toContain(`state="running"`)
       expect(job?.status).toBe("running")
-      expect(published).toEqual([`start ${chat.id} ${result.metadata.sessionId} general inspect bug`])
-      yield* jobs.cancel(result.metadata.sessionId)
-      expect(published.at(-1)).toBe(`end ${chat.id} ${result.metadata.sessionId}`)
+      expect(yield* status.get(chat.id)).toMatchObject({
+        type: "idle",
+        background: { running: true, jobs: [{ role: "general", title: "inspect bug", owner: expect.any(String) }] },
+      })
     }),
   )
 
@@ -1455,6 +1450,8 @@ describe("tool.task", () => {
         attempt: 1,
         parentSessionID: chat.id,
         parentMessageID: assistant.id,
+        role: "general",
+        title: "do work",
         // Execution settled; the parent has not durably received the report
         // yet - that mark belongs to the tool-part persistence, not the tool.
         deliveryOutcome: "pending",

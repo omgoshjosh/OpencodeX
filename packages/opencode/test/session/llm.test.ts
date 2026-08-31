@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test"
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
 import path from "path"
-import { tool, type ModelMessage } from "ai"
+import { APICallError, tool, type ModelMessage } from "ai"
 import { Cause, Effect, Exit, Fiber, Layer, Stream } from "effect"
 import { InstanceRef } from "../../src/effect/instance-ref"
 import { HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
@@ -167,6 +167,89 @@ describe("session.llm.hasToolCalls", () => {
       },
     ] as ModelMessage[]
     expect(LLM.hasToolCalls(messages)).toBe(true)
+  })
+})
+
+describe("session.llm stream error logging", () => {
+  test("sanitizes the AI SDK onError wrapper without retaining provider secrets", () => {
+    const sentinel = "provider-secret-aGVhZGVyLWJvZHk="
+    const error = new APICallError({
+      message: sentinel,
+      url: `https://user:${sentinel}@api.example.com/v1/chat?token=${sentinel}#${sentinel}`,
+      requestBodyValues: { sentinel },
+      statusCode: 429,
+      responseHeaders: { authorization: `Bearer ${sentinel}` },
+      responseBody: sentinel,
+      isRetryable: true,
+    })
+    Object.assign(error, { cause: { sentinel }, data: { sentinel }, headers: { sentinel }, stack: sentinel })
+
+    const result = LLM.sanitizeStreamError({ error })
+    const serialized = JSON.stringify(result)
+
+    expect(result).toEqual({
+      name: "AI_APICallError",
+      statusCode: 429,
+      isRetryable: true,
+      url: "https://api.example.com",
+    })
+    expect(serialized).not.toContain(sentinel)
+    expect(serialized).not.toContain("user:")
+    expect(new TextEncoder().encode(serialized).byteLength).toBeLessThanOrEqual(512)
+  })
+
+  test("returns a bounded fallback for circular and throwing values", () => {
+    const circular: { self?: unknown } = {}
+    circular.self = circular
+    const throwing = new Proxy(new APICallError({
+      message: "ignored",
+      url: "https://api.example.com",
+      requestBodyValues: {},
+      statusCode: 500,
+      responseHeaders: {},
+      responseBody: "ignored",
+      isRetryable: false,
+    }), {
+      get() {
+        throw new Error("getter must not escape")
+      },
+    })
+
+    expect(() => LLM.sanitizeStreamError({ error: circular })).not.toThrow()
+    expect(LLM.sanitizeStreamError({ error: circular })).toEqual({ name: "UnknownStreamError" })
+    expect(() => LLM.sanitizeStreamError({ error: throwing })).not.toThrow()
+    expect(LLM.sanitizeStreamError({ error: throwing })).toEqual({ name: "UnknownStreamError" })
+  })
+
+  test("rejects primitive nested errors and throwing wrapper accessors", () => {
+    for (const error of [null, "provider error", 429]) {
+      expect(() => LLM.sanitizeStreamError({ error })).not.toThrow()
+      expect(LLM.sanitizeStreamError({ error })).toEqual({ name: "UnknownStreamError" })
+    }
+    const throwingWrapper = {
+      get error(): unknown {
+        throw new Error("wrapper getter must not escape")
+      },
+    }
+
+    expect(() => LLM.sanitizeStreamError(throwingWrapper)).not.toThrow()
+    expect(LLM.sanitizeStreamError(throwingWrapper)).toEqual({ name: "UnknownStreamError" })
+  })
+
+  test("omits malformed fields and oversized origins from recognized API errors", () => {
+    const error = new APICallError({
+      message: "ignored",
+      url: `https://${"a".repeat(300)}.example.com/path`,
+      requestBodyValues: {},
+      statusCode: 700,
+      responseHeaders: {},
+      responseBody: "ignored",
+      isRetryable: false,
+    })
+
+    const result = LLM.sanitizeStreamError({ error })
+    expect(result).toEqual({ name: "AI_APICallError", isRetryable: false })
+    expect(new TextEncoder().encode(JSON.stringify(result)).byteLength).toBeLessThanOrEqual(512)
   })
 })
 

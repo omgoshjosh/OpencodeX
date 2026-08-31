@@ -31,6 +31,7 @@ class ScenarioBuilder<S = undefined> {
       mutates: false,
       reset: true,
       auth,
+      authParity: false,
     }
   }
 
@@ -80,6 +81,10 @@ class ScenarioBuilder<S = undefined> {
 
   ticketBypass() {
     return this.auth("ticket-bypass")
+  }
+
+  authParity() {
+    return this.clone({ authParity: true })
   }
 
   private auth(auth: AuthPolicy) {
@@ -167,6 +172,7 @@ class ScenarioBuilder<S = undefined> {
       mutates: state.mutates,
       reset: state.reset,
       auth: state.auth,
+      authParity: state.authParity,
     }
   }
 }

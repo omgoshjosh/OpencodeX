@@ -60,13 +60,51 @@ const scenarios: Scenario[] = [
     }),
   http.protected
     .post("/session/{sessionID}/child/{childSessionID}/retry", "session.child.retry")
+    .authParity()
     .seeded((ctx) =>
       Effect.gen(function* () {
         const parent = yield* ctx.session({ title: "retry parent" })
-        const child = yield* ctx.session({ title: "retry child", parentID: parent.id })
+        const otherParent = yield* ctx.session({ title: "other retry parent" })
+        const child = yield* ctx.session({ title: "retry child", parentID: otherParent.id })
         return { parent, child }
       }),
     )
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/child/{childSessionID}/retry", {
+        sessionID: ctx.state.parent.id,
+        childSessionID: ctx.state.child.id,
+      }),
+      headers: ctx.headers(),
+    }))
+    .json(400),
+  http.protected
+    .post("/session/{sessionID}/child/{childSessionID}/retry", "session.child.retry.nonblocked")
+    .authParity()
+    .seeded((ctx) => ctx.retryChild())
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/child/{childSessionID}/retry", {
+        sessionID: ctx.state.parent.id,
+        childSessionID: ctx.state.child.id,
+      }),
+      headers: ctx.headers(),
+    }))
+    .json(400),
+  http.protected
+    .post("/session/{sessionID}/child/{childSessionID}/retry", "session.child.retry.no_route")
+    .authParity()
+    .seeded((ctx) => ctx.retryChild({ blocked: true }))
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/child/{childSessionID}/retry", {
+        sessionID: ctx.state.parent.id,
+        childSessionID: ctx.state.child.id,
+      }),
+      headers: ctx.headers(),
+    }))
+    .json(400),
+  http.protected
+    .post("/session/{sessionID}/child/{childSessionID}/retry", "session.child.retry.partial_output")
+    .authParity()
+    .seeded((ctx) => ctx.retryChild({ blocked: true, partialOutput: true }))
     .at((ctx) => ({
       path: route("/session/{sessionID}/child/{childSessionID}/retry", {
         sessionID: ctx.state.parent.id,

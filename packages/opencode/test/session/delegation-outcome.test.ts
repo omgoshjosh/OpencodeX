@@ -121,6 +121,14 @@ describe("delegation record metadata", () => {
     // Malformed timestamps are rejected rather than tolerated.
     expect(delegationRecord(withDelegationRecord(undefined, running({ startedAt: Number.NaN })))).toBeUndefined()
     expect(
+      delegationRecord({ opencodex: { delegation: { ...running(), phase: "settled", completedAt: 2 } } }),
+    ).toBeUndefined()
+    expect(
+      delegationRecord({ opencodex: { delegation: { ...running(), outcome: "completed", completedAt: 2 } } }),
+    ).toBeUndefined()
+    // Malformed timestamps are rejected rather than tolerated.
+    expect(delegationRecord(withDelegationRecord(undefined, running({ startedAt: Number.NaN })))).toBeUndefined()
+    expect(
       delegationRecord(
         withDelegationRecord(undefined, settleDelegation(running(), { outcome: "completed", completedAt: Number.NaN })),
       ),

@@ -37,6 +37,12 @@ export type DelegationRecord = {
   parentSessionID: string
   parentMessageID?: string
   toolCallID?: string
+  /** Background runs are recoverable from durable transcript evidence only. */
+  mode?: "background"
+  /** Process identity that started this exact run. */
+  ownerID?: string
+  /** Exact child assistant turn; recovery never infers a result without it. */
+  childMessageID?: string
   /** 1-based; a reused `task_id` session increments across runs. */
   attempt: number
   phase: "running" | "settled"
@@ -164,12 +170,24 @@ export function delegationRecord(metadata: Record<string, unknown> | undefined |
   if (raw.completedAt !== undefined && (typeof raw.completedAt !== "number" || !Number.isFinite(raw.completedAt)))
     return undefined
   if (raw.deliveryOutcome !== undefined && !isDelivery(raw.deliveryOutcome)) return undefined
+  if (raw.phase === "settled" && (!isOutcome(raw.outcome) || typeof raw.completedAt !== "number")) return undefined
+  if (
+    raw.phase === "running" &&
+    (raw.outcome !== undefined ||
+      raw.completedAt !== undefined ||
+      raw.deliveryOutcome !== undefined ||
+      raw.deliveredAt !== undefined)
+  )
+    return undefined
   return {
     version: DELEGATION_RECORD_VERSION,
     runID: raw.runID,
     parentSessionID: raw.parentSessionID,
     ...(typeof raw.parentMessageID === "string" ? { parentMessageID: raw.parentMessageID } : {}),
     ...(typeof raw.toolCallID === "string" ? { toolCallID: raw.toolCallID } : {}),
+    ...(raw.mode === "background" ? { mode: raw.mode } : {}),
+    ...(typeof raw.ownerID === "string" ? { ownerID: raw.ownerID } : {}),
+    ...(typeof raw.childMessageID === "string" ? { childMessageID: raw.childMessageID } : {}),
     attempt: raw.attempt,
     phase: raw.phase,
     ...(raw.outcome !== undefined ? { outcome: raw.outcome } : {}),

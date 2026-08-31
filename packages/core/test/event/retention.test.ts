@@ -1,5 +1,5 @@
 import { describe, expect } from "bun:test"
-import { asc, eq } from "drizzle-orm"
+import { asc, eq, sql } from "drizzle-orm"
 import { Context, Effect, Layer } from "effect"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
@@ -150,6 +150,23 @@ const drain = Effect.fnUntraced(function* (retention: EventRetention.Retention) 
 })
 
 describe("EventRetention", () => {
+  it.effect("installs and uses the entity revision index", () =>
+    Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      const index = yield* db
+        .all<{ name: string }>(sql`SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'event_compaction_entity_idx'`)
+        .pipe(Effect.orDie)
+      expect(index).toHaveLength(1)
+
+      const plan = yield* db
+        .all<{ detail: string }>(
+          sql`EXPLAIN QUERY PLAN ${EventRetention.supersededQuery(["missing"], 1)}`,
+        )
+        .pipe(Effect.orDie)
+      expect(plan.some((row) => row.detail.includes("event_compaction_entity_idx"))).toBeTrue()
+    }),
+  )
+
   it.effect("drops every revision between an entity's first and last", () =>
     Effect.gen(function* () {
       const events = yield* EventV2.Service
@@ -208,6 +225,39 @@ describe("EventRetention", () => {
       expect(revisions.map((row) => (row.data as any).part.text)).toEqual(["only", "chunk 49"])
       // A second run has nothing left to do.
       expect(yield* retention.compact()).toBe(0)
+    }),
+  )
+
+  it.effect("drains a long revision chain in bounded batches", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const ids = yield* seed(events, db)
+      const retention = yield* EventRetention.make(db, events.barrier, {
+        aggregatesPerPass: 1_000,
+        maintenanceBatchSize: 5,
+      })
+
+      for (let index = 0; index < 30; index++) {
+        yield* events.publish(SessionLegacy.Event.PartUpdated, {
+          sessionID: ids.sessionID,
+          part: textPart(ids.sessionID, ids.messageID, ids.other, `bounded ${index}`),
+          time: 8_000 + index,
+        })
+      }
+
+      const deleted: number[] = []
+      for (let pass = 0; pass < 16; pass++) {
+        const count = yield* retention.compact()
+        deleted.push(count)
+        if (count === 0) break
+      }
+      expect(deleted.every((count) => count <= 5)).toBeTrue()
+      expect(deleted.filter((count) => count === 5).length).toBeGreaterThan(1)
+      const revisions = (yield* journal(db, ids.sessionID)).filter(
+        (row) => row.type === "message.part.updated.1" && (row.data as any).part.id === ids.other,
+      )
+      expect(revisions.map((row) => (row.data as any).part.text)).toEqual(["only", "bounded 29"])
     }),
   )
 

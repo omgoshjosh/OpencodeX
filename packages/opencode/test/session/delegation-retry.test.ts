@@ -14,10 +14,22 @@ describe("session.delegation-retry", () => {
     expect(DelegationRetry.selectUntriedRoute(routes, routes.map((route) => `${route.providerID}/${route.modelID}`))).toBeUndefined()
   })
 
-  test("rejects assistant text and tool activity before replay", () => {
+  test("accepts legacy roles without fallbacks and preserves attempted route metadata", () => {
+    const routes = [{ providerID: "current", modelID: "primary" }]
+    const attempted = ["retired/primary"]
+    expect(DelegationRetry.selectUntriedRoute(routes, attempted)).toEqual(routes[0])
+    expect(DelegationRetry.selectUntriedRoute(routes, [...attempted, "current/primary"])).toBeUndefined()
+  })
+
+  test("rejects partial assistant text, tool activity, and external side effects before replay", () => {
     const message = (parts: unknown[]) => ({ info: { role: "assistant" }, parts })
     expect(DelegationRetry.hasUnsafeRetryOutput(([message([{ type: "text", synthetic: false, text: "partial" }])] as never))).toBe(true)
     expect(DelegationRetry.hasUnsafeRetryOutput(([message([{ type: "tool" }])] as never))).toBe(true)
+    expect(
+      DelegationRetry.hasUnsafeRetryOutput(
+        ([message([{ type: "tool", state: { status: "completed", externalSideEffect: true } }])] as never),
+      ),
+    ).toBe(true)
     expect(DelegationRetry.hasUnsafeRetryOutput(([message([{ type: "text", synthetic: true, text: "briefing" }])] as never))).toBe(false)
   })
 })

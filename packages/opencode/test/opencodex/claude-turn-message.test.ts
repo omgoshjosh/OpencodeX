@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import path from "node:path"
-import { claudeTurnMessage } from "../../src/session/prompt-swarm"
+import { claudeTurnImages, claudeTurnMessage } from "../../src/session/prompt-swarm"
 
 const messages = [
   { info: { id: "msg_1", role: "user" } },
@@ -21,6 +21,19 @@ describe("claudeTurnMessage", () => {
   test("returns undefined for an unknown id or a non-user id", () => {
     expect(claudeTurnMessage(messages, "msg_nope")).toBeUndefined()
     expect(claudeTurnMessage(messages, "msg_2")).toBeUndefined()
+  })
+})
+
+describe("claudeTurnImages", () => {
+  test("uses only image parts persisted on the selected user message", () => {
+    const selected = {
+      info: { id: "msg_3", role: "user" },
+      parts: [
+        { type: "file", mime: "image/png", url: "data:image/png;base64,aGVsbG8=" },
+        { type: "file", mime: "text/plain", url: "file:///not-read" },
+      ],
+    } as never
+    expect(claudeTurnImages(selected)).toEqual([{ mime: "image/png", url: "data:image/png;base64,aGVsbG8=" }])
   })
 })
 

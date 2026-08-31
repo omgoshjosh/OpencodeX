@@ -92,6 +92,8 @@ it.live("headerTimeout aborts when response headers do not arrive", () =>
           const model = yield* provider.getModel(ProviderV2.ID.make("test"), ProviderV2.ModelID.make("test-model"))
           const result = streamText({
             model: yield* provider.getLanguage(model),
+            // This test verifies one request's header deadline, not SDK retry policy.
+            maxRetries: 0,
             onError() {},
             messages: [{ role: "user", content: "hello" }],
           })

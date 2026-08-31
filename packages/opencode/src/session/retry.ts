@@ -136,7 +136,7 @@ export function policy(opts: {
         const now = yield* Clock.currentTimeMillis
         startedAt ??= now
         const remaining = remainingElapsed(startedAt, now)
-        if (remaining <= 0) return Cause.done(meta.attempt)
+        if (remaining <= 0) return yield* Cause.done(meta.attempt)
         const wait = Math.min(delay(meta.attempt, SessionLegacy.APIError.isInstance(error) ? error : undefined), remaining)
         yield* opts.set({
           attempt: meta.attempt,

@@ -109,6 +109,7 @@ export const layer: Layer.Layer<
   | Agent.Service
   | Skill.Service
   | Session.Service
+  | SessionStatus.Service
   | BackgroundJob.Service
   | Provider.Service
   | Git.Service

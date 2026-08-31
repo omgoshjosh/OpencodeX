@@ -59,6 +59,23 @@ const scenarios: Scenario[] = [
       check(body.healthy === true, "server should report healthy")
     }),
   http.protected
+    .post("/session/{sessionID}/child/{childSessionID}/retry", "session.child.retry")
+    .seeded((ctx) =>
+      Effect.gen(function* () {
+        const parent = yield* ctx.session({ title: "retry parent" })
+        const child = yield* ctx.session({ title: "retry child", parentID: parent.id })
+        return { parent, child }
+      }),
+    )
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/child/{childSessionID}/retry", {
+        sessionID: ctx.state.parent.id,
+        childSessionID: ctx.state.child.id,
+      }),
+      headers: ctx.headers(),
+    }))
+    .json(400),
+  http.protected
     .get("/global/event", "global.event")
     .global()
     .stream()

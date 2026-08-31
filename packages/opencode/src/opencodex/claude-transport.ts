@@ -1,5 +1,6 @@
 import { stat } from "node:fs/promises"
 import path from "node:path"
+import type { SDKUserMessage } from "@anthropic-ai/claude-agent-sdk"
 import z from "zod"
 import type { ClaudeEvent } from "./claude-mapper"
 
@@ -40,18 +41,7 @@ export type TransportOptions = {
 
 export type ClaudeImage = { mime: string; url: string }
 
-export type ClaudePrompt =
-  | string
-  | AsyncIterable<{
-      type: "user"
-      message: {
-        role: "user"
-        content: Array<
-          | { type: "text"; text: string }
-          | { type: "image"; source: { type: "base64"; media_type: "image/jpeg" | "image/png" | "image/gif" | "image/webp"; data: string } }
-        >
-      }
-    }>
+export type ClaudePrompt = string | AsyncIterable<SDKUserMessage>
 
 export type DelegateCapability = {
   roles: Array<{ name: string; description?: string }>
@@ -99,7 +89,7 @@ export function claudePrompt(text: string, images: ClaudeImage[]): ClaudePrompt 
   return promptParts(text, images)
 }
 
-async function* promptParts(text: string, images: ClaudeImage[]) {
+async function* promptParts(text: string, images: ClaudeImage[]): AsyncGenerator<SDKUserMessage> {
   const content: Array<
     | { type: "text"; text: string }
     | { type: "image"; source: { type: "base64"; media_type: "image/jpeg" | "image/png" | "image/gif" | "image/webp"; data: string } }
@@ -113,7 +103,7 @@ async function* promptParts(text: string, images: ClaudeImage[]) {
     }
     content.push({ type: "text", text: `[Unsupported image attachment: ${image.mime}]` })
   }
-  yield { type: "user" as const, message: { role: "user" as const, content } }
+  yield { type: "user", parent_tool_use_id: null, message: { role: "user", content } }
 }
 
 /**

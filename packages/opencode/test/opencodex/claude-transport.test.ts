@@ -1,5 +1,5 @@
-import { describe, expect, test } from "bun:test"
-import { DELEGATE_SERVER, DELEGATE_TOOL, claudePrompt, delegateServer } from "../../src/opencodex/claude-transport"
+import { describe, expect, mock, test } from "bun:test"
+import { DELEGATE_SERVER, DELEGATE_TOOL, claudePrompt, createSdkTransport, delegateServer } from "../../src/opencodex/claude-transport"
 
 function fakeSdk() {
   const calls: { tool?: { name: string; description: string; extras?: Record<string, unknown> }; server?: Record<string, unknown> } = {}
@@ -66,6 +66,38 @@ describe("claudePrompt", () => {
         content: [
           { type: "text", text: "[Unsupported image attachment: image/svg+xml]" },
           { type: "text", text: "[Unsupported image attachment: image/png]" },
+        ],
+      },
+    })
+  })
+
+  test("sends SDKUserMessages with a null parent tool use id to sdk.query", async () => {
+    let received: unknown
+    mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+      query: (input: unknown) => {
+        received = input
+        return {
+          async *[Symbol.asyncIterator]() {},
+        }
+      },
+    }))
+    const turn = createSdkTransport().run(claudePrompt("Inspect this.", [{ mime: "image/png", url: "data:image/png;base64,aGVsbG8=" }]), {
+      cwd: process.cwd(),
+      executable: "claude",
+      canUseTool: async () => ({ allow: true }),
+    })
+    for await (const _ of turn.events) {
+      // Consume the query so its prompt stream is read by the mocked SDK.
+    }
+    const prompt = (received as { prompt: ReturnType<typeof claudePrompt> }).prompt
+    expect(await first(prompt)).toEqual({
+      type: "user",
+      parent_tool_use_id: null,
+      message: {
+        role: "user",
+        content: [
+          { type: "text", text: "Inspect this." },
+          { type: "image", source: { type: "base64", media_type: "image/png", data: "aGVsbG8=" } },
         ],
       },
     })

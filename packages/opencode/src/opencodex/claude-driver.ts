@@ -14,7 +14,9 @@ import { ClaudePermission } from "./claude-permission"
 import { ClaudeSidechain } from "./claude-sidechain"
 import {
   ClaudeTransport,
+  claudePrompt,
   createSdkTransport,
+  type ClaudeImage,
   type ClaudeTransport as Transport,
   type DelegateCapability,
 } from "./claude-transport"
@@ -54,6 +56,7 @@ export interface Interface {
     sessionID: SessionID
     parentMessageID: typeof SessionLegacy.MessageID.Type
     text: string
+    images?: ClaudeImage[]
     directory: string
     /**
      * The catalog route the reader picked, used for transcript attribution.
@@ -99,6 +102,7 @@ export const layer = Layer.effect(
       sessionID: SessionID
       parentMessageID: typeof SessionLegacy.MessageID.Type
       text: string
+      images?: ClaudeImage[]
       directory: string
       providerID: string
       modelID: string
@@ -207,7 +211,8 @@ export const layer = Layer.effect(
       // Claude keeps its own conversation state, so anything that came before is
       // invisible to a conversation it has not been resuming. Replay it once,
       // when opening a new one on a session that already has history.
-      const prompt = resumeID ? input.text : yield* primedPrompt(input.sessionID, input.parentMessageID, input.text)
+      const text = resumeID ? input.text : yield* primedPrompt(input.sessionID, input.parentMessageID, input.text)
+      const prompt = claudePrompt(text, input.images ?? [])
 
       // Captured here so a permission prompt raised inside Claude's callback
       // still carries this request's instance and workspace context.

@@ -894,6 +894,7 @@ export const layer = Layer.effect(
           parts: [{ type: "text", synthetic: true, text: input.text }],
           noReply: input.noReply,
         }).pipe(Effect.orDie),
+      refresh: status.refresh,
     })
     const unregisterRecovery = SessionPromptRecovery.register(() =>
       delegationRecovery.recover().pipe(Effect.andThen(recover)),

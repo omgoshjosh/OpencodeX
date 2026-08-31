@@ -6,6 +6,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { OpencodeXSwarmRoleTable, OpencodeXSwarmTable } from "@opencode-ai/core/opencodex/sql"
 import { Image } from "@/image/image"
 import { OpencodeXClaudeDriver } from "@/opencodex/claude-driver"
+import type { ClaudeImage } from "@/opencodex/claude-transport"
 import { SwarmBriefing } from "@/opencodex/swarm-briefing"
 import { Skill } from "@/skill"
 import { CLAUDE_CODE_DEFAULT_MODEL_ID, isClaudeCodeProvider } from "@/provider/claude-code-provider"
@@ -56,6 +57,13 @@ export function claudeTurnMessage<T extends { info: { id: string; role: string }
   if (messageID === undefined) return messages.findLast((message) => message.info.role === "user")
   const message = messages.find((message) => message.info.id === messageID)
   return message?.info.role === "user" ? message : undefined
+}
+
+/** Only persisted image parts travel to Claude; paths are never reopened. */
+export function claudeTurnImages(message: SessionLegacy.WithParts): ClaudeImage[] {
+  return message.parts.flatMap((part) =>
+    part.type === "file" && part.mime.startsWith("image/") ? [{ mime: part.mime, url: part.url }] : [],
+  )
 }
 
 /**
@@ -156,6 +164,7 @@ export function make(deps: Deps) {
     roles: SwarmRoleRow[]
     role: string
     prompt: string
+    images?: ClaudeImage[]
   }) {
     const role = SwarmBriefing.matchSwarmRole(input.roles, input.role)
     if (!role) {
@@ -190,21 +199,21 @@ export function make(deps: Deps) {
       version: DELEGATION_RECORD_VERSION,
       runID,
       parentSessionID: input.sessionID,
+      role: role.name,
+      title: child.title,
       attempt: 1,
       phase: "running",
       startedAt: Date.now(),
     }
     const stamp = (record: DelegationRecord, expectRunID?: string) =>
-      sessions
-        .stampDelegation({ sessionID: child.id, record, ...(expectRunID ? { expectRunID } : {}) })
-        .pipe(
-          Effect.catchCause((cause) =>
-            Effect.sync(() => {
-              log.error("swarm delegation stamp failed", { sessionID: child.id, runID, cause })
-              return false
-            }),
-          ),
-        )
+      sessions.stampDelegation({ sessionID: child.id, record, ...(expectRunID ? { expectRunID } : {}) }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.sync(() => {
+            log.error("swarm delegation stamp failed", { sessionID: child.id, runID, cause })
+            return false
+          }),
+        ),
+      )
     const settle = (outcome: DelegationOutcome, summary?: string) =>
       stamp(settleDelegation(started, { outcome, summary }), runID).pipe(Effect.asVoid)
     yield* stamp(started)
@@ -227,7 +236,7 @@ export function make(deps: Deps) {
         ...(role.agent ? { agent: role.agent } : {}),
         // "default" is the sentinel for "no variant" everywhere in the loop.
         ...(role.variant && role.variant !== "default" ? { variant: role.variant } : {}),
-        parts: [{ type: "text", text }],
+        parts: [{ type: "text", text }, ...(input.images ?? []).map((image) => ({ type: "file" as const, ...image }))],
       })
       if (result.info.role === "assistant" && result.info.error) {
         return { state: "error" as const, text: `Role "${role.name}" failed: ${JSON.stringify(result.info.error)}` }
@@ -277,8 +286,9 @@ export function make(deps: Deps) {
       .flatMap((part) => (part.type === "text" && part.text.trim() ? [part.text] : []))
       .join("\n")
       .trim()
-    if (!text) return undefined
-    yield* ensureClaudeTitle(session, text)
+    const images = claudeTurnImages(last)
+    if (!text && images.length === 0) return undefined
+    if (text) yield* ensureClaudeTitle(session, text)
     const specialists = swarm?.roles.slice(1) ?? []
     // Attribute the turn to the route the reader picked, so a swarm session
     // stays labelled with the team rather than the orchestrator's model. The
@@ -296,6 +306,7 @@ export function make(deps: Deps) {
       sessionID,
       parentMessageID: last.info.id,
       text,
+      images,
       directory: session.directory,
       providerID: turnProviderID,
       modelID: turnModelID,
@@ -316,6 +327,7 @@ export function make(deps: Deps) {
                   roles: swarm!.roles,
                   role: delegated.role,
                   prompt: delegated.prompt,
+                  images,
                 }),
             },
           }
@@ -331,7 +343,9 @@ export function make(deps: Deps) {
             // Avoid doubling up when the subagent's own title already says
             // "subagent" (e.g. "code-reviewer subagent"), which would otherwise
             // render as "code-reviewer subagent (@claude subagent)".
-            const title = /subagent/i.test(spawnInput.title) ? spawnInput.title : `${spawnInput.title} (@claude subagent)`
+            const title = /subagent/i.test(spawnInput.title)
+              ? spawnInput.title
+              : `${spawnInput.title} (@claude subagent)`
             const child = yield* sessions
               .create({
                 parentID: sessionID,

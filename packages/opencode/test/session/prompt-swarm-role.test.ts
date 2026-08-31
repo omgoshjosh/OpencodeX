@@ -43,6 +43,21 @@ describe("swarm role delegation prompt", () => {
     })
   })
 
+  test("copies delegated images into the specialist's persisted prompt", async () => {
+    const { runSwarmRole, promptParts } = harness({ skills: {} })
+    await Effect.runPromise(
+      runSwarmRole({
+        sessionID: SessionID.make("ses_parent"),
+        swarmID: "swm_1",
+        roles: [role({ name: "Specialist", skill: null, instructions: "" })],
+        role: "Specialist",
+        prompt: "Inspect this.",
+        images: [{ mime: "image/jpeg", url: "data:image/jpeg;base64,aGVsbG8=" }],
+      }),
+    )
+    expect(promptParts[0]).toContainEqual({ type: "file", mime: "image/jpeg", url: "data:image/jpeg;base64,aGVsbG8=" })
+  })
+
   test("sends instructions and task alone when the role has no skill", async () => {
     const { runSwarmRole, prompts } = harness({ skills: {} })
 
@@ -182,6 +197,7 @@ function harness(input: {
   skillFailure?: Effect.Effect<never>
 }) {
   const prompts: string[] = []
+  const promptParts: Array<Array<{ type: string; text?: string; mime?: string; url?: string }>> = []
   const stamps: Array<{ record: DelegationRecord; expectRunID?: string }> = []
   const deps = {
     claudeDriver: {} as never,
@@ -205,6 +221,7 @@ function harness(input: {
     } as never,
     prompt: (promptInput: { parts: Array<{ type: string; text?: string }> }) => {
       if (input.promptResult) return input.promptResult
+      promptParts.push(promptInput.parts)
       const text = promptInput.parts.flatMap((part) => (part.type === "text" && part.text ? [part.text] : [])).join("\n")
       prompts.push(text)
       return Effect.succeed({
@@ -214,5 +231,5 @@ function harness(input: {
     },
   }
   const { runSwarmRole } = PromptSwarm.make(deps as never)
-  return { runSwarmRole, prompts, stamps }
+  return { runSwarmRole, prompts, promptParts, stamps }
 }

@@ -11,7 +11,7 @@ import { deriveSubagentSessionPermission } from "../agent/subagent-permissions"
 import type { SessionPrompt } from "../session/prompt"
 import { Config } from "@/config/config"
 import { ProviderV2 } from "@opencode-ai/core/provider"
-import { Cause, Effect, Exit, Schema, Scope } from "effect"
+import { Cause, Effect, Exit, Option, Schema, Scope } from "effect"
 import { asc, eq } from "drizzle-orm"
 import { EffectBridge } from "@/effect/bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -29,6 +29,7 @@ import { OpencodeXSwarmRoleTable } from "@opencode-ai/core/opencodex/sql"
 import { SwarmBriefing } from "@/opencodex/swarm-briefing"
 import { isSwarmProvider } from "@/provider/swarm-provider"
 import { ensureRunID } from "@opencode-ai/core/util/opencode-process"
+import { SessionStatus } from "@/session/status"
 
 const log = Log.create({ service: "tool.task" })
 
@@ -185,6 +186,7 @@ export const TaskTool = Tool.define(
     const background = yield* BackgroundJob.Service
     const config = yield* Config.Service
     const sessions = yield* Session.Service
+    const status = Option.getOrUndefined(yield* Effect.serviceOption(SessionStatus.Service))
     const scope = yield* Scope.Scope
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
@@ -323,6 +325,8 @@ export const TaskTool = Tool.define(
         parentSessionID: ctx.sessionID,
         parentMessageID: ctx.messageID,
         ...(ctx.callID ? { toolCallID: ctx.callID } : {}),
+        role: swarmRole?.name ?? next.name,
+        title: params.description,
         ...(runInBackground
           ? {
               mode: "background" as const,
@@ -355,7 +359,7 @@ export const TaskTool = Tool.define(
             ...(outcome === "completed" || runInBackground ? { deliveryOutcome: "pending" as const } : {}),
           }),
           runID,
-        ).pipe(Effect.asVoid)
+        ).pipe(Effect.andThen(status ? status.refresh(ctx.sessionID) : Effect.void), Effect.asVoid)
       // An observed cancellation request wins over a late clean return.
       const cancelState = { requested: false }
       const settleResult = (result: TaskRunResult) =>
@@ -363,7 +367,7 @@ export const TaskTool = Tool.define(
           ? settle("cancelled", result.text)
           : settle(result.state === "error" ? "errored" : result.state, result.text)
 
-      yield* stamp(started)
+      yield* stamp(started).pipe(Effect.andThen(status ? status.refresh(ctx.sessionID) : Effect.void))
 
       return yield* Effect.gen(function* () {
         const msg = yield* MessageV2.get({ sessionID: ctx.sessionID, messageID: ctx.messageID }).pipe(

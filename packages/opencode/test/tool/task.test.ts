@@ -109,15 +109,26 @@ function stubOps(opts?: { onPrompt?: (input: SessionPrompt.PromptInput) => void;
     cancel: () => Effect.void,
     resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
     prompt: (input) =>
-      Effect.sync(() => {
+      Effect.gen(function* () {
         opts?.onPrompt?.(input)
-        return reply(input, opts?.text ?? "done")
+        return yield* persist(reply(input, opts?.text ?? "done"))
       }),
     loop: () => Effect.die("unexpected task loop"),
   }
 }
 
-function reply(input: SessionPrompt.PromptInput, text: string): SessionLegacy.WithParts {
+type AssistantWithParts = { info: SessionLegacy.Assistant; parts: SessionLegacy.Part[] }
+
+function persist(message: AssistantWithParts) {
+  return Effect.gen(function* () {
+    const session = yield* Session.Service
+    yield* session.updateMessage(message.info)
+    yield* Effect.forEach(message.parts, (part) => session.updatePart(part))
+    return message
+  })
+}
+
+function reply(input: SessionPrompt.PromptInput, text: string): AssistantWithParts {
   const id = MessageID.ascending()
   return {
     info: {
@@ -388,7 +399,7 @@ describe("tool.task", () => {
           Effect.promise(() => {
             ready.resolve(input)
             return cancelled.promise
-          }).pipe(Effect.as(reply(input, "cancelled"))),
+          }).pipe(Effect.andThen(() => persist(reply(input, "cancelled")))),
         loop: () => Effect.die("unexpected task loop"),
       }
 
@@ -974,9 +985,9 @@ describe("tool.task", () => {
       const promptOps: TaskPromptOps = {
         ...stubOps(),
         prompt: (input) =>
-          Effect.sync(() => {
+          Effect.gen(function* () {
             const base = reply(input, "")
-            return {
+            return yield* persist({
               info: {
                 ...base.info,
                 error: {
@@ -985,7 +996,7 @@ describe("tool.task", () => {
                 } as SessionLegacy.Assistant["error"],
               },
               parts: [],
-            }
+            })
           }),
       }
 
@@ -1005,22 +1016,30 @@ describe("tool.task", () => {
       )
 
       expect(result.output).toContain("The subagent failed:")
+      expect(result.output).toContain('state="error"')
+      expect(result.output).toContain("<task_error>")
+      expect(result.output).toContain("ProviderAuthError")
       expect(result.output).toContain("credentials expired")
+      const child = yield* (yield* Session.Service).get(SessionID.make(result.metadata.sessionId))
+      expect(delegationOutcome(child.metadata)).toBe("errored")
     }),
   )
 
-  it.instance("labels an empty report instead of returning an empty string", () =>
+  it.instance("treats an empty report as a subagent error", () =>
     Effect.gen(function* () {
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
       const def = yield* tool.init()
       const promptOps: TaskPromptOps = {
         ...stubOps(),
-        // Only a synthetic part: an injected briefing, not a report.
         prompt: (input) =>
-          Effect.sync(() => {
-            const base = reply(input, "internal briefing")
-            return { info: base.info, parts: [{ ...base.parts[0], synthetic: true }] }
+          Effect.gen(function* () {
+            const base = reply(input, "")
+            const part = base.parts.find((part): part is SessionLegacy.TextPart => part.type === "text")!
+            return yield* persist({
+              info: base.info,
+              parts: [part, { ...part, id: PartID.ascending(), text: "internal briefing", synthetic: true }],
+            })
           }),
       }
 
@@ -1040,7 +1059,56 @@ describe("tool.task", () => {
       )
 
       expect(result.output).toContain("The subagent completed without producing a text report.")
+      expect(result.output).toContain('state="error"')
+      expect(result.output).toContain("<task_error>")
       expect(result.output).not.toContain("internal briefing")
+      const child = yield* (yield* Session.Service).get(SessionID.make(result.metadata.sessionId))
+      expect(delegationOutcome(child.metadata)).toBe("errored")
+    }),
+  )
+
+  it.instance("uses persisted abort state instead of a stale prompt snapshot", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const result = yield* def.execute(
+        { description: "inspect bug", prompt: "look into it", subagent_type: "general" },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          directory: chat.directory,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: {
+            promptOps: {
+              ...stubOps(),
+              prompt: (input) =>
+                Effect.gen(function* () {
+                  const snapshot = reply(input, "")
+                  yield* persist({
+                    ...snapshot,
+                    info: {
+                      ...snapshot.info,
+                      error: { name: "MessageAbortedError", data: { message: "Aborted" } },
+                    },
+                    parts: [],
+                  })
+                  return snapshot
+                }),
+            } satisfies TaskPromptOps,
+          },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      expect(result.output).toContain('state="error"')
+      expect(result.output).toContain("MessageAbortedError")
+      expect(result.output).toContain("Aborted")
+      const child = yield* (yield* Session.Service).get(SessionID.make(result.metadata.sessionId))
+      expect(delegationOutcome(child.metadata)).toBe("errored")
     }),
   )
 
@@ -1184,7 +1252,7 @@ describe("tool.task", () => {
             promptOps: {
               ...stubOps({ text: "background done" }),
               prompt: (input) =>
-                input.sessionID === chat.id ? Effect.never : Effect.succeed(reply(input, "background done")),
+                input.sessionID === chat.id ? Effect.never : persist(reply(input, "background done")),
             } satisfies TaskPromptOps,
           },
           messages: [],
@@ -1397,12 +1465,12 @@ describe("tool.task", () => {
       const failingOps: TaskPromptOps = {
         ...stubOps(),
         prompt: (input) =>
-          Effect.sync(() => {
+          Effect.gen(function* () {
             const message = reply(input, "partial output")
-            return {
+            return yield* persist({
               ...message,
               info: { ...message.info, error: { name: "UnknownError", data: { message: "boom" } } },
-            } as SessionLegacy.WithParts
+            })
           }),
       }
 
@@ -1487,7 +1555,7 @@ describe("tool.task", () => {
           Effect.promise(() => {
             ready.resolve(input)
             return cancelled.promise
-          }).pipe(Effect.as(reply(input, "finished anyway"))),
+          }).pipe(Effect.andThen(() => persist(reply(input, "finished anyway")))),
         loop: () => Effect.die("unexpected task loop"),
       }
 
@@ -1512,6 +1580,10 @@ describe("tool.task", () => {
       abort.abort()
       const exit = yield* Fiber.await(fiber)
       expect(Exit.isSuccess(exit)).toBe(true)
+      if (Exit.isFailure(exit)) throw new Error("task execution failed")
+      expect(exit.value.output).toContain('state="cancelled"')
+      expect(exit.value.output).toContain("<task_error>")
+      expect(exit.value.output).not.toContain('state="completed"')
 
       // The observed cancellation request wins over the late clean return.
       const child = yield* sessions.get(input.sessionID)
@@ -1557,7 +1629,7 @@ describe("tool.task", () => {
     }),
   )
 
-  background.instance("a background subagent error fails the job and stamps the child errored", () =>
+  background.instance("a persisted background abort fails the job and stamps the child errored", () =>
     Effect.gen(function* () {
       const jobs = yield* BackgroundJob.Service
       const sessions = yield* Session.Service
@@ -1565,21 +1637,22 @@ describe("tool.task", () => {
       const tool = yield* TaskTool
       const def = yield* tool.init()
       const notifications: string[] = []
-      // The child's turn returns an assistant-level error; the parent's
-      // notification prompt succeeds so the wording can be observed.
+      // The prompt returns a stale clean snapshot after persisting an abort.
       const promptOps: TaskPromptOps = {
         ...stubOps(),
         prompt: (input) =>
-          Effect.sync(() => {
+          Effect.gen(function* () {
             if (input.sessionID === chat.id) {
               for (const part of input.parts) if (part.type === "text") notifications.push(part.text)
-              return reply(input, "noted")
+              return yield* persist(reply(input, "noted"))
             }
-            const base = reply(input, "partial output")
-            return {
-              ...base,
-              info: { ...base.info, error: { name: "UnknownError", data: { message: "boom" } } },
-            } as SessionLegacy.WithParts
+            const snapshot = reply(input, "")
+            yield* persist({
+              ...snapshot,
+              info: { ...snapshot.info, error: { name: "MessageAbortedError", data: { message: "Aborted" } } },
+              parts: [],
+            })
+            return snapshot
           }),
       }
 
@@ -1614,7 +1687,8 @@ describe("tool.task", () => {
         return notifications
       })
       expect(settled[0]).toContain('state="error"')
-      expect(settled[0]).toContain("Background task failed")
+      expect(settled[0]).toContain("MessageAbortedError")
+      expect(settled[0]).toContain("Aborted")
     }),
   )
 

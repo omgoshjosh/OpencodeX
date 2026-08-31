@@ -651,6 +651,9 @@ export type SessionStatus =
   | {
       type: "monitoring"
       childSessionID?: string
+      monitorID?: string
+      since?: number
+      checkAfter?: number
     }
 
 export type QuestionOption = {

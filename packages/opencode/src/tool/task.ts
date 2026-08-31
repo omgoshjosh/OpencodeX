@@ -17,6 +17,7 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import {
   DELEGATION_RECORD_VERSION,
   delegationAttempts,
+  monitorDelegation,
   settleDelegation,
   type DelegationOutcome,
   type DelegationRecord,
@@ -79,6 +80,17 @@ export const Parameters = Schema.Struct({
 
 function output(sessionID: SessionID, text: string) {
   return [`<task id="${sessionID}" state="completed">`, "<task_result>", text, "</task_result>", "</task>"].join("\n")
+}
+
+function monitoringOutput(input: { sessionID: SessionID; monitorID: string; checkAfter?: number }) {
+  return [
+    `<task id="${input.sessionID}" state="monitoring" monitor_id="${input.monitorID}">`,
+    "<summary>Subagent local work returned; external work is still being monitored</summary>",
+    "<task_result>",
+    `Monitoring ${input.monitorID}.${input.checkAfter ? ` Next check after ${input.checkAfter}.` : ""}`,
+    "</task_result>",
+    "</task>",
+  ].join("\n")
 }
 
 function backgroundOutput(sessionID: SessionID) {
@@ -415,16 +427,14 @@ export const TaskTool = Tool.define(
       // completed child rendered as unknown - so failures are logged, not
       // silently ignored.
       const stamp = (record: DelegationRecord, expectRunID?: string) =>
-        sessions
-          .stampDelegation({ sessionID: nextSession.id, record, ...(expectRunID ? { expectRunID } : {}) })
-          .pipe(
-            Effect.catchCause((cause) =>
-              Effect.sync(() => {
-                log.error("delegation stamp failed", { sessionID: nextSession.id, runID, cause })
-                return false
-              }),
-            ),
-          )
+        sessions.stampDelegation({ sessionID: nextSession.id, record, ...(expectRunID ? { expectRunID } : {}) }).pipe(
+          Effect.catchCause((cause) =>
+            Effect.sync(() => {
+              log.error("delegation stamp failed", { sessionID: nextSession.id, runID, cause })
+              return false
+            }),
+          ),
+        )
       const settle = (outcome: DelegationOutcome, summary?: string, error?: string) =>
         stamp(
           settleDelegation(started, {
@@ -457,7 +467,8 @@ export const TaskTool = Tool.define(
         // model comes next: a role spawning helpers of itself should run them on
         // what it is running, not on whatever its agent happens to configure.
         // Outside a swarm the agent's model keeps priority, as it always has.
-        const requested = parseModelOverride(params.model) ??
+        const requested =
+          parseModelOverride(params.model) ??
           swarmRoleModel(swarmRole) ??
           (swarm && !isSwarmProvider(caller.providerID) ? caller : undefined) ??
           next.model ??
@@ -470,7 +481,7 @@ export const TaskTool = Tool.define(
         // (the orchestrator delegating), so the fallback is the concrete model
         // that facade stands for.
         const model = isSwarmProvider(requested.providerID)
-          ? (yield* orchestratorModel(requested.modelID)) ?? next.model
+          ? ((yield* orchestratorModel(requested.modelID)) ?? next.model)
           : requested
         if (!model || isSwarmProvider(model.providerID))
           return yield* Effect.fail(
@@ -516,7 +527,7 @@ export const TaskTool = Tool.define(
               // to the next layer, so a swarm member keeps the task tool even
               // when its agent does not grant it explicitly - up to the depth cap,
               // past which delegation stops rather than recursing forever.
-              ...(( swarm && childDepth < MAX_SWARM_DELEGATION_DEPTH) ||
+              ...((swarm && childDepth < MAX_SWARM_DELEGATION_DEPTH) ||
               next.permission.some((rule) => rule.permission === id)
                 ? {}
                 : { task: false }),
@@ -529,7 +540,9 @@ export const TaskTool = Tool.define(
           // the caller - that is exactly the "completed but empty" confusion.
           const report =
             result.parts
-              .flatMap((part) => (part.type === "text" && !part.synthetic && part.text.trim() ? [part.text.trim()] : []))
+              .flatMap((part) =>
+                part.type === "text" && !part.synthetic && part.text.trim() ? [part.text.trim()] : [],
+              )
               .at(-1) ?? ""
           if (result.info.role === "assistant" && result.info.error) {
             const failure = [`The subagent failed: ${safeErrorText(result.info.error)}`, report]
@@ -571,6 +584,84 @@ export const TaskTool = Tool.define(
               ...(failure.retryAt !== undefined ? { retryAt: failure.retryAt } : {}),
             })
           })
+        const monitoringJob = () =>
+          background
+            .list()
+            .pipe(
+              Effect.map((jobs) =>
+                jobs.find(
+                  (job) =>
+                    job.status === "running" &&
+                    job.id !== nextSession.id &&
+                    job.metadata?.parentSessionId === nextSession.id,
+                ),
+              ),
+            )
+        const monitor = Effect.fn("TaskTool.monitorBackgroundChild")(function* (job: BackgroundJob.Info) {
+          const since = Date.now()
+          const record = monitorDelegation(started, {
+            monitorID: job.id,
+            childSessionID: nextSession.id,
+            since,
+          })
+          if (!(yield* stamp(record, runID))) return false
+          yield* status.set(nextSession.id, {
+            type: "monitoring",
+            childSessionID: nextSession.id,
+            monitorID: job.id,
+            since,
+          })
+          yield* background.wait({ id: job.id }).pipe(
+            Effect.andThen((waited) => {
+              const info = waited.info
+              if (!info || info.status === "completed")
+                return status
+                  .settleMonitoring({ sessionID: nextSession.id, monitorID: job.id, status: { type: "idle" } })
+                  .pipe(Effect.andThen((won) => (won ? settle("completed") : Effect.void)))
+              if (info.status === "cancelled")
+                return status
+                  .settleMonitoring({ sessionID: nextSession.id, monitorID: job.id, status: { type: "idle" } })
+                  .pipe(Effect.andThen((won) => (won ? settle("cancelled") : Effect.void)))
+              const failure = providerFailure(info.error ?? "External monitor failed", model)
+              return status
+                .settleMonitoring({
+                  sessionID: nextSession.id,
+                  monitorID: job.id,
+                  status: failure
+                    ? {
+                        type: "blocked",
+                        childSessionID: nextSession.id,
+                        attemptedModels: [`${model.providerID}/${model.modelID}`],
+                        error: failure.message,
+                        ...(failure.retryAt !== undefined ? { retryAt: failure.retryAt } : {}),
+                      }
+                    : { type: "idle" },
+                })
+                .pipe(
+                  Effect.andThen((won) =>
+                    won
+                      ? failure
+                        ? settle("errored", info.error, failure.message).pipe(
+                            Effect.andThen(
+                              status.set(ctx.sessionID, {
+                                type: "blocked",
+                                childSessionID: nextSession.id,
+                                attemptedModels: [`${model.providerID}/${model.modelID}`],
+                                error: failure.message,
+                                ...(failure.retryAt !== undefined ? { retryAt: failure.retryAt } : {}),
+                              }),
+                            ),
+                          )
+                        : settle("errored", info.error)
+                      : Effect.void,
+                  ),
+                )
+            }),
+            Effect.catchCause((cause) => Effect.logWarning("background monitor wait failed", { cause, jobID: job.id })),
+            Effect.forkIn(scope, { startImmediately: true }),
+          )
+          return true
+        })
         const settleFailure = (error: unknown) => {
           const failure = providerFailure(error, model)
           const evidence = failure
@@ -669,10 +760,9 @@ export const TaskTool = Tool.define(
                     ? inject("error", result.text).pipe(Effect.andThen(Effect.fail(new Error(result.text))))
                     : inject("completed", result.text).pipe(Effect.as(result.text)),
                 onFailure: (cause) =>
-                  (Cause.hasInterruptsOnly(cause)
-                    ? Effect.void
-                    : inject("error", errorText(Cause.squash(cause)))
-                  ).pipe(Effect.andThen(Effect.failCause(cause))),
+                  (Cause.hasInterruptsOnly(cause) ? Effect.void : inject("error", errorText(Cause.squash(cause)))).pipe(
+                    Effect.andThen(Effect.failCause(cause)),
+                  ),
               }),
             ),
           })
@@ -709,6 +799,14 @@ export const TaskTool = Tool.define(
                   title: params.description,
                   metadata,
                   output: output(nextSession.id, "The subagent was cancelled."),
+                }
+              }
+              const job = result.state === "completed" ? yield* monitoringJob() : undefined
+              if (job && (yield* monitor(job))) {
+                return {
+                  title: params.description,
+                  metadata: { ...metadata, monitorID: job.id },
+                  output: monitoringOutput({ sessionID: nextSession.id, monitorID: job.id }),
                 }
               }
               yield* settleResult(result)

@@ -14,7 +14,7 @@ import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
 
 import { MAX_SWARM_DELEGATION_DEPTH, TaskTool, type TaskPromptOps } from "../../src/tool/task"
-import { delegationOutcome, delegationRecord } from "../../src/session/delegation-outcome"
+import { DELEGATION_RECORD_VERSION, delegationOutcome, delegationRecord } from "../../src/session/delegation-outcome"
 import { Truncate } from "@/tool/truncate"
 import { ToolRegistry } from "@/tool/registry"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -24,6 +24,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { OpencodeXProjectTable, OpencodeXSwarmRoleTable, OpencodeXSwarmTable } from "@opencode-ai/core/opencodex/sql"
+import { ensureRunID } from "@opencode-ai/core/util/opencode-process"
 
 afterEach(async () => {
   await disposeAllInstances()
@@ -923,9 +924,17 @@ describe("tool.task", () => {
     Effect.gen(function* () {
       const jobs = yield* BackgroundJob.Service
       const status = yield* SessionStatus.Service
+      const events = yield* EventV2Bridge.Service
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
       const def = yield* tool.init()
+      const statuses: SessionStatus.Info[] = []
+      const off = yield* events.listen((event) => {
+        if (event.type !== SessionStatus.Event.Status.type) return Effect.void
+        const data = event.data as typeof SessionStatus.Event.Status.data.Type
+        if (data.sessionID === chat.id) statuses.push(data.status)
+        return Effect.void
+      })
 
       const result = yield* def.execute(
         {
@@ -960,15 +969,34 @@ describe("tool.task", () => {
         type: "idle",
         background: { running: true, jobs: [{ role: "general", title: "inspect bug", owner: expect.any(String) }] },
       })
+      yield* status.set(chat.id, { type: "busy" })
+      yield* status.set(chat.id, { type: "retry", attempt: 1, message: "retrying", next: 1 })
+      yield* status.set(chat.id, { type: "idle" })
+      yield* off
+      expect(statuses).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ type: "idle", background: { running: true, jobs: expect.any(Array) } }),
+          expect.objectContaining({ type: "busy", background: { running: true, jobs: expect.any(Array) } }),
+          expect.objectContaining({ type: "retry", background: { running: true, jobs: expect.any(Array) } }),
+        ]),
+      )
     }),
   )
 
   background.instance("background tasks complete through the background job service", () =>
     Effect.gen(function* () {
       const jobs = yield* BackgroundJob.Service
+      const events = yield* EventV2Bridge.Service
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
       const def = yield* tool.init()
+      const statuses: SessionStatus.Info[] = []
+      const off = yield* events.listen((event) => {
+        if (event.type !== SessionStatus.Event.Status.type) return Effect.void
+        const data = event.data as typeof SessionStatus.Event.Status.data.Type
+        if (data.sessionID === chat.id) statuses.push(data.status)
+        return Effect.void
+      })
 
       const result = yield* def.execute(
         {
@@ -994,6 +1022,56 @@ describe("tool.task", () => {
       expect(waited.timedOut).toBe(false)
       expect(waited.info?.status).toBe("completed")
       expect(waited.info?.output).toBe("background done")
+      yield* off
+      expect(statuses.at(-1)).toEqual({ type: "idle" })
+    }),
+  )
+
+  background.instance("publishes sorted live jobs and excludes dead owners", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const status = yield* SessionStatus.Service
+      const events = yield* EventV2Bridge.Service
+      const parent = yield* sessions.create({})
+      const children = yield* Effect.forEach(["zeta", "alpha", "dead"], () => sessions.create({ parentID: parent.id }))
+      yield* Effect.forEach(children, (child, index) =>
+        sessions.stampDelegation({
+          sessionID: child.id,
+          record: {
+            version: DELEGATION_RECORD_VERSION,
+            runID: `run_${index}`,
+            parentSessionID: parent.id,
+            mode: "background",
+            ownerID: index === 2 ? "local:999999:dead:run" : `local:${process.pid}:${ensureRunID()}:run_${index}`,
+            role: "general",
+            title: ["zeta", "alpha", "dead"][index]!,
+            attempt: 1,
+            phase: "running",
+            startedAt: 1,
+          },
+        }),
+      )
+      const published: SessionStatus.Info[] = []
+      const off = yield* events.listen((event) => {
+        if (event.type !== SessionStatus.Event.Status.type) return Effect.void
+        const data = event.data as typeof SessionStatus.Event.Status.data.Type
+        if (data.sessionID === parent.id) published.push(data.status)
+        return Effect.void
+      })
+      yield* status.set(parent.id, { type: "busy" })
+      yield* off
+      expect(published).toEqual([
+        {
+          type: "busy",
+          background: {
+            running: true,
+            jobs: [
+              { role: "general", title: "alpha", owner: expect.any(String) },
+              { role: "general", title: "zeta", owner: expect.any(String) },
+            ],
+          },
+        },
+      ])
     }),
   )
 

@@ -185,10 +185,12 @@ export const layer = Layer.effect(
         broadcasts,
         (event) =>
           Effect.gen(function* () {
-            yield* events.publish(Event.Status, {
-              sessionID: event.sessionID,
-              status: withBackground({ type: "idle" }, (yield* backgrounds()).get(event.sessionID)),
-            })
+            yield* events.broadcast(
+              yield* events.payload(Event.Status, {
+                sessionID: event.sessionID,
+                status: withBackground({ type: "idle" }, (yield* backgrounds()).get(event.sessionID)),
+              }),
+            )
             yield* events.broadcast(event.idle)
           }),
         { discard: true },
@@ -274,10 +276,12 @@ export const layer = Layer.effect(
           .pipe(Effect.orDie),
       )
       if (!committed) return false
-      yield* events.publish(Event.Status, {
-        sessionID,
-        status: withBackground(persisted, (yield* backgrounds()).get(sessionID)),
-      })
+      yield* events.broadcast(
+        yield* events.payload(Event.Status, {
+          sessionID,
+          status: withBackground(persisted, (yield* backgrounds()).get(sessionID)),
+        }),
+      )
       if (committed.idle) yield* events.broadcast(committed.idle)
       return true
     })

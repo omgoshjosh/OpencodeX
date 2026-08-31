@@ -23,6 +23,7 @@ import { ApiNotFoundError, PermissionNotFoundError, SessionBusyError } from "../
 import { described } from "./metadata"
 import { QueryBoolean } from "./query"
 import { ProviderV2 } from "@opencode-ai/core/provider"
+import { DelegationRetry } from "@/session/delegation-retry"
 
 const root = "/session"
 export const ListQuery = Schema.Struct({
@@ -112,6 +113,7 @@ export const SessionPaths = {
   deleteMessage: `${root}/:sessionID/message/:messageID`,
   deletePart: `${root}/:sessionID/message/:messageID/part/:partID`,
   updatePart: `${root}/:sessionID/message/:messageID/part/:partID`,
+  retryChild: `${root}/:sessionID/child/:childSessionID/retry`,
 } as const
 
 export const SessionApi = HttpApi.make("session")
@@ -161,6 +163,26 @@ export const SessionApi = HttpApi.make("session")
             identifier: "session.children",
             summary: "Get session children",
             description: "Retrieve all child sessions that were forked from the specified parent session.",
+          }),
+        ),
+        HttpApiEndpoint.post("retryChild", SessionPaths.retryChild, {
+          params: { sessionID: SessionID, childSessionID: SessionID },
+          query: WorkspaceRoutingQuery,
+          success: described(
+            Schema.Struct({
+              childSessionID: SessionID,
+              attempt: Schema.Number,
+              providerID: ProviderV2.ID,
+              modelID: ProviderV2.ModelID,
+              status: Schema.Literal("busy"),
+            }),
+            "Started blocked child retry",
+          ),
+          error: HttpApiError.BadRequest,
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "session.child.retry",
+            summary: "Retry a blocked child using its swarm role routes",
           }),
         ),
         HttpApiEndpoint.get("todo", SessionPaths.todo, {

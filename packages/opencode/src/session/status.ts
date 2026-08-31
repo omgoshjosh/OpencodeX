@@ -3,33 +3,25 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
 import { NonNegativeInt } from "@opencode-ai/core/schema"
-import { SessionExecutionTable, SessionStatusTable, SessionTable } from "@opencode-ai/core/session/sql"
+import { SessionExecutionTable, SessionStatusTable } from "@opencode-ai/core/session/sql"
 import { ensureRunID } from "@opencode-ai/core/util/opencode-process"
 import { and, eq } from "drizzle-orm"
 import { Context, Duration, Effect, Layer, Option, Schedule, Schema } from "effect"
 import { SessionID } from "./schema"
 import { SessionExecutionOwner } from "./execution-owner"
-import { delegationRecord } from "./delegation-outcome"
 
-const Background = Schema.Struct({
-  running: Schema.Boolean,
-  jobs: Schema.Array(Schema.Struct({ role: Schema.String, title: Schema.String, owner: Schema.String })),
-})
 export const Info = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("idle"),
-    background: Schema.optional(Background),
   }),
   Schema.Struct({
     type: Schema.Literal("retry"),
     attempt: NonNegativeInt,
     message: Schema.String,
     next: NonNegativeInt,
-    background: Schema.optional(Background),
   }),
   Schema.Struct({
     type: Schema.Literal("busy"),
-    background: Schema.optional(Background),
   }),
   Schema.Struct({
     type: Schema.Literal("blocked"),
@@ -72,6 +64,10 @@ export interface Interface {
   readonly set: (sessionID: SessionID, status: Info) => Effect.Effect<void>
   readonly setForGeneration: (sessionID: SessionID, generation: number, status: Info) => Effect.Effect<boolean>
   readonly refresh: (sessionID: SessionID) => Effect.Effect<void>
+  readonly claimBlockedRetry: (input: {
+    sessionID: SessionID
+    childSessionID: SessionID
+  }) => Effect.Effect<boolean>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionStatus") {}
@@ -91,37 +87,6 @@ export const layer = Layer.effect(
     const { db } = yield* Database.Service
     const processRunID = ensureRunID()
 
-    const backgrounds = Effect.fnUntraced(function* () {
-      const rows = yield* db
-        .select({ metadata: SessionTable.metadata, title: SessionTable.title })
-        .from(SessionTable)
-        .all()
-        .pipe(Effect.orDie)
-      return rows.reduce((result, row) => {
-        const record = delegationRecord(row.metadata)
-        if (record?.mode !== "background" || record.phase !== "running" || !record.ownerID) return result
-        if (!SessionExecutionOwner.alive(record.ownerID, processRunID)) return result
-        const parentID = SessionID.make(record.parentSessionID)
-        const jobs = result.get(parentID) ?? []
-        jobs.push({ role: record.role ?? "Background task", title: record.title ?? row.title, owner: record.ownerID })
-        result.set(parentID, jobs)
-        return result
-      }, new Map<SessionID, { role: string; title: string; owner: string }[]>())
-    })
-
-    const withBackground = (status: Info, jobs: { role: string; title: string; owner: string }[] | undefined): Info =>
-      jobs?.length
-        ? {
-            ...status,
-            background: {
-              running: true,
-              jobs: jobs.toSorted((a, b) =>
-                `${a.role}\u0000${a.title}\u0000${a.owner}`.localeCompare(`${b.role}\u0000${b.title}\u0000${b.owner}`),
-              ),
-            },
-          }
-        : status
-
     // `sessionID` scopes the scan to one row. Reads take that path so a status
     // lookup stays an indexed point query instead of two full table scans in an
     // immediate transaction under the event barrier; the periodic sweep below
@@ -129,83 +94,69 @@ export const layer = Layer.effect(
     const recover = Effect.fn("SessionStatus.recover")(function* (sessionID?: SessionID) {
       const now = Date.now()
       const broadcasts = yield* events.barrier(
-        db
-          .transaction(
-            (transaction) =>
-              Effect.gen(function* () {
-                const statusQuery = transaction.select().from(SessionStatusTable)
-                const statuses = (yield* (
-                  sessionID ? statusQuery.where(eq(SessionStatusTable.session_id, sessionID)) : statusQuery
-                ).all()).filter((row) => {
-                  const status = Option.getOrUndefined(decode(row.status))
-                  return status?.type === "busy" || status?.type === "retry"
-                })
-                if (statuses.length === 0) return [] as { sessionID: SessionID; idle: EventV2.Payload }[]
-                const executionQuery = transaction.select().from(SessionExecutionTable)
-                const executions = new Map(
-                  (yield* (
-                    sessionID ? executionQuery.where(eq(SessionExecutionTable.session_id, sessionID)) : executionQuery
-                  ).all()).map((row) => [row.session_id, row]),
-                )
-                const stale = statuses.filter((row) => {
-                  const execution = executions.get(row.session_id)
-                  if (!execution) return row.time_updated + OWNERLESS_STALE_MILLIS <= now
-                  if (execution.state !== "running" || !execution.owner_id) return true
-                  if (!execution.lease_expires_at || execution.lease_expires_at <= now) return true
-                  return !SessionExecutionOwner.alive(execution.owner_id, processRunID)
-                })
-                const result: { sessionID: SessionID; idle: EventV2.Payload }[] = []
-                for (const row of stale) {
-                  const execution = executions.get(row.session_id)
-                  if (execution) {
-                    yield* transaction
-                      .update(SessionExecutionTable)
-                      .set({
-                        state: "interrupted",
-                        owner_id: null,
-                        lease_expires_at: null,
-                        completed_at: now,
-                        time_updated: now,
-                      })
-                      .where(
-                        and(
-                          eq(SessionExecutionTable.session_id, row.session_id),
-                          eq(SessionExecutionTable.generation, execution.generation),
-                        ),
-                      )
-                      .run()
-                  }
+        db.transaction(
+          (transaction) =>
+            Effect.gen(function* () {
+              const statusQuery = transaction.select().from(SessionStatusTable)
+              const statuses = (yield* (sessionID
+                ? statusQuery.where(eq(SessionStatusTable.session_id, sessionID))
+                : statusQuery
+              ).all()).filter((row) => {
+                const status = Option.getOrUndefined(decode(row.status))
+                return status?.type === "busy" || status?.type === "retry"
+              })
+              if (statuses.length === 0) return [] as EventV2.Payload[]
+              const executionQuery = transaction.select().from(SessionExecutionTable)
+              const executions = new Map(
+                (yield* (sessionID
+                  ? executionQuery.where(eq(SessionExecutionTable.session_id, sessionID))
+                  : executionQuery
+                ).all()).map((row) => [row.session_id, row]),
+              )
+              const stale = statuses.filter((row) => {
+                const execution = executions.get(row.session_id)
+                if (!execution) return row.time_updated + OWNERLESS_STALE_MILLIS <= now
+                if (execution.state !== "running" || !execution.owner_id) return true
+                if (!execution.lease_expires_at || execution.lease_expires_at <= now) return true
+                return !SessionExecutionOwner.alive(execution.owner_id, processRunID)
+              })
+              const result: EventV2.Payload[] = []
+              for (const row of stale) {
+                const execution = executions.get(row.session_id)
+                if (execution) {
                   yield* transaction
-                    .update(SessionStatusTable)
-                    .set({ status: { type: "idle" }, time_updated: now })
-                    .where(eq(SessionStatusTable.session_id, row.session_id))
+                    .update(SessionExecutionTable)
+                    .set({
+                      state: "interrupted",
+                      owner_id: null,
+                      lease_expires_at: null,
+                      completed_at: now,
+                      time_updated: now,
+                    })
+                    .where(
+                      and(
+                        eq(SessionExecutionTable.session_id, row.session_id),
+                        eq(SessionExecutionTable.generation, execution.generation),
+                      ),
+                    )
                     .run()
-                  yield* events.commit(Event.Status, { sessionID: row.session_id, status: { type: "idle" } })
-                  result.push({
-                    sessionID: row.session_id,
-                    idle: yield* events.commit(Event.Idle, { sessionID: row.session_id }),
-                  })
                 }
-                return result
-              }),
-            { behavior: "immediate" },
-          )
-          .pipe(Effect.orDie),
+                yield* transaction
+                  .update(SessionStatusTable)
+                  .set({ status: { type: "idle" }, time_updated: now })
+                  .where(eq(SessionStatusTable.session_id, row.session_id))
+                  .run()
+                result.push(
+                  yield* events.commit(Event.Status, { sessionID: row.session_id, status: { type: "idle" } }),
+                  yield* events.commit(Event.Idle, { sessionID: row.session_id }),
+                )
+              }
+              return result
+            }),
+          { behavior: "immediate" },
+        ).pipe(Effect.orDie),
       )
-      yield* Effect.forEach(
-        broadcasts,
-        (event) =>
-          Effect.gen(function* () {
-            yield* events.broadcast(
-              yield* events.payload(Event.Status, {
-                sessionID: event.sessionID,
-                status: withBackground({ type: "idle" }, (yield* backgrounds()).get(event.sessionID)),
-              }),
-            )
-            yield* events.broadcast(event.idle)
-          }),
-        { discard: true },
-      )
+      yield* Effect.forEach(broadcasts, events.broadcast, { discard: true })
     })
 
     const get = Effect.fn("SessionStatus.get")(function* (sessionID: SessionID) {
@@ -216,10 +167,7 @@ export const layer = Layer.effect(
         .where(eq(SessionStatusTable.session_id, sessionID))
         .get()
         .pipe(Effect.orDie)
-      const status = row
-        ? Option.getOrElse(decode(row.status), () => ({ type: "idle" as const }))
-        : { type: "idle" as const }
-      return withBackground(status, (yield* backgrounds()).get(sessionID))
+      return row ? Option.getOrElse(decode(row.status), () => ({ type: "idle" as const })) : { type: "idle" as const }
     })
 
     const list = Effect.fn("SessionStatus.list")(function* () {
@@ -229,82 +177,72 @@ export const layer = Layer.effect(
         .from(SessionStatusTable)
         .all()
         .pipe(Effect.orDie)
-      const result = new Map<SessionID, Info>(
+      return new Map(
         rows.flatMap((row) => {
           const status = Option.getOrUndefined(decode(row.status))
           return status && status.type !== "idle" ? [[row.sessionID, status] as const] : []
         }),
       )
-      for (const [sessionID, jobs] of yield* backgrounds()) {
-        result.set(sessionID, withBackground(result.get(sessionID) ?? { type: "idle" }, jobs))
-      }
-      return result
     })
 
     const write = Effect.fnUntraced(function* (sessionID: SessionID, status: Info, generation?: number) {
       const ctx = yield* InstanceState.context
       const now = Date.now()
-      const { background: _background, ...persisted } = status
       const committed = yield* events.barrier(
-        db
-          .transaction(
-            (transaction) =>
-              Effect.gen(function* () {
-                if (generation !== undefined) {
-                  const execution = yield* transaction
-                    .select({ generation: SessionExecutionTable.generation, state: SessionExecutionTable.state })
-                    .from(SessionExecutionTable)
-                    .where(eq(SessionExecutionTable.session_id, sessionID))
-                    .get()
-                  if (execution?.generation !== generation) return undefined
-                  if (status.type !== "idle" && execution.state !== "running") return undefined
-                }
-                // A blocked child and external monitoring are independently
-                // owned states. Releasing the local execution must not erase
-                // either state after it has been persisted.
-                if (status.type === "idle") {
-                  const current = yield* transaction
-                    .select({ status: SessionStatusTable.status })
-                    .from(SessionStatusTable)
-                    .where(eq(SessionStatusTable.session_id, sessionID))
-                    .get()
-                  const existing = current && Option.getOrUndefined(decode(current.status))
-                  if (existing?.type === "blocked" || existing?.type === "monitoring") return undefined
-                }
-                yield* transaction
-                  .insert(SessionStatusTable)
-                  .values({
-                    session_id: sessionID,
+        db.transaction(
+          (transaction) =>
+            Effect.gen(function* () {
+              if (generation !== undefined) {
+                const execution = yield* transaction
+                  .select({ generation: SessionExecutionTable.generation, state: SessionExecutionTable.state })
+                  .from(SessionExecutionTable)
+                  .where(eq(SessionExecutionTable.session_id, sessionID))
+                  .get()
+                if (execution?.generation !== generation) return undefined
+                if (status.type !== "idle" && execution.state !== "running") return undefined
+              }
+              // A blocked child and external monitoring are independently
+              // owned states. Releasing the local execution must not erase
+              // either state after it has been persisted.
+              if (status.type === "idle") {
+                const current = yield* transaction
+                  .select({ status: SessionStatusTable.status })
+                  .from(SessionStatusTable)
+                  .where(eq(SessionStatusTable.session_id, sessionID))
+                  .get()
+                const existing = current && Option.getOrUndefined(decode(current.status))
+                if (existing?.type === "blocked" || existing?.type === "monitoring") return undefined
+              }
+              yield* transaction
+                .insert(SessionStatusTable)
+                .values({
+                  session_id: sessionID,
+                  project_id: ctx.project.id,
+                  directory: ctx.directory,
+                  status,
+                  time_created: now,
+                  time_updated: now,
+                })
+                .onConflictDoUpdate({
+                  target: SessionStatusTable.session_id,
+                  set: {
                     project_id: ctx.project.id,
                     directory: ctx.directory,
-                    status: persisted,
-                    time_created: now,
+                    status,
                     time_updated: now,
-                  })
-                  .onConflictDoUpdate({
-                    target: SessionStatusTable.session_id,
-                    set: {
-                      project_id: ctx.project.id,
-                      directory: ctx.directory,
-                      status: persisted,
-                      time_updated: now,
-                    },
-                  })
-                  .run()
-                yield* events.commit(Event.Status, { sessionID, status: persisted })
-                return { idle: status.type === "idle" ? yield* events.commit(Event.Idle, { sessionID }) : undefined }
-              }),
-            { behavior: "immediate" },
-          )
-          .pipe(Effect.orDie),
+                  },
+                })
+                .run()
+              return {
+                status: yield* events.commit(Event.Status, { sessionID, status }),
+                idle: status.type === "idle" ? yield* events.commit(Event.Idle, { sessionID }) : undefined,
+              }
+            }),
+          { behavior: "immediate" },
+        ).pipe(Effect.orDie),
       )
       if (!committed) return false
-      yield* events.broadcast(
-        yield* events.payload(Event.Status, {
-          sessionID,
-          status: withBackground(persisted, (yield* backgrounds()).get(sessionID)),
-        }),
-      )
+      yield* events.broadcast(committed.status)
       if (committed.idle) yield* events.broadcast(committed.idle)
       return true
     })
@@ -324,6 +262,37 @@ export const layer = Layer.effect(
         return
       }
       yield* write(sessionID, status)
+    })
+
+    const claimBlockedRetry = Effect.fn("SessionStatus.claimBlockedRetry")(function* (input: {
+      sessionID: SessionID
+      childSessionID: SessionID
+    }) {
+      const now = Date.now()
+      const committed = yield* events.barrier(
+        db.transaction(
+          (transaction) =>
+            Effect.gen(function* () {
+              const current = yield* transaction
+                .select({ status: SessionStatusTable.status })
+                .from(SessionStatusTable)
+                .where(eq(SessionStatusTable.session_id, input.sessionID))
+                .get()
+              const status = current && Option.getOrUndefined(decode(current.status))
+              if (status?.type !== "blocked" || status.childSessionID !== input.childSessionID) return undefined
+              yield* transaction
+                .update(SessionStatusTable)
+                .set({ status: { type: "busy" }, time_updated: now })
+                .where(eq(SessionStatusTable.session_id, input.sessionID))
+                .run()
+              return yield* events.commit(Event.Status, { sessionID: input.sessionID, status: { type: "busy" } })
+            }),
+          { behavior: "immediate" },
+        ).pipe(Effect.orDie),
+      )
+      if (!committed) return false
+      yield* events.broadcast(committed)
+      return true
     })
 
     const refresh = Effect.fn("SessionStatus.refresh")(function* (sessionID: SessionID) {
@@ -347,10 +316,13 @@ export const layer = Layer.effect(
       Effect.forkScoped,
     )
 
-    return Service.of({ get, list, set, setForGeneration, refresh })
+    return Service.of({ get, list, set, setForGeneration, refresh, claimBlockedRetry })
   }),
 )
 
-export const defaultLayer = layer.pipe(Layer.provide(Database.defaultLayer), Layer.provide(EventV2Bridge.defaultLayer))
+export const defaultLayer = layer.pipe(
+  Layer.provide(Database.defaultLayer),
+  Layer.provide(EventV2Bridge.defaultLayer),
+)
 
 export * as SessionStatus from "./status"

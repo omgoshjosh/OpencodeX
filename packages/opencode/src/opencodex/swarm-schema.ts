@@ -33,12 +33,10 @@ export const RoleStatus = Schema.Literals([
 ])
 export type RoleStatus = Schema.Schema.Type<typeof RoleStatus>
 
-export const FallbackModel = Schema.Struct({
+export const ModelRef = Schema.Struct({
   providerID: ProviderV2.ID,
   modelID: ProviderV2.ModelID,
-  variant: Schema.optional(Schema.String),
-}).annotate({ identifier: "OpencodeXSwarmFallbackModel" })
-export type FallbackModel = Schema.Schema.Type<typeof FallbackModel>
+})
 
 export const Event = Schema.Struct({
   id: Schema.String,
@@ -79,9 +77,9 @@ export const Role = Schema.Struct({
   skill: Schema.optional(Schema.String),
   providerID: Schema.optional(ProviderV2.ID),
   modelID: Schema.optional(ProviderV2.ModelID),
+  fallbackModels: Schema.optional(Schema.Array(ModelRef)),
   /** The model variant (effort level) this role runs at, when one is chosen. */
   variant: Schema.optional(Schema.String),
-  fallbackModels: Schema.Array(FallbackModel),
   modelProfile: Schema.optional(Schema.String),
   status: RoleStatus,
   instructions: Schema.String,
@@ -120,9 +118,9 @@ export const RoleInput = Schema.Struct({
   skill: Schema.optional(Schema.String),
   providerID: Schema.optional(ProviderV2.ID),
   modelID: Schema.optional(ProviderV2.ModelID),
+  fallbackModels: Schema.optional(Schema.Array(ModelRef)),
   /** The model variant (effort level) to run this role at. */
   variant: Schema.optional(Schema.String),
-  fallbackModels: Schema.optional(Schema.Array(FallbackModel)),
   modelProfile: Schema.optional(Schema.String),
   instructions: Schema.String,
   metadata: Schema.optional(Metadata),
@@ -156,10 +154,10 @@ export const UpdateRoleInput = Schema.Struct({
   name: Schema.optional(Schema.String),
   agent: Schema.optional(Schema.String),
   skill: Schema.optional(Schema.String),
-  providerID: Schema.optional(ProviderV2.ID),
-  modelID: Schema.optional(ProviderV2.ModelID),
+  providerID: Schema.optional(Schema.String),
+  modelID: Schema.optional(Schema.String),
+  fallbackModels: Schema.optional(Schema.Array(ModelRef)),
   variant: Schema.optional(Schema.String),
-  fallbackModels: Schema.optional(Schema.Array(FallbackModel)),
   modelProfile: Schema.optional(Schema.String),
   instructions: Schema.optional(Schema.String),
   metadata: Schema.optional(Metadata),

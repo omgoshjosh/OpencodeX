@@ -7,7 +7,7 @@ import type { Config } from "../../../src/config/config"
 import type { MessageV2 } from "../../../src/session/message-v2"
 import { MessageID, PartID } from "../../../src/session/schema"
 import { call, callAuthProbe } from "./backend"
-import { original } from "./environment"
+import { original, resetExerciseDatabase } from "./environment"
 import { runtime } from "./runtime"
 import type { ActiveScenario, Options, ProjectOptions, Result, Scenario, ScenarioContext, SeededContext } from "./types"
 import { ProviderV2 } from "@opencode-ai/core/provider"
@@ -16,13 +16,14 @@ export function runScenario(options: Options) {
   return (scenario: Scenario) => {
     if (scenario.kind === "todo") return Effect.succeed({ status: "skip", scenario } as Result)
     return runActive(options, scenario).pipe(
+      Effect.scoped,
+      Effect.ensuring(scenario.reset ? resetState : Effect.void),
       Effect.timeoutOrElse({
         duration: options.scenarioTimeout,
         orElse: () => Effect.die(new Error(`scenario timed out after ${Duration.format(options.scenarioTimeout)}`)),
       }),
       Effect.as({ status: "pass", scenario } as Result),
       Effect.catchCause((cause) => Effect.succeed({ status: "fail" as const, scenario, message: Cause.pretty(cause) })),
-      Effect.scoped,
     )
   }
 }
@@ -44,10 +45,10 @@ function runActive(options: Options, scenario: ActiveScenario) {
 
 function runAuth(scenario: ActiveScenario, ctx: SeededContext<unknown>) {
   return Effect.gen(function* () {
-    const result = yield* callAuthProbe(scenario, ctx.headers(), "missing")
+    const result = yield* callAuthProbe(scenario, ctx, "missing")
     if (scenario.auth === "protected") {
       if (result.status !== 401) throw new Error(`auth expected 401, got ${result.status}`)
-      const authed = yield* callAuthProbe(scenario, ctx.headers(), "valid")
+      const authed = yield* callAuthProbe(scenario, ctx, "valid")
       if (authed.status === 401) throw new Error("auth rejected valid credentials")
       return
     }
@@ -89,7 +90,8 @@ function withContext<A, E>(
         yield* trace(options, scenario, `${label} runtime start`)
         const modules = yield* Effect.promise(() => runtime())
         const scope = yield* Scope.Scope
-        const app = yield* Layer.buildWithMemoMap(modules.AppLayer, modules.memoMap, scope)
+        const memoMap = modules.memoMap()
+        const app = yield* Layer.buildWithMemoMap(modules.AppLayer, memoMap, scope)
         yield* trace(options, scenario, `${label} runtime done`)
         const path = context.dir?.path
         const instance = path
@@ -123,6 +125,8 @@ function withContext<A, E>(
           return context.llm
         }
         const base: ScenarioContext = {
+          memoMap,
+          apps: {},
           directory: context.dir?.path,
           headers: (extra) => ({
             ...(context.dir?.path ? { "x-opencode-directory": context.dir.path } : {}),
@@ -183,6 +187,9 @@ function withContext<A, E>(
           llmWait: (count) => Effect.suspend(() => llm().wait(count)),
           tuiRequest: (request) => Effect.sync(() => modules.Tui.submitTuiRequest(request)),
         }
+        yield* Effect.addFinalizer(() =>
+          Effect.forEach(Object.values(base.apps), (app) => Effect.promise(() => app.dispose()).pipe(Effect.ignore)),
+        )
         yield* trace(options, scenario, `${label} seed start`)
         const state = seed ? yield* scenario.seed(base) : undefined
         yield* trace(options, scenario, `${label} seed done`)
@@ -192,7 +199,6 @@ function withContext<A, E>(
         return result
       }).pipe(Effect.ensuring(context.llm ? context.llm.reset : Effect.void)),
     ),
-    Effect.ensuring(options.mode !== "auth" && scenario.reset ? resetState : Effect.void),
   )
 }
 
@@ -256,10 +262,8 @@ function fakeLlmConfig(url: string): Partial<Config.Info> {
 }
 
 const resetState = Effect.promise(async () => {
-  const modules = await runtime()
   Flag.OPENCODE_SERVER_PASSWORD = original.OPENCODE_SERVER_PASSWORD
   Flag.OPENCODE_SERVER_USERNAME = original.OPENCODE_SERVER_USERNAME
-  await modules.disposeAllInstances()
-  await modules.resetDatabase()
+  await Effect.runPromise(resetExerciseDatabase)
   await Bun.sleep(25)
 })

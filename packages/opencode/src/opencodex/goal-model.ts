@@ -1,4 +1,8 @@
-import type { OpencodeXGoalEdgeTable, OpencodeXGoalNodeTable, OpencodeXGoalTable } from "@opencode-ai/core/opencodex/sql"
+import type {
+  OpencodeXGoalEdgeTable,
+  OpencodeXGoalNodeTable,
+  OpencodeXGoalTable,
+} from "@opencode-ai/core/opencodex/sql"
 import { Option, Schema } from "effect"
 import { OpencodeXJob } from "@/opencodex/job"
 import {
@@ -79,13 +83,13 @@ export function hydrateNode(row: NodeRow, all: readonly NodeRow[]): Node {
     brief: row.brief,
     status: Schema.decodeUnknownSync(NodeStatus)(row.status),
     executor: row.executor_json ? Option.getOrUndefined(decodeExecutor(row.executor_json)) : undefined,
-    parentNodeID: row.parent_node_id ?? undefined,
+    parentNodeID: row.parent_node_id?.trim() || undefined,
     loop: loop
       ? {
           ...loop,
           // Membership lives on the child rows, so the body list cannot drift
           // out of sync with the nodes that actually belong to the loop.
-          bodyNodeIDs: all.filter((item) => item.parent_node_id === row.id).map((item) => item.id),
+          bodyNodeIDs: all.filter((item) => item.parent_node_id?.trim() === row.id).map((item) => item.id),
         }
       : undefined,
     sortOrder: row.sort_order,

@@ -30,6 +30,7 @@ import { SwarmBriefing } from "@/opencodex/swarm-briefing"
 import { isSwarmProvider } from "@/provider/swarm-provider"
 import { hydrateFallbackModels } from "@/opencodex/swarm-model"
 import { shouldAdvanceModelFallback } from "@/session/model-fallback"
+import { ensureRunID } from "@opencode-ai/core/util/opencode-process"
 
 const log = Log.create({ service: "tool.task" })
 
@@ -94,7 +95,9 @@ export const Parameters = Schema.Struct({
 
 function output(sessionID: SessionID, result: TaskRunResult) {
   const tag = result.state === "completed" ? "task_result" : "task_error"
-  return [`<task id="${sessionID}" state="${result.state}">`, `<${tag}>`, result.text, `</${tag}>`, "</task>"].join("\n")
+  return [`<task id="${sessionID}" state="${result.state}">`, `<${tag}>`, result.text, `</${tag}>`, "</task>"].join(
+    "\n",
+  )
 }
 
 function backgroundOutput(sessionID: SessionID) {
@@ -355,12 +358,23 @@ export const TaskTool = Tool.define(
       // previous outcome, and every later write compare-and-sets on the runID
       // so a stale run can never overwrite a newer one.
       const runID = Identifier.ascending("run")
+      // This is the exact child *user* message boundary. Its assistant reply
+      // has `parentID === childMessageID`, which restart recovery uses instead
+      // of guessing from a reused child session's latest transcript entry.
+      const childMessageID = MessageID.ascending()
       const started: DelegationRecord = {
         version: DELEGATION_RECORD_VERSION,
         runID,
         parentSessionID: ctx.sessionID,
         parentMessageID: ctx.messageID,
         ...(ctx.callID ? { toolCallID: ctx.callID } : {}),
+        ...(runInBackground
+          ? {
+              mode: "background" as const,
+              ownerID: `local:${process.pid}:${ensureRunID()}:${runID}`,
+              childMessageID,
+            }
+          : {}),
         attempt: delegationAttempts(nextSession.metadata) + 1,
         phase: "running",
         startedAt: Date.now(),
@@ -382,10 +396,8 @@ export const TaskTool = Tool.define(
           settleDelegation(started, {
             outcome,
             summary,
-            // Delivery starts pending only for a clean completion the parent
-            // still has to durably receive; errors surface through their own
-            // channels.
-            ...(outcome === "completed" ? { deliveryOutcome: "pending" as const } : {}),
+            // Background terminal outcomes all need durable parent delivery.
+            ...(outcome === "completed" || runInBackground ? { deliveryOutcome: "pending" as const } : {}),
           }),
           runID,
         ).pipe(Effect.asVoid)
@@ -473,7 +485,7 @@ export const TaskTool = Tool.define(
 
         const runTask = Effect.fn("TaskTool.runTask")(function* () {
           const parts = yield* ops.resolvePromptParts(params.prompt)
-          const userMessageID = MessageID.ascending()
+          const userMessageID = childMessageID
           const first = models[0]
           metadata.model = { providerID: first.providerID, modelID: first.modelID }
           const initial = yield* ops.prompt({
@@ -542,7 +554,9 @@ export const TaskTool = Tool.define(
           // the caller - that is exactly the "completed but empty" confusion.
           const report =
             persisted.parts
-              .flatMap((part) => (part.type === "text" && !part.synthetic && part.text.trim() ? [part.text.trim()] : []))
+              .flatMap((part) =>
+                part.type === "text" && !part.synthetic && part.text.trim() ? [part.text.trim()] : [],
+              )
               .at(-1) ?? ""
           if (persisted.info.role === "assistant" && persisted.info.error) {
             const failure = [`The subagent failed: ${JSON.stringify(persisted.info.error)}`, report]

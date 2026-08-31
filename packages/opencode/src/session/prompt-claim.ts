@@ -8,16 +8,15 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { InstanceState } from "@/effect/instance-state"
 import { MessageID, SessionID } from "./schema"
 import type { LoopInput } from "./prompt-schema"
-import { SessionPromptRecovery } from "./prompt-recovery"
 import * as Session from "./session"
+import { SessionExecutionOwner } from "./execution-owner"
+import { ensureRunID } from "@opencode-ai/core/util/opencode-process"
 
 export interface Deps {
   readonly database: Context.Service.Shape<typeof Database.Service>
   readonly events: Context.Service.Shape<typeof EventV2Bridge.Service>
   readonly scope: Scope.Scope
   readonly loop: (input: LoopInput) => Effect.Effect<SessionLegacy.WithParts>
-  readonly commandLeaseMillis?: number
-  readonly clock?: () => number
 }
 
 /**
@@ -30,12 +29,12 @@ export function make(deps: Deps) {
   return Effect.gen(function* () {
     const { database, events, scope, loop } = deps
     const { db } = database
-    const commandOwner = `local:${process.pid}:prompt:${crypto.randomUUID()}`
-    const commandLeaseMillis = deps.commandLeaseMillis ?? 30_000
-    const clock = deps.clock ?? Date.now
+    const processRunID = ensureRunID()
+    const commandOwner = `local:${process.pid}:${processRunID}:${crypto.randomUUID()}`
+    const commandLeaseMillis = 30_000
 
     const claimCommandTurn = Effect.fn("SessionPrompt.claimCommandTurn")(function* (commandID: string) {
-      const now = clock()
+      const now = Date.now()
       return yield* db
         .transaction(
           (transaction) =>
@@ -48,15 +47,19 @@ export function make(deps: Deps) {
               if (!current || ["succeeded", "failed", "cancelled"].includes(current.status)) {
                 return { state: "done" as const }
               }
-              if (current.status === "running" && current.lease_expires_at && current.lease_expires_at > now) {
-                return { state: "occupied" as const }
+              if (
+                current.status === "running" &&
+                current.owner_id &&
+                current.lease_expires_at &&
+                current.lease_expires_at > now &&
+                SessionExecutionOwner.alive(current.owner_id, processRunID)
+              ) {
+                return { state: "waiting" as const }
               }
               const active = yield* transaction
                 .select({
                   id: SessionCommandTable.id,
                   created: SessionCommandTable.time_created,
-                  status: SessionCommandTable.status,
-                  leaseExpiresAt: SessionCommandTable.lease_expires_at,
                 })
                 .from(SessionCommandTable)
                 .where(
@@ -66,18 +69,14 @@ export function make(deps: Deps) {
                   ),
                 )
                 .all()
-              const blocker = active.find(
+              const blocked = active.some(
                 (item) =>
                   item.id !== current.id &&
                   (item.created < current.time_created ||
                     (item.created === current.time_created && item.id.localeCompare(current.id) < 0)),
               )
-              if (blocker) {
-                if (blocker.status === "running" && (!blocker.leaseExpiresAt || blocker.leaseExpiresAt <= now)) {
-                  return { state: "blocked" as const, commandID: blocker.id }
-                }
-                return { state: "waiting" as const }
-              }
+              if (blocked) return { state: "waiting" as const }
+              const runningOwner = current.status === "running" ? current.owner_id : undefined
               const claimed = yield* transaction
                 .update(SessionCommandTable)
                 .set({
@@ -93,14 +92,12 @@ export function make(deps: Deps) {
                     eq(SessionCommandTable.id, commandID),
                     eq(SessionCommandTable.status, current.status),
                     eq(SessionCommandTable.claim_generation, current.claim_generation),
-                    current.status === "running"
-                      ? or(isNull(SessionCommandTable.lease_expires_at), lt(SessionCommandTable.lease_expires_at, now))
-                      : undefined,
+                    runningOwner ? eq(SessionCommandTable.owner_id, runningOwner) : undefined,
                   ),
                 )
                 .returning()
                 .get()
-              if (!claimed) return { state: "occupied" as const }
+              if (!claimed) return { state: "waiting" as const }
               return { state: "ready" as const, command: claimed }
             }),
           { behavior: "immediate" },
@@ -122,7 +119,11 @@ export function make(deps: Deps) {
               .get()
               .pipe(Effect.orDie),
             db
-              .select({ state: SessionExecutionTable.state, leaseExpiresAt: SessionExecutionTable.lease_expires_at })
+              .select({
+                state: SessionExecutionTable.state,
+                owner: SessionExecutionTable.owner_id,
+                leaseExpiresAt: SessionExecutionTable.lease_expires_at,
+              })
               .from(SessionExecutionTable)
               .where(eq(SessionExecutionTable.session_id, sessionID))
               .get()
@@ -131,50 +132,74 @@ export function make(deps: Deps) {
           { concurrency: "unbounded" },
         )
         if (!command || ["succeeded", "failed", "cancelled"].includes(command.status)) return false
-        if (execution?.state !== "running" || !execution.leaseExpiresAt || execution.leaseExpiresAt <= clock()) {
+        if (
+          execution?.state !== "running" ||
+          !execution.owner ||
+          !execution.leaseExpiresAt ||
+          execution.leaseExpiresAt <= Date.now() ||
+          !SessionExecutionOwner.alive(execution.owner, processRunID)
+        ) {
           return true
         }
         yield* Effect.sleep("200 millis")
       }
     })
 
-    type ExecuteCommand = (commandID: string) => Effect.Effect<void>
-    const executeCommand: ExecuteCommand = Effect.fn("SessionPrompt.executeCommand")(function* (commandID: string) {
+    const executeCommand = Effect.fn("SessionPrompt.executeCommand")(function* (commandID: string) {
       let claimed = yield* claimCommandTurn(commandID)
-      while (claimed.state === "waiting" || claimed.state === "occupied" || claimed.state === "blocked") {
-        if (claimed.state === "blocked") yield* executeCommand(claimed.commandID)
+      while (claimed.state === "waiting") {
         yield* Effect.sleep("200 millis")
         claimed = yield* claimCommandTurn(commandID)
       }
       if (claimed.state !== "ready") return
       const command = claimed.command
+      if (!(yield* waitForExecutionTurn(commandID, command.session_id))) return
+      const admitted = yield* db
+        .select({ id: SessionCommandTable.id })
+        .from(SessionCommandTable)
+        .where(
+          and(
+            eq(SessionCommandTable.id, commandID),
+            eq(SessionCommandTable.status, "running"),
+            eq(SessionCommandTable.owner_id, commandOwner),
+            eq(SessionCommandTable.claim_generation, command.claim_generation),
+          ),
+        )
+        .get()
+        .pipe(Effect.orDie)
+      if (!admitted) return
+
       const heartbeat = yield* Effect.sleep(Math.floor(commandLeaseMillis / 3)).pipe(
         Effect.andThen(
-          Effect.suspend(() => {
-            const now = clock()
-            return db
-              .update(SessionCommandTable)
-              .set({ lease_expires_at: now + commandLeaseMillis, time_updated: now })
-              .where(
-                and(
-                  eq(SessionCommandTable.id, commandID),
-                  eq(SessionCommandTable.status, "running"),
-                  eq(SessionCommandTable.owner_id, commandOwner),
-                  eq(SessionCommandTable.claim_generation, command.claim_generation),
-                ),
-              )
-              .run()
-              .pipe(Effect.orDie)
-          }),
+          db
+            .update(SessionCommandTable)
+            .set({ lease_expires_at: Date.now() + commandLeaseMillis, time_updated: Date.now() })
+            .where(
+              and(
+                eq(SessionCommandTable.id, commandID),
+                eq(SessionCommandTable.status, "running"),
+                eq(SessionCommandTable.owner_id, commandOwner),
+                eq(SessionCommandTable.claim_generation, command.claim_generation),
+              ),
+            )
+            .run()
+            .pipe(Effect.orDie),
         ),
         Effect.repeat(Schedule.forever),
         Effect.forkIn(scope),
       )
-      const exit = yield* Effect.gen(function* () {
-        if (!(yield* waitForExecutionTurn(commandID, command.session_id))) return
-        const admitted = yield* db
-          .select({ id: SessionCommandTable.id })
-          .from(SessionCommandTable)
+      const requeue = Effect.fnUntraced(function* () {
+        const completedAt = Date.now()
+        yield* db
+          .update(SessionCommandTable)
+          .set({
+            status: "queued",
+            owner_id: null,
+            lease_expires_at: null,
+            error: null,
+            completed_at: null,
+            time_updated: completedAt,
+          })
           .where(
             and(
               eq(SessionCommandTable.id, commandID),
@@ -183,20 +208,18 @@ export function make(deps: Deps) {
               eq(SessionCommandTable.claim_generation, command.claim_generation),
             ),
           )
-          .get()
+          .run()
           .pipe(Effect.orDie)
-        if (!admitted) return
-        return yield* loop({ sessionID: command.session_id, messageID: command.message_id })
-      }).pipe(Effect.exit, Effect.ensuring(Fiber.interrupt(heartbeat)))
-      const completedAt = clock()
-      const error = Exit.isFailure(exit)
-        ? Cause.pretty(exit.cause)
-        : exit.value?.info.role === "assistant" &&
-            exit.value.info.error &&
-            exit.value.info.error.name !== "MessageAbortedError"
-          ? JSON.stringify(exit.value.info.error)
-          : undefined
-      if (!error) {
+      })
+      const exit = yield* Effect.uninterruptibleMask((restore) =>
+        restore(
+          loop({ sessionID: command.session_id, messageID: command.message_id }).pipe(
+            Effect.onInterrupt(() => requeue()),
+          ),
+        ).pipe(Effect.exit, Effect.ensuring(Fiber.interrupt(heartbeat))),
+      )
+      const completedAt = Date.now()
+      if (Exit.isSuccess(exit)) {
         yield* db
           .update(SessionCommandTable)
           .set({
@@ -219,6 +242,12 @@ export function make(deps: Deps) {
         return
       }
 
+      if (Cause.hasInterruptsOnly(exit.cause)) {
+        yield* requeue()
+        return
+      }
+
+      const error = Cause.pretty(exit.cause)
       yield* db
         .update(SessionCommandTable)
         .set({
@@ -239,7 +268,6 @@ export function make(deps: Deps) {
         )
         .run()
         .pipe(Effect.orDie)
-      if (Exit.isSuccess(exit)) return
       yield* Effect.logError("prompt_async failed").pipe(
         Effect.annotateLogs({ sessionID: command.session_id, cause: exit.cause }),
       )
@@ -256,8 +284,14 @@ export function make(deps: Deps) {
       )
     })
 
+    /**
+     * Launches every command this session still owes work on: anything queued,
+     * plus a `running` row whose lease has lapsed (its owner died). Pin-only
+     * entry point used by `promptAsync` so a newly queued or re-queued prompt
+     * starts without waiting for the next recovery sweep.
+     */
     const wakeSession = Effect.fn("SessionPrompt.wakeSession")(function* (sessionID: SessionID) {
-      const now = clock()
+      const now = Date.now()
       const commands = yield* db
         .select({ id: SessionCommandTable.id })
         .from(SessionCommandTable)
@@ -293,8 +327,21 @@ export function make(deps: Deps) {
         .pipe(Effect.orDie)
       yield* Effect.forEach(commands, (command) => launchCommand(command.id), { discard: true })
     })
-    const unregisterRecovery = SessionPromptRecovery.register(() => recover())
-    yield* Effect.addFinalizer(() => Effect.sync(unregisterRecovery))
+    yield* Effect.addFinalizer(() =>
+      db
+        .update(SessionCommandTable)
+        .set({
+          status: "queued",
+          owner_id: null,
+          lease_expires_at: null,
+          error: null,
+          completed_at: null,
+          time_updated: Date.now(),
+        })
+        .where(and(eq(SessionCommandTable.status, "running"), eq(SessionCommandTable.owner_id, commandOwner)))
+        .run()
+        .pipe(Effect.orDie),
+    )
 
     /**
      * Cancels a message that is still waiting in the queue (OpencodeX-8vq).
@@ -307,7 +354,7 @@ export function make(deps: Deps) {
       sessionID: SessionID
       messageID: MessageID
     }) {
-      const now = clock()
+      const now = Date.now()
       return yield* db
         .transaction(
           (transaction) =>

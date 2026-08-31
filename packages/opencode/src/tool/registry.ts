@@ -1,5 +1,6 @@
 import { PlanExitTool } from "./plan"
 import { Session } from "@/session/session"
+import { SessionStatus } from "@/session/status"
 import { QuestionTool } from "./question"
 import { ShellTool } from "./shell"
 import { EditTool } from "./edit"
@@ -437,6 +438,7 @@ export const defaultLayer = Layer.suspend(() =>
       Layer.provide(Skill.defaultLayer),
       Layer.provide(Agent.defaultLayer),
       Layer.provide(Session.defaultLayer),
+      Layer.provide(SessionStatus.defaultLayer),
       Layer.provide(BackgroundJob.defaultLayer),
       Layer.provide(Provider.defaultLayer),
       Layer.provide(Layer.mergeAll(Git.defaultLayer, RepositoryCache.defaultLayer)),

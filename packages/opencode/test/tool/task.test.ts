@@ -38,12 +38,6 @@ const ref = {
   modelID: ProviderV2.ModelID.make("test-model"),
 }
 
-const status = SessionStatus.layer.pipe(
-  Layer.provide(Database.defaultLayer),
-  Layer.provideMerge(EventV2Bridge.defaultLayer),
-)
-const runState = SessionRunState.layer.pipe(Layer.provide(status))
-
 const layer = (flags: Partial<RuntimeFlags.Info> = {}) =>
   Layer.mergeAll(
     Agent.defaultLayer,
@@ -52,8 +46,8 @@ const layer = (flags: Partial<RuntimeFlags.Info> = {}) =>
     Config.defaultLayer,
     CrossSpawnSpawner.defaultLayer,
     Session.defaultLayer,
-    runState,
-    status,
+    SessionRunState.defaultLayer,
+    SessionStatus.defaultLayer,
     Truncate.defaultLayer,
     ToolRegistry.defaultLayer,
     Database.defaultLayer,
@@ -1563,7 +1557,27 @@ describe("tool.task", () => {
     }),
   )
 
-  it.instance("blocks the parent and durably stamps a terminal child failure", () =>
+  it.instance("keeps child activity separate from the parent's local execution", () =>
+    Effect.gen(function* () {
+      const { chat } = yield* seed()
+      const sessions = yield* Session.Service
+      const status = yield* SessionStatus.Service
+      const runState = yield* SessionRunState.Service
+      const child = yield* sessions.create({ parentID: chat.id, title: "Active child" })
+
+      yield* status.set(child.id, { type: "busy" })
+      expect(yield* status.get(child.id)).toEqual({ type: "busy" })
+      expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
+      yield* runState.assertNotBusy(chat.id)
+
+      yield* status.set(child.id, { type: "monitoring", childSessionID: child.id })
+      expect(yield* status.get(child.id)).toEqual({ type: "monitoring", childSessionID: child.id })
+      expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
+      yield* runState.assertNotBusy(chat.id)
+    }),
+  )
+
+  it.instance("blocks the parent without marking its local execution busy and preserves redacted evidence", () =>
     Effect.gen(function* () {
       const { chat, assistant } = yield* seed()
       const sessions = yield* Session.Service
@@ -1625,7 +1639,11 @@ describe("tool.task", () => {
       })
       yield* status.set(chat.id, { type: "busy" })
       yield* status.set(chat.id, { type: "idle" })
-      expect(JSON.stringify((yield* sessions.get(chat.id)).metadata)).toContain("code=insufficient_quota")
+      const cleared = yield* sessions.get(chat.id)
+      expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
+      expect(JSON.stringify(cleared.metadata)).toContain("code=insufficient_quota")
+      expect(JSON.stringify(cleared.metadata)).not.toContain("child-secret")
+      yield* (yield* SessionRunState.Service).assertNotBusy(chat.id)
       // The stamp must ride alongside the swarm bookkeeping, never replace it.
       expect(result.output).toContain("failed")
     }),

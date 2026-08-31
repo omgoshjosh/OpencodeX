@@ -221,6 +221,21 @@ describe("session.llm stream error logging", () => {
     expect(LLM.sanitizeStreamError({ error: throwing })).toEqual({ name: "UnknownStreamError" })
   })
 
+  test("rejects primitive nested errors and throwing wrapper accessors", () => {
+    for (const error of [null, "provider error", 429]) {
+      expect(() => LLM.sanitizeStreamError({ error })).not.toThrow()
+      expect(LLM.sanitizeStreamError({ error })).toEqual({ name: "UnknownStreamError" })
+    }
+    const throwingWrapper = {
+      get error(): unknown {
+        throw new Error("wrapper getter must not escape")
+      },
+    }
+
+    expect(() => LLM.sanitizeStreamError(throwingWrapper)).not.toThrow()
+    expect(LLM.sanitizeStreamError(throwingWrapper)).toEqual({ name: "UnknownStreamError" })
+  })
+
   test("omits malformed fields and oversized origins from recognized API errors", () => {
     const error = new APICallError({
       message: "ignored",

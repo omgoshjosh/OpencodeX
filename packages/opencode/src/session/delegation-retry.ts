@@ -2,7 +2,8 @@ import { OpencodeXSwarmRoleTable } from "@opencode-ai/core/opencodex/sql"
 import { Database } from "@opencode-ai/core/database/database"
 import { Identifier } from "@opencode-ai/core/util/identifier"
 import { ProviderV2 } from "@opencode-ai/core/provider"
-import { Effect, Scope } from "effect"
+import { SessionLegacy } from "@opencode-ai/core/session/legacy"
+import { Effect } from "effect"
 import { eq, and } from "drizzle-orm"
 import { BackgroundJob } from "@/background/job"
 import { Session } from "./session"
@@ -30,7 +31,6 @@ export const retryBlockedChild = Effect.fn("DelegationRetry.retryBlockedChild")(
   const prompt = yield* SessionPrompt.Service
   const background = yield* BackgroundJob.Service
   const { db } = yield* Database.Service
-  const scope = yield* Scope.Scope
   const [parent, child] = yield* Effect.all([sessions.get(input.parentSessionID), sessions.get(input.childSessionID)])
   if (child.parentID !== parent.id || delegationRecord(child.metadata)?.parentSessionID !== parent.id) {
     return yield* Effect.fail(new RetryError("Child does not belong to this parent."))
@@ -43,13 +43,7 @@ export const retryBlockedChild = Effect.fn("DelegationRetry.retryBlockedChild")(
     return yield* Effect.fail(new RetryError("Child is already running."))
   }
   const messages = yield* sessions.messages({ sessionID: child.id })
-  if (
-    messages.some(
-      (message) =>
-        message.info.role === "assistant" &&
-        message.parts.some((part) => part.type === "tool" || (part.type === "text" && !part.synthetic && part.text.trim())),
-    )
-  ) {
+  if (hasUnsafeRetryOutput(messages)) {
     return yield* Effect.fail(new RetryError("Child produced output or tool activity and cannot be safely retried."))
   }
   const user = messages.findLast((message) => message.info.role === "user")
@@ -73,7 +67,7 @@ export const retryBlockedChild = Effect.fn("DelegationRetry.retryBlockedChild")(
     .pipe(Effect.orDie)
   if (!role?.providerID || !role.modelID) return yield* Effect.fail(new RetryError("Swarm role has no current primary model."))
   const routes = [{ providerID: role.providerID, modelID: role.modelID }, ...(role.fallbackModels ?? [])]
-  const selected = routes.find((route) => !blocked.attemptedModels.includes(`${route.providerID}/${route.modelID}`))
+  const selected = selectUntriedRoute(routes, blocked.attemptedModels)
   if (!selected) return yield* Effect.fail(new RetryError("No untried model route remains. Update the role or add a fallback model."))
   if (!(yield* status.claimBlockedRetry({ sessionID: parent.id, childSessionID: child.id }))) {
     return yield* Effect.fail(new RetryError("Child retry is already in progress."))
@@ -108,7 +102,7 @@ export const retryBlockedChild = Effect.fn("DelegationRetry.retryBlockedChild")(
           error: error.message || "Retry could not be started.",
         }),
       ),
-      Effect.forkIn(scope),
+      Effect.forkScoped,
     )
   return {
     childSessionID: child.id,
@@ -121,6 +115,21 @@ export const retryBlockedChild = Effect.fn("DelegationRetry.retryBlockedChild")(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+export function selectUntriedRoute(
+  routes: readonly { providerID: string; modelID: string }[],
+  attemptedModels: readonly string[],
+) {
+  return routes.find((route) => !attemptedModels.includes(`${route.providerID}/${route.modelID}`))
+}
+
+export function hasUnsafeRetryOutput(messages: SessionLegacy.WithParts[]) {
+  return messages.some(
+    (message) =>
+      message.info.role === "assistant" &&
+      message.parts.some((part) => part.type === "tool" || (part.type === "text" && !part.synthetic && part.text.trim())),
+  )
 }
 
 export * as DelegationRetry from "./delegation-retry"

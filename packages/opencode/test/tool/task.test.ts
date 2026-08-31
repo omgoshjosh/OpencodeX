@@ -1600,7 +1600,8 @@ describe("tool.task", () => {
                   data: {
                     message: "quota exhausted, token=child-secret",
                     statusCode: 429,
-                    retryAfterMs: 1_000,
+                    isRetryable: false,
+                    responseHeaders: { "retry-after-ms": "1000" },
                     metadata: { code: "insufficient_quota" },
                   },
                 },

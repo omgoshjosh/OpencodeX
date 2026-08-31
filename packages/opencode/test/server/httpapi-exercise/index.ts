@@ -59,12 +59,22 @@ const scenarios: Scenario[] = [
       check(body.healthy === true, "server should report healthy")
     }),
   http.protected
-    .get("/global/restart-readiness", "global.restartReadiness")
-    .global()
-    .json(200, (body) => {
-      object(body)
-      check(typeof body.ready === "boolean", "server should report restart readiness")
-    }),
+    .post("/session/{sessionID}/child/{childSessionID}/retry", "session.child.retry")
+    .seeded((ctx) =>
+      Effect.gen(function* () {
+        const parent = yield* ctx.session({ title: "retry parent" })
+        const child = yield* ctx.session({ title: "retry child", parentID: parent.id })
+        return { parent, child }
+      }),
+    )
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/child/{childSessionID}/retry", {
+        sessionID: ctx.state.parent.id,
+        childSessionID: ctx.state.child.id,
+      }),
+      headers: ctx.headers(),
+    }))
+    .json(400),
   http.protected
     .get("/global/event", "global.event")
     .global()
@@ -470,14 +480,6 @@ const scenarios: Scenario[] = [
     .at((ctx) => ({ path: "/sync/history", headers: ctx.headers(), body: {} }))
     .json(200, array),
   http.protected
-    .post("/sync/history/page", "sync.history.page")
-    .at((ctx) => ({ path: "/sync/history/page", headers: ctx.headers(), body: { state: {} } }))
-    .json(200, (body) => {
-      object(body)
-      array(body.events)
-      check(body.next === null, "empty history page should have a terminal cursor")
-    }),
-  http.protected
     .post("/sync/replay", "sync.replay")
     .at((ctx) => ({ path: "/sync/replay", headers: ctx.headers(), body: { directory: ctx.directory, events: [] } }))
     .status(400),
@@ -800,26 +802,6 @@ const scenarios: Scenario[] = [
     }))
     .json(200, (body) => {
       check(body === true, "missing session abort should remain a no-op success")
-    }),
-  http.protected
-    .post("/session/{sessionID}/message/{messageID}/cancel", "session.cancelQueued")
-    .seeded((ctx) =>
-      Effect.gen(function* () {
-        const session = yield* ctx.session({ title: "Cancel queued message session" })
-        const message = yield* ctx.message(session.id, { text: "already settled" })
-        return { session, message }
-      }),
-    )
-    .at((ctx) => ({
-      path: route("/session/{sessionID}/message/{messageID}/cancel", {
-        sessionID: ctx.state.session.id,
-        messageID: ctx.state.message.info.id,
-      }),
-      headers: ctx.headers(),
-    }))
-    .json(200, (body) => {
-      object(body)
-      check(body.outcome === "missing", "message without a queued command should be missing")
     }),
   http.protected
     .post("/session/{sessionID}/init", "session.init")

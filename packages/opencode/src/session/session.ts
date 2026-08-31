@@ -1056,6 +1056,9 @@ export const layer: Layer.Layer<
       return yield* mutate(input.sessionID, (current) => {
         const stored = delegationRecord(current.metadata)
         if (!stored || stored.runID !== input.runID) return undefined
+        // Delivery is monotonic: a late failed retry can never erase proof that
+        // the parent already durably received this run's result.
+        if (stored.deliveryOutcome === "delivered" && input.outcome === "failed") return undefined
         return {
           ...current,
           metadata: withDelegationRecord(current.metadata, {

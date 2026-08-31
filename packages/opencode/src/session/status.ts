@@ -3,54 +3,33 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
 import { NonNegativeInt } from "@opencode-ai/core/schema"
-import { SessionExecutionTable, SessionStatusTable } from "@opencode-ai/core/session/sql"
+import { SessionExecutionTable, SessionStatusTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { ensureRunID } from "@opencode-ai/core/util/opencode-process"
 import { and, eq } from "drizzle-orm"
 import { Context, Duration, Effect, Layer, Option, Schedule, Schema } from "effect"
 import { SessionID } from "./schema"
 import { SessionExecutionOwner } from "./execution-owner"
+import { delegationRecord } from "./delegation-outcome"
 
-/**
- * One delegation running in the background on behalf of this session (a
- * child session under BackgroundJob). Carried on every status variant so a
- * parent that reads `idle` while its team works still shows the work.
- */
-export const BackgroundTask = Schema.Struct({
-  sessionID: Schema.String,
-  title: Schema.String,
-  role: Schema.optional(Schema.String),
-  since: NonNegativeInt,
-  /**
-   * The process that runs the job, in execution-owner form. Jobs live in
-   * memory, so one whose owner is gone is gone too: readers prune it (see
-   * `pruneBackground`) instead of trusting a row the dead process left.
-   */
-  owner: Schema.String,
+const Background = Schema.Struct({
+  running: Schema.Boolean,
+  jobs: Schema.Array(Schema.Struct({ role: Schema.String, title: Schema.String, owner: Schema.String })),
 })
-export type BackgroundTask = Schema.Schema.Type<typeof BackgroundTask>
-
-const Background = Schema.optional(
-  Schema.Struct({
-    running: NonNegativeInt,
-    jobs: Schema.Array(BackgroundTask),
-  }),
-)
-
 export const Info = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("idle"),
-    background: Background,
+    background: Schema.optional(Background),
   }),
   Schema.Struct({
     type: Schema.Literal("retry"),
     attempt: NonNegativeInt,
     message: Schema.String,
     next: NonNegativeInt,
-    background: Background,
+    background: Schema.optional(Background),
   }),
   Schema.Struct({
     type: Schema.Literal("busy"),
-    background: Background,
+    background: Schema.optional(Background),
   }),
 ]).annotate({ identifier: "SessionStatus" })
 export type Info = Schema.Schema.Type<typeof Info>
@@ -81,10 +60,7 @@ export interface Interface {
   readonly list: () => Effect.Effect<Map<SessionID, Info>>
   readonly set: (sessionID: SessionID, status: Info) => Effect.Effect<void>
   readonly setForGeneration: (sessionID: SessionID, generation: number, status: Info) => Effect.Effect<boolean>
-  /** Records a background delegation on its parent's status; idempotent per child. */
-  readonly backgroundStart: (sessionID: SessionID, task: Omit<BackgroundTask, "owner">) => Effect.Effect<boolean>
-  /** Drops a finished background delegation from its parent's status. */
-  readonly backgroundEnd: (sessionID: SessionID, childSessionID: string) => Effect.Effect<boolean>
+  readonly refresh: (sessionID: SessionID) => Effect.Effect<void>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionStatus") {}
@@ -97,34 +73,43 @@ export const ExecutionGeneration = Context.Reference<{ sessionID: SessionID; gen
 const decode = Schema.decodeUnknownOption(Info)
 const OWNERLESS_STALE_MILLIS = 15_000
 
-/**
- * Background work belongs to the session, not to one status variant: a turn
- * ending (busy -> idle) must not erase the delegations still running.
- */
-function carry(status: Info, current: Info | undefined): Info {
-  const background = status.background ?? current?.background
-  return background ? { ...status, background } : status
-}
-
-function withBackground(status: Info, jobs: readonly BackgroundTask[]): Info {
-  const { background: _background, ...rest } = status
-  return jobs.length > 0 ? { ...rest, background: { running: jobs.length, jobs: [...jobs] } } : rest
-}
-
-/** Drops background jobs whose owning process is no longer alive. */
-function pruneBackground(status: Info, runID: string): Info {
-  const jobs = status.background?.jobs
-  if (!jobs) return status
-  const live = jobs.filter((job) => SessionExecutionOwner.alive(job.owner, runID))
-  return live.length === jobs.length ? status : withBackground(status, live)
-}
-
 export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const events = yield* EventV2Bridge.Service
     const { db } = yield* Database.Service
     const processRunID = ensureRunID()
+
+    const backgrounds = Effect.fnUntraced(function* () {
+      const rows = yield* db
+        .select({ metadata: SessionTable.metadata, title: SessionTable.title })
+        .from(SessionTable)
+        .all()
+        .pipe(Effect.orDie)
+      return rows.reduce((result, row) => {
+        const record = delegationRecord(row.metadata)
+        if (record?.mode !== "background" || record.phase !== "running" || !record.ownerID) return result
+        if (!SessionExecutionOwner.alive(record.ownerID, processRunID)) return result
+        const parentID = SessionID.make(record.parentSessionID)
+        const jobs = result.get(parentID) ?? []
+        jobs.push({ role: record.role ?? "Background task", title: record.title ?? row.title, owner: record.ownerID })
+        result.set(parentID, jobs)
+        return result
+      }, new Map<SessionID, { role: string; title: string; owner: string }[]>())
+    })
+
+    const withBackground = (status: Info, jobs: { role: string; title: string; owner: string }[] | undefined): Info =>
+      jobs?.length
+        ? {
+            ...status,
+            background: {
+              running: true,
+              jobs: jobs.toSorted((a, b) =>
+                `${a.role}\u0000${a.title}\u0000${a.owner}`.localeCompare(`${b.role}\u0000${b.title}\u0000${b.owner}`),
+              ),
+            },
+          }
+        : status
 
     // `sessionID` scopes the scan to one row. Reads take that path so a status
     // lookup stays an indexed point query instead of two full table scans in an
@@ -179,24 +164,14 @@ export const layer = Layer.effect(
                       )
                       .run()
                   }
-                  // The dead owner's turn is over; background delegations
-                  // whose own process is still alive are not.
-                  const previous = Option.getOrUndefined(decode(row.status))
-                  const idle = withBackground(
-                    { type: "idle" },
-                    previous ? (pruneBackground(previous, processRunID).background?.jobs ?? []) : [],
-                  )
                   yield* transaction
                     .update(SessionStatusTable)
-                    .set({ status: idle, time_updated: now })
+                    .set({ status: { type: "idle" }, time_updated: now })
                     .where(eq(SessionStatusTable.session_id, row.session_id))
                     .run()
-                  // Idle before status: SDK/GUI sync handlers reduce the
-                  // (deprecated) idle event to a bare `{type: "idle"}`, which
-                  // would erase the background jobs if it arrived second.
                   result.push(
+                    yield* events.commit(Event.Status, { sessionID: row.session_id, status: { type: "idle" } }),
                     yield* events.commit(Event.Idle, { sessionID: row.session_id }),
-                    yield* events.commit(Event.Status, { sessionID: row.session_id, status: idle }),
                   )
                 }
                 return result
@@ -216,12 +191,10 @@ export const layer = Layer.effect(
         .where(eq(SessionStatusTable.session_id, sessionID))
         .get()
         .pipe(Effect.orDie)
-      return row
-        ? pruneBackground(
-            Option.getOrElse(decode(row.status), () => ({ type: "idle" as const })),
-            processRunID,
-          )
+      const status = row
+        ? Option.getOrElse(decode(row.status), () => ({ type: "idle" as const }))
         : { type: "idle" as const }
+      return withBackground(status, (yield* backgrounds()).get(sessionID))
     })
 
     const list = Effect.fn("SessionStatus.list")(function* () {
@@ -231,24 +204,22 @@ export const layer = Layer.effect(
         .from(SessionStatusTable)
         .all()
         .pipe(Effect.orDie)
-      return new Map(
+      const result = new Map<SessionID, Info>(
         rows.flatMap((row) => {
-          const decoded = Option.getOrUndefined(decode(row.status))
-          const status = decoded ? pruneBackground(decoded, processRunID) : undefined
-          // An idle parent with background delegations is still "something
-          // going on" to a client, so it stays in the listing.
-          return status && (status.type !== "idle" || status.background) ? [[row.sessionID, status] as const] : []
+          const status = Option.getOrUndefined(decode(row.status))
+          return status && status.type !== "idle" ? [[row.sessionID, status] as const] : []
         }),
       )
+      for (const [sessionID, jobs] of yield* backgrounds()) {
+        result.set(sessionID, withBackground(result.get(sessionID) ?? { type: "idle" }, jobs))
+      }
+      return result
     })
 
-    const write = Effect.fnUntraced(function* (
-      sessionID: SessionID,
-      status: Info | ((current: Info | undefined) => Info | undefined),
-      generation?: number,
-    ) {
+    const write = Effect.fnUntraced(function* (sessionID: SessionID, status: Info, generation?: number) {
       const ctx = yield* InstanceState.context
       const now = Date.now()
+      const { background: _background, ...persisted } = status
       const committed = yield* events.barrier(
         db
           .transaction(
@@ -261,31 +232,15 @@ export const layer = Layer.effect(
                     .where(eq(SessionExecutionTable.session_id, sessionID))
                     .get()
                   if (execution?.generation !== generation) return undefined
-                  if ((typeof status === "function" || status.type !== "idle") && execution.state !== "running")
-                    return undefined
+                  if (status.type !== "idle" && execution.state !== "running") return undefined
                 }
-                const existing = yield* transaction
-                  .select({ status: SessionStatusTable.status })
-                  .from(SessionStatusTable)
-                  .where(eq(SessionStatusTable.session_id, sessionID))
-                  .get()
-                // Prune here for the same reason `get` and `list` do: a coordinator
-                // that died with delegations running leaves background jobs whose
-                // owner is gone. Without this, `carry` copies them into the new row
-                // and the `session.status` broadcast, publishing a phantom
-                // `background.running` that clients cannot clear -- they have no way
-                // to know owner liveness.
-                const decoded = existing ? Option.getOrUndefined(decode(existing.status)) : undefined
-                const current = decoded ? pruneBackground(decoded, processRunID) : undefined
-                const next = typeof status === "function" ? status(current) : carry(status, current)
-                if (!next) return undefined
                 yield* transaction
                   .insert(SessionStatusTable)
                   .values({
                     session_id: sessionID,
                     project_id: ctx.project.id,
                     directory: ctx.directory,
-                    status: next,
+                    status: persisted,
                     time_created: now,
                     time_updated: now,
                   })
@@ -294,14 +249,14 @@ export const layer = Layer.effect(
                     set: {
                       project_id: ctx.project.id,
                       directory: ctx.directory,
-                      status: next,
+                      status: persisted,
                       time_updated: now,
                     },
                   })
                   .run()
                 return {
-                  status: yield* events.commit(Event.Status, { sessionID, status: next }),
-                  idle: next.type === "idle" ? yield* events.commit(Event.Idle, { sessionID }) : undefined,
+                  status: yield* events.commit(Event.Status, { sessionID, status: persisted }),
+                  idle: status.type === "idle" ? yield* events.commit(Event.Idle, { sessionID }) : undefined,
                 }
               }),
             { behavior: "immediate" },
@@ -309,38 +264,9 @@ export const layer = Layer.effect(
           .pipe(Effect.orDie),
       )
       if (!committed) return false
-      // Idle first, for the same reason as in `recover`.
-      if (committed.idle) yield* events.broadcast(committed.idle)
       yield* events.broadcast(committed.status)
+      if (committed.idle) yield* events.broadcast(committed.idle)
       return true
-    })
-
-    // Background bookkeeping deliberately skips the execution-generation gate:
-    // the parent is usually idle while its delegations run, and a gated write
-    // on an idle session is refused.
-    const backgroundStart = Effect.fn("SessionStatus.backgroundStart")(function* (
-      sessionID: SessionID,
-      task: Omit<BackgroundTask, "owner">,
-    ) {
-      const owned: BackgroundTask = {
-        ...task,
-        owner: `local:${process.pid}:${processRunID}:background:${task.sessionID}`,
-      }
-      return yield* write(sessionID, (current) => {
-        const jobs = (current?.background?.jobs ?? []).filter((job) => job.sessionID !== task.sessionID)
-        return withBackground(current ?? { type: "idle" }, [...jobs, owned])
-      })
-    })
-
-    const backgroundEnd = Effect.fn("SessionStatus.backgroundEnd")(function* (
-      sessionID: SessionID,
-      childSessionID: string,
-    ) {
-      return yield* write(sessionID, (current) => {
-        if (!current?.background) return undefined
-        const jobs = current.background.jobs.filter((job) => job.sessionID !== childSessionID)
-        return jobs.length === current.background.jobs.length ? undefined : withBackground(current, jobs)
-      })
     })
 
     const setForGeneration = Effect.fn("SessionStatus.setForGeneration")(function* (
@@ -360,6 +286,10 @@ export const layer = Layer.effect(
       yield* write(sessionID, status)
     })
 
+    const refresh = Effect.fn("SessionStatus.refresh")(function* (sessionID: SessionID) {
+      yield* events.publish(Event.Status, { sessionID, status: yield* get(sessionID) })
+    })
+
     // Recovery reconciles rows whose owning execution died. It used to run on
     // every read, which meant two full table scans inside an immediate
     // transaction under the event barrier for something as routine as painting
@@ -377,7 +307,7 @@ export const layer = Layer.effect(
       Effect.forkScoped,
     )
 
-    return Service.of({ get, list, set, setForGeneration, backgroundStart, backgroundEnd })
+    return Service.of({ get, list, set, setForGeneration, refresh })
   }),
 )
 

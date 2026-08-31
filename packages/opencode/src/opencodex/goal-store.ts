@@ -1,10 +1,6 @@
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
-import {
-  OpencodeXGoalEdgeTable,
-  OpencodeXGoalNodeTable,
-  OpencodeXGoalTable,
-} from "@opencode-ai/core/opencodex/sql"
+import { OpencodeXGoalEdgeTable, OpencodeXGoalNodeTable, OpencodeXGoalTable } from "@opencode-ai/core/opencodex/sql"
 import { Identifier } from "@opencode-ai/core/util/identifier"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionID } from "@/session/schema"
@@ -247,12 +243,7 @@ export function createGoalStore(db: Database.Interface["db"], events: EventV2.In
                   : {}),
                 time_updated: Date.now(),
               })
-              .where(
-                and(
-                  eq(OpencodeXGoalNodeTable.goal_id, input.goalID),
-                  eq(OpencodeXGoalNodeTable.id, patch.id),
-                ),
-              )
+              .where(and(eq(OpencodeXGoalNodeTable.goal_id, input.goalID), eq(OpencodeXGoalNodeTable.id, patch.id)))
               .run(),
           { concurrency: 1, discard: true },
         )
@@ -328,9 +319,7 @@ export function createGoalStore(db: Database.Interface["db"], events: EventV2.In
 export type GoalStore = ReturnType<typeof createGoalStore>
 
 /** One store shared by the service, the dispatcher, and the node executor. */
-export class GoalStoreService extends Context.Service<GoalStoreService, GoalStore>()(
-  "@opencode/OpencodeXGoalStore",
-) {}
+export class GoalStoreService extends Context.Service<GoalStoreService, GoalStore>()("@opencode/OpencodeXGoalStore") {}
 
 export const goalStoreLayer = Layer.effect(
   GoalStoreService,
@@ -364,7 +353,7 @@ function insertNodes(
           brief: node.brief,
           status: "planned",
           executor_json: encode(node.executor),
-          parent_node_id: node.parentNodeID ?? null,
+          parent_node_id: node.parentNodeID?.trim() || null,
           loop_json: node.loop
             ? encode({
                 exitCheckNodeID: node.loop.exitCheckNodeID,
@@ -384,11 +373,7 @@ function insertNodes(
   ).pipe(Effect.orDie)
 }
 
-function insertEdges(
-  transaction: Transaction,
-  goalID: string,
-  edges: readonly EdgeInput[],
-): Effect.Effect<void> {
+function insertEdges(transaction: Transaction, goalID: string, edges: readonly EdgeInput[]): Effect.Effect<void> {
   if (edges.length === 0) return Effect.void
   const now = Date.now()
   return Effect.forEach(

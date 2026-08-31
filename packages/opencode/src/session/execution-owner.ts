@@ -2,7 +2,7 @@ export function alive(owner: string, runID: string) {
   const match = /^local:(\d+):([^:]+):/.exec(owner)
   if (!match) return true
   const pid = Number(match[1])
-  if (pid === process.pid) return match[2] === runID
+  if (pid === process.pid) return match[2] === runID || match[2] === "prompt"
   try {
     process.kill(pid, 0)
     return true

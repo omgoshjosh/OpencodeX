@@ -28,6 +28,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { OpencodeXSwarmRoleTable } from "@opencode-ai/core/opencodex/sql"
 import { SwarmBriefing } from "@/opencodex/swarm-briefing"
 import { isSwarmProvider } from "@/provider/swarm-provider"
+import { ensureRunID } from "@opencode-ai/core/util/opencode-process"
 
 const log = Log.create({ service: "tool.task" })
 
@@ -79,7 +80,9 @@ export const Parameters = Schema.Struct({
 
 function output(sessionID: SessionID, result: TaskRunResult) {
   const tag = result.state === "completed" ? "task_result" : "task_error"
-  return [`<task id="${sessionID}" state="${result.state}">`, `<${tag}>`, result.text, `</${tag}>`, "</task>"].join("\n")
+  return [`<task id="${sessionID}" state="${result.state}">`, `<${tag}>`, result.text, `</${tag}>`, "</task>"].join(
+    "\n",
+  )
 }
 
 function backgroundOutput(sessionID: SessionID) {
@@ -310,12 +313,23 @@ export const TaskTool = Tool.define(
       // previous outcome, and every later write compare-and-sets on the runID
       // so a stale run can never overwrite a newer one.
       const runID = Identifier.ascending("run")
+      // This is the exact child *user* message boundary. Its assistant reply
+      // has `parentID === childMessageID`, which restart recovery uses instead
+      // of guessing from a reused child session's latest transcript entry.
+      const childMessageID = MessageID.ascending()
       const started: DelegationRecord = {
         version: DELEGATION_RECORD_VERSION,
         runID,
         parentSessionID: ctx.sessionID,
         parentMessageID: ctx.messageID,
         ...(ctx.callID ? { toolCallID: ctx.callID } : {}),
+        ...(runInBackground
+          ? {
+              mode: "background" as const,
+              ownerID: `local:${process.pid}:${ensureRunID()}:${runID}`,
+              childMessageID,
+            }
+          : {}),
         attempt: delegationAttempts(nextSession.metadata) + 1,
         phase: "running",
         startedAt: Date.now(),
@@ -324,25 +338,21 @@ export const TaskTool = Tool.define(
       // completed child rendered as unknown - so failures are logged, not
       // silently ignored.
       const stamp = (record: DelegationRecord, expectRunID?: string) =>
-        sessions
-          .stampDelegation({ sessionID: nextSession.id, record, ...(expectRunID ? { expectRunID } : {}) })
-          .pipe(
-            Effect.catchCause((cause) =>
-              Effect.sync(() => {
-                log.error("delegation stamp failed", { sessionID: nextSession.id, runID, cause })
-                return false
-              }),
-            ),
-          )
+        sessions.stampDelegation({ sessionID: nextSession.id, record, ...(expectRunID ? { expectRunID } : {}) }).pipe(
+          Effect.catchCause((cause) =>
+            Effect.sync(() => {
+              log.error("delegation stamp failed", { sessionID: nextSession.id, runID, cause })
+              return false
+            }),
+          ),
+        )
       const settle = (outcome: DelegationOutcome, summary?: string) =>
         stamp(
           settleDelegation(started, {
             outcome,
             summary,
-            // Delivery starts pending only for a clean completion the parent
-            // still has to durably receive; errors surface through their own
-            // channels.
-            ...(outcome === "completed" ? { deliveryOutcome: "pending" as const } : {}),
+            // Background terminal outcomes all need durable parent delivery.
+            ...(outcome === "completed" || runInBackground ? { deliveryOutcome: "pending" as const } : {}),
           }),
           runID,
         ).pipe(Effect.asVoid)
@@ -368,7 +378,8 @@ export const TaskTool = Tool.define(
         // model comes next: a role spawning helpers of itself should run them on
         // what it is running, not on whatever its agent happens to configure.
         // Outside a swarm the agent's model keeps priority, as it always has.
-        const requested = parseModelOverride(params.model) ??
+        const requested =
+          parseModelOverride(params.model) ??
           swarmRoleModel(swarmRole) ??
           (swarm && !isSwarmProvider(caller.providerID) ? caller : undefined) ??
           next.model ??
@@ -381,7 +392,7 @@ export const TaskTool = Tool.define(
         // (the orchestrator delegating), so the fallback is the concrete model
         // that facade stands for.
         const model = isSwarmProvider(requested.providerID)
-          ? (yield* orchestratorModel(requested.modelID)) ?? next.model
+          ? ((yield* orchestratorModel(requested.modelID)) ?? next.model)
           : requested
         if (!model || isSwarmProvider(model.providerID))
           return yield* Effect.fail(
@@ -415,7 +426,7 @@ export const TaskTool = Tool.define(
           const parts = yield* ops.resolvePromptParts(params.prompt)
           const result = yield* ops
             .prompt({
-              messageID: MessageID.ascending(),
+              messageID: childMessageID,
               sessionID: nextSession.id,
               model: {
                 modelID: model.modelID,
@@ -448,7 +459,9 @@ export const TaskTool = Tool.define(
           // the caller - that is exactly the "completed but empty" confusion.
           const report =
             persisted.parts
-              .flatMap((part) => (part.type === "text" && !part.synthetic && part.text.trim() ? [part.text.trim()] : []))
+              .flatMap((part) =>
+                part.type === "text" && !part.synthetic && part.text.trim() ? [part.text.trim()] : [],
+              )
               .at(-1) ?? ""
           if (persisted.info.role === "assistant" && persisted.info.error) {
             const failure = [`The subagent failed: ${JSON.stringify(persisted.info.error)}`, report]
@@ -534,10 +547,9 @@ export const TaskTool = Tool.define(
                     ? inject("error", result.text).pipe(Effect.andThen(Effect.fail(new Error(result.text))))
                     : inject("completed", result.text).pipe(Effect.as(result.text)),
                 onFailure: (cause) =>
-                  (Cause.hasInterruptsOnly(cause)
-                    ? Effect.void
-                    : inject("error", errorText(Cause.squash(cause)))
-                  ).pipe(Effect.andThen(Effect.failCause(cause))),
+                  (Cause.hasInterruptsOnly(cause) ? Effect.void : inject("error", errorText(Cause.squash(cause)))).pipe(
+                    Effect.andThen(Effect.failCause(cause)),
+                  ),
               }),
             ),
           })

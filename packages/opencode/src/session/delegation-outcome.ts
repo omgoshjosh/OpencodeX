@@ -37,6 +37,12 @@ export type DelegationRecord = {
   parentSessionID: string
   parentMessageID?: string
   toolCallID?: string
+  /** Background runs are recoverable from durable transcript evidence only. */
+  mode?: "background"
+  /** Process identity that started this exact run. */
+  ownerID?: string
+  /** Exact child assistant turn; recovery never infers a result without it. */
+  childMessageID?: string
   /** 1-based; a reused `task_id` session increments across runs. */
   attempt: number
   phase: "running" | "settled"
@@ -142,9 +148,7 @@ function isDelivery(value: unknown): value is DelegationDelivery {
  * unknown version, a missing identity, or a malformed field reads as no
  * record at all - consumers must degrade to "unknown", never guess success.
  */
-export function delegationRecord(
-  metadata: Record<string, unknown> | undefined | null,
-): DelegationRecord | undefined {
+export function delegationRecord(metadata: Record<string, unknown> | undefined | null): DelegationRecord | undefined {
   const raw = rawDelegation(metadata)
   if (!raw) return undefined
   if (raw.version !== DELEGATION_RECORD_VERSION) return undefined
@@ -157,12 +161,24 @@ export function delegationRecord(
   if (raw.completedAt !== undefined && (typeof raw.completedAt !== "number" || !Number.isFinite(raw.completedAt)))
     return undefined
   if (raw.deliveryOutcome !== undefined && !isDelivery(raw.deliveryOutcome)) return undefined
+  if (raw.phase === "settled" && (!isOutcome(raw.outcome) || typeof raw.completedAt !== "number")) return undefined
+  if (
+    raw.phase === "running" &&
+    (raw.outcome !== undefined ||
+      raw.completedAt !== undefined ||
+      raw.deliveryOutcome !== undefined ||
+      raw.deliveredAt !== undefined)
+  )
+    return undefined
   return {
     version: DELEGATION_RECORD_VERSION,
     runID: raw.runID,
     parentSessionID: raw.parentSessionID,
     ...(typeof raw.parentMessageID === "string" ? { parentMessageID: raw.parentMessageID } : {}),
     ...(typeof raw.toolCallID === "string" ? { toolCallID: raw.toolCallID } : {}),
+    ...(raw.mode === "background" ? { mode: raw.mode } : {}),
+    ...(typeof raw.ownerID === "string" ? { ownerID: raw.ownerID } : {}),
+    ...(typeof raw.childMessageID === "string" ? { childMessageID: raw.childMessageID } : {}),
     attempt: raw.attempt,
     phase: raw.phase,
     ...(raw.outcome !== undefined ? { outcome: raw.outcome } : {}),
@@ -191,9 +207,7 @@ export function legacyDelegationOutcome(
  * legacy stamps normalized (`succeeded` -> `completed`, `failed` ->
  * `errored`). A record still `running` has no outcome yet.
  */
-export function delegationOutcome(
-  metadata: Record<string, unknown> | undefined | null,
-): DelegationOutcome | undefined {
+export function delegationOutcome(metadata: Record<string, unknown> | undefined | null): DelegationOutcome | undefined {
   const record = delegationRecord(metadata)
   if (record) return record.phase === "settled" ? record.outcome : undefined
   const legacy = legacyDelegationOutcome(metadata)
@@ -203,9 +217,7 @@ export function delegationOutcome(
 }
 
 /** Reads the recorded report summary, whichever record shape carried it. */
-export function delegationSummary(
-  metadata: Record<string, unknown> | undefined | null,
-): string | undefined {
+export function delegationSummary(metadata: Record<string, unknown> | undefined | null): string | undefined {
   const raw = rawDelegation(metadata)
   if (!raw) return undefined
   const summary = raw.summary

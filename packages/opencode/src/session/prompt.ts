@@ -54,6 +54,8 @@ import { OpencodeXClaudeDriver } from "@/opencodex/claude-driver"
 import { PromptInput, LoopInput, ShellInput, CommandInput } from "./prompt-schema"
 import { STRUCTURED_OUTPUT_SYSTEM_PROMPT, createStructuredOutputTool } from "./prompt-structured-output"
 import * as PromptClaim from "./prompt-claim"
+import { SessionDelegationRecovery } from "./delegation-recovery"
+import { SessionPromptRecovery } from "./prompt-recovery"
 import * as PromptShell from "./prompt-shell"
 import * as PromptSubtask from "./prompt-subtask"
 import * as PromptSwarm from "./prompt-swarm"
@@ -310,9 +312,7 @@ export const layer = Layer.effect(
     })
 
     const titles = new Set<SessionID>()
-    const ensureTitle = Effect.fn("SessionPrompt.ensureTitle")(function* (
-      input: Parameters<typeof generateTitle>[0],
-    ) {
+    const ensureTitle = Effect.fn("SessionPrompt.ensureTitle")(function* (input: Parameters<typeof generateTitle>[0]) {
       const claimed = yield* Effect.sync(() => {
         if (titles.has(input.session.id)) return false
         titles.add(input.session.id)
@@ -883,6 +883,22 @@ export const layer = Layer.effect(
       if (steering) yield* markSteering(message)
       if (input.noReply !== true) yield* launchCommand(acceptedCommandID)
     })
+
+    const delegationRecovery = yield* SessionDelegationRecovery.make({
+      database,
+      sessions,
+      notify: (input) =>
+        promptAsync({
+          sessionID: input.sessionID,
+          messageID: input.messageID,
+          parts: [{ type: "text", synthetic: true, text: input.text }],
+          noReply: input.noReply,
+        }).pipe(Effect.orDie),
+    })
+    const unregisterRecovery = SessionPromptRecovery.register(() =>
+      delegationRecovery.recover().pipe(Effect.andThen(recover)),
+    )
+    yield* Effect.addFinalizer(() => Effect.sync(unregisterRecovery))
 
     const command = Effect.fn("SessionPrompt.command")(function* (input: CommandInput) {
       yield* elog.info("command", { sessionID: input.sessionID, command: input.command, agent: input.agent })

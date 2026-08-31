@@ -577,7 +577,9 @@ describe("tool.task", () => {
       yield* database.db
         .insert(ProjectTable)
         .values({ id: ProjectV2.ID.make("prj_task_test"), worktree: "/tmp", sandboxes: [] })
-      yield* database.db.insert(OpencodeXProjectTable).values({ id: "opx_task_test", project_id: ProjectV2.ID.make("prj_task_test") })
+      yield* database.db
+        .insert(OpencodeXProjectTable)
+        .values({ id: "opx_task_test", project_id: ProjectV2.ID.make("prj_task_test") })
       yield* database.db.insert(OpencodeXSwarmTable).values({
         id: "swm_task_test",
         opencodex_project_id: "opx_task_test",
@@ -587,7 +589,14 @@ describe("tool.task", () => {
         source: "manual",
       })
       yield* database.db.insert(OpencodeXSwarmRoleTable).values([
-        { id: "role_orch", swarm_id: "swm_task_test", name: "Orchestrator", status: "running", instructions: "", sort_order: 0 },
+        {
+          id: "role_orch",
+          swarm_id: "swm_task_test",
+          name: "Orchestrator",
+          status: "running",
+          instructions: "",
+          sort_order: 0,
+        },
         {
           id: "role_eng",
           swarm_id: "swm_task_test",
@@ -1274,13 +1283,9 @@ describe("tool.task", () => {
         )
 
       const first = yield* exec()
-      const firstRecord = delegationRecord(
-        (yield* sessions.get(SessionID.make(first.metadata.sessionId))).metadata,
-      )
+      const firstRecord = delegationRecord((yield* sessions.get(SessionID.make(first.metadata.sessionId))).metadata)
       const second = yield* exec(first.metadata.sessionId)
-      const secondRecord = delegationRecord(
-        (yield* sessions.get(SessionID.make(second.metadata.sessionId))).metadata,
-      )
+      const secondRecord = delegationRecord((yield* sessions.get(SessionID.make(second.metadata.sessionId))).metadata)
 
       expect(second.metadata.sessionId).toBe(first.metadata.sessionId)
       expect(firstRecord).toMatchObject({ attempt: 1, phase: "settled", outcome: "completed" })
@@ -1488,7 +1493,13 @@ describe("tool.task", () => {
         }
         return undefined
       })
-      expect(record).toMatchObject({ outcome: "completed", deliveryOutcome: "delivered" })
+      expect(record).toMatchObject({
+        outcome: "completed",
+        deliveryOutcome: "delivered",
+        mode: "background",
+        ownerID: expect.stringMatching(/^local:\d+:[^:]+:/),
+        childMessageID: expect.any(String),
+      })
     }),
   )
 })

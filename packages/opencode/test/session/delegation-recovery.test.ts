@@ -108,6 +108,7 @@ it.instance("settles only the exact completed child reply and redelivers idempot
       database,
       sessions,
       notify: (input) => Ref.update(notices, (items) => [...items, input]),
+      refresh: () => Effect.void,
     })
     yield* recovery.recover()
     expect(delegationRecord((yield* sessions.get(child.id)).metadata)).toMatchObject({
@@ -136,6 +137,7 @@ it.instance("abandons a dead run without an exact terminal reply and marks faile
       database,
       sessions,
       notify: () => Effect.die(new Error("offline")),
+      refresh: () => Effect.void,
     })
     yield* recovery.recover()
     expect(delegationRecord((yield* sessions.get(child.id)).metadata)).toMatchObject({

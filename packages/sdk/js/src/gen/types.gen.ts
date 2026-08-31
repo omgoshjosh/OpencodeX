@@ -453,15 +453,39 @@ export type EventPermissionReplied = {
 export type SessionStatus =
   | {
       type: "idle"
+      background?: {
+        running: boolean
+        jobs: Array<{
+          role: string
+          title: string
+          owner: string
+        }>
+      }
     }
   | {
       type: "retry"
       attempt: number
       message: string
       next: number
+      background?: {
+        running: boolean
+        jobs: Array<{
+          role: string
+          title: string
+          owner: string
+        }>
+      }
     }
   | {
       type: "busy"
+      background?: {
+        running: boolean
+        jobs: Array<{
+          role: string
+          title: string
+          owner: string
+        }>
+      }
     }
 
 export type EventSessionStatus = {

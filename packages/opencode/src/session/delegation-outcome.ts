@@ -41,6 +41,9 @@ export type DelegationRecord = {
   mode?: "background"
   /** Process identity that started this exact run. */
   ownerID?: string
+  /** Optional display labels captured at delegation time. */
+  role?: string
+  title?: string
   /** Exact child assistant turn; recovery never infers a result without it. */
   childMessageID?: string
   /** 1-based; a reused `task_id` session increments across runs. */
@@ -178,6 +181,8 @@ export function delegationRecord(metadata: Record<string, unknown> | undefined |
     ...(typeof raw.toolCallID === "string" ? { toolCallID: raw.toolCallID } : {}),
     ...(raw.mode === "background" ? { mode: raw.mode } : {}),
     ...(typeof raw.ownerID === "string" ? { ownerID: raw.ownerID } : {}),
+    ...(typeof raw.role === "string" ? { role: raw.role } : {}),
+    ...(typeof raw.title === "string" ? { title: raw.title } : {}),
     ...(typeof raw.childMessageID === "string" ? { childMessageID: raw.childMessageID } : {}),
     attempt: raw.attempt,
     phase: raw.phase,

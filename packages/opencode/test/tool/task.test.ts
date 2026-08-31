@@ -922,6 +922,7 @@ describe("tool.task", () => {
   background.instance("execute launches background tasks without waiting for completion", () =>
     Effect.gen(function* () {
       const jobs = yield* BackgroundJob.Service
+      const status = yield* SessionStatus.Service
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
       const def = yield* tool.init()
@@ -955,6 +956,10 @@ describe("tool.task", () => {
       expect(result.metadata.background).toBe(true)
       expect(result.output).toContain(`state="running"`)
       expect(job?.status).toBe("running")
+      expect(yield* status.get(chat.id)).toMatchObject({
+        type: "idle",
+        background: { running: true, jobs: [{ role: "general", title: "inspect bug", owner: expect.any(String) }] },
+      })
     }),
   )
 
@@ -1210,6 +1215,8 @@ describe("tool.task", () => {
         attempt: 1,
         parentSessionID: chat.id,
         parentMessageID: assistant.id,
+        role: "general",
+        title: "do work",
         // Execution settled; the parent has not durably received the report
         // yet - that mark belongs to the tool-part persistence, not the tool.
         deliveryOutcome: "pending",

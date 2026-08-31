@@ -117,6 +117,7 @@ describe("session.retry.delay", () => {
       })
     }),
   )
+
 })
 
 describe("session.retry.retryable", () => {
@@ -240,6 +241,23 @@ describe("session.retry.retryable", () => {
     )
 
     expect(SessionRetry.retryable(error)).toBeUndefined()
+  })
+
+  test("fails quota and authentication errors fast even when marked retryable", () => {
+    const quota = Schema.decodeUnknownSync(SessionLegacy.APIError.Schema)(
+      new SessionLegacy.APIError({
+        message: "quota exhausted",
+        isRetryable: true,
+        statusCode: 429,
+        metadata: { code: "insufficient_quota" },
+      }).toObject(),
+    )
+    const auth = Schema.decodeUnknownSync(SessionLegacy.APIError.Schema)(
+      new SessionLegacy.APIError({ message: "unauthorized", isRetryable: true, statusCode: 401 }).toObject(),
+    )
+    expect(SessionRetry.retryable(quota)).toBeUndefined()
+    expect(SessionRetry.retryable(auth)).toBeUndefined()
+    expect(SessionRetry.retryable({ name: "ProviderAuthError", data: { message: "expired" } })).toBeUndefined()
   })
 
   test("retries ZlibError decompression failures", () => {

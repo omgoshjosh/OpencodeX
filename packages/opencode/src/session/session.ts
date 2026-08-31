@@ -36,9 +36,11 @@ import { SessionID, MessageID, PartID } from "./schema"
 import {
   DELEGATION_DELIVERY_CLAIM_GRACE,
   delegationRecord,
+  withDelegationFailure,
   withDelegationRecord,
   withoutDelegationRecord,
   type DelegationRecord,
+  type DelegationFailure,
 } from "./delegation-outcome"
 import { Identifier } from "@/id/id"
 
@@ -508,6 +510,8 @@ export interface Interface {
     at?: number
     token?: string
   }) => Effect.Effect<string | undefined>
+  /** Persists parent-owned failure evidence before a transient status transition. */
+  readonly recordDelegationFailure: (input: { sessionID: SessionID; failure: DelegationFailure }) => Effect.Effect<boolean>
   readonly setPermission: (input: { sessionID: SessionID; permission: Permission.Ruleset }) => Effect.Effect<void>
   readonly setRevert: (input: {
     sessionID: SessionID
@@ -1167,6 +1171,17 @@ export const layer: Layer.Layer<
       )
     })
 
+    const recordDelegationFailure = Effect.fn("Session.recordDelegationFailure")(function* (input: {
+      sessionID: SessionID
+      failure: DelegationFailure
+    }) {
+      return yield* mutate(input.sessionID, (current) => ({
+        ...current,
+        metadata: withDelegationFailure(current.metadata, input.failure),
+        time: { ...current.time, updated: Date.now() },
+      })).pipe(Effect.orDie)
+    })
+
     const setPermission = Effect.fn("Session.setPermission")(function* (input: {
       sessionID: SessionID
       permission: Permission.Ruleset
@@ -1323,6 +1338,7 @@ export const layer: Layer.Layer<
       stampDelegation,
       stampDelegationDelivery,
       claimDelegationDelivery,
+      recordDelegationFailure,
       setPermission,
       setRevert,
       clearRevert,

@@ -38,6 +38,12 @@ const ref = {
   modelID: ProviderV2.ModelID.make("test-model"),
 }
 
+const status = SessionStatus.layer.pipe(
+  Layer.provide(Database.defaultLayer),
+  Layer.provideMerge(EventV2Bridge.defaultLayer),
+)
+const runState = SessionRunState.layer.pipe(Layer.provide(status))
+
 const layer = (flags: Partial<RuntimeFlags.Info> = {}) =>
   Layer.mergeAll(
     Agent.defaultLayer,
@@ -46,8 +52,8 @@ const layer = (flags: Partial<RuntimeFlags.Info> = {}) =>
     Config.defaultLayer,
     CrossSpawnSpawner.defaultLayer,
     Session.defaultLayer,
-    SessionRunState.defaultLayer,
-    SessionStatus.defaultLayer,
+    runState,
+    status,
     Truncate.defaultLayer,
     ToolRegistry.defaultLayer,
     Database.defaultLayer,
@@ -1606,14 +1612,20 @@ describe("tool.task", () => {
       )
 
       const child = yield* sessions.get(SessionID.make(result.metadata.sessionId))
+      const parent = yield* sessions.get(chat.id)
       expect(delegationOutcome(child.metadata)).toBe("errored")
       expect(delegationRecord(child.metadata)?.error).toContain("code=insufficient_quota")
       expect(delegationRecord(child.metadata)?.error).not.toContain("child-secret")
+      expect(JSON.stringify(parent.metadata)).toContain("code=insufficient_quota")
+      expect(JSON.stringify(parent.metadata)).not.toContain("child-secret")
       expect(yield* status.get(chat.id)).toMatchObject({
         type: "blocked",
         childSessionID: child.id,
         attemptedModels: ["test/test-model"],
       })
+      yield* status.set(chat.id, { type: "busy" })
+      yield* status.set(chat.id, { type: "idle" })
+      expect(JSON.stringify((yield* sessions.get(chat.id)).metadata)).toContain("code=insufficient_quota")
       // The stamp must ride alongside the swarm bookkeeping, never replace it.
       expect(result.output).toContain("failed")
     }),

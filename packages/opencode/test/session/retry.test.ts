@@ -133,7 +133,10 @@ describe("session.retry.delay", () => {
     await Effect.runPromise(step(error))
     await Effect.runPromise(step(error))
     await Effect.runPromise(step(error))
-    await Effect.runPromise(step(error))
+    await expect(Promise.resolve().then(() => Effect.runPromise(step(error)))).rejects.toMatchObject({
+      _tag: "Done",
+      value: 4,
+    })
     expect(updates).toEqual([1, 2, 3])
 
     const partialUpdates: number[] = []
@@ -146,7 +149,10 @@ describe("session.retry.delay", () => {
         }),
       ),
     )
-    await Effect.runPromise(partial(error))
+    await expect(Promise.resolve().then(() => Effect.runPromise(partial(error)))).rejects.toMatchObject({
+      _tag: "Done",
+      value: 1,
+    })
     expect(partialUpdates).toEqual([])
   })
 })

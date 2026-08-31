@@ -131,7 +131,7 @@ export function policy(opts: {
     Effect.succeed((meta: Schedule.InputMetadata<unknown>) => {
       const error = opts.parse(meta.input)
       const retry = retryable(error)
-      if (!retry || (opts.canRetry && !opts.canRetry()) || meta.attempt >= RETRY_MAX_ATTEMPTS) return Cause.done(meta.attempt)
+      if (!retry || (opts.canRetry && !opts.canRetry()) || meta.attempt > RETRY_MAX_ATTEMPTS) return Cause.done(meta.attempt)
       return Effect.gen(function* () {
         const now = yield* Clock.currentTimeMillis
         startedAt ??= now

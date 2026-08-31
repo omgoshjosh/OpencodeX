@@ -34,7 +34,7 @@ const log = Log.create({ service: "tool.task" })
 export interface TaskPromptOps {
   cancel(sessionID: SessionID): Effect.Effect<void>
   resolvePromptParts(template: string): Effect.Effect<SessionPrompt.PromptInput["parts"]>
-  prompt(input: SessionPrompt.PromptInput): Effect.Effect<SessionLegacy.WithParts>
+  prompt(input: SessionPrompt.PromptInput): Effect.Effect<SessionLegacy.WithParts, never, Session.Service>
 }
 
 const id = "task"
@@ -77,8 +77,9 @@ export const Parameters = Schema.Struct({
   }),
 })
 
-function output(sessionID: SessionID, text: string) {
-  return [`<task id="${sessionID}" state="completed">`, "<task_result>", text, "</task_result>", "</task>"].join("\n")
+function output(sessionID: SessionID, result: TaskRunResult) {
+  const tag = result.state === "completed" ? "task_result" : "task_error"
+  return [`<task id="${sessionID}" state="${result.state}">`, `<${tag}>`, result.text, `</${tag}>`, "</task>"].join("\n")
 }
 
 function backgroundOutput(sessionID: SessionID) {
@@ -120,7 +121,7 @@ function errorText(error: unknown) {
 }
 
 /** What one child run produced, before it is folded into the tool result. */
-type TaskRunResult = { state: "completed" | "error"; text: string }
+type TaskRunResult = { state: "completed" | "error" | "cancelled"; text: string }
 
 /**
  * How many delegation hops a swarm may nest.
@@ -345,14 +346,12 @@ export const TaskTool = Tool.define(
           }),
           runID,
         ).pipe(Effect.asVoid)
-      // An observed cancellation request wins over a late clean return: the
-      // stamp records user intent, even though the report text still flows
-      // back to the parent.
+      // An observed cancellation request wins over a late clean return.
       const cancelState = { requested: false }
       const settleResult = (result: TaskRunResult) =>
         cancelState.requested
           ? settle("cancelled", result.text)
-          : settle(result.state === "error" ? "errored" : "completed", result.text)
+          : settle(result.state === "error" ? "errored" : result.state, result.text)
 
       yield* stamp(started)
 
@@ -414,44 +413,57 @@ export const TaskTool = Tool.define(
 
         const runTask = Effect.fn("TaskTool.runTask")(function* () {
           const parts = yield* ops.resolvePromptParts(params.prompt)
-          const result = yield* ops.prompt({
-            messageID: MessageID.ascending(),
-            sessionID: nextSession.id,
-            model: {
-              modelID: model.modelID,
-              providerID: model.providerID,
-            },
-            agent: next.name,
-            tools: {
-              ...(next.permission.some((rule) => rule.permission === "todowrite") ? {} : { todowrite: false }),
-              // A swarm role must be able to fan its own work out and to hand it
-              // to the next layer, so a swarm member keeps the task tool even
-              // when its agent does not grant it explicitly - up to the depth cap,
-              // past which delegation stops rather than recursing forever.
-              ...(( swarm && childDepth < MAX_SWARM_DELEGATION_DEPTH) ||
-              next.permission.some((rule) => rule.permission === id)
-                ? {}
-                : { task: false }),
-              ...Object.fromEntries((cfg.experimental?.primary_tools ?? []).map((item) => [item, false])),
-            },
-            parts,
-          })
+          const result = yield* ops
+            .prompt({
+              messageID: MessageID.ascending(),
+              sessionID: nextSession.id,
+              model: {
+                modelID: model.modelID,
+                providerID: model.providerID,
+              },
+              agent: next.name,
+              tools: {
+                ...(next.permission.some((rule) => rule.permission === "todowrite") ? {} : { todowrite: false }),
+                // A swarm role must be able to fan its own work out and to hand it
+                // to the next layer, so a swarm member keeps the task tool even
+                // when its agent does not grant it explicitly - up to the depth cap,
+                // past which delegation stops rather than recursing forever.
+                ...((swarm && childDepth < MAX_SWARM_DELEGATION_DEPTH) ||
+                next.permission.some((rule) => rule.permission === id)
+                  ? {}
+                  : { task: false }),
+                ...Object.fromEntries((cfg.experimental?.primary_tools ?? []).map((item) => [item, false])),
+              },
+              parts,
+            })
+            .pipe(Effect.provideService(Session.Service, sessions))
+          // Prompt returns a transport snapshot that can be stale if completion
+          // persistence races with its return. Classify the durable assistant turn.
+          const persisted = yield* MessageV2.get({ sessionID: nextSession.id, messageID: result.info.id }).pipe(
+            Effect.provideService(Database.Service, database),
+            Effect.orDie,
+          )
           // The report is the last real text part. Synthetic parts are injected
           // briefings, and a silent "" for a failed subagent reads as success to
           // the caller - that is exactly the "completed but empty" confusion.
           const report =
-            result.parts
+            persisted.parts
               .flatMap((part) => (part.type === "text" && !part.synthetic && part.text.trim() ? [part.text.trim()] : []))
               .at(-1) ?? ""
-          if (result.info.role === "assistant" && result.info.error) {
-            const failure = [`The subagent failed: ${JSON.stringify(result.info.error)}`, report]
+          if (persisted.info.role === "assistant" && persisted.info.error) {
+            const failure = [`The subagent failed: ${JSON.stringify(persisted.info.error)}`, report]
               .filter(Boolean)
               .join("\n")
             return { state: "error", text: failure } satisfies TaskRunResult
           }
+          if (!report)
+            return {
+              state: "error",
+              text: "The subagent completed without producing a text report.",
+            } satisfies TaskRunResult
           return {
             state: "completed",
-            text: report || "The subagent completed without producing a text report.",
+            text: report,
           } satisfies TaskRunResult
         })
 
@@ -478,6 +490,7 @@ export const TaskTool = Tool.define(
               ],
             })
             .pipe(
+              Effect.provideService(Session.Service, sessions),
               // The notification's durable persistence is what "delivered"
               // means for a background delegation; anything short of that must
               // not read as the parent having received the result.
@@ -554,11 +567,14 @@ export const TaskTool = Tool.define(
           () =>
             Effect.gen(function* () {
               const result = yield* runTask()
-              yield* settleResult(result)
+              const final = cancelState.requested
+                ? ({ state: "cancelled", text: "The subagent was cancelled." } satisfies TaskRunResult)
+                : result
+              yield* settleResult(final)
               return {
                 title: params.description,
                 metadata,
-                output: output(nextSession.id, result.text),
+                output: output(nextSession.id, final),
               }
             }),
           (_, exit) =>

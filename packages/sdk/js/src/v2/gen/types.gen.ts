@@ -641,6 +641,17 @@ export type SessionStatus =
   | {
       type: "busy"
     }
+  | {
+      type: "blocked"
+      childSessionID: string
+      attemptedModels: Array<string>
+      error: string
+      retryAt?: number
+    }
+  | {
+      type: "monitoring"
+      childSessionID?: string
+    }
 
 export type QuestionOption = {
   /**
@@ -2454,6 +2465,10 @@ export type OpencodeXSwarmRole = {
   skill?: string
   providerID?: string
   modelID?: string
+  fallbackModels?: Array<{
+    providerID: string
+    modelID: string
+  }>
   variant?: string
   modelProfile?: string
   status: "planned" | "queued" | "running" | "cancelling" | "blocked" | "failed" | "completed" | "cancelled"
@@ -2806,6 +2821,10 @@ export type OpencodeXSwarmRoleInput = {
   skill?: string
   providerID?: string
   modelID?: string
+  fallbackModels?: Array<{
+    providerID: string
+    modelID: string
+  }>
   variant?: string
   modelProfile?: string
   instructions: string
@@ -2844,6 +2863,10 @@ export type OpencodeXSwarmUpdateRoleInput = {
   skill?: string
   providerID?: string
   modelID?: string
+  fallbackModels?: Array<{
+    providerID: string
+    modelID: string
+  }>
   variant?: string
   modelProfile?: string
   instructions?: string
@@ -10021,6 +10044,43 @@ export type SessionChildrenResponses = {
 }
 
 export type SessionChildrenResponse = SessionChildrenResponses[keyof SessionChildrenResponses]
+
+export type SessionChildRetryData = {
+  body?: never
+  path: {
+    sessionID: string
+    childSessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/child/{childSessionID}/retry"
+}
+
+export type SessionChildRetryErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+}
+
+export type SessionChildRetryError = SessionChildRetryErrors[keyof SessionChildRetryErrors]
+
+export type SessionChildRetryResponses = {
+  /**
+   * Started blocked child retry
+   */
+  200: {
+    childSessionID: string
+    attempt: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    providerID: string
+    modelID: string
+    status: "busy"
+  }
+}
+
+export type SessionChildRetryResponse = SessionChildRetryResponses[keyof SessionChildRetryResponses]
 
 export type SessionTodoData = {
   body?: never

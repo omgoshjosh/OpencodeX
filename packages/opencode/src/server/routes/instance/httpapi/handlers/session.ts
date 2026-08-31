@@ -11,6 +11,7 @@ import { SessionPrompt } from "@/session/prompt"
 import { SessionRevert } from "@/session/revert"
 import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
+import { DelegationRetry } from "@/session/delegation-retry"
 import { SessionSummary } from "@/session/summary"
 import { Todo } from "@/session/todo"
 import { MessageID, PartID, SessionID } from "@/session/schema"
@@ -343,6 +344,15 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       return HttpApiSchema.NoContent.make()
     })
 
+    const retryChild = Effect.fn("SessionHttpApi.retryChild")(function* (ctx: {
+      params: { sessionID: SessionID; childSessionID: SessionID }
+    }) {
+      return yield* DelegationRetry.retryBlockedChild({
+        parentSessionID: ctx.params.sessionID,
+        childSessionID: ctx.params.childSessionID,
+      }).pipe(Effect.mapError(() => new HttpApiError.BadRequest({})))
+    })
+
     const command = Effect.fn("SessionHttpApi.command")(function* (ctx: {
       params: { sessionID: SessionID }
       payload: typeof CommandPayload.Type
@@ -443,6 +453,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       .handle("summarize", summarize)
       .handle("prompt", prompt)
       .handle("promptAsync", promptAsync)
+      .handle("retryChild", retryChild)
       .handle("command", command)
       .handle("shell", shell)
       .handle("revert", revert)

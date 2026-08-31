@@ -71,6 +71,7 @@ export const planLayer = Layer.effect(
                       skill: role.skill,
                       provider_id: role.providerID,
                       model_id: role.modelID,
+                      fallback_models: role.fallbackModels ? [...role.fallbackModels] : undefined,
                       variant: role.variant,
                       model_profile: role.modelProfile,
                       status: "planned",

@@ -63,6 +63,10 @@ export interface Interface {
   readonly list: () => Effect.Effect<Map<SessionID, Info>>
   readonly set: (sessionID: SessionID, status: Info) => Effect.Effect<void>
   readonly setForGeneration: (sessionID: SessionID, generation: number, status: Info) => Effect.Effect<boolean>
+  readonly claimBlockedRetry: (input: {
+    sessionID: SessionID
+    childSessionID: SessionID
+  }) => Effect.Effect<boolean>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionStatus") {}
@@ -259,6 +263,37 @@ export const layer = Layer.effect(
       yield* write(sessionID, status)
     })
 
+    const claimBlockedRetry = Effect.fn("SessionStatus.claimBlockedRetry")(function* (input: {
+      sessionID: SessionID
+      childSessionID: SessionID
+    }) {
+      const now = Date.now()
+      const committed = yield* events.barrier(
+        db.transaction(
+          (transaction) =>
+            Effect.gen(function* () {
+              const current = yield* transaction
+                .select({ status: SessionStatusTable.status })
+                .from(SessionStatusTable)
+                .where(eq(SessionStatusTable.session_id, input.sessionID))
+                .get()
+              const status = current && Option.getOrUndefined(decode(current.status))
+              if (status?.type !== "blocked" || status.childSessionID !== input.childSessionID) return undefined
+              yield* transaction
+                .update(SessionStatusTable)
+                .set({ status: { type: "busy" }, time_updated: now })
+                .where(eq(SessionStatusTable.session_id, input.sessionID))
+                .run()
+              return yield* events.commit(Event.Status, { sessionID: input.sessionID, status: { type: "busy" } })
+            }),
+          { behavior: "immediate" },
+        ).pipe(Effect.orDie),
+      )
+      if (!committed) return false
+      yield* events.broadcast(committed)
+      return true
+    })
+
     // Recovery reconciles rows whose owning execution died. It used to run on
     // every read, which meant two full table scans inside an immediate
     // transaction under the event barrier for something as routine as painting
@@ -276,7 +311,7 @@ export const layer = Layer.effect(
       Effect.forkScoped,
     )
 
-    return Service.of({ get, list, set, setForGeneration })
+    return Service.of({ get, list, set, setForGeneration, claimBlockedRetry })
   }),
 )
 

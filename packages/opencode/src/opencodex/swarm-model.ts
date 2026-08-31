@@ -89,6 +89,10 @@ export function hydrateRole(row: typeof OpencodeXSwarmRoleTable.$inferSelect): R
     skill: row.skill ?? undefined,
     providerID: row.provider_id ? ProviderV2.ID.make(row.provider_id) : undefined,
     modelID: row.model_id ? ProviderV2.ModelID.make(row.model_id) : undefined,
+    fallbackModels: row.fallback_models?.map((model) => ({
+      providerID: ProviderV2.ID.make(model.providerID),
+      modelID: ProviderV2.ModelID.make(model.modelID),
+    })),
     variant: row.variant ?? undefined,
     modelProfile: row.model_profile ?? undefined,
     status: Schema.decodeUnknownSync(RoleStatus)(row.status),

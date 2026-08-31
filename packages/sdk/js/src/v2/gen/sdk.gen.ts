@@ -366,6 +366,8 @@ import type {
   SessionAbortResponses,
   SessionChildrenErrors,
   SessionChildrenResponses,
+  SessionChildRetryErrors,
+  SessionChildRetryResponses,
   SessionCommandErrors,
   SessionCommandResponses,
   SessionCreateErrors,
@@ -5905,6 +5907,40 @@ export class Provider extends HeyApiClient {
   }
 }
 
+export class Child extends HeyApiClient {
+  /**
+   * Retry a blocked child using its swarm role routes
+   */
+  public retry<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      childSessionID: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "path", key: "childSessionID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<SessionChildRetryResponses, SessionChildRetryErrors, ThrowOnError>({
+      url: "/session/{sessionID}/child/{childSessionID}/retry",
+      ...options,
+      ...params,
+    })
+  }
+}
+
 export class Session3 extends HeyApiClient {
   /**
    * List sessions
@@ -6826,6 +6862,11 @@ export class Session3 extends HeyApiClient {
       ...options,
       ...params,
     })
+  }
+
+  private _child?: Child
+  get child(): Child {
+    return (this._child ??= new Child({ client: this.client }))
   }
 }
 

@@ -540,10 +540,7 @@ export interface Interface {
    * `transient` publishes the revision to live subscribers without journaling
    * it. Use it for in-flight progress only - terminal state must stay durable.
    */
-  readonly updatePart: <T extends SessionLegacy.Part>(
-    part: T,
-    options?: { transient?: boolean },
-  ) => Effect.Effect<T>
+  readonly updatePart: <T extends SessionLegacy.Part>(part: T, options?: { transient?: boolean }) => Effect.Effect<T>
   readonly updatePartDelta: (input: {
     sessionID: SessionID
     messageID: MessageID
@@ -837,9 +834,7 @@ export const layer: Layer.Layer<
         // revision is unobservable. Same shape as `message.part.delta`, which
         // has always been broadcast-only.
         if (options?.transient) {
-          yield* events.broadcast(
-            yield* events.payload(SessionLegacy.Event.PartUpdated, data, { location }),
-          )
+          yield* events.broadcast(yield* events.payload(SessionLegacy.Event.PartUpdated, data, { location }))
           return part
         }
         yield* events.publish(SessionLegacy.Event.PartUpdated, data, { location })
@@ -1048,6 +1043,9 @@ export const layer: Layer.Layer<
       return yield* mutate(input.sessionID, (current) => {
         const stored = delegationRecord(current.metadata)
         if (!stored || stored.runID !== input.runID) return undefined
+        // Delivery is monotonic: a late failed retry can never erase proof that
+        // the parent already durably received this run's result.
+        if (stored.deliveryOutcome === "delivered" && input.outcome === "failed") return undefined
         return {
           ...current,
           metadata: withDelegationRecord(current.metadata, {

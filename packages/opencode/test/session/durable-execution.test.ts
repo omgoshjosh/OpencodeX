@@ -8,6 +8,8 @@ import { QuestionID } from "@/question/schema"
 import { SessionRunState } from "@/session/run-state"
 import { MessageID, SessionID } from "@/session/schema"
 import { SessionStatus } from "@/session/status"
+import * as PromptClaim from "@/session/prompt-claim"
+import { ensureRunID } from "@opencode-ai/core/util/opencode-process"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Database } from "@opencode-ai/core/database/database"
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
@@ -20,7 +22,7 @@ import {
   SessionStatusTable,
 } from "@opencode-ai/core/session/sql"
 import { and, eq } from "drizzle-orm"
-import { Context, Effect, Exit, Fiber, Latch, Layer, Ref } from "effect"
+import { Context, Effect, Exit, Fiber, Latch, Layer, Ref, Scope } from "effect"
 import { pollWithTimeout, testEffect } from "../lib/effect"
 
 const env = Layer.mergeAll(
@@ -102,6 +104,41 @@ const buildQuestionGraph = Effect.fn("DurableExecutionTest.buildQuestionGraph")(
   return Context.get(context, Question.Service)
 })
 
+const buildPromptClaim = Effect.fn("DurableExecutionTest.buildPromptClaim")(function* (loop = Effect.succeed(output)) {
+  const database = yield* Database.Service
+  const events = yield* EventV2Bridge.Service
+  const scope = yield* Scope.Scope
+  return yield* PromptClaim.make({ database, events, scope, loop: () => loop })
+})
+
+const insertCommand = Effect.fn("DurableExecutionTest.insertCommand")(function* (input: {
+  id: string
+  status?: "queued" | "running" | "cancelled"
+  owner?: string
+  leaseExpiresAt?: number
+  generation?: number
+}) {
+  const { db } = yield* Database.Service
+  const now = Date.now()
+  yield* db
+    .insert(SessionCommandTable)
+    .values({
+      id: input.id,
+      session_id: sessionID,
+      message_id: MessageID.make(`msg_${input.id}`),
+      project_id: "prj_test",
+      directory: ".",
+      status: input.status ?? "queued",
+      owner_id: input.owner,
+      lease_expires_at: input.leaseExpiresAt,
+      claim_generation: input.generation ?? 0,
+      time_created: now,
+      time_updated: now,
+    })
+    .run()
+    .pipe(Effect.orDie)
+})
+
 it.instance("allows one lease winner and makes a foreign caller join", () =>
   Effect.gen(function* () {
     const first = yield* buildRunGraph()
@@ -152,7 +189,10 @@ it.instance("rejects stale status writes after a newer execution generation clai
         .from(SessionExecutionTable)
         .where(eq(SessionExecutionTable.session_id, sessionID))
         .get()
-        .pipe(Effect.orDie, Effect.map((row) => (row?.generation === 2 ? true : undefined))),
+        .pipe(
+          Effect.orDie,
+          Effect.map((row) => (row?.generation === 2 ? true : undefined)),
+        ),
       "new execution generation never claimed",
     )
     yield* Fiber.join(firstFiber)
@@ -303,6 +343,192 @@ it.instance("recovers a dead owner and stale busy status", () =>
   }),
 )
 
+it.instance("reclaims a dead command lease immediately and leaves a live owner untouched", () =>
+  Effect.gen(function* () {
+    const claim = yield* buildPromptClaim()
+    const now = Date.now()
+    yield* insertCommand({
+      id: "sec_dead_command",
+      status: "running",
+      owner: "local:999999:dead:command",
+      leaseExpiresAt: now + 60_000,
+      generation: 1,
+    })
+    yield* insertCommand({
+      id: "sec_live_command",
+      status: "running",
+      owner: `local:${process.pid}:${ensureRunID()}:command`,
+      leaseExpiresAt: now + 60_000,
+      generation: 1,
+    })
+    yield* insertCommand({
+      id: "sec_legacy_live_command",
+      status: "running",
+      owner: `local:${process.pid}:prompt:legacy`,
+      leaseExpiresAt: now + 60_000,
+      generation: 1,
+    })
+
+    expect(yield* claim.claimCommandTurn("sec_dead_command")).toMatchObject({ state: "ready" })
+    expect(yield* claim.claimCommandTurn("sec_live_command")).toEqual({ state: "waiting" })
+    expect(yield* claim.claimCommandTurn("sec_legacy_live_command")).toEqual({ state: "waiting" })
+
+    const { db } = yield* Database.Service
+    yield* db
+      .insert(SessionExecutionTable)
+      .values({
+        session_id: sessionID,
+        project_id: "prj_test",
+        directory: ".",
+        state: "running",
+        owner_id: "local:999999:dead:execution",
+        generation: 1,
+        lease_expires_at: now + 60_000,
+        time_created: now,
+        time_updated: now,
+      })
+      .run()
+      .pipe(Effect.orDie)
+    expect(yield* claim.waitForExecutionTurn("sec_dead_command", sessionID)).toBe(true)
+  }),
+)
+
+it.instance("only one recoverer reclaims a dead command lease", () =>
+  Effect.gen(function* () {
+    const first = yield* buildPromptClaim()
+    const second = yield* buildPromptClaim()
+    yield* insertCommand({
+      id: "sec_dead_race",
+      status: "running",
+      owner: "local:999999:dead:race",
+      leaseExpiresAt: Date.now() + 60_000,
+      generation: 1,
+    })
+
+    const results = yield* Effect.all(
+      [first.claimCommandTurn("sec_dead_race"), second.claimCommandTurn("sec_dead_race")],
+      {
+        concurrency: "unbounded",
+      },
+    )
+    expect(results.filter((result) => result.state === "ready")).toHaveLength(1)
+    expect(results.filter((result) => result.state === "waiting")).toHaveLength(1)
+  }),
+)
+
+it.instance("scope interruption requeues its command but never revives cancellation", () =>
+  Effect.gen(function* () {
+    const claim = yield* buildPromptClaim(Effect.never)
+    const { db } = yield* Database.Service
+    yield* insertCommand({ id: "sec_interrupted" })
+    const interrupted = yield* claim.executeCommand("sec_interrupted").pipe(Effect.forkScoped)
+    yield* pollWithTimeout(
+      db
+        .select({ status: SessionCommandTable.status })
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.id, "sec_interrupted"))
+        .get()
+        .pipe(
+          Effect.orDie,
+          Effect.map((row) => (row?.status === "running" ? true : undefined)),
+        ),
+      "command was not claimed",
+    )
+    yield* Fiber.interrupt(interrupted)
+    expect(
+      yield* db
+        .select({ status: SessionCommandTable.status })
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.id, "sec_interrupted"))
+        .get()
+        .pipe(Effect.orDie),
+    ).toEqual({ status: "queued" })
+    yield* db
+      .update(SessionCommandTable)
+      .set({ status: "cancelled", completed_at: Date.now(), time_updated: Date.now() })
+      .where(eq(SessionCommandTable.id, "sec_interrupted"))
+      .run()
+      .pipe(Effect.orDie)
+
+    yield* insertCommand({ id: "sec_cancelled" })
+    const cancelled = yield* claim.executeCommand("sec_cancelled").pipe(Effect.forkScoped)
+    yield* pollWithTimeout(
+      db
+        .select({ status: SessionCommandTable.status })
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.id, "sec_cancelled"))
+        .get()
+        .pipe(
+          Effect.orDie,
+          Effect.map((row) => (row?.status === "running" ? true : undefined)),
+        ),
+      "cancelled command was not claimed",
+    )
+    yield* db
+      .update(SessionCommandTable)
+      .set({ status: "cancelled", owner_id: null, lease_expires_at: null, time_updated: Date.now() })
+      .where(eq(SessionCommandTable.id, "sec_cancelled"))
+      .run()
+      .pipe(Effect.orDie)
+    yield* Fiber.interrupt(cancelled)
+    expect(
+      yield* db
+        .select({ status: SessionCommandTable.status })
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.id, "sec_cancelled"))
+        .get()
+        .pipe(Effect.orDie),
+    ).toEqual({ status: "cancelled" })
+  }),
+)
+
+it.instance("a stale command owner cannot settle a reclaimed command", () =>
+  Effect.gen(function* () {
+    const release = yield* Latch.make()
+    const claim = yield* buildPromptClaim(release.await.pipe(Effect.as(output)))
+    const { db } = yield* Database.Service
+    yield* insertCommand({ id: "sec_stale_settle" })
+    const fiber = yield* claim.executeCommand("sec_stale_settle").pipe(Effect.forkScoped)
+    yield* pollWithTimeout(
+      db
+        .select({ status: SessionCommandTable.status })
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.id, "sec_stale_settle"))
+        .get()
+        .pipe(
+          Effect.orDie,
+          Effect.map((row) => (row?.status === "running" ? true : undefined)),
+        ),
+      "stale command was not claimed",
+    )
+    yield* db
+      .update(SessionCommandTable)
+      .set({
+        owner_id: "foreign:reclaimed",
+        claim_generation: 2,
+        lease_expires_at: Date.now() + 60_000,
+        time_updated: Date.now(),
+      })
+      .where(eq(SessionCommandTable.id, "sec_stale_settle"))
+      .run()
+      .pipe(Effect.orDie)
+    yield* release.open
+    yield* Fiber.join(fiber)
+    expect(
+      yield* db
+        .select({
+          status: SessionCommandTable.status,
+          owner: SessionCommandTable.owner_id,
+          generation: SessionCommandTable.claim_generation,
+        })
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.id, "sec_stale_settle"))
+        .get()
+        .pipe(Effect.orDie),
+    ).toEqual({ status: "running", owner: "foreign:reclaimed", generation: 2 })
+  }),
+)
+
 it.instance("shares permission requests, replies once, and persists always grants", () =>
   Effect.gen(function* () {
     const first = yield* buildPermissionGraph()
@@ -332,10 +558,7 @@ it.instance("shares permission requests, replies once, and persists always grant
       "permission was not visible across graphs",
     )
 
-    yield* Effect.all([
-      first.reply({ requestID, reply: "always" }),
-      second.reply({ requestID, reply: "reject" }),
-    ])
+    yield* Effect.all([first.reply({ requestID, reply: "always" }), second.reply({ requestID, reply: "reject" })])
     yield* Fiber.await(ask)
     expect(yield* Ref.get(replies)).toBe(1)
 
@@ -425,10 +648,7 @@ it.instance("shares questions and settles the owning Deferred from a remote repl
         : Effect.void,
     )
     yield* Effect.addFinalizer(() => unsubscribe)
-    yield* Effect.all([
-      first.reply({ requestID: pending.id, answers: [["Yes"]] }),
-      second.reject(pending.id),
-    ])
+    yield* Effect.all([first.reply({ requestID: pending.id, answers: [["Yes"]] }), second.reject(pending.id)])
     const exit = yield* Fiber.await(ask)
     expect(Exit.isSuccess(exit) ? exit.value : exit.cause).toBeDefined()
     expect(yield* Ref.get(replies)).toBe(1)

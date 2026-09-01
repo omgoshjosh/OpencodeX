@@ -37,3 +37,19 @@ export const EventTable = sqliteTable(
     ),
   ],
 )
+
+// A separate AUTOINCREMENT key provides a global journal cursor that SQLite
+// never reuses after retention deletes rows from EventTable.
+export const EventCursorTable = sqliteTable("event_cursor", {
+  position: integer().primaryKey({ autoIncrement: true }),
+  event_id: text()
+    .notNull()
+    .unique()
+    .references(() => EventTable.id, { onDelete: "cascade" }),
+})
+
+export const EventCursorLeaseTable = sqliteTable("event_cursor_lease", {
+  token: text().primaryKey(),
+  fence: integer().notNull(),
+  expires_at: integer().notNull(),
+})

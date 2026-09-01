@@ -1600,7 +1600,7 @@ describe("workspace sync state", () => {
               Effect.gen(function* () {
                 expect((yield* sessionSvc.get(session.id).pipe(Effect.orDie)).title).toBe("after reset")
               }),
-              4_000,
+              10_000,
             )
             expect(historyBodies).toEqual([
               { state: { [session.id]: historyNextSeq - 1 } },

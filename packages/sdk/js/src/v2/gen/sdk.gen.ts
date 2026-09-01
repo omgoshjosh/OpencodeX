@@ -412,6 +412,8 @@ import type {
   SubtaskPartInput,
   SyncHistoryListErrors,
   SyncHistoryListResponses,
+  SyncHistoryPageErrors,
+  SyncHistoryPageResponses,
   SyncReplayErrors,
   SyncReplayResponses,
   SyncStartErrors,
@@ -6950,7 +6952,7 @@ export class History extends HeyApiClient {
   /**
    * List sync events
    *
-   * List sync events. Keys in `state` are aggregate IDs the client already knows about, values are the last known sequence ID. Events with seq > value are returned for those aggregates. Aggregates not listed in the input get their full history. When the optional `directory` query parameter is set, the journal is scoped to sessions that belong to that directory; otherwise the full journal is returned.
+   * List one bounded page of sync events. Keys in `state` are aggregate IDs the client already knows about, values are the last known sequence ID. Events with seq > value are returned for those aggregates. Aggregates not listed in the input begin at their first retained event. Advance the per-aggregate sequence values from each response and repeat until a page contains fewer than 512 events. When the optional `directory` query parameter is set, the journal is scoped to sessions that belong to that directory; otherwise the full journal is returned.
    */
   public list<ThrowOnError extends boolean = false>(
     parameters?: {
@@ -6976,6 +6978,47 @@ export class History extends HeyApiClient {
     )
     return (options?.client ?? this.client).post<SyncHistoryListResponses, SyncHistoryListErrors, ThrowOnError>({
       url: "/sync/history",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Page sync events
+   *
+   * List one bounded, snapshot-fenced page of sync events. Pass the opaque `next` cursor unchanged until it is null. The `state` revision vector filters events the caller already has.
+   */
+  public page<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+      state?: {
+        [key: string]: number
+      }
+      cursor?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "state" },
+            { in: "body", key: "cursor" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<SyncHistoryPageResponses, SyncHistoryPageErrors, ThrowOnError>({
+      url: "/sync/history/page",
       ...options,
       ...params,
       headers: {

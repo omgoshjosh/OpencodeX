@@ -63,6 +63,19 @@ if (sseTypesPatched === sseTypesSource) {
 }
 await Bun.write(sseTypesPath, sseTypesPatched)
 
+// The OpenAPI generator drops `null` from this response union, although the
+// endpoint deliberately uses null to signal the final page.
+const historyTypesPath = "./src/v2/gen/types.gen.ts"
+const historyTypesSource = await Bun.file(historyTypesPath).text()
+const historyTypesPatched = historyTypesSource.replace(
+  "        next: string;\n    };\n};\n\nexport type SyncHistoryPageResponse",
+  "        next: string | null;\n    };\n};\n\nexport type SyncHistoryPageResponse",
+)
+if (historyTypesPatched === historyTypesSource) {
+  throw new Error(`SyncHistoryPage patch did not apply; @hey-api/openapi-ts output may have changed (${historyTypesPath})`)
+}
+await Bun.write(historyTypesPath, historyTypesPatched)
+
 await $`bun prettier --write src/gen`
 await $`bun prettier --write src/v2`
 await $`rm -rf dist`

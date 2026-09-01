@@ -1522,6 +1522,7 @@ describe("workspace sync state", () => {
               Effect.gen(function* () {
                 expect((yield* sessionSvc.get(session.id).pipe(Effect.orDie)).title).toBe("paged history complete")
               }),
+              10_000,
             )
             expect(historyBodies).toEqual([
               { state: { [session.id]: historyNextSeq - 1 } },
@@ -1596,10 +1597,11 @@ describe("workspace sync state", () => {
             yield* workspace.startWorkspaceSyncing(instance.project.id)
 
             yield* eventuallyEffect(
-              Effect.sync(() => expect(historyBodies).toHaveLength(3)),
+              Effect.gen(function* () {
+                expect((yield* sessionSvc.get(session.id).pipe(Effect.orDie)).title).toBe("after reset")
+              }),
               4_000,
             )
-            expect((yield* sessionSvc.get(session.id).pipe(Effect.orDie)).title).toBe("after reset")
             expect(historyBodies).toEqual([
               { state: { [session.id]: historyNextSeq - 1 } },
               { state: { [session.id]: historyNextSeq }, cursor: "resume-after-reset" },

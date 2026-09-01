@@ -1,4 +1,4 @@
-import { Context, Effect, FiberMap, Iterable, Layer, Schema, Stream } from "effect"
+import { Context, Duration, Effect, FiberMap, Iterable, Layer, Schema, Stream } from "effect"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { FetchHttpClient, HttpBody, HttpClient, HttpClientError, HttpClientRequest } from "effect/unstable/http"
 import { Database } from "@opencode-ai/core/database/database"
@@ -44,6 +44,9 @@ export const ConnectionStatus = Schema.Struct({
   status: Schema.Literals(["connected", "connecting", "disconnected", "error"]),
 })
 export type ConnectionStatus = Schema.Schema.Type<typeof ConnectionStatus>
+
+export const HISTORY_PAGE_SIZE = 512
+const HISTORY_PAGE_DELAY_MS = 25
 
 export const Event = {
   Ready: EventV2.define({
@@ -361,49 +364,70 @@ export const layer = Layer.effect(
         known: Object.keys(state).length,
       })
 
-      const historyURL = route(url, "/sync/history")
-      if (space.directory) historyURL.searchParams.set("directory", space.directory)
+      const historyURL = route(url, "/sync/history/page")
+      if (space.directory !== undefined && space.directory !== null)
+        historyURL.searchParams.set("directory", space.directory)
+      let page = 0
+      let total = 0
+      let cursor: string | undefined
 
-      const response = yield* http.execute(
-        HttpClientRequest.post(historyURL, {
-          headers: new Headers(headers),
-          body: HttpBody.jsonUnsafe(state),
-        }),
-      )
+      while (true) {
+        const response = yield* http.execute(
+          HttpClientRequest.post(historyURL, {
+            headers: new Headers(headers),
+            body: HttpBody.jsonUnsafe({ state, cursor }),
+          }),
+        )
 
-      if (response.status < 200 || response.status >= 300) {
-        const body = yield* response.text
-        return yield* new SyncHttpError({
-          message: `Workspace history HTTP failure: ${response.status} ${body}`,
-          status: response.status,
-          body,
+        if (response.status < 200 || response.status >= 300) {
+          const body = yield* response.text
+          return yield* new SyncHttpError({
+            message: `Workspace history HTTP failure: ${response.status} ${body}`,
+            status: response.status,
+            body,
+          })
+        }
+
+        const result = (yield* response.json) as { events: HistoryEvent[]; next: string | null }
+        const history = result.events
+        page++
+        total += history.length
+        log.info("workspace history page received", {
+          workspaceID: space.id,
+          page,
+          events: history.length,
+          total,
         })
-      }
 
-      const history = (yield* response.json) as HistoryEvent[]
+        yield* Effect.forEach(
+          history,
+          (event) =>
+            events
+              .replay(
+                {
+                  id: EventV2.ID.make(event.id),
+                  aggregateID: event.aggregate_id,
+                  seq: event.seq,
+                  type: event.type,
+                  data: event.data,
+                },
+                { publish: true },
+              )
+              .pipe(Effect.provideService(WorkspaceRef, space.id)),
+          { discard: true },
+        )
+        for (const event of history) state[event.aggregate_id] = Math.max(state[event.aggregate_id] ?? -1, event.seq)
+        cursor = result.next ?? undefined
+        if (!cursor) break
+        yield* Effect.sleep(Duration.millis(HISTORY_PAGE_DELAY_MS))
+      }
 
       log.info("workspace history synced", {
         workspaceID: space.id,
-        events: history.length,
+        pages: page,
+        events: total,
       })
-
-      yield* Effect.forEach(
-        history,
-        (event) =>
-          events
-            .replay(
-              {
-                id: EventV2.ID.make(event.id),
-                aggregateID: event.aggregate_id,
-                seq: event.seq,
-                type: event.type,
-                data: event.data,
-              },
-              { publish: true },
-            )
-            .pipe(Effect.provideService(WorkspaceRef, space.id)),
-        { discard: true },
-      )
+      return true
     })
 
     const syncWorkspaceLoop = Effect.fn("Workspace.syncWorkspaceLoop")(function* (space: Info) {
@@ -633,7 +657,9 @@ export const layer = Layer.effect(
           const previous = yield* get(current.workspaceID)
           if (previous) {
             if (input.projectID && previous.projectID !== input.projectID) {
-              return yield* new WorkspaceScopeError({ message: "Source workspace does not belong to the active project" })
+              return yield* new WorkspaceScopeError({
+                message: "Source workspace does not belong to the active project",
+              })
             }
             const target = yield* WorkspaceAdapterRuntime.target(previous)
 

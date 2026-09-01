@@ -130,9 +130,7 @@ export const make = Effect.fn("EventRetention.make")(function* (
    * applying the output limit.
    */
   const superseded = (aggregates: string[]) =>
-    db
-      .all<{ id: string }>(supersededQuery(aggregates, settings.maintenanceBatchSize))
-      .pipe(Effect.orDie)
+    db.all<{ id: string }>(supersededQuery(aggregates, settings.maintenanceBatchSize)).pipe(Effect.orDie)
 
   const compact = Effect.fn("EventRetention.compact")(function* () {
     const aggregates = yield* window()
@@ -149,23 +147,31 @@ export const make = Effect.fn("EventRetention.make")(function* (
       return 0
     }
     const ids = doomed.map((row) => row.id)
-    yield* barrier(
+    const deleted = yield* barrier(
       db
         .transaction(
           (transaction) =>
             Effect.gen(function* () {
+              const now = Date.now()
+              yield* transaction.run(sql`DELETE FROM event_cursor_lease WHERE expires_at <= ${now}`)
+              const lease = yield* transaction.get<{ active: number }>(
+                sql`SELECT EXISTS(SELECT 1 FROM event_cursor_lease WHERE expires_at > ${now}) AS active`,
+              )
+              if (lease?.active) return 0
               for (let index = 0; index < ids.length; index += DELETE_CHUNK) {
                 yield* transaction.run(sql`DELETE FROM event WHERE id IN ${ids.slice(index, index + DELETE_CHUNK)}`)
               }
+              return ids.length
             }),
           { behavior: "immediate" },
         )
         .pipe(Effect.orDie),
     )
+    if (deleted === 0) return 0
     // A saturated batch means this window still has more to shed, so hold the
     // cursor rather than waiting a full rotation to come back to it.
     if (ids.length < settings.maintenanceBatchSize) advance(aggregates)
-    return ids.length
+    return deleted
   })
 
   return { compact } satisfies Retention
@@ -179,8 +185,11 @@ export const start = Effect.fnUntraced(function* (
 ) {
   const retention = yield* make(db, barrier, options)
   const interval = Math.max(1, options?.maintenanceIntervalMs ?? MAINTENANCE_INTERVAL_MS)
+  const batchSize = Math.max(1, options?.maintenanceBatchSize ?? MAINTENANCE_BATCH_SIZE)
+  yield* Effect.logInfo("event retention scheduled", { intervalMs: interval, batchSize })
   yield* Effect.sleep(Duration.millis(interval)).pipe(
     Effect.andThen(retention.compact()),
+    Effect.tap((deleted) => Effect.logInfo("event retention pass complete", { deleted, batchSize })),
     // A failed pass (e.g. SQLITE_BUSY outliving the busy timeout in
     // multi-process use) must not kill the loop for the life of the process;
     // log it and try again next interval.

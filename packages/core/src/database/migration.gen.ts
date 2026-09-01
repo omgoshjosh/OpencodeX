@@ -52,5 +52,6 @@ export const migrations = (
     import("./migration/20260731171735_gigantic_piledriver"),
     import("./migration/20260821043607_dashing_ikaris"),
     import("./migration/20260831161557_clean_johnny_blaze"),
+    import("./migration/20260901190000_event_cursor"),
   ])
 ).map((module) => module.default) satisfies DatabaseMigration.Migration[]

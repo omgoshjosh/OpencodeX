@@ -4,7 +4,7 @@ import { Context, Effect, Layer } from "effect"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
 import { EventRetention } from "@opencode-ai/core/event/retention"
-import { EventTable } from "@opencode-ai/core/event/sql"
+import { EventCursorLeaseTable, EventTable } from "@opencode-ai/core/event/sql"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
@@ -199,6 +199,31 @@ describe("EventRetention", () => {
       expect(
         after.filter((row) => row.type === "message.part.updated.1" && (row.data as any).part.id === ids.other),
       ).toHaveLength(1)
+    }),
+  )
+
+  it.effect("pauses compaction while a history snapshot lease is active", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const ids = yield* seed(events, db)
+      const retention = yield* EventRetention.make(db, events.barrier, { aggregatesPerPass: 1_000 })
+      const before = yield* journal(db, ids.sessionID)
+      yield* db
+        .insert(EventCursorLeaseTable)
+        .values({ token: "active-history-drain", fence: 1, expires_at: Date.now() + 60_000 })
+        .run()
+        .pipe(Effect.orDie)
+
+      expect(yield* retention.compact()).toBe(0)
+      expect(yield* journal(db, ids.sessionID)).toEqual(before)
+
+      yield* db
+        .delete(EventCursorLeaseTable)
+        .where(eq(EventCursorLeaseTable.token, "active-history-drain"))
+        .run()
+        .pipe(Effect.orDie)
+      expect(yield* retention.compact()).toBeGreaterThan(0)
     }),
   )
 

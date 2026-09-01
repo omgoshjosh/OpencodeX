@@ -26,6 +26,10 @@ export const SessionPayload = Schema.Struct({
   sessionID: SessionID,
 })
 export const HistoryPayload = Schema.Record(Schema.String, NonNegativeInt)
+export const HistoryPagePayload = Schema.Struct({
+  state: HistoryPayload,
+  cursor: Schema.optional(Schema.String),
+})
 export const HistoryEvent = Schema.Struct({
   id: Schema.String,
   aggregate_id: Schema.String,
@@ -33,12 +37,17 @@ export const HistoryEvent = Schema.Struct({
   type: Schema.String,
   data: Schema.Record(Schema.String, Schema.Unknown),
 })
+export const HistoryPageResponse = Schema.Struct({
+  events: Schema.Array(HistoryEvent),
+  next: Schema.NullOr(Schema.String),
+})
 
 export const SyncPaths = {
   start: `${root}/start`,
   replay: `${root}/replay`,
   steal: `${root}/steal`,
   history: `${root}/history`,
+  historyPage: `${root}/history/page`,
 } as const
 
 export const SyncApi = HttpApi.make("sync")
@@ -89,7 +98,20 @@ export const SyncApi = HttpApi.make("sync")
             identifier: "sync.history.list",
             summary: "List sync events",
             description:
-              "List sync events. Keys in `state` are aggregate IDs the client already knows about, values are the last known sequence ID. Events with seq > value are returned for those aggregates. Aggregates not listed in the input get their full history. When the optional `directory` query parameter is set, the journal is scoped to sessions that belong to that directory; otherwise the full journal is returned.",
+              "List one bounded page of sync events. Keys in `state` are aggregate IDs the client already knows about, values are the last known sequence ID. Events with seq > value are returned for those aggregates. Aggregates not listed in the input begin at their first retained event. Advance the per-aggregate sequence values from each response and repeat until a page contains fewer than 512 events. When the optional `directory` query parameter is set, the journal is scoped to sessions that belong to that directory; otherwise the full journal is returned.",
+          }),
+        ),
+        HttpApiEndpoint.post("historyPage", SyncPaths.historyPage, {
+          query: WorkspaceRoutingQuery,
+          payload: HistoryPagePayload,
+          success: described(HistoryPageResponse, "Bounded sync event page"),
+          error: HttpApiError.BadRequest,
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "sync.history.page",
+            summary: "Page sync events",
+            description:
+              "List one bounded, snapshot-fenced page of sync events. Pass the opaque `next` cursor unchanged until it is null. The `state` revision vector filters events the caller already has.",
           }),
         ),
       )

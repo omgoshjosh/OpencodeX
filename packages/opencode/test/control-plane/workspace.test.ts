@@ -1547,7 +1547,7 @@ describe("workspace sync state", () => {
           const bodyText = yield* req.text
           const url = new URL(req.url, "http://localhost")
           if (url.pathname === "/reset-history/global/event")
-            return HttpServerResponse.fromWeb(eventStreamResponse())
+            return HttpServerResponse.fromWeb(eventStreamResponse([], false))
           if (url.pathname === "/reset-history/sync/history/page") {
             const request = historyBodies.length
             historyBodies.push(bodyText ? JSON.parse(bodyText) : undefined)

@@ -44,7 +44,6 @@ export function make(deps: Deps) {
             const child = found.value
             const record = delegationRecord(child.metadata)
             if (!record) return
-            if (record.phase === "settled" && record.deliveryOutcome === "delivered") return
             const parent = yield* deps.sessions.get(SessionID.make(record.parentSessionID)).pipe(Effect.option)
             const parentPart =
               parent._tag === "Some" ? yield* taskPart(deps.sessions, record, parent.value.id) : undefined
@@ -55,7 +54,8 @@ export function make(deps: Deps) {
               (parentPart !== undefined &&
                 "metadata" in parentPart.state &&
                 parentPart.state.metadata?.background === true)
-            if (record.mode !== "background" && !legacyBackground) return
+            const foreground = record.mode === "foreground"
+            if (record.mode !== "background" && !foreground && !legacyBackground) return
             const message = record.childMessageID
               ? (yield* deps.sessions.messageWithChildren({
                   sessionID: child.id,
@@ -91,7 +91,7 @@ export function make(deps: Deps) {
 
               const outcome =
                 message?.info.role === "assistant" && message.info.time.completed
-                  ? message.info.error
+                  ? message.info.error || !report
                     ? "errored"
                     : message.info.finish === "abort"
                       ? "cancelled"
@@ -122,10 +122,24 @@ export function make(deps: Deps) {
               !settled ||
               settled.runID !== record.runID ||
               settled.phase !== "settled" ||
-              settled.deliveryOutcome === "delivered" ||
               parent._tag !== "Some"
             )
               return
+            // A foreground result is the parent task part itself. Repair it
+            // before honoring delivery evidence: the child can be marked
+            // delivered while its provider stream lost the terminal part frame.
+            if (foreground && parentPart) {
+              const repaired = yield* finalizeRecoveredPart(deps.sessions, parentPart, child.id, settled, report ?? "")
+              if (repaired) {
+                yield* deps.sessions.stampDelegationDelivery({
+                  sessionID: child.id,
+                  runID: settled.runID,
+                  outcome: "delivered",
+                })
+                yield* deps.refresh(parent.value.id)
+              }
+            }
+            if (settled.deliveryOutcome === "delivered" || foreground) return
             const text = [
               `Background delegation recovery for child ${child.id}, run ${settled.runID}.`,
               report ?? settled.summary ?? `The child run is recorded as ${settled.outcome}.`,
@@ -208,6 +222,54 @@ const finalizeDanglingPart = Effect.fn("SessionDelegationRecovery.finalizeDangli
       time: { start: part.state.status === "running" ? part.state.time.start : Date.now(), end: Date.now() },
     },
   })
+})
+
+const finalizeRecoveredPart = Effect.fn("SessionDelegationRecovery.finalizeRecoveredPart")(function* (
+  sessions: Context.Service.Shape<typeof Session.Service>,
+  part: SessionLegacy.ToolPart,
+  childSessionID: SessionID,
+  record: Exclude<ReturnType<typeof delegationRecord>, undefined>,
+  report: string,
+) {
+  // Only claim an in-flight part. A concurrent provider terminal write wins.
+  if (part.state.status !== "pending" && part.state.status !== "running") return false
+  const start = part.state.status === "running" ? part.state.time.start : Date.now()
+  const metadata = { sessionId: childSessionID, runID: record.runID }
+  if (record.outcome === "completed" && report) {
+    yield* sessions.updatePart({
+      ...part,
+      state: {
+        status: "completed",
+        input: part.state.input,
+        title: record.title ?? "Task completed",
+        metadata,
+        output: [
+          `<task id="${childSessionID}" state="completed">`,
+          "<task_result>",
+          report,
+          "</task_result>",
+          "</task>",
+        ].join("\n"),
+        time: { start, end: record.completedAt ?? Date.now() },
+      },
+    } satisfies SessionLegacy.ToolPart)
+    return true
+  }
+  const error =
+    record.outcome === "abandoned"
+      ? "Delegated child run was orphaned after daemon restart; inspect the child transcript before continuing."
+      : report || record.summary || `Delegated child run ended as ${record.outcome}.`
+  yield* sessions.updatePart({
+    ...part,
+    state: {
+      status: "error",
+      input: part.state.input,
+      metadata,
+      error,
+      time: { start, end: record.completedAt ?? Date.now() },
+    },
+  } satisfies SessionLegacy.ToolPart)
+  return true
 })
 
 export * as SessionDelegationRecovery from "./delegation-recovery"

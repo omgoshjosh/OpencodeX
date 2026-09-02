@@ -37,8 +37,8 @@ export type DelegationRecord = {
   parentSessionID: string
   parentMessageID?: string
   toolCallID?: string
-  /** Background runs are recoverable from durable transcript evidence only. */
-  mode?: "background"
+  /** How the parent receives this run's result after a reconnect. */
+  mode?: "background" | "foreground"
   /** Process identity that started this exact run. */
   ownerID?: string
   /** Optional display labels captured at delegation time. */
@@ -179,7 +179,7 @@ export function delegationRecord(metadata: Record<string, unknown> | undefined |
     parentSessionID: raw.parentSessionID,
     ...(typeof raw.parentMessageID === "string" ? { parentMessageID: raw.parentMessageID } : {}),
     ...(typeof raw.toolCallID === "string" ? { toolCallID: raw.toolCallID } : {}),
-    ...(raw.mode === "background" ? { mode: raw.mode } : {}),
+    ...(raw.mode === "background" || raw.mode === "foreground" ? { mode: raw.mode } : {}),
     ...(typeof raw.ownerID === "string" ? { ownerID: raw.ownerID } : {}),
     ...(typeof raw.role === "string" ? { role: raw.role } : {}),
     ...(typeof raw.title === "string" ? { title: raw.title } : {}),

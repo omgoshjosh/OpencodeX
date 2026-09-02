@@ -215,7 +215,11 @@ describe("EventRetention", () => {
         .run()
         .pipe(Effect.orDie)
 
-      expect(yield* retention.compact()).toBe(0)
+      const blocked = yield* retention.compactResult()
+      expect(blocked.deletedCount).toBe(0)
+      expect(blocked.activeLeaseCount).toBe(1)
+      expect(blocked.blockReason).toBe("active_lease")
+      expect(blocked.cursorAction).toBe("hold")
       expect(yield* journal(db, ids.sessionID)).toEqual(before)
 
       yield* db
@@ -224,6 +228,55 @@ describe("EventRetention", () => {
         .run()
         .pipe(Effect.orDie)
       expect(yield* retention.compact()).toBeGreaterThan(0)
+    }),
+  )
+
+  it.effect("reports readable pass fields for zero-candidate, deleting, and saturated windows", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const empty = yield* EventRetention.make(db, events.barrier)
+      const emptyPass = yield* empty.compactResult()
+      expect(emptyPass.blockReason).toBe("no_candidates")
+      expect(EventRetention.formatPass(emptyPass)).toContain("candidate_count=0")
+      expect(EventRetention.formatPass(emptyPass)).toContain('failure="none"')
+
+      const ids = yield* seed(events, db)
+      const deleting = yield* EventRetention.make(db, events.barrier, { aggregatesPerPass: 1_000 })
+      const deleted = yield* deleting.compactResult()
+      expect(deleted.deletedCount).toBeGreaterThan(0)
+      expect(deleted.cursorAction).toBe("advance")
+      const line = EventRetention.formatPass(deleted)
+      for (const field of [
+        "event_retention_pass instance=",
+        "duration_ms=",
+        "cursor_before=",
+        "window_first=",
+        "aggregate_count=",
+        "candidate_count=",
+        "deleted_count=",
+        "active_lease_count=",
+        "block_reason=",
+        "batch_size=",
+        "failure=",
+      ]) {
+        expect(line).toContain(field)
+      }
+
+      for (let index = 0; index < 30; index++) {
+        yield* events.publish(SessionLegacy.Event.PartUpdated, {
+          sessionID: ids.sessionID,
+          part: textPart(ids.sessionID, ids.messageID, ids.other, `telemetry ${index}`),
+          time: 8_000 + index,
+        })
+      }
+      const saturated = yield* EventRetention.make(db, events.barrier, {
+        aggregatesPerPass: 1_000,
+        maintenanceBatchSize: 5,
+      })
+      const held = yield* saturated.compactResult()
+      expect(held.candidateCount).toBe(5)
+      expect(held.cursorAction).toBe("hold")
     }),
   )
 

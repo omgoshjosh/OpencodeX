@@ -107,11 +107,19 @@ const buildQuestionGraph = Effect.fn("DurableExecutionTest.buildQuestionGraph")(
 const buildPromptClaim = Effect.fn("DurableExecutionTest.buildPromptClaim")(function* (
   loop = Effect.succeed(output),
   recoveryInterval?: Duration.Input,
+  beforeExecutionAdmission?: PromptClaim.Deps["beforeExecutionAdmission"],
 ) {
   const database = yield* Database.Service
   const events = yield* EventV2Bridge.Service
   const scope = yield* Scope.Scope
-  return yield* PromptClaim.make({ database, events, scope, loop: () => loop, recoveryInterval })
+  return yield* PromptClaim.make({
+    database,
+    events,
+    scope,
+    loop: () => loop,
+    recoveryInterval,
+    beforeExecutionAdmission,
+  })
 })
 
 const insertCommand = Effect.fn("DurableExecutionTest.insertCommand")(function* (input: {
@@ -599,6 +607,97 @@ it.instance("periodic recovery does not reclaim a running command before lease e
         .get()
         .pipe(Effect.orDie),
     ).toEqual({ status: "running", owner: "unknown:owner" })
+  }),
+)
+
+it.instance("periodic recovery reclaims an expired running command", () =>
+  Effect.gen(function* () {
+    const claim = yield* buildPromptClaim()
+    const { db } = yield* Database.Service
+    yield* insertCommand({
+      id: "sec_periodic_expired",
+      status: "running",
+      owner: "unknown:owner",
+      leaseExpiresAt: Date.now() - 1,
+    })
+
+    yield* claim.recover()
+    yield* pollWithTimeout(
+      db
+        .select({ status: SessionCommandTable.status })
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.id, "sec_periodic_expired"))
+        .get()
+        .pipe(
+          Effect.orDie,
+          Effect.map((row) => (row?.status === "succeeded" ? true : undefined)),
+        ),
+      "expired running command was not recovered",
+    )
+  }),
+)
+
+it.instance("requeues its own command claim when execution admission loses a race", () =>
+  Effect.gen(function* () {
+    const { db } = yield* Database.Service
+    const ctx = yield* InstanceState.context
+    const claim = yield* buildPromptClaim(Effect.succeed(output), undefined, ({ sessionID }) =>
+      db
+        .insert(SessionExecutionTable)
+        .values({
+          session_id: sessionID,
+          project_id: "prj_test",
+          directory: ctx.directory,
+          state: "running",
+          owner_id: "foreign:execution",
+          generation: 1,
+          lease_expires_at: Date.now() + 60_000,
+          time_created: Date.now(),
+          time_updated: Date.now(),
+        })
+        .run()
+        .pipe(Effect.orDie),
+    )
+    yield* insertCommand({ id: "sec_admission_race" })
+
+    yield* claim.executeCommand("sec_admission_race")
+    expect(
+      yield* db
+        .select({ status: SessionCommandTable.status, owner: SessionCommandTable.owner_id })
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.id, "sec_admission_race"))
+        .get()
+        .pipe(Effect.orDie),
+    ).toEqual({ status: "queued", owner: null })
+  }),
+)
+
+it.instance("admission requeue never overwrites a newer command claimant", () =>
+  Effect.gen(function* () {
+    const { db } = yield* Database.Service
+    const claim = yield* buildPromptClaim(Effect.succeed(output), undefined, ({ commandID }) =>
+      db
+        .update(SessionCommandTable)
+        .set({ owner_id: "foreign:newer", claim_generation: 2, time_updated: Date.now() })
+        .where(eq(SessionCommandTable.id, commandID))
+        .run()
+        .pipe(Effect.orDie),
+    )
+    yield* insertCommand({ id: "sec_admission_newer" })
+
+    yield* claim.executeCommand("sec_admission_newer")
+    expect(
+      yield* db
+        .select({
+          status: SessionCommandTable.status,
+          owner: SessionCommandTable.owner_id,
+          generation: SessionCommandTable.claim_generation,
+        })
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.id, "sec_admission_newer"))
+        .get()
+        .pipe(Effect.orDie),
+    ).toEqual({ status: "running", owner: "foreign:newer", generation: 2 })
   }),
 )
 

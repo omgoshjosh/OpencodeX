@@ -1,6 +1,7 @@
 import { expect } from "bun:test"
 import { BackgroundJob } from "@/background/job"
 import { EventV2Bridge } from "@/event-v2-bridge"
+import { InstanceState } from "@/effect/instance-state"
 import { Permission } from "@/permission"
 import { PermissionID } from "@/permission/schema"
 import { Question } from "@/question"
@@ -119,6 +120,7 @@ const insertCommand = Effect.fn("DurableExecutionTest.insertCommand")(function* 
   generation?: number
 }) {
   const { db } = yield* Database.Service
+  const ctx = yield* InstanceState.context
   const now = Date.now()
   yield* db
     .insert(SessionCommandTable)
@@ -127,7 +129,7 @@ const insertCommand = Effect.fn("DurableExecutionTest.insertCommand")(function* 
       session_id: sessionID,
       message_id: MessageID.make(`msg_${input.id}`),
       project_id: "prj_test",
-      directory: ".",
+      directory: ctx.directory,
       status: input.status ?? "queued",
       owner_id: input.owner,
       lease_expires_at: input.leaseExpiresAt,
@@ -413,6 +415,111 @@ it.instance("only one recoverer reclaims a dead command lease", () =>
     )
     expect(results.filter((result) => result.state === "ready")).toHaveLength(1)
     expect(results.filter((result) => result.state === "waiting")).toHaveLength(1)
+  }),
+)
+
+it.instance("sweeps a queued command without status after bootstrap", () =>
+  Effect.gen(function* () {
+    const claim = yield* buildPromptClaim()
+    const { db } = yield* Database.Service
+    yield* insertCommand({ id: "sec_missing_status" })
+
+    yield* claim.recover()
+    yield* pollWithTimeout(
+      db
+        .select({ status: SessionCommandTable.status })
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.id, "sec_missing_status"))
+        .get()
+        .pipe(
+          Effect.orDie,
+          Effect.map((row) => (row?.status === "succeeded" ? true : undefined)),
+        ),
+      "queued command was not recovered",
+    )
+  }),
+)
+
+it.instance("concurrent sweepers launch one durable command exactly once", () =>
+  Effect.gen(function* () {
+    const launches = yield* Ref.make(0)
+    const loop = Ref.update(launches, (count) => count + 1).pipe(Effect.as(output))
+    const first = yield* buildPromptClaim(loop)
+    const second = yield* buildPromptClaim(loop)
+    const { db } = yield* Database.Service
+    yield* insertCommand({ id: "sec_sweep_race" })
+
+    yield* Effect.all([first.recover(), second.recover()], { concurrency: "unbounded" })
+    yield* pollWithTimeout(
+      db
+        .select({ status: SessionCommandTable.status })
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.id, "sec_sweep_race"))
+        .get()
+        .pipe(
+          Effect.orDie,
+          Effect.map((row) => (row?.status === "succeeded" ? true : undefined)),
+        ),
+      "concurrent sweepers did not settle command",
+    )
+    expect(yield* Ref.get(launches)).toBe(1)
+  }),
+)
+
+it.instance("sweep never revives a cancelled command", () =>
+  Effect.gen(function* () {
+    const claim = yield* buildPromptClaim()
+    const { db } = yield* Database.Service
+    yield* insertCommand({ id: "sec_sweep_cancelled", status: "cancelled" })
+
+    yield* claim.recover()
+    expect(
+      yield* db
+        .select({ status: SessionCommandTable.status })
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.id, "sec_sweep_cancelled"))
+        .get()
+        .pipe(Effect.orDie),
+    ).toEqual({ status: "cancelled" })
+  }),
+)
+
+it.instance("sweep restores an interrupted execution with a new generation", () =>
+  Effect.gen(function* () {
+    const graph = yield* buildRunGraph()
+    const claim = yield* buildPromptClaim(
+      graph.run.ensureRunning(sessionID, Effect.succeed(output), Effect.succeed(output)),
+    )
+    const { db } = yield* Database.Service
+    const now = Date.now()
+    yield* insertCommand({ id: "sec_interrupted_execution" })
+    yield* db
+      .insert(SessionExecutionTable)
+      .values({
+        session_id: sessionID,
+        project_id: "prj_test",
+        directory: (yield* InstanceState.context).directory,
+        state: "interrupted",
+        generation: 7,
+        time_created: now,
+        time_updated: now,
+      })
+      .run()
+      .pipe(Effect.orDie)
+
+    yield* claim.recover()
+    yield* pollWithTimeout(
+      db
+        .select({ generation: SessionExecutionTable.generation })
+        .from(SessionExecutionTable)
+        .where(eq(SessionExecutionTable.session_id, sessionID))
+        .get()
+        .pipe(
+          Effect.orDie,
+          Effect.map((row) => (row?.generation === 8 ? true : undefined)),
+        ),
+      "interrupted execution was not reclaimed with a new generation",
+    )
   }),
 )
 

@@ -117,9 +117,10 @@ const insertCommand = Effect.fn("DurableExecutionTest.insertCommand")(function* 
   owner?: string
   leaseExpiresAt?: number
   generation?: number
+  createdAt?: number
 }) {
   const { db } = yield* Database.Service
-  const now = Date.now()
+  const now = input.createdAt ?? Date.now()
   yield* db
     .insert(SessionCommandTable)
     .values({
@@ -138,6 +139,129 @@ const insertCommand = Effect.fn("DurableExecutionTest.insertCommand")(function* 
     .run()
     .pipe(Effect.orDie)
 })
+
+it.instance("periodic sweep self-heals an omitted launch exactly once", () =>
+  Effect.gen(function* () {
+    const runs = yield* Ref.make(0)
+    const claim = yield* buildPromptClaim(Ref.update(runs, (value) => value + 1).pipe(Effect.as(output)))
+    yield* insertCommand({ id: "sec_sweep_omitted" })
+
+    yield* Effect.all([claim.sweep(), claim.sweep()], { concurrency: "unbounded" })
+    yield* pollWithTimeout(
+      Ref.get(runs).pipe(Effect.map((count) => (count === 1 ? true : undefined))),
+      "periodic sweep did not execute the omitted launch",
+    )
+    yield* claim.sweep()
+    expect(yield* Ref.get(runs)).toBe(1)
+  }),
+)
+
+it.instance("periodic sweep drains an orphan predecessor before its successor", () =>
+  Effect.gen(function* () {
+    const runs = yield* Ref.make(0)
+    const claim = yield* buildPromptClaim(Ref.update(runs, (value) => value + 1).pipe(Effect.as(output)))
+    const now = Date.now()
+    yield* insertCommand({ id: "sec_sweep_first", createdAt: now - 1 })
+    yield* insertCommand({ id: "sec_sweep_second", createdAt: now })
+
+    yield* claim.sweep()
+    yield* pollWithTimeout(
+      Ref.get(runs).pipe(Effect.map((value) => (value === 1 ? true : undefined))),
+      "periodic sweep did not drain the predecessor",
+    )
+    const { db } = yield* Database.Service
+    expect(
+      yield* db
+        .select({ status: SessionCommandTable.status })
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.id, "sec_sweep_second"))
+        .get()
+        .pipe(Effect.orDie),
+    ).toEqual({ status: "queued" })
+    yield* claim.sweep()
+    yield* pollWithTimeout(
+      Ref.get(runs).pipe(Effect.map((value) => (value === 2 ? true : undefined))),
+      "periodic sweep did not drain the successor",
+    )
+  }),
+)
+
+it.instance("racing periodic sweeps execute a queued command once", () =>
+  Effect.gen(function* () {
+    const runs = yield* Ref.make(0)
+    const loop = Ref.update(runs, (value) => value + 1).pipe(Effect.as(output))
+    const first = yield* buildPromptClaim(loop)
+    const second = yield* buildPromptClaim(loop)
+    yield* insertCommand({ id: "sec_sweep_race" })
+
+    yield* Effect.all([first.sweep(), second.sweep()], { concurrency: "unbounded" })
+    yield* pollWithTimeout(
+      Ref.get(runs).pipe(Effect.map((count) => (count === 1 ? true : undefined))),
+      "racing periodic sweeps executed more than once",
+    )
+    expect(yield* Ref.get(runs)).toBe(1)
+  }),
+)
+
+it.instance("periodic sweep leaves live command ownership untouched", () =>
+  Effect.gen(function* () {
+    const runs = yield* Ref.make(0)
+    const claim = yield* buildPromptClaim(Ref.update(runs, (value) => value + 1).pipe(Effect.as(output)))
+    const owner = `local:${process.pid}:${ensureRunID()}:sweep-live`
+    yield* insertCommand({
+      id: "sec_sweep_live",
+      status: "running",
+      owner,
+      leaseExpiresAt: Date.now() + 60_000,
+      generation: 1,
+    })
+
+    yield* claim.sweep()
+    const { db } = yield* Database.Service
+    expect(
+      yield* db
+        .select({ status: SessionCommandTable.status, owner: SessionCommandTable.owner_id })
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.id, "sec_sweep_live"))
+        .get()
+        .pipe(Effect.orDie),
+    ).toEqual({ status: "running", owner })
+    expect(yield* Ref.get(runs)).toBe(0)
+  }),
+)
+
+it.instance("periodic sweep never revives an abort race", () =>
+  Effect.gen(function* () {
+    const claim = yield* buildPromptClaim(Effect.never)
+    const { db } = yield* Database.Service
+    yield* insertCommand({ id: "sec_sweep_cancelled" })
+
+    yield* claim.sweep()
+    yield* pollWithTimeout(
+      db
+        .select({ status: SessionCommandTable.status })
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.id, "sec_sweep_cancelled"))
+        .get()
+        .pipe(Effect.orDie, Effect.map((row) => (row?.status === "running" ? true : undefined))),
+      "periodic sweep did not claim the command",
+    )
+    yield* db
+      .update(SessionCommandTable)
+      .set({ status: "cancelled", owner_id: null, lease_expires_at: null, time_updated: Date.now() })
+      .where(eq(SessionCommandTable.id, "sec_sweep_cancelled"))
+      .run()
+      .pipe(Effect.orDie)
+    expect(
+      yield* db
+        .select({ status: SessionCommandTable.status })
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.id, "sec_sweep_cancelled"))
+        .get()
+        .pipe(Effect.orDie),
+    ).toEqual({ status: "cancelled" })
+  }),
+)
 
 it.instance("allows one lease winner and makes a foreign caller join", () =>
   Effect.gen(function* () {

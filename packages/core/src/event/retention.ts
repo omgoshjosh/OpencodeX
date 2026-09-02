@@ -35,6 +35,7 @@ const AGGREGATES_PER_PASS = 64
 const DELETE_CHUNK = 500
 
 let retentionInstances = 0
+const scheduled = new WeakSet<object>()
 
 const PART_UPDATED = "message.part.updated.1"
 const MESSAGE_UPDATED = "message.updated.1"
@@ -208,22 +209,35 @@ export const make = Effect.fn("EventRetention.make")(function* (
     const started = Date.now()
     const cursorBefore = cursor
     passStarted = started
+    partial = {
+      cursorBefore: opaque(cursorBefore),
+      cursorAfter: opaque(cursor),
+      windowFirst: "none",
+      windowLast: "none",
+      aggregateCount: 0,
+      selectedCount: 0,
+      deletedCount: 0,
+      activeLease: "absent",
+      blockReason: "failure",
+      cursorAction: "hold",
+      batchSize: settings.maintenanceBatchSize,
+      failure: "none",
+    }
     const finish = (result: PassDetails) => {
       partial = result
       return { instance, pass, durationMs: Date.now() - started, ...result } satisfies Pass
     }
     const aggregates = yield* window()
+    partial = {
+      ...partial,
+      windowFirst: opaque(aggregates[0] ?? ""),
+      windowLast: opaque(aggregates.at(-1) ?? ""),
+      aggregateCount: aggregates.length,
+    }
     if (aggregates.length === 0) {
       cursor = ""
       return finish({
-        cursorBefore: opaque(cursorBefore),
-        cursorAfter: opaque(cursor),
-        windowFirst: "none",
-        windowLast: "none",
-        aggregateCount: 0,
-        selectedCount: 0,
-        deletedCount: 0,
-        activeLease: "absent",
+      ...partial,
         blockReason: "no_aggregates",
         cursorAction: "reset",
         batchSize: settings.maintenanceBatchSize,
@@ -236,11 +250,6 @@ export const make = Effect.fn("EventRetention.make")(function* (
     const doomed = yield* superseded(aggregates)
     partial = {
       ...partial,
-      cursorBefore: opaque(cursorBefore),
-      cursorAfter: opaque(cursor),
-      windowFirst: opaque(aggregates[0] ?? ""),
-      windowLast: opaque(aggregates.at(-1) ?? ""),
-      aggregateCount: aggregates.length,
       selectedCount: doomed.length,
     }
     if (doomed.length === 0) {
@@ -336,6 +345,9 @@ export const start = Effect.fnUntraced(function* (
   options?: RetentionOptions,
 ) {
   const retention = yield* make(db, barrier, options)
+  if (scheduled.has(db)) return { ...retention, schedulerStarted: false }
+  scheduled.add(db)
+  yield* Effect.addFinalizer(() => Effect.sync(() => scheduled.delete(db)))
   const interval = Math.max(1, options?.maintenanceIntervalMs ?? MAINTENANCE_INTERVAL_MS)
   const batchSize = Math.max(1, options?.maintenanceBatchSize ?? MAINTENANCE_BATCH_SIZE)
   yield* Effect.logInfo(
@@ -355,5 +367,5 @@ export const start = Effect.fnUntraced(function* (
     Effect.repeat(Schedule.forever),
     Effect.forkScoped,
   )
-  return retention
+  return { ...retention, schedulerStarted: true }
 })

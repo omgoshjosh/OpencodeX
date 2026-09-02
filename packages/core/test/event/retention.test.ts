@@ -280,6 +280,61 @@ describe("EventRetention", () => {
     }),
   )
 
+  it.effect("runs one scheduler per database and releases it with its scope", () =>
+    Effect.gen(function* () {
+      const db = {} as Db
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const first = yield* EventRetention.start(db, (effect) => effect, { maintenanceIntervalMs: 60_000 })
+          const duplicate = yield* EventRetention.start(db, (effect) => effect, { maintenanceIntervalMs: 60_000 })
+          expect(first.schedulerStarted).toBeTrue()
+          expect(duplicate.schedulerStarted).toBeFalse()
+        }),
+      )
+      const restarted = yield* Effect.scoped(
+        EventRetention.start(db, (effect) => effect, { maintenanceIntervalMs: 60_000 }),
+      )
+      expect(restarted.schedulerStarted).toBeTrue()
+    }),
+  )
+
+  it.effect("resets and preserves partial metrics around candidate discovery failures", () =>
+    Effect.gen(function* () {
+      let calls = 0
+      const beforeWindow = {
+        all: () => {
+          calls++
+          if (calls === 1) return Effect.succeed([{ aggregate: "previous-secret" }])
+          if (calls === 2) return Effect.succeed([])
+          return Effect.die(new Error("SQLITE_BUSY before-window"))
+        },
+      } as unknown as Db
+      const retention = yield* EventRetention.make(beforeWindow, (effect) => effect)
+      yield* retention.compactResult()
+      const beforeCause = yield* retention.compactResult().pipe(Effect.sandbox, Effect.flip)
+      const before = retention.failure(EventRetention.failureReason(beforeCause))
+      expect(before.aggregateCount).toBe(0)
+      expect(before.selectedCount).toBe(0)
+      expect(before.windowFirst).toBe("none")
+
+      calls = 0
+      const duringCandidates = {
+        all: () => {
+          calls++
+          if (calls === 1) return Effect.succeed([{ aggregate: "candidate-secret" }])
+          return Effect.die(new Error("SQLITE_BUSY during-candidates"))
+        },
+      } as unknown as Db
+      const during = yield* EventRetention.make(duringCandidates, (effect) => effect)
+      const duringCause = yield* during.compactResult().pipe(Effect.sandbox, Effect.flip)
+      const partial = during.failure(EventRetention.failureReason(duringCause))
+      expect(partial.aggregateCount).toBe(1)
+      expect(partial.selectedCount).toBe(0)
+      expect(partial.windowFirst).toMatch(/^id-[0-9a-f]{12}$/)
+      expect(EventRetention.formatPass(partial)).not.toContain("candidate-secret")
+    }),
+  )
+
   it.effect("collapses a long revision chain to two rows", () =>
     Effect.gen(function* () {
       const context = yield* Layer.build(
@@ -307,6 +362,7 @@ describe("EventRetention", () => {
         (row) => row.type === "message.part.updated.1" && (row.data as any).part.id === ids.other,
       )
       expect(revisions.map((row) => (row.data as any).part.text)).toEqual(["only", "chunk 49"])
+      expect(yield* retention.compact()).toBe(0)
     }),
   )
 

@@ -511,6 +511,61 @@ const boot = Effect.fn("test.boot")(function* (input?: { title?: string }) {
 
 // Loop semantics
 
+/**
+ * A user-role message whose every part is synthetic -- the shape of
+ * msg_delegation_recovery_* and task-completion injections.
+ */
+const injectSynthetic = Effect.fn("test.injectSynthetic")(function* (sessionID: SessionID, text: string) {
+  const session = yield* Session.Service
+  const msg = yield* session.updateMessage({
+    id: MessageID.ascending(),
+    role: "user",
+    sessionID,
+    agent: "build",
+    model: ref,
+    time: { created: Date.now() },
+  })
+  yield* session.updatePart({
+    id: PartID.ascending(),
+    messageID: msg.id,
+    sessionID,
+    type: "text",
+    synthetic: true,
+    text,
+  })
+  return msg
+})
+
+/**
+ * Regression for the 2026-09-01 runaway. A synthetic message injected AFTER the
+ * assistant finished made `lastUser.id < lastAssistant.id` false, so the loop
+ * skipped its whole exit block -- including the AUTO_CONTINUE_LIMIT cap, which
+ * lives inside it and was therefore never reached rather than exceeded. One turn
+ * reached step=387 and emitted 288 identical assistant messages over 44 minutes.
+ * The turn must now end on the seeded assistant and produce no new ones.
+ */
+noLLMServer.instance(
+  "loop terminates when a synthetic message is injected after the assistant finished",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      yield* seed(chat.id, { finish: "stop" })
+      yield* injectSynthetic(chat.id, "Background delegation recovery for child ses_x, run run_y.")
+
+      const result = yield* prompt.loop({ sessionID: chat.id })
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role === "assistant") expect(result.info.finish).toBe("stop")
+
+      const assistants = (yield* sessions.messages({ sessionID: chat.id })).filter(
+        (m) => m.info.role === "assistant",
+      )
+      expect(assistants.length).toBe(1)
+    }),
+  { config: cfg },
+)
+
 noLLMServer.instance(
   "loop exits immediately when last assistant has stop finish",
   () =>

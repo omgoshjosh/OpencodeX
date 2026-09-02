@@ -282,6 +282,7 @@ describe("EventRetention", () => {
 
   it.effect("runs one scheduler per database and releases it with its scope", () =>
     Effect.gen(function* () {
+      // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- scheduler never reaches the stub database
       const db = {} as Db
       yield* Effect.scoped(
         Effect.gen(function* () {
@@ -301,6 +302,7 @@ describe("EventRetention", () => {
   it.effect("resets and preserves partial metrics around candidate discovery failures", () =>
     Effect.gen(function* () {
       let calls = 0
+      // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- partial database double for this failure path
       const beforeWindow = {
         all: () => {
           calls++
@@ -318,6 +320,7 @@ describe("EventRetention", () => {
       expect(before.windowFirst).toBe("none")
 
       calls = 0
+      // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- partial database double for this failure path
       const duringCandidates = {
         all: () => {
           calls++

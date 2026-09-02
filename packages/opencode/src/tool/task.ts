@@ -360,13 +360,9 @@ export const TaskTool = Tool.define(
         ...(ctx.callID ? { toolCallID: ctx.callID } : {}),
         role: swarmRole?.name ?? next.name,
         title: params.description,
-        ...(runInBackground
-          ? {
-              mode: "background" as const,
-              ownerID: `local:${process.pid}:${ensureRunID()}:${runID}`,
-              childMessageID,
-            }
-          : {}),
+        mode: runInBackground ? "background" : "foreground",
+        ownerID: `local:${process.pid}:${ensureRunID()}:${runID}`,
+        childMessageID,
         attempt: delegationAttempts(nextSession.metadata) + 1,
         phase: "running",
         startedAt: Date.now(),
@@ -388,8 +384,9 @@ export const TaskTool = Tool.define(
           settleDelegation(started, {
             outcome,
             summary,
-            // Background terminal outcomes all need durable parent delivery.
-            ...(outcome === "completed" || runInBackground ? { deliveryOutcome: "pending" as const } : {}),
+            // Delivery is separate from execution settlement for both modes:
+            // the parent part can be lost after the child has already stopped.
+            deliveryOutcome: "pending" as const,
           }),
           runID,
         ).pipe(Effect.andThen(status ? status.refresh(ctx.sessionID) : Effect.void), Effect.asVoid)

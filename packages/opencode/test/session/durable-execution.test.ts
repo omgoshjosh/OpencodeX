@@ -23,7 +23,7 @@ import {
   SessionStatusTable,
 } from "@opencode-ai/core/session/sql"
 import { and, eq } from "drizzle-orm"
-import { Context, Effect, Exit, Fiber, Latch, Layer, Ref, Scope } from "effect"
+import { Context, Duration, Effect, Exit, Fiber, Latch, Layer, Ref, Scope } from "effect"
 import { pollWithTimeout, testEffect } from "../lib/effect"
 
 const env = Layer.mergeAll(
@@ -105,11 +105,14 @@ const buildQuestionGraph = Effect.fn("DurableExecutionTest.buildQuestionGraph")(
   return Context.get(context, Question.Service)
 })
 
-const buildPromptClaim = Effect.fn("DurableExecutionTest.buildPromptClaim")(function* (loop = Effect.succeed(output)) {
+const buildPromptClaim = Effect.fn("DurableExecutionTest.buildPromptClaim")(function* (
+  loop = Effect.succeed(output),
+  recoveryInterval?: Duration.Input,
+) {
   const database = yield* Database.Service
   const events = yield* EventV2Bridge.Service
   const scope = yield* Scope.Scope
-  return yield* PromptClaim.make({ database, events, scope, loop: () => loop })
+  return yield* PromptClaim.make({ database, events, scope, loop: () => loop, recoveryInterval })
 })
 
 const insertCommand = Effect.fn("DurableExecutionTest.insertCommand")(function* (input: {
@@ -118,15 +121,17 @@ const insertCommand = Effect.fn("DurableExecutionTest.insertCommand")(function* 
   owner?: string
   leaseExpiresAt?: number
   generation?: number
+  sessionID?: SessionID
+  createdAt?: number
 }) {
   const { db } = yield* Database.Service
   const ctx = yield* InstanceState.context
-  const now = Date.now()
+  const now = input.createdAt ?? Date.now()
   yield* db
     .insert(SessionCommandTable)
     .values({
       id: input.id,
-      session_id: sessionID,
+      session_id: input.sessionID ?? sessionID,
       message_id: MessageID.make(`msg_${input.id}`),
       project_id: "prj_test",
       directory: ctx.directory,
@@ -436,6 +441,106 @@ it.instance("sweeps a queued command without status after bootstrap", () =>
           Effect.map((row) => (row?.status === "succeeded" ? true : undefined)),
         ),
       "queued command was not recovered",
+    )
+  }),
+)
+
+it.instance("starts one per-instance recovery timer under instance context", () =>
+  Effect.gen(function* () {
+    const launches = yield* Ref.make(0)
+    const claim = yield* buildPromptClaim(
+      Ref.update(launches, (count) => count + 1).pipe(Effect.as(output)),
+      "1 millis",
+    )
+    const { db } = yield* Database.Service
+    yield* insertCommand({ id: "sec_timer_context" })
+
+    yield* Effect.all([claim.start(), claim.start()], { concurrency: "unbounded" })
+    yield* pollWithTimeout(
+      db
+        .select({ status: SessionCommandTable.status })
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.id, "sec_timer_context"))
+        .get()
+        .pipe(
+          Effect.orDie,
+          Effect.map((row) => (row?.status === "succeeded" ? true : undefined)),
+        ),
+      "per-instance recovery timer did not run",
+    )
+    expect(yield* Ref.get(launches)).toBe(1)
+  }),
+)
+
+it.instance("stops the per-instance recovery timer when its scope closes", () =>
+  Effect.gen(function* () {
+    const recoveryScope = yield* Scope.make()
+    const claim = yield* buildPromptClaim(Effect.succeed(output), "1 millis").pipe(
+      Effect.provideService(Scope.Scope, recoveryScope),
+    )
+    const { db } = yield* Database.Service
+    yield* claim.start()
+    yield* Scope.close(recoveryScope, Exit.void)
+    yield* insertCommand({ id: "sec_timer_disposed" })
+    yield* Effect.sleep("20 millis")
+
+    expect(
+      yield* db
+        .select({ status: SessionCommandTable.status })
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.id, "sec_timer_disposed"))
+        .get()
+        .pipe(Effect.orDie),
+    ).toEqual({ status: "queued" })
+  }),
+)
+
+it.instance("recovers more than one batch in deterministic session FIFO order", () =>
+  Effect.gen(function* () {
+    const claim = yield* buildPromptClaim()
+    const { db } = yield* Database.Service
+    const now = Date.now()
+    const commands = Array.from({ length: 33 }, (_, index) => ({
+      id: `sec_fifo_${index.toString().padStart(2, "0")}`,
+      sessionID: SessionID.make(`ses_fifo_${index.toString().padStart(2, "0")}`),
+      createdAt: now + index,
+    }))
+    yield* Effect.forEach(commands, insertCommand, { discard: true })
+
+    yield* claim.recover()
+    yield* pollWithTimeout(
+      db
+        .select({ status: SessionCommandTable.status })
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.id, "sec_fifo_31"))
+        .get()
+        .pipe(
+          Effect.orDie,
+          Effect.map((row) => (row?.status === "succeeded" ? true : undefined)),
+        ),
+      "first fair recovery batch did not settle",
+    )
+    expect(
+      yield* db
+        .select({ status: SessionCommandTable.status })
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.id, "sec_fifo_32"))
+        .get()
+        .pipe(Effect.orDie),
+    ).toEqual({ status: "queued" })
+
+    yield* claim.recover()
+    yield* pollWithTimeout(
+      db
+        .select({ status: SessionCommandTable.status })
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.id, "sec_fifo_32"))
+        .get()
+        .pipe(
+          Effect.orDie,
+          Effect.map((row) => (row?.status === "succeeded" ? true : undefined)),
+        ),
+      "next fair recovery batch did not settle",
     )
   }),
 )

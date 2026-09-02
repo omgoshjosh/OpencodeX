@@ -516,4 +516,41 @@ describe("EventRetention", () => {
       expect(line).not.toContain("secret")
     }),
   )
+  /**
+   * Ported from the parallel retention PR (#32), which independently rebuilt the
+   * same scheduler guard and delete accounting this branch already has. Its
+   * implementation is superseded -- this branch counts deletions with
+   * `DELETE ... RETURNING id`, which is atomic with the delete rather than
+   * depending on connection-scoped `changes()` -- but its concurrency assertion
+   * covered a property nothing here did: two retention instances compacting at
+   * once must report counts that sum to exactly the rows actually removed, with
+   * no double-counting.
+   */
+  it.effect("reports bounded pass fields and exact concurrent deletion counts", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const ids = yield* seed(events, db)
+      const first = yield* EventRetention.make(db, events.barrier, { aggregatesPerPass: 1_000 })
+      const second = yield* EventRetention.make(db, events.barrier, { aggregatesPerPass: 1_000 })
+      const initial = yield* first.compactResult()
+
+      for (const text of ["concurrent one", "concurrent two", "concurrent three"]) {
+        yield* events.publish(SessionLegacy.Event.PartUpdated, {
+          sessionID: ids.sessionID,
+          part: textPart(ids.sessionID, ids.messageID, ids.other, text),
+          time: 9_000,
+        })
+      }
+      const before = yield* journal(db, ids.sessionID)
+      const concurrent = yield* Effect.all([first.compact(), second.compact()], { concurrency: "unbounded" })
+      const after = yield* journal(db, ids.sessionID)
+
+      expect(initial.aggregateCount).toBeGreaterThan(0)
+      expect(initial.durationMs).toBeGreaterThanOrEqual(0)
+      expect(initial.deletedCount).toBeGreaterThan(0)
+      expect(initial.deletedCount).toBeLessThanOrEqual(initial.selectedCount)
+      expect(concurrent[0] + concurrent[1]).toBe(before.length - after.length)
+    }),
+  )
 })

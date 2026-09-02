@@ -3,14 +3,19 @@ import { BackgroundJob } from "@/background/job"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { SessionDelegationRecovery } from "@/session/delegation-recovery"
-import { delegationRecord, DELEGATION_RECORD_VERSION, type DelegationRecord } from "@/session/delegation-outcome"
-import { MessageID, PartID } from "@/session/schema"
+import {
+  DELEGATION_DELIVERY_CLAIM_GRACE,
+  delegationRecord,
+  DELEGATION_RECORD_VERSION,
+  type DelegationRecord,
+} from "@/session/delegation-outcome"
+import { MessageID, PartID, SessionID } from "@/session/schema"
 import { Session } from "@/session/session"
 import { Database } from "@opencode-ai/core/database/database"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
-import { Effect, Layer, Ref } from "effect"
+import { Context, Effect, Layer, Ref } from "effect"
 import { Storage } from "@/storage/storage"
 import { testInstanceStoreLayer } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
@@ -49,6 +54,36 @@ function record(
     ...overrides,
   }
 }
+
+const runningParentTask = Effect.fn("DelegationRecoveryTest.runningParentTask")(function* (
+  sessions: Context.Service.Shape<typeof Session.Service>,
+  parentSessionID: SessionID,
+) {
+  const message = yield* sessions.updateMessage({
+    id: MessageID.ascending(),
+    sessionID: parentSessionID,
+    role: "assistant",
+    parentID: MessageID.ascending(),
+    mode: "build",
+    agent: "build",
+    providerID: ProviderV2.ID.make("test"),
+    modelID: ProviderV2.ModelID.make("test"),
+    path: { cwd: ".", root: "." },
+    cost: 0,
+    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    time: { created: 1 },
+  })
+  const part = yield* sessions.updatePart({
+    id: PartID.ascending(),
+    sessionID: parentSessionID,
+    messageID: message.id,
+    type: "tool",
+    tool: "task",
+    callID: "call_recovery",
+    state: { status: "running", input: {}, time: { start: 1 } },
+  })
+  return { message, part }
+})
 
 it.instance("settles only the exact completed child reply and redelivers idempotently", () =>
   Effect.gen(function* () {
@@ -110,7 +145,7 @@ it.instance("settles only the exact completed child reply and redelivers idempot
       notify: (input) => Ref.update(notices, (items) => [...items, input]),
       refresh: () => Effect.void,
     })
-    yield* recovery.recover()
+    yield* Effect.all([recovery.recover(), recovery.recover()], { concurrency: "unbounded", discard: true })
     expect(delegationRecord((yield* sessions.get(child.id)).metadata)).toMatchObject({
       outcome: "completed",
       deliveryOutcome: "delivered",
@@ -175,5 +210,319 @@ it.instance("abandons a dead run without an exact terminal reply and marks faile
       outcome: "abandoned",
       deliveryOutcome: "failed",
     })
+  }),
+)
+
+it.instance(
+  "repairs a settled foreground task after a deterministic provider reset before delivery short-circuits",
+  () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const database = yield* Database.Service
+      const parent = yield* sessions.create({})
+      const child = yield* sessions.create({ parentID: parent.id })
+      const parentTask = yield* runningParentTask(sessions, parent.id)
+      const boundary = "msg_foreground_boundary"
+      yield* sessions.stampDelegation({
+        sessionID: child.id,
+        record: record(parent.id, boundary, {
+          mode: "foreground",
+          parentMessageID: parentTask.message.id,
+          toolCallID: "call_recovery",
+          phase: "settled",
+          outcome: "completed",
+          completedAt: 2,
+          // The child settled before the reset, but the provider never persisted
+          // the corresponding parent tool-part terminal frame.
+          deliveryOutcome: "delivered",
+        }),
+      })
+      yield* sessions.updateMessage({
+        id: MessageID.make(boundary),
+        sessionID: child.id,
+        role: "user",
+        time: { created: 1 },
+        agent: "build",
+        model: { providerID: ProviderV2.ID.make("test"), modelID: ProviderV2.ModelID.make("test") },
+      })
+      yield* sessions.updateMessage({
+        id: MessageID.make("msg_foreground_exact"),
+        sessionID: child.id,
+        role: "assistant",
+        parentID: MessageID.make(boundary),
+        providerID: ProviderV2.ID.make("test"),
+        modelID: ProviderV2.ModelID.make("test"),
+        mode: "build",
+        agent: "build",
+        path: { cwd: ".", root: "." },
+        cost: 0,
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        time: { created: 1, completed: 2 },
+        finish: "stop",
+      })
+      yield* sessions.updatePart({
+        id: PartID.make("prt_foreground_exact"),
+        sessionID: child.id,
+        messageID: MessageID.make("msg_foreground_exact"),
+        type: "text",
+        text: "recovered foreground report",
+      })
+      const notices = yield* Ref.make(0)
+      const recovery = yield* SessionDelegationRecovery.make({
+        database,
+        sessions,
+        notify: () => Ref.update(notices, (count) => count + 1),
+        refresh: () => Effect.void,
+      })
+      yield* recovery.recover()
+      const repaired = yield* sessions.getPart({
+        sessionID: parent.id,
+        messageID: parentTask.message.id,
+        partID: parentTask.part.id,
+      })
+      expect(repaired?.type).toBe("tool")
+      if (!repaired || repaired.type !== "tool") return
+      expect(repaired.state).toMatchObject({
+        status: "completed",
+        output: expect.stringContaining("recovered foreground report"),
+      })
+      expect(yield* Ref.get(notices)).toBe(0)
+      // A reconnect repeats recovery, not the parent terminal event.
+      yield* recovery.recover()
+      const repeated = yield* sessions.getPart({
+        sessionID: parent.id,
+        messageID: parentTask.message.id,
+        partID: parentTask.part.id,
+      })
+      expect(repeated?.type).toBe("tool")
+      if (!repeated || repeated.type !== "tool") return
+      expect(repeated.state.status).toBe("completed")
+      expect(yield* Ref.get(notices)).toBe(0)
+    }),
+)
+
+it.instance("bounds a missing foreground child reply as an orphaned parent task", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const database = yield* Database.Service
+    const parent = yield* sessions.create({})
+    const child = yield* sessions.create({ parentID: parent.id })
+    const parentTask = yield* runningParentTask(sessions, parent.id)
+    yield* sessions.stampDelegation({
+      sessionID: child.id,
+      record: record(parent.id, "msg_missing_foreground", {
+        mode: "foreground",
+        parentMessageID: parentTask.message.id,
+        toolCallID: "call_recovery",
+      }),
+    })
+    const recovery = yield* SessionDelegationRecovery.make({
+      database,
+      sessions,
+      notify: () => Effect.die(new Error("foreground runs do not notify")),
+      refresh: () => Effect.void,
+    })
+    yield* recovery.recover()
+    expect(delegationRecord((yield* sessions.get(child.id)).metadata)).toMatchObject({ outcome: "abandoned" })
+    const orphaned = yield* sessions.getPart({
+      sessionID: parent.id,
+      messageID: parentTask.message.id,
+      partID: parentTask.part.id,
+    })
+    expect(orphaned?.type).toBe("tool")
+    if (!orphaned || orphaned.type !== "tool") return
+    expect(orphaned.state).toMatchObject({ status: "error", error: expect.stringContaining("orphaned") })
+  }),
+)
+
+it.instance("never overwrites a provider terminal part and settles its pending foreground delivery", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const database = yield* Database.Service
+    const parent = yield* sessions.create({})
+    const child = yield* sessions.create({ parentID: parent.id })
+    const parentTask = yield* runningParentTask(sessions, parent.id)
+    yield* sessions.stampDelegation({
+      sessionID: child.id,
+      record: record(parent.id, "msg_provider_race", {
+        mode: "foreground",
+        parentMessageID: parentTask.message.id,
+        toolCallID: "call_recovery",
+        phase: "settled",
+        outcome: "abandoned",
+        completedAt: 2,
+        deliveryOutcome: "pending",
+      }),
+    })
+    const recovery = yield* SessionDelegationRecovery.make({
+      database,
+      sessions: {
+        ...sessions,
+        updatePartIfPendingOrRunning: (input) =>
+          Effect.gen(function* () {
+            // Simulate the provider terminal event landing after recovery read
+            // the running snapshot but before its conditional transaction.
+            yield* sessions.updatePart({
+              ...parentTask.part,
+              state: {
+                status: "completed",
+                input: {},
+                title: "Provider result",
+                metadata: {},
+                output: "provider terminal result",
+                time: { start: 1, end: 2 },
+              },
+            })
+            return yield* sessions.updatePartIfPendingOrRunning(input)
+          }),
+      },
+      notify: () => Effect.die(new Error("foreground runs do not notify")),
+      refresh: () => Effect.void,
+    })
+    yield* recovery.recover()
+    const current = yield* sessions.getPart({
+      sessionID: parent.id,
+      messageID: parentTask.message.id,
+      partID: parentTask.part.id,
+    })
+    expect(current?.type).toBe("tool")
+    if (!current || current.type !== "tool") return
+    expect(current.state).toMatchObject({ status: "completed", output: "provider terminal result" })
+    expect(delegationRecord((yield* sessions.get(child.id)).metadata)).toMatchObject({ deliveryOutcome: "delivered" })
+  }),
+)
+
+it.instance("recovers a pre-mode background record from durable parent metadata", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const database = yield* Database.Service
+    const parent = yield* sessions.create({})
+    const child = yield* sessions.create({ parentID: parent.id })
+    const parentTask = yield* runningParentTask(sessions, parent.id)
+    yield* sessions.updatePart({
+      ...parentTask.part,
+      state: { ...parentTask.part.state, metadata: { background: true } },
+    })
+    yield* sessions.stampDelegation({
+      sessionID: child.id,
+      record: record(parent.id, "msg_legacy_missing", {
+        mode: undefined,
+        parentMessageID: parentTask.message.id,
+        toolCallID: "call_recovery",
+      }),
+    })
+    const notices = yield* Ref.make(0)
+    const recovery = yield* SessionDelegationRecovery.make({
+      database,
+      sessions,
+      notify: () => Ref.update(notices, (count) => count + 1),
+      refresh: () => Effect.void,
+    })
+    yield* recovery.recover()
+    expect(delegationRecord((yield* sessions.get(child.id)).metadata)).toMatchObject({
+      outcome: "abandoned",
+      deliveryOutcome: "delivered",
+    })
+    expect(yield* Ref.get(notices)).toBe(1)
+  }),
+)
+
+it.instance("reclaims a stale crashed delivery claim but excludes fresh and old claimants", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const parent = yield* sessions.create({})
+    const child = yield* sessions.create({ parentID: parent.id })
+    yield* sessions.stampDelegation({
+      sessionID: child.id,
+      record: record(parent.id, "msg_claim", {
+        phase: "settled",
+        outcome: "completed",
+        completedAt: 2,
+        deliveryOutcome: "pending",
+      }),
+    })
+    expect(
+      yield* sessions.claimDelegationDelivery({ sessionID: child.id, runID: "run_recovery", at: 100, token: "old" }),
+    ).toBe("old")
+    expect(
+      yield* sessions.claimDelegationDelivery({
+        sessionID: child.id,
+        runID: "run_recovery",
+        at: 100 + DELEGATION_DELIVERY_CLAIM_GRACE - 1,
+        token: "fresh",
+      }),
+    ).toBeUndefined()
+    expect(
+      yield* sessions.claimDelegationDelivery({
+        sessionID: child.id,
+        runID: "run_recovery",
+        at: 100 + DELEGATION_DELIVERY_CLAIM_GRACE,
+        token: "new",
+      }),
+    ).toBe("new")
+    expect(
+      yield* sessions.stampDelegationDelivery({
+        sessionID: child.id,
+        runID: "run_recovery",
+        outcome: "delivered",
+        claimToken: "old",
+      }),
+    ).toBe(false)
+    expect(
+      yield* sessions.stampDelegationDelivery({
+        sessionID: child.id,
+        runID: "run_recovery",
+        outcome: "delivered",
+        claimToken: "new",
+      }),
+    ).toBe(true)
+    const concurrent = yield* sessions.create({ parentID: parent.id })
+    yield* sessions.stampDelegation({
+      sessionID: concurrent.id,
+      record: record(parent.id, "msg_concurrent_claim", {
+        phase: "settled",
+        outcome: "completed",
+        completedAt: 2,
+        deliveryOutcome: "pending",
+      }),
+    })
+    const claims = yield* Effect.all(
+      [
+        sessions.claimDelegationDelivery({ sessionID: concurrent.id, runID: "run_recovery", at: 100, token: "one" }),
+        sessions.claimDelegationDelivery({ sessionID: concurrent.id, runID: "run_recovery", at: 100, token: "two" }),
+      ],
+      { concurrency: "unbounded" },
+    )
+    expect(claims.filter(Boolean)).toHaveLength(1)
+  }),
+)
+
+it.instance("replays a stale crash claim once while concurrent fresh claimants remain exclusive", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const database = yield* Database.Service
+    const parent = yield* sessions.create({})
+    const child = yield* sessions.create({ parentID: parent.id })
+    yield* sessions.stampDelegation({
+      sessionID: child.id,
+      record: record(parent.id, "msg_crashed_claim", {
+        phase: "settled",
+        outcome: "abandoned",
+        completedAt: 2,
+        deliveryOutcome: "delivering",
+        deliveryClaimedAt: Date.now() - DELEGATION_DELIVERY_CLAIM_GRACE,
+        deliveryClaimToken: "crashed",
+      }),
+    })
+    const notices = yield* Ref.make(0)
+    const recovery = yield* SessionDelegationRecovery.make({
+      database,
+      sessions,
+      notify: () => Ref.update(notices, (count) => count + 1),
+      refresh: () => Effect.void,
+    })
+    yield* Effect.all([recovery.recover(), recovery.recover()], { concurrency: "unbounded", discard: true })
+    expect(yield* Ref.get(notices)).toBe(1)
+    expect(delegationRecord((yield* sessions.get(child.id)).metadata)).toMatchObject({ deliveryOutcome: "delivered" })
   }),
 )

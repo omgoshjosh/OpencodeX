@@ -842,7 +842,7 @@ export const layer = Layer.effect(
       },
     )
 
-    const { launchCommand, recover } = yield* PromptClaim.make({
+    const { launchCommand, recover, start } = yield* PromptClaim.make({
       database,
       events,
       scope,
@@ -968,7 +968,7 @@ export const layer = Layer.effect(
       refresh: status.refresh,
     })
     const unregisterRecovery = SessionPromptRecovery.register(() =>
-      delegationRecovery.recover().pipe(Effect.andThen(recover)),
+      start().pipe(Effect.andThen(delegationRecovery.recover()), Effect.andThen(recover)),
     )
     yield* Effect.addFinalizer(() => Effect.sync(unregisterRecovery))
 

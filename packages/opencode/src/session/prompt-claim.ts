@@ -1,15 +1,20 @@
-import { and, eq, inArray } from "drizzle-orm"
-import { Cause, Context, Effect, Exit, Fiber, Schedule, Scope } from "effect"
+import { and, asc, desc, eq, inArray, isNull, lt, min, or } from "drizzle-orm"
+import { Cause, Context, Duration, Effect, Exit, Fiber, Schedule, Scope } from "effect"
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
 import { Database } from "@opencode-ai/core/database/database"
 import { NamedError } from "@opencode-ai/core/util/error"
-import { SessionCommandTable, SessionExecutionTable } from "@opencode-ai/core/session/sql"
+import {
+  MessageTable,
+  SessionCommandTable,
+  SessionExecutionTable,
+  SessionStatusTable,
+  SessionTable,
+} from "@opencode-ai/core/session/sql"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { InstanceState } from "@/effect/instance-state"
 import { SessionID } from "./schema"
 import type { LoopInput } from "./prompt-schema"
 import * as Session from "./session"
-import { SessionExecutionOwner } from "./execution-owner"
 import { ensureRunID } from "@opencode-ai/core/util/opencode-process"
 
 export interface Deps {
@@ -17,6 +22,8 @@ export interface Deps {
   readonly events: Context.Service.Shape<typeof EventV2Bridge.Service>
   readonly scope: Scope.Scope
   readonly loop: (input: LoopInput) => Effect.Effect<SessionLegacy.WithParts>
+  readonly recoveryInterval?: Duration.Input
+  readonly beforeExecutionAdmission?: (input: { sessionID: SessionID; commandID: string }) => Effect.Effect<void>
 }
 
 /**
@@ -27,11 +34,63 @@ export interface Deps {
  */
 export function make(deps: Deps) {
   return Effect.gen(function* () {
-    const { database, events, scope, loop } = deps
+    const { database, events, scope, loop, beforeExecutionAdmission } = deps
     const { db } = database
     const processRunID = ensureRunID()
     const commandOwner = `local:${process.pid}:${processRunID}:${crypto.randomUUID()}`
     const commandLeaseMillis = 30_000
+    const recoveryBatchSize = 32
+    const recoveryInterval = deps.recoveryInterval ?? "20 seconds"
+    const launching = new Set<string>()
+
+    const diagnostic = Effect.fnUntraced(function* (
+      commandID: string,
+      action: "launch" | "claim",
+      cas: "not-attempted" | "ready" | "waiting" | "done",
+    ) {
+      const command = yield* db
+        .select()
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.id, commandID))
+        .get()
+        .pipe(Effect.orDie)
+      if (!command) {
+        yield* Effect.logInfo("session command recovery", {
+          commandID,
+          statusPresent: false,
+          action,
+          cas,
+        })
+        return
+      }
+      const [execution, status] = yield* Effect.all(
+        [
+          db
+            .select()
+            .from(SessionExecutionTable)
+            .where(eq(SessionExecutionTable.session_id, command.session_id))
+            .get()
+            .pipe(Effect.orDie),
+          db
+            .select({ sessionID: SessionStatusTable.session_id })
+            .from(SessionStatusTable)
+            .where(eq(SessionStatusTable.session_id, command.session_id))
+            .get()
+            .pipe(Effect.orDie),
+        ],
+        { concurrency: "unbounded" },
+      )
+      yield* Effect.logInfo("session command recovery", {
+        commandID,
+        commandAgeMillis: Date.now() - command.time_created,
+        executionGeneration: execution?.generation,
+        executionOwner: execution?.owner_id,
+        executionLeaseExpiresAt: execution?.lease_expires_at,
+        statusPresent: !!status,
+        action,
+        cas,
+      })
+    })
 
     const claimCommandTurn = Effect.fn("SessionPrompt.claimCommandTurn")(function* (commandID: string) {
       const now = Date.now()
@@ -47,13 +106,19 @@ export function make(deps: Deps) {
               if (!current || ["succeeded", "failed", "cancelled"].includes(current.status)) {
                 return { state: "done" as const }
               }
-              if (
-                current.status === "running" &&
-                current.owner_id &&
-                current.lease_expires_at &&
-                current.lease_expires_at > now &&
-                SessionExecutionOwner.alive(current.owner_id, processRunID)
-              ) {
+              const execution = yield* transaction
+                .select({
+                  state: SessionExecutionTable.state,
+                  owner: SessionExecutionTable.owner_id,
+                  leaseExpiresAt: SessionExecutionTable.lease_expires_at,
+                })
+                .from(SessionExecutionTable)
+                .where(eq(SessionExecutionTable.session_id, current.session_id))
+                .get()
+              if (execution?.state === "running" && execution.leaseExpiresAt && execution.leaseExpiresAt > now) {
+                return { state: "waiting" as const }
+              }
+              if (current.status === "running" && current.lease_expires_at && current.lease_expires_at > now) {
                 return { state: "waiting" as const }
               }
               const active = yield* transaction
@@ -76,7 +141,6 @@ export function make(deps: Deps) {
                     (item.created === current.time_created && item.id.localeCompare(current.id) < 0)),
               )
               if (blocked) return { state: "waiting" as const }
-              const runningOwner = current.status === "running" ? current.owner_id : undefined
               const claimed = yield* transaction
                 .update(SessionCommandTable)
                 .set({
@@ -92,7 +156,9 @@ export function make(deps: Deps) {
                     eq(SessionCommandTable.id, commandID),
                     eq(SessionCommandTable.status, current.status),
                     eq(SessionCommandTable.claim_generation, current.claim_generation),
-                    runningOwner ? eq(SessionCommandTable.owner_id, runningOwner) : undefined,
+                    current.status === "running"
+                      ? or(isNull(SessionCommandTable.lease_expires_at), lt(SessionCommandTable.lease_expires_at, now))
+                      : undefined,
                   ),
                 )
                 .returning()
@@ -109,51 +175,60 @@ export function make(deps: Deps) {
       commandID: string,
       sessionID: SessionID,
     ) {
-      while (true) {
-        const [command, execution] = yield* Effect.all(
-          [
-            db
-              .select({ status: SessionCommandTable.status })
-              .from(SessionCommandTable)
-              .where(eq(SessionCommandTable.id, commandID))
-              .get()
-              .pipe(Effect.orDie),
-            db
-              .select({
-                state: SessionExecutionTable.state,
-                owner: SessionExecutionTable.owner_id,
-                leaseExpiresAt: SessionExecutionTable.lease_expires_at,
-              })
-              .from(SessionExecutionTable)
-              .where(eq(SessionExecutionTable.session_id, sessionID))
-              .get()
-              .pipe(Effect.orDie),
-          ],
-          { concurrency: "unbounded" },
-        )
-        if (!command || ["succeeded", "failed", "cancelled"].includes(command.status)) return false
-        if (
-          execution?.state !== "running" ||
-          !execution.owner ||
-          !execution.leaseExpiresAt ||
-          execution.leaseExpiresAt <= Date.now() ||
-          !SessionExecutionOwner.alive(execution.owner, processRunID)
-        ) {
-          return true
-        }
-        yield* Effect.sleep("200 millis")
-      }
+      const [command, execution] = yield* Effect.all(
+        [
+          db
+            .select({ status: SessionCommandTable.status })
+            .from(SessionCommandTable)
+            .where(eq(SessionCommandTable.id, commandID))
+            .get()
+            .pipe(Effect.orDie),
+          db
+            .select({ state: SessionExecutionTable.state, leaseExpiresAt: SessionExecutionTable.lease_expires_at })
+            .from(SessionExecutionTable)
+            .where(eq(SessionExecutionTable.session_id, sessionID))
+            .get()
+            .pipe(Effect.orDie),
+        ],
+        { concurrency: "unbounded" },
+      )
+      if (!command || ["succeeded", "failed", "cancelled"].includes(command.status)) return false
+      return execution?.state !== "running" || !execution.leaseExpiresAt || execution.leaseExpiresAt <= Date.now()
     })
 
     const executeCommand = Effect.fn("SessionPrompt.executeCommand")(function* (commandID: string) {
-      let claimed = yield* claimCommandTurn(commandID)
-      while (claimed.state === "waiting") {
-        yield* Effect.sleep("200 millis")
-        claimed = yield* claimCommandTurn(commandID)
-      }
+      const claimed = yield* claimCommandTurn(commandID)
+      yield* diagnostic(commandID, "claim", claimed.state).pipe(Effect.catchCause(() => Effect.void))
       if (claimed.state !== "ready") return
       const command = claimed.command
-      if (!(yield* waitForExecutionTurn(commandID, command.session_id))) return
+      const requeue = Effect.fnUntraced(function* () {
+        const completedAt = Date.now()
+        yield* db
+          .update(SessionCommandTable)
+          .set({
+            status: "queued",
+            owner_id: null,
+            lease_expires_at: null,
+            error: null,
+            completed_at: null,
+            time_updated: completedAt,
+          })
+          .where(
+            and(
+              eq(SessionCommandTable.id, commandID),
+              eq(SessionCommandTable.status, "running"),
+              eq(SessionCommandTable.owner_id, commandOwner),
+              eq(SessionCommandTable.claim_generation, command.claim_generation),
+            ),
+          )
+          .run()
+          .pipe(Effect.orDie)
+      })
+      if (beforeExecutionAdmission) yield* beforeExecutionAdmission({ sessionID: command.session_id, commandID })
+      if (!(yield* waitForExecutionTurn(commandID, command.session_id))) {
+        yield* requeue()
+        return
+      }
       const admitted = yield* db
         .select({ id: SessionCommandTable.id })
         .from(SessionCommandTable)
@@ -188,29 +263,6 @@ export function make(deps: Deps) {
         Effect.repeat(Schedule.forever),
         Effect.forkIn(scope),
       )
-      const requeue = Effect.fnUntraced(function* () {
-        const completedAt = Date.now()
-        yield* db
-          .update(SessionCommandTable)
-          .set({
-            status: "queued",
-            owner_id: null,
-            lease_expires_at: null,
-            error: null,
-            completed_at: null,
-            time_updated: completedAt,
-          })
-          .where(
-            and(
-              eq(SessionCommandTable.id, commandID),
-              eq(SessionCommandTable.status, "running"),
-              eq(SessionCommandTable.owner_id, commandOwner),
-              eq(SessionCommandTable.claim_generation, command.claim_generation),
-            ),
-          )
-          .run()
-          .pipe(Effect.orDie)
-      })
       const exit = yield* Effect.uninterruptibleMask((restore) =>
         restore(
           loop({ sessionID: command.session_id, messageID: command.message_id }).pipe(
@@ -278,26 +330,120 @@ export function make(deps: Deps) {
     })
 
     const launchCommand = Effect.fn("SessionPrompt.launchCommand")(function* (commandID: string) {
+      if (launching.has(commandID)) return
+      launching.add(commandID)
       yield* executeCommand(commandID).pipe(
         Effect.catchCause((cause) => Effect.logError("prompt_async recovery failed", { commandID, cause })),
+        Effect.ensuring(Effect.sync(() => launching.delete(commandID))),
         Effect.forkIn(scope, { startImmediately: true }),
       )
     })
 
     const recover = Effect.fn("SessionPrompt.recover")(function* () {
       const ctx = yield* InstanceState.context
-      const commands = yield* db
-        .select({ id: SessionCommandTable.id })
+      const sessions = yield* db
+        .select({ sessionID: SessionCommandTable.session_id, oldest: min(SessionCommandTable.time_created) })
         .from(SessionCommandTable)
         .where(
           and(
             eq(SessionCommandTable.directory, ctx.directory),
-            inArray(SessionCommandTable.status, ["queued", "running"]),
+            or(
+              and(eq(SessionCommandTable.status, "queued"), isNull(SessionCommandTable.owner_id)),
+              and(eq(SessionCommandTable.status, "running"), lt(SessionCommandTable.lease_expires_at, Date.now())),
+            ),
           ),
         )
+        .groupBy(SessionCommandTable.session_id)
+        .orderBy(asc(min(SessionCommandTable.time_created)), asc(SessionCommandTable.session_id))
+        .limit(recoveryBatchSize)
         .all()
         .pipe(Effect.orDie)
-      yield* Effect.forEach(commands, (command) => launchCommand(command.id), { discard: true })
+      yield* Effect.forEach(
+        sessions,
+        (session) =>
+          db
+            .select({ id: SessionCommandTable.id })
+            .from(SessionCommandTable)
+            .where(
+              and(
+                eq(SessionCommandTable.session_id, session.sessionID),
+                eq(SessionCommandTable.directory, ctx.directory),
+                or(
+                  and(eq(SessionCommandTable.status, "queued"), isNull(SessionCommandTable.owner_id)),
+                  and(eq(SessionCommandTable.status, "running"), lt(SessionCommandTable.lease_expires_at, Date.now())),
+                ),
+              ),
+            )
+            .orderBy(asc(SessionCommandTable.time_created), asc(SessionCommandTable.id))
+            .limit(1)
+            .get()
+            .pipe(
+              Effect.orDie,
+              Effect.flatMap((command) =>
+                command
+                  ? diagnostic(command.id, "launch", "not-attempted").pipe(
+                      Effect.catchCause(() => Effect.void),
+                      Effect.andThen(launchCommand(command.id)),
+                    )
+                  : Effect.void,
+              ),
+            ),
+        { discard: true },
+      )
+      const messages = yield* db
+        .select({
+          id: MessageTable.id,
+          sessionID: MessageTable.session_id,
+          data: MessageTable.data,
+          created: MessageTable.time_created,
+          commandID: SessionCommandTable.id,
+        })
+        .from(MessageTable)
+        .innerJoin(SessionTable, eq(SessionTable.id, MessageTable.session_id))
+        .leftJoin(
+          SessionCommandTable,
+          and(
+            eq(SessionCommandTable.session_id, MessageTable.session_id),
+            eq(SessionCommandTable.message_id, MessageTable.id),
+          ),
+        )
+        .where(eq(SessionTable.directory, ctx.directory))
+        .orderBy(desc(MessageTable.time_created))
+        .limit(recoveryBatchSize)
+        .all()
+        .pipe(Effect.orDie)
+      for (const message of messages) {
+        if (message.data.role !== "user" || message.commandID) continue
+        if (
+          messages.some(
+            (other) =>
+              other.sessionID === message.sessionID &&
+              other.created > message.created &&
+              other.data.role === "assistant",
+          )
+        )
+          continue
+        yield* Effect.logWarning("session transcript has pending message without durable command", {
+          messageID: message.id,
+          sessionID: message.sessionID,
+          messageAgeMillis: Date.now() - message.created,
+          action: "transcript-only",
+          cas: "not-attempted",
+        }).pipe(Effect.catchCause(() => Effect.void))
+      }
+    })
+    const recovery = yield* InstanceState.make(() =>
+      Effect.gen(function* () {
+        yield* Effect.sleep(recoveryInterval).pipe(
+          Effect.andThen(recover()),
+          Effect.catchCause((cause) => Effect.logWarning("session command recovery sweep failed", { cause })),
+          Effect.repeat(Schedule.forever),
+          Effect.forkScoped,
+        )
+      }),
+    )
+    const start = Effect.fn("SessionPrompt.startRecovery")(function* () {
+      yield* InstanceState.get(recovery)
     })
     yield* Effect.addFinalizer(() =>
       db
@@ -323,6 +469,7 @@ export function make(deps: Deps) {
       executeCommand,
       launchCommand,
       recover,
+      start,
     }
   })
 }

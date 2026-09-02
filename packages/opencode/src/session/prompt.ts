@@ -880,7 +880,9 @@ export const layer = Layer.effect(
           { behavior: "immediate" },
         )
         .pipe(Effect.orDie)
-      yield* Effect.logDebug("prompt_async accepted", { sessionID: input.sessionID, commandID: acceptedCommandID })
+      yield* Effect.logDebug("prompt_async accepted").pipe(
+        Effect.annotateLogs({ sessionID: input.sessionID, commandID: acceptedCommandID }),
+      )
       const steering = input.delivery === "immediate" && (yield* state.interrupt(input.sessionID))
       if (steering) yield* markSteering(message)
       if (input.noReply !== true) yield* launchCommand(acceptedCommandID)

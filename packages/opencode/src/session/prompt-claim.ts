@@ -12,6 +12,8 @@ import * as Session from "./session"
 import { SessionExecutionOwner } from "./execution-owner"
 import { ensureRunID } from "@opencode-ai/core/util/opencode-process"
 
+const launching = new Set<string>()
+
 export interface Deps {
   readonly database: Context.Service.Shape<typeof Database.Service>
   readonly events: Context.Service.Shape<typeof EventV2Bridge.Service>
@@ -33,7 +35,6 @@ export function make(deps: Deps) {
     const commandOwner = `local:${process.pid}:${processRunID}:${crypto.randomUUID()}`
     const commandLeaseMillis = 30_000
     const sweepMillis = 20_000
-    const launching = new Set<string>()
 
     const claimCommandTurn = Effect.fn("SessionPrompt.claimCommandTurn")(function* (commandID: string) {
       const now = Date.now()
@@ -47,7 +48,7 @@ export function make(deps: Deps) {
                 .where(eq(SessionCommandTable.id, commandID))
                 .get()
               if (!current || ["succeeded", "failed", "cancelled"].includes(current.status)) {
-                yield* Effect.logDebug("prompt_async claim", { decision: "done", commandID })
+                yield* Effect.logDebug("prompt_async claim").pipe(Effect.annotateLogs({ decision: "done", commandID }))
                 return { state: "done" as const }
               }
               if (
@@ -57,7 +58,9 @@ export function make(deps: Deps) {
                 current.lease_expires_at > now &&
                 SessionExecutionOwner.alive(current.owner_id, processRunID)
               ) {
-                yield* Effect.logDebug("prompt_async claim", { decision: "live_owner", commandID })
+                yield* Effect.logDebug("prompt_async claim").pipe(
+                  Effect.annotateLogs({ decision: "live_owner", commandID }),
+                )
                 return { state: "waiting" as const }
               }
               const active = yield* transaction
@@ -80,7 +83,7 @@ export function make(deps: Deps) {
                     (item.created === current.time_created && item.id.localeCompare(current.id) < 0)),
               )
               if (blocked) {
-                yield* Effect.logDebug("prompt_async claim", { decision: "blocked", commandID })
+                yield* Effect.logDebug("prompt_async claim").pipe(Effect.annotateLogs({ decision: "blocked", commandID }))
                 return { state: "waiting" as const }
               }
               const runningOwner = current.status === "running" ? current.owner_id : undefined
@@ -105,10 +108,10 @@ export function make(deps: Deps) {
                 .returning()
                 .get()
               if (!claimed) {
-                yield* Effect.logDebug("prompt_async claim", { decision: "cas_lost", commandID })
+                yield* Effect.logDebug("prompt_async claim").pipe(Effect.annotateLogs({ decision: "cas_lost", commandID }))
                 return { state: "waiting" as const }
               }
-              yield* Effect.logDebug("prompt_async claim", { decision: "claimed", commandID })
+              yield* Effect.logDebug("prompt_async claim").pipe(Effect.annotateLogs({ decision: "claimed", commandID }))
               return { state: "ready" as const, command: claimed }
             }),
           { behavior: "immediate" },
@@ -290,13 +293,15 @@ export function make(deps: Deps) {
 
     const launchCommand = Effect.fn("SessionPrompt.launchCommand")(function* (commandID: string) {
       if (launching.has(commandID)) {
-        yield* Effect.logDebug("prompt_async wake", { decision: "deduplicated", commandID })
+        yield* Effect.logDebug("prompt_async wake").pipe(Effect.annotateLogs({ decision: "deduplicated", commandID }))
         return
       }
       launching.add(commandID)
-      yield* Effect.logDebug("prompt_async wake", { decision: "launched", commandID })
+      yield* Effect.logDebug("prompt_async wake").pipe(Effect.annotateLogs({ decision: "launched", commandID }))
       yield* executeCommand(commandID).pipe(
-        Effect.catchCause((cause) => Effect.logError("prompt_async recovery failed", { commandID, cause })),
+        Effect.catchCause((cause) =>
+          Effect.logError("prompt_async recovery failed").pipe(Effect.annotateLogs({ commandID, cause })),
+        ),
         Effect.ensuring(Effect.sync(() => launching.delete(commandID))),
         Effect.forkIn(scope, { startImmediately: true }),
       )
@@ -316,7 +321,9 @@ export function make(deps: Deps) {
         .all()
         .pipe(Effect.orDie)
       yield* Effect.forEach(commands, (command) => launchCommand(command.id), { discard: true })
-      yield* Effect.logDebug("prompt_async recovery", { decision: "startup", commands: commands.length })
+      yield* Effect.logDebug("prompt_async recovery").pipe(
+        Effect.annotateLogs({ decision: "startup", commands: commands.length }),
+      )
     })
     const sweep = Effect.fn("SessionPrompt.sweep")(function* () {
       const ctx = yield* InstanceState.context
@@ -347,18 +354,24 @@ export function make(deps: Deps) {
       yield* Effect.forEach(
         commands,
         (command) =>
-          Effect.logDebug("prompt_async recovery", {
-            decision: "wake",
-            commandID: command.id,
-            sessionID: command.sessionID,
-            queueAgeMillis: Date.now() - command.queuedAt,
-          }).pipe(Effect.andThen(launchCommand(command.id))),
+          Effect.logDebug("prompt_async recovery")
+            .pipe(
+              Effect.annotateLogs({
+                decision: "wake",
+                commandID: command.id,
+                sessionID: command.sessionID,
+                queueAgeMillis: Date.now() - command.queuedAt,
+              }),
+            )
+            .pipe(Effect.andThen(launchCommand(command.id))),
         { discard: true },
       )
     })
     const startPeriodicRecovery = Effect.fn("SessionPrompt.startPeriodicRecovery")(function* () {
       yield* sweep().pipe(
-        Effect.catchCause((cause) => Effect.logError("prompt_async periodic recovery failed", { cause })),
+        Effect.catchCause((cause) =>
+          Effect.logError("prompt_async periodic recovery failed").pipe(Effect.annotateLogs("cause", cause)),
+        ),
         Effect.repeat(Schedule.spaced(Duration.millis(sweepMillis))),
         Effect.forkIn(scope),
       )

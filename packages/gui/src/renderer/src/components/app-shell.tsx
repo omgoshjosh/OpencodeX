@@ -300,8 +300,7 @@ export function AppShell(props: { model: GuiAppModel }) {
                   type="button"
                   onClick={() =>
                     void model.notices.run(async () => {
-                      await window.opencodex!.attachVersionMismatch()
-                      window.location.reload()
+                      if (await window.opencodex!.attachVersionMismatch()) window.location.reload()
                     })
                   }
                 >

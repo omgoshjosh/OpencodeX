@@ -269,7 +269,14 @@ export const layer = Layer.effect(
                   .from(SessionStatusTable)
                   .where(eq(SessionStatusTable.session_id, sessionID))
                   .get()
-                const current = existing ? Option.getOrUndefined(decode(existing.status)) : undefined
+                // Prune here for the same reason `get` and `list` do: a coordinator
+                // that died with delegations running leaves background jobs whose
+                // owner is gone. Without this, `carry` copies them into the new row
+                // and the `session.status` broadcast, publishing a phantom
+                // `background.running` that clients cannot clear -- they have no way
+                // to know owner liveness.
+                const decoded = existing ? Option.getOrUndefined(decode(existing.status)) : undefined
+                const current = decoded ? pruneBackground(decoded, processRunID) : undefined
                 const next = typeof status === "function" ? status(current) : carry(status, current)
                 if (!next) return undefined
                 yield* transaction

@@ -82,7 +82,7 @@ function invoke<T>(channel: string, ...args: unknown[]): Promise<T> {
 
 contextBridge.exposeInMainWorld("opencodex", {
   connection: () => invoke<GuiConnectionResult>("opencodex:connection"),
-  attachVersionMismatch: () => invoke<void>("opencodex:attach-version-mismatch"),
+  attachVersionMismatch: () => invoke<boolean>("opencodex:attach-version-mismatch"),
   installationID: () => invoke<string>("opencodex:installation-id"),
   claude: {
     status: () => invoke<ClaudeCodeStatus>("opencodex:claude:status"),

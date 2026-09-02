@@ -293,7 +293,9 @@ ipcMain.handle("opencodex:attach-version-mismatch", async (event) => {
   if (!window || event.senderFrame !== event.sender.mainFrame) {
     throw new Error("Coordinator version override is only available from the main OpencodeX window.")
   }
-  await confirmCoordinatorVersionMismatch({
+  // Returns false when the user picks Cancel. The renderer reloads only on true;
+  // reloading unconditionally discarded the choice and attached anyway.
+  return await confirmCoordinatorVersionMismatch({
     window,
     pending: pendingCoordinatorVersionMismatch,
     approve: allowCoordinatorVersionMismatch,

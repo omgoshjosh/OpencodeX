@@ -234,6 +234,40 @@ it.instance("carries background delegations across status changes and lists an i
   }),
 )
 
+it.instance("does not republish dead-owner background jobs on the next status write", () =>
+  Effect.gen(function* () {
+    const graph = yield* buildRunGraph()
+    const { db } = yield* Database.Service
+    const task = { sessionID: "ses_child", role: "QA", title: "Task QA: run the suite", since: 1 }
+
+    // Create a real status row first, then overwrite its owner with a dead one --
+    // the state a coordinator leaves behind when it dies mid-delegation.
+    expect(yield* graph.status.backgroundStart(sessionID, task)).toBe(true)
+    const dead = { ...task, owner: "local:2147483000:gone:background:ses_child" }
+    yield* db
+      .update(SessionStatusTable)
+      .set({ status: { type: "idle", background: { running: 1, jobs: [dead] } } })
+      .where(eq(SessionStatusTable.session_id, sessionID))
+      .run()
+      .pipe(Effect.orDie)
+
+    // `get` prunes this phantom on read. The write path did not: it decoded the
+    // row unpruned, so `carry` copied the dead job into the new row and into the
+    // `session.status` broadcast, where no client can clear it.
+    yield* graph.status.set(sessionID, { type: "busy" })
+
+    // Read the raw row, so read-side pruning cannot mask a bad write.
+    const row = yield* db
+      .select({ status: SessionStatusTable.status })
+      .from(SessionStatusTable)
+      .where(eq(SessionStatusTable.session_id, sessionID))
+      .get()
+      .pipe(Effect.orDie)
+    expect((row?.status as { background?: unknown })?.background).toBeUndefined()
+    expect(yield* graph.status.get(sessionID)).toMatchObject({ type: "busy" })
+  }),
+)
+
 it.instance("persists abort across graphs and interrupts the owner", () =>
   Effect.gen(function* () {
     const owner = yield* buildRunGraph()

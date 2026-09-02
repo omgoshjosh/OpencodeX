@@ -34,11 +34,13 @@ import { ProjectV2 } from "@opencode-ai/core/project"
 import { WorkspaceV2 } from "@opencode-ai/core/workspace"
 import { SessionID, MessageID, PartID } from "./schema"
 import {
+  DELEGATION_DELIVERY_CLAIM_GRACE,
   delegationRecord,
   withDelegationRecord,
   withoutDelegationRecord,
   type DelegationRecord,
 } from "./delegation-outcome"
+import { Identifier } from "@/id/id"
 
 import type { Provider } from "@/provider/provider"
 import { Permission } from "@/permission"
@@ -506,8 +508,16 @@ export interface Interface {
     sessionID: SessionID
     runID: string
     outcome: "delivered" | "failed"
+    claimToken?: string
     at?: number
   }) => Effect.Effect<boolean>
+  /** Claims one pending report delivery before its idempotent notification write. */
+  readonly claimDelegationDelivery: (input: {
+    sessionID: SessionID
+    runID: string
+    at?: number
+    token?: string
+  }) => Effect.Effect<string | undefined>
   readonly setPermission: (input: { sessionID: SessionID; permission: Permission.Ruleset }) => Effect.Effect<void>
   readonly setRevert: (input: {
     sessionID: SessionID
@@ -541,6 +551,13 @@ export interface Interface {
    * it. Use it for in-flight progress only - terminal state must stay durable.
    */
   readonly updatePart: <T extends SessionLegacy.Part>(part: T, options?: { transient?: boolean }) => Effect.Effect<T>
+  /** Atomically replaces an in-flight tool part, never a provider terminal state. */
+  readonly updatePartIfPendingOrRunning: (input: {
+    sessionID: SessionID
+    messageID: MessageID
+    partID: PartID
+    update: (part: SessionLegacy.ToolPart) => SessionLegacy.ToolPart
+  }) => Effect.Effect<"updated" | "terminal" | "missing">
   readonly updatePartDelta: (input: {
     sessionID: SessionID
     messageID: MessageID
@@ -854,6 +871,57 @@ export const layer: Layer.Layer<
         return part
       }).pipe(Effect.withSpan("Session.updatePart"))
 
+    const updatePartIfPendingOrRunning: Interface["updatePartIfPendingOrRunning"] = Effect.fn(
+      "Session.updatePartIfPendingOrRunning",
+    )(function* (input) {
+      return yield* events
+        .barrier(
+          Effect.gen(function* () {
+            const result = yield* db.transaction(
+              () =>
+                Effect.gen(function* () {
+                  const row = yield* db
+                    .select()
+                    .from(PartTable)
+                    .where(
+                      and(
+                        eq(PartTable.session_id, input.sessionID),
+                        eq(PartTable.message_id, input.messageID),
+                        eq(PartTable.id, input.partID),
+                      ),
+                    )
+                    .get()
+                    .pipe(Effect.orDie)
+                  if (!row) return { status: "missing" as const }
+                  const current = {
+                    ...row.data,
+                    id: row.id,
+                    sessionID: row.session_id,
+                    messageID: row.message_id,
+                  } as SessionLegacy.Part
+                  if (
+                    current.type !== "tool" ||
+                    (current.state.status !== "pending" && current.state.status !== "running")
+                  )
+                    return { status: "terminal" as const }
+                  const session = yield* get(input.sessionID)
+                  const event = yield* events.commit(
+                    SessionLegacy.Event.PartUpdated,
+                    { sessionID: input.sessionID, part: structuredClone(input.update(current)), time: Date.now() },
+                    { location: eventLocation(session) },
+                  )
+                  return { status: "updated" as const, event }
+                }),
+              { behavior: "immediate" },
+            )
+            if (result.status !== "updated") return result.status
+            yield* events.broadcast(result.event)
+            return result.status
+          }),
+        )
+        .pipe(Effect.orDie)
+    })
+
     const getPart: Interface["getPart"] = Effect.fn("Session.getPart")(function* (input) {
       const row = yield* db
         .select()
@@ -1051,11 +1119,13 @@ export const layer: Layer.Layer<
       sessionID: SessionID
       runID: string
       outcome: "delivered" | "failed"
+      claimToken?: string
       at?: number
     }) {
       return yield* mutate(input.sessionID, (current) => {
         const stored = delegationRecord(current.metadata)
         if (!stored || stored.runID !== input.runID) return undefined
+        if (stored.deliveryOutcome === "delivering" && stored.deliveryClaimToken !== input.claimToken) return undefined
         // Delivery is monotonic: a late failed retry can never erase proof that
         // the parent already durably received this run's result.
         if (stored.deliveryOutcome === "delivered" && input.outcome === "failed") return undefined
@@ -1064,11 +1134,47 @@ export const layer: Layer.Layer<
           metadata: withDelegationRecord(current.metadata, {
             ...stored,
             deliveryOutcome: input.outcome,
+            deliveryClaimedAt: undefined,
+            deliveryClaimToken: undefined,
             ...(input.outcome === "delivered" ? { deliveredAt: input.at ?? Date.now() } : {}),
           }),
           time: { ...current.time, updated: Date.now() },
         }
       }).pipe(Effect.orDie)
+    })
+
+    const claimDelegationDelivery = Effect.fn("Session.claimDelegationDelivery")(function* (input: {
+      sessionID: SessionID
+      runID: string
+      at?: number
+      token?: string
+    }) {
+      const token = input.token ?? Identifier.ascending("run")
+      return yield* mutate(input.sessionID, (current) => {
+        const stored = delegationRecord(current.metadata)
+        if (!stored || stored.runID !== input.runID) return undefined
+        const at = input.at ?? Date.now()
+        if (stored.deliveryOutcome === "delivered") return undefined
+        if (
+          stored.deliveryOutcome === "delivering" &&
+          stored.deliveryClaimedAt !== undefined &&
+          at - stored.deliveryClaimedAt < DELEGATION_DELIVERY_CLAIM_GRACE
+        )
+          return undefined
+        return {
+          ...current,
+          metadata: withDelegationRecord(current.metadata, {
+            ...stored,
+            deliveryOutcome: "delivering",
+            deliveryClaimedAt: at,
+            deliveryClaimToken: token,
+          }),
+          time: { ...current.time, updated: Date.now() },
+        }
+      }).pipe(
+        Effect.map((claimed) => (claimed ? token : undefined)),
+        Effect.orDie,
+      )
     })
 
     const setPermission = Effect.fn("Session.setPermission")(function* (input: {
@@ -1226,6 +1332,7 @@ export const layer: Layer.Layer<
       setMetadata,
       stampDelegation,
       stampDelegationDelivery,
+      claimDelegationDelivery,
       setPermission,
       setRevert,
       clearRevert,
@@ -1240,6 +1347,7 @@ export const layer: Layer.Layer<
       removeMessage,
       removePart,
       updatePart,
+      updatePartIfPendingOrRunning,
       getPart,
       updatePartDelta,
       findMessage,

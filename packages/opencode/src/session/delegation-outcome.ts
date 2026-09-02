@@ -27,7 +27,10 @@ export const DELEGATION_RECORD_VERSION = 2
 
 export type DelegationOutcome = "completed" | "errored" | "cancelled" | "abandoned"
 
-export type DelegationDelivery = "pending" | "delivered" | "failed"
+export type DelegationDelivery = "pending" | "delivering" | "delivered" | "failed"
+
+/** A crashed recovery claimant is reclaimable after this bounded grace. */
+export const DELEGATION_DELIVERY_CLAIM_GRACE = 30_000
 
 export type DelegationRecord = {
   version: typeof DELEGATION_RECORD_VERSION
@@ -37,8 +40,8 @@ export type DelegationRecord = {
   parentSessionID: string
   parentMessageID?: string
   toolCallID?: string
-  /** Background runs are recoverable from durable transcript evidence only. */
-  mode?: "background"
+  /** How the parent receives this run's result after a reconnect. */
+  mode?: "background" | "foreground"
   /** Process identity that started this exact run. */
   ownerID?: string
   /** Optional display labels captured at delegation time. */
@@ -57,6 +60,8 @@ export type DelegationRecord = {
   summary?: string
   /** Whether the parent workflow durably received the report. */
   deliveryOutcome?: DelegationDelivery
+  deliveryClaimedAt?: number
+  deliveryClaimToken?: string
   deliveredAt?: number
   /**
    * A background delegation: the parent was told to carry on and expects the
@@ -150,7 +155,7 @@ function isOutcome(value: unknown): value is DelegationOutcome {
 }
 
 function isDelivery(value: unknown): value is DelegationDelivery {
-  return value === "pending" || value === "delivered" || value === "failed"
+  return value === "pending" || value === "delivering" || value === "delivered" || value === "failed"
 }
 
 /**
@@ -177,6 +182,8 @@ export function delegationRecord(metadata: Record<string, unknown> | undefined |
     (raw.outcome !== undefined ||
       raw.completedAt !== undefined ||
       raw.deliveryOutcome !== undefined ||
+      raw.deliveryClaimedAt !== undefined ||
+      raw.deliveryClaimToken !== undefined ||
       raw.deliveredAt !== undefined)
   )
     return undefined
@@ -186,7 +193,7 @@ export function delegationRecord(metadata: Record<string, unknown> | undefined |
     parentSessionID: raw.parentSessionID,
     ...(typeof raw.parentMessageID === "string" ? { parentMessageID: raw.parentMessageID } : {}),
     ...(typeof raw.toolCallID === "string" ? { toolCallID: raw.toolCallID } : {}),
-    ...(raw.mode === "background" ? { mode: raw.mode } : {}),
+    ...(raw.mode === "background" || raw.mode === "foreground" ? { mode: raw.mode } : {}),
     ...(typeof raw.ownerID === "string" ? { ownerID: raw.ownerID } : {}),
     ...(typeof raw.role === "string" ? { role: raw.role } : {}),
     ...(typeof raw.title === "string" ? { title: raw.title } : {}),
@@ -198,6 +205,12 @@ export function delegationRecord(metadata: Record<string, unknown> | undefined |
     ...(raw.completedAt !== undefined ? { completedAt: raw.completedAt } : {}),
     ...(typeof raw.summary === "string" && raw.summary ? { summary: raw.summary } : {}),
     ...(raw.deliveryOutcome !== undefined ? { deliveryOutcome: raw.deliveryOutcome } : {}),
+    ...(typeof raw.deliveryClaimedAt === "number" && Number.isFinite(raw.deliveryClaimedAt)
+      ? { deliveryClaimedAt: raw.deliveryClaimedAt }
+      : {}),
+    ...(typeof raw.deliveryClaimToken === "string" && raw.deliveryClaimToken
+      ? { deliveryClaimToken: raw.deliveryClaimToken }
+      : {}),
     ...(typeof raw.deliveredAt === "number" && Number.isFinite(raw.deliveredAt)
       ? { deliveredAt: raw.deliveredAt }
       : {}),

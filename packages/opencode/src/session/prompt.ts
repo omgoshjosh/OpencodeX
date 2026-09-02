@@ -771,12 +771,13 @@ export const layer = Layer.effect(
       },
     )
 
-    const { launchCommand, recover } = yield* PromptClaim.make({
+    const { launchCommand, recover, startPeriodicRecovery } = yield* PromptClaim.make({
       database,
       events,
       scope,
       loop: (input) => loop(input),
     })
+    yield* startPeriodicRecovery()
 
     const promptAsync = Effect.fn("SessionPrompt.promptAsync")(function* (input: PromptInput) {
       if (input.messageID) {

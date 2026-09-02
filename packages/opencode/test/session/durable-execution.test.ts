@@ -1,6 +1,7 @@
 import { expect } from "bun:test"
 import { BackgroundJob } from "@/background/job"
 import { EventV2Bridge } from "@/event-v2-bridge"
+import { InstanceState } from "@/effect/instance-state"
 import { Permission } from "@/permission"
 import { PermissionID } from "@/permission/schema"
 import { Question } from "@/question"
@@ -120,6 +121,7 @@ const insertCommand = Effect.fn("DurableExecutionTest.insertCommand")(function* 
   createdAt?: number
 }) {
   const { db } = yield* Database.Service
+  const ctx = yield* InstanceState.context
   const now = input.createdAt ?? Date.now()
   yield* db
     .insert(SessionCommandTable)
@@ -128,7 +130,7 @@ const insertCommand = Effect.fn("DurableExecutionTest.insertCommand")(function* 
       session_id: sessionID,
       message_id: MessageID.make(`msg_${input.id}`),
       project_id: "prj_test",
-      directory: ".",
+      directory: ctx.directory,
       status: input.status ?? "queued",
       owner_id: input.owner,
       lease_expires_at: input.leaseExpiresAt,
@@ -139,6 +141,13 @@ const insertCommand = Effect.fn("DurableExecutionTest.insertCommand")(function* 
     .run()
     .pipe(Effect.orDie)
 })
+
+it.instance("starts periodic recovery when prompt claims are constructed", () =>
+  Effect.gen(function* () {
+    const claim = yield* buildPromptClaim()
+    yield* claim.startPeriodicRecovery()
+  }),
+)
 
 it.instance("periodic sweep self-heals an omitted launch exactly once", () =>
   Effect.gen(function* () {

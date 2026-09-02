@@ -356,11 +356,13 @@ export function make(deps: Deps) {
         { discard: true },
       )
     })
-    yield* sweep.pipe(
-      Effect.catchCause((cause) => Effect.logError("prompt_async periodic recovery failed", { cause })),
-      Effect.repeat(Schedule.spaced(Duration.millis(sweepMillis))),
-      Effect.forkIn(scope),
-    )
+    const startPeriodicRecovery = Effect.fn("SessionPrompt.startPeriodicRecovery")(function* () {
+      yield* sweep().pipe(
+        Effect.catchCause((cause) => Effect.logError("prompt_async periodic recovery failed", { cause })),
+        Effect.repeat(Schedule.spaced(Duration.millis(sweepMillis))),
+        Effect.forkIn(scope),
+      )
+    })
     yield* Effect.addFinalizer(() =>
       db
         .update(SessionCommandTable)
@@ -386,6 +388,7 @@ export function make(deps: Deps) {
       launchCommand,
       recover,
       sweep,
+      startPeriodicRecovery,
     }
   })
 }

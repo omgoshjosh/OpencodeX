@@ -27,7 +27,7 @@ export const DELEGATION_RECORD_VERSION = 2
 
 export type DelegationOutcome = "completed" | "errored" | "cancelled" | "abandoned"
 
-export type DelegationDelivery = "pending" | "delivered" | "failed"
+export type DelegationDelivery = "pending" | "delivering" | "delivered" | "failed"
 
 export type DelegationRecord = {
   version: typeof DELEGATION_RECORD_VERSION
@@ -57,6 +57,7 @@ export type DelegationRecord = {
   summary?: string
   /** Whether the parent workflow durably received the report. */
   deliveryOutcome?: DelegationDelivery
+  deliveryClaimedAt?: number
   deliveredAt?: number
 }
 
@@ -143,7 +144,7 @@ function isOutcome(value: unknown): value is DelegationOutcome {
 }
 
 function isDelivery(value: unknown): value is DelegationDelivery {
-  return value === "pending" || value === "delivered" || value === "failed"
+  return value === "pending" || value === "delivering" || value === "delivered" || value === "failed"
 }
 
 /**
@@ -170,6 +171,7 @@ export function delegationRecord(metadata: Record<string, unknown> | undefined |
     (raw.outcome !== undefined ||
       raw.completedAt !== undefined ||
       raw.deliveryOutcome !== undefined ||
+      raw.deliveryClaimedAt !== undefined ||
       raw.deliveredAt !== undefined)
   )
     return undefined
@@ -191,6 +193,9 @@ export function delegationRecord(metadata: Record<string, unknown> | undefined |
     ...(raw.completedAt !== undefined ? { completedAt: raw.completedAt } : {}),
     ...(typeof raw.summary === "string" && raw.summary ? { summary: raw.summary } : {}),
     ...(raw.deliveryOutcome !== undefined ? { deliveryOutcome: raw.deliveryOutcome } : {}),
+    ...(typeof raw.deliveryClaimedAt === "number" && Number.isFinite(raw.deliveryClaimedAt)
+      ? { deliveryClaimedAt: raw.deliveryClaimedAt }
+      : {}),
     ...(typeof raw.deliveredAt === "number" && Number.isFinite(raw.deliveredAt)
       ? { deliveredAt: raw.deliveredAt }
       : {}),

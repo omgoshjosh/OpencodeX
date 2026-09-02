@@ -1,9 +1,15 @@
-import { and, eq, inArray, isNull, lt, or } from "drizzle-orm"
+import { and, desc, eq, inArray, isNull, lt, or } from "drizzle-orm"
 import { Cause, Context, Effect, Exit, Fiber, Schedule, Scope } from "effect"
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
 import { Database } from "@opencode-ai/core/database/database"
 import { NamedError } from "@opencode-ai/core/util/error"
-import { SessionCommandTable, SessionExecutionTable } from "@opencode-ai/core/session/sql"
+import {
+  MessageTable,
+  SessionCommandTable,
+  SessionExecutionTable,
+  SessionStatusTable,
+  SessionTable,
+} from "@opencode-ai/core/session/sql"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { InstanceState } from "@/effect/instance-state"
 import { MessageID, SessionID } from "./schema"
@@ -37,6 +43,48 @@ export function make(deps: Deps) {
     const commandOwner = `local:${process.pid}:${processRunID}:${crypto.randomUUID()}`
     const commandLeaseMillis = deps.commandLeaseMillis ?? 30_000
     const clock = deps.clock ?? Date.now
+    const recoveryBatchSize = 32
+    const launching = new Set<string>()
+
+    const diagnostic = Effect.fnUntraced(function* (
+      commandID: string,
+      action: "launch" | "claim",
+      cas: "not-attempted" | "ready" | "waiting" | "done",
+    ) {
+      const command = yield* db
+        .select()
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.id, commandID))
+        .get()
+        .pipe(Effect.orDie)
+      const [execution, status] = yield* Effect.all(
+        [
+          db
+            .select()
+            .from(SessionExecutionTable)
+            .where(eq(SessionExecutionTable.session_id, command?.session_id ?? SessionID.make("ses_missing")))
+            .get()
+            .pipe(Effect.orDie),
+          db
+            .select({ sessionID: SessionStatusTable.session_id })
+            .from(SessionStatusTable)
+            .where(eq(SessionStatusTable.session_id, command?.session_id ?? SessionID.make("ses_missing")))
+            .get()
+            .pipe(Effect.orDie),
+        ],
+        { concurrency: "unbounded" },
+      )
+      yield* Effect.logInfo("session command recovery", {
+        commandID,
+        commandAgeMillis: command ? clock() - command.time_created : undefined,
+        executionGeneration: execution?.generation,
+        executionOwner: execution?.owner_id,
+        executionLeaseExpiresAt: execution?.lease_expires_at,
+        statusPresent: !!status,
+        action,
+        cas,
+      })
+    })
 
     const claimCommandTurn = Effect.fn("SessionPrompt.claimCommandTurn")(function* (commandID: string) {
       const now = clock()
@@ -156,6 +204,7 @@ export function make(deps: Deps) {
         yield* Effect.sleep("200 millis")
         claimed = yield* claimCommandTurn(commandID)
       }
+      yield* diagnostic(commandID, "claim", claimed.state)
       if (claimed.state !== "ready") return
       const command = claimed.command
       if (!(yield* waitForExecutionTurn(commandID, command.session_id))) return
@@ -283,8 +332,11 @@ export function make(deps: Deps) {
     })
 
     const launchCommand = Effect.fn("SessionPrompt.launchCommand")(function* (commandID: string) {
+      if (launching.has(commandID)) return
+      launching.add(commandID)
       yield* executeCommand(commandID).pipe(
         Effect.catchCause((cause) => Effect.logError("prompt_async recovery failed", { commandID, cause })),
+        Effect.ensuring(Effect.sync(() => launching.delete(commandID))),
         Effect.forkIn(scope, { startImmediately: true }),
       )
     })
@@ -328,10 +380,62 @@ export function make(deps: Deps) {
             inArray(SessionCommandTable.status, ["queued", "running"]),
           ),
         )
+        .limit(recoveryBatchSize)
         .all()
         .pipe(Effect.orDie)
-      yield* Effect.forEach(commands, (command) => launchCommand(command.id), { discard: true })
+      yield* Effect.forEach(
+        commands,
+        (command) => diagnostic(command.id, "launch", "not-attempted").pipe(Effect.andThen(launchCommand(command.id))),
+        { discard: true },
+      )
+      const messages = yield* db
+        .select({
+          id: MessageTable.id,
+          sessionID: MessageTable.session_id,
+          data: MessageTable.data,
+          created: MessageTable.time_created,
+          commandID: SessionCommandTable.id,
+        })
+        .from(MessageTable)
+        .innerJoin(SessionTable, eq(SessionTable.id, MessageTable.session_id))
+        .leftJoin(
+          SessionCommandTable,
+          and(
+            eq(SessionCommandTable.session_id, MessageTable.session_id),
+            eq(SessionCommandTable.message_id, MessageTable.id),
+          ),
+        )
+        .where(eq(SessionTable.directory, ctx.directory))
+        .orderBy(desc(MessageTable.time_created))
+        .limit(recoveryBatchSize)
+        .all()
+        .pipe(Effect.orDie)
+      for (const message of messages) {
+        if (message.data.role !== "user" || message.commandID) continue
+        if (
+          messages.some(
+            (other) =>
+              other.sessionID === message.sessionID &&
+              other.created > message.created &&
+              other.data.role === "assistant",
+          )
+        )
+          continue
+        yield* Effect.logWarning("session transcript has pending message without durable command", {
+          messageID: message.id,
+          sessionID: message.sessionID,
+          messageAgeMillis: clock() - message.created,
+          action: "transcript-only",
+          cas: "not-attempted",
+        })
+      }
     })
+    yield* Effect.sleep("15 seconds").pipe(
+      Effect.andThen(recover()),
+      Effect.catchCause((cause) => Effect.logWarning("session command recovery sweep failed", { cause })),
+      Effect.repeat(Schedule.forever),
+      Effect.forkIn(scope),
+    )
     yield* Effect.addFinalizer(() =>
       db
         .update(SessionCommandTable)

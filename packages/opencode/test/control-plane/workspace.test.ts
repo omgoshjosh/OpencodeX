@@ -723,7 +723,8 @@ describe("workspace CRUD", () => {
           calls.push(call)
           if (call.url.pathname === "/base/global/event")
             return HttpServerResponse.fromWeb(eventStreamResponse([], false))
-          if (call.url.pathname === "/base/sync/history") return yield* HttpServerResponse.json([])
+          if (call.url.pathname === "/base/sync/history/page")
+            return yield* HttpServerResponse.json({ events: [], next: null })
           return HttpServerResponse.text("unexpected", { status: 500 })
         }),
       )
@@ -741,8 +742,8 @@ describe("workspace CRUD", () => {
 
             expect(
               calls.map((call) => `${call.method} ${call.url.pathname}${call.url.search}${call.url.hash}`),
-            ).toEqual(["GET /base/global/event", `POST /base/sync/history?directory=${encodeURIComponent(dir)}`])
-            expect(calls[1].json).toEqual({})
+            ).toEqual(["GET /base/global/event", `POST /base/sync/history/page?directory=${encodeURIComponent(dir)}`])
+            expect(calls[1].json).toEqual({ state: {} })
             expect((yield* workspace.status()).find((item) => item.workspaceID === info.id)?.status).toBe("connected")
             expect(yield* workspace.isSyncing(info.id)).toBe(true)
 
@@ -1014,16 +1015,19 @@ describe("workspace CRUD", () => {
             json: bodyText ? JSON.parse(bodyText) : undefined,
           }
           calls.push(call)
-          if (call.url.pathname === "/warp-source/sync/history") {
-            return yield* HttpServerResponse.json([
-              {
-                id: `evt_${unique("warp-source-history")}`,
-                aggregate_id: historySessionID!,
-                seq: historyNextSeq,
-                type: "session.updated.1",
-                data: { sessionID: historySessionID!, info: historySession! },
-              },
-            ])
+          if (call.url.pathname === "/warp-source/sync/history/page") {
+            return yield* HttpServerResponse.json({
+              events: [
+                {
+                  id: `evt_${unique("warp-source-history")}`,
+                  aggregate_id: historySessionID!,
+                  seq: historyNextSeq,
+                  type: "session.updated.1",
+                  data: { sessionID: historySessionID!, info: historySession! },
+                },
+              ],
+              next: null,
+            })
           }
           if (call.url.pathname === "/warp-source/vcs/diff/raw") return HttpServerResponse.text("remote patch")
           if (call.url.pathname === "/warp-target/sync/replay")
@@ -1058,13 +1062,13 @@ describe("workspace CRUD", () => {
             yield* workspace.sessionWarp({ workspaceID: target.id, sessionID: session.id, copyChanges: true })
 
             expect(calls.map((call) => `${call.method} ${call.url.pathname}`)).toEqual([
-              "POST /warp-source/sync/history",
+              "POST /warp-source/sync/history/page",
               "GET /warp-source/vcs/diff/raw",
               "POST /warp-target/vcs/apply",
               "POST /warp-target/sync/replay",
               "POST /warp-target/sync/steal",
             ])
-            expect(calls[0].json).toEqual({ [session.id]: historyNextSeq - 1 })
+            expect(calls[0].json).toEqual({ state: { [session.id]: historyNextSeq - 1 } })
             expect(calls[2].json).toEqual({ patch: "remote patch" })
             expect(calls[3].json).toMatchObject({
               directory: "remote-target-dir",
@@ -1235,7 +1239,8 @@ describe("workspace sync state", () => {
           }
           calls.push(call)
           if (call.url.pathname === "/sync/global/event") return HttpServerResponse.fromWeb(eventStreamResponse())
-          if (call.url.pathname === "/sync/sync/history") return HttpServerResponse.fromWeb(Response.json([]))
+          if (call.url.pathname === "/sync/sync/history/page")
+            return HttpServerResponse.fromWeb(Response.json({ events: [], next: null }))
           return HttpServerResponse.text("unexpected", { status: 500 })
         }),
       )
@@ -1271,7 +1276,7 @@ describe("workspace sync state", () => {
                   .map((event) => event.payload.properties.status),
               ).toEqual(["disconnected", "connecting", "connected"])
               expect(calls.filter((call) => call.url.pathname === "/sync/global/event")).toHaveLength(1)
-              expect(calls.filter((call) => call.url.pathname === "/sync/sync/history")).toHaveLength(1)
+              expect(calls.filter((call) => call.url.pathname === "/sync/sync/history/page")).toHaveLength(1)
               expect(yield* workspace.isSyncing(info.id)).toBe(true)
 
               yield* workspace.remove(info.id)
@@ -1331,7 +1336,7 @@ describe("workspace sync state", () => {
           const url = new URL(req.url, "http://localhost")
           if (url.pathname === "/history-failed/global/event")
             return HttpServerResponse.fromWeb(eventStreamResponse([], false))
-          if (url.pathname === "/history-failed/sync/history")
+          if (url.pathname === "/history-failed/sync/history/page")
             return HttpServerResponse.text("history failed", { status: 500 })
           return HttpServerResponse.fromWeb(Response.json([]))
         }),
@@ -1376,18 +1381,21 @@ describe("workspace sync state", () => {
           const bodyText = yield* req.text
           const url = new URL(req.url, "http://localhost")
           if (url.pathname === "/history/global/event") return HttpServerResponse.fromWeb(eventStreamResponse())
-          if (url.pathname === "/history/sync/history") {
+          if (url.pathname === "/history/sync/history/page") {
             historyBodies.push(bodyText ? JSON.parse(bodyText) : undefined)
             return HttpServerResponse.fromWeb(
-              Response.json([
-                {
-                  id: `evt_${unique("history")}`,
-                  aggregate_id: historySessionID!,
-                  seq: historyNextSeq,
-                  type: "session.updated.1",
-                  data: { sessionID: historySessionID!, info: historySession! },
-                },
-              ]),
+              Response.json({
+                events: [
+                  {
+                    id: `evt_${unique("history")}`,
+                    aggregate_id: historySessionID!,
+                    seq: historyNextSeq,
+                    type: "session.updated.1",
+                    data: { sessionID: historySessionID!, info: historySession! },
+                  },
+                ],
+                next: null,
+              }),
             )
           }
           return HttpServerResponse.text("unexpected", { status: 500 })
@@ -1419,7 +1427,7 @@ describe("workspace sync state", () => {
                   expect((yield* sessionSvc.get(session.id).pipe(Effect.orDie)).title).toBe("from history")
                 }),
               )
-              expect(historyBodies).toEqual([{ [session.id]: historyNextSeq - 1 }])
+              expect(historyBodies).toEqual([{ state: { [session.id]: historyNextSeq - 1 } }])
               expect(
                 captured.events.some(
                   (event) =>
@@ -1433,6 +1441,174 @@ describe("workspace sync state", () => {
             } finally {
               captured.dispose()
             }
+          }),
+        { git: true },
+      )
+    })
+  })
+
+  it.live("sync history drains bounded pages with advancing sequence fences", () => {
+    const historyBodies: unknown[] = []
+    let historySessionID: SessionID | undefined
+    let historySession: SessionNs.Info | undefined
+    let historyNextSeq = 0
+    return Effect.gen(function* () {
+      yield* HttpServer.serveEffect()(
+        Effect.gen(function* () {
+          const req = yield* HttpServerRequest.HttpServerRequest
+          const bodyText = yield* req.text
+          const url = new URL(req.url, "http://localhost")
+          if (url.pathname === "/paged-history/global/event") return HttpServerResponse.fromWeb(eventStreamResponse())
+          if (url.pathname === "/paged-history/sync/history/page") {
+            const page = historyBodies.length
+            historyBodies.push(bodyText ? JSON.parse(bodyText) : {})
+            if (page === 0)
+              return HttpServerResponse.fromWeb(
+                Response.json({
+                  events: Array.from({ length: Workspace.HISTORY_PAGE_SIZE }, (_, index) => ({
+                    id: `evt_${unique(`paged-history-${index}`)}`,
+                    aggregate_id: historySessionID!,
+                    seq: historyNextSeq + index,
+                    type: "session.updated.1",
+                    data: {
+                      sessionID: historySessionID!,
+                      info: { ...historySession!, title: `history page one ${index}` },
+                    },
+                  })),
+                  next: "page-two",
+                }),
+              )
+            return HttpServerResponse.fromWeb(
+              Response.json({
+                events: [
+                  {
+                    id: `evt_${unique("paged-history-final")}`,
+                    aggregate_id: historySessionID!,
+                    seq: historyNextSeq + Workspace.HISTORY_PAGE_SIZE,
+                    type: "session.updated.1",
+                    data: {
+                      sessionID: historySessionID!,
+                      info: { ...historySession!, title: "paged history complete" },
+                    },
+                  },
+                ],
+                next: null,
+              }),
+            )
+          }
+          return HttpServerResponse.text("unexpected", { status: 500 })
+        }),
+      )
+      const url = yield* serverUrl()
+      yield* provideTmpdirInstance(
+        () =>
+          Effect.gen(function* () {
+            const workspace = yield* Workspace.Service
+            const sessionSvc = yield* SessionNs.Service
+            const instance = yield* requireInstance
+            const type = unique("paged-history")
+            const info = workspaceInfo(instance.project.id, type)
+            yield* insertWorkspace(info)
+            registerAdapter(instance.project.id, type, remoteAdapter(`${url}/paged-history`).adapter)
+            const session = yield* sessionSvc.create({ title: "before paged history" })
+            yield* attachSessionToWorkspace(session.id, info.id)
+            historySessionID = session.id
+            historySession = { ...session, workspaceID: info.id }
+            historyNextSeq = ((yield* sessionSequence(session.id)) ?? -1) + 1
+
+            yield* workspace.startWorkspaceSyncing(instance.project.id)
+
+            yield* eventuallyEffect(
+              Effect.gen(function* () {
+                expect((yield* sessionSvc.get(session.id).pipe(Effect.orDie)).title).toBe("paged history complete")
+              }),
+              10_000,
+            )
+            expect(historyBodies).toEqual([
+              { state: { [session.id]: historyNextSeq - 1 } },
+              { state: { [session.id]: historyNextSeq + Workspace.HISTORY_PAGE_SIZE - 1 }, cursor: "page-two" },
+            ])
+            yield* workspace.remove(info.id)
+          }),
+        { git: true },
+      )
+    })
+  })
+
+  it.live("sync history resumes from durable state after a response body is interrupted", () => {
+    const historyBodies: unknown[] = []
+    let historySessionID: SessionID | undefined
+    let historySession: SessionNs.Info | undefined
+    let historyNextSeq = 0
+    return Effect.gen(function* () {
+      yield* HttpServer.serveEffect()(
+        Effect.gen(function* () {
+          const req = yield* HttpServerRequest.HttpServerRequest
+          const bodyText = yield* req.text
+          const url = new URL(req.url, "http://localhost")
+          if (url.pathname === "/reset-history/global/event")
+            return HttpServerResponse.fromWeb(eventStreamResponse([], false))
+          if (url.pathname === "/reset-history/sync/history/page") {
+            const request = historyBodies.length
+            historyBodies.push(bodyText ? JSON.parse(bodyText) : undefined)
+            if (request === 1)
+              return HttpServerResponse.fromWeb(
+                new Response('{"events":', { headers: { "content-type": "application/json" } }),
+              )
+            const seq = request === 0 ? historyNextSeq : historyNextSeq + 1
+            return HttpServerResponse.fromWeb(
+              Response.json({
+                events: [
+                  {
+                    id: `evt_${unique(`reset-history-${request}`)}`,
+                    aggregate_id: historySessionID!,
+                    seq,
+                    type: "session.updated.1",
+                    data: {
+                      sessionID: historySessionID!,
+                      info: { ...historySession!, title: request === 0 ? "before reset" : "after reset" },
+                    },
+                  },
+                ],
+                next: request === 0 ? "resume-after-reset" : null,
+              }),
+            )
+          }
+          return HttpServerResponse.text("unexpected", { status: 500 })
+        }),
+      )
+      const url = yield* serverUrl()
+      yield* provideTmpdirInstance(
+        () =>
+          Effect.gen(function* () {
+            const workspace = yield* Workspace.Service
+            const sessionSvc = yield* SessionNs.Service
+            const instance = yield* requireInstance
+            const type = unique("reset-history")
+            const info = workspaceInfo(instance.project.id, type)
+            yield* insertWorkspace(info)
+            registerAdapter(instance.project.id, type, remoteAdapter(`${url}/reset-history`).adapter)
+            const session = yield* sessionSvc.create({ title: "before history reset" })
+            yield* attachSessionToWorkspace(session.id, info.id)
+            historySessionID = session.id
+            historySession = { ...session, workspaceID: info.id }
+            historyNextSeq = ((yield* sessionSequence(session.id)) ?? -1) + 1
+
+            yield* workspace.startWorkspaceSyncing(instance.project.id)
+
+            yield* eventuallyEffect(
+              Effect.gen(function* () {
+                expect((yield* sessionSvc.get(session.id).pipe(Effect.orDie)).title).toBe("after reset")
+              }),
+              10_000,
+            )
+            expect(historyBodies).toEqual([
+              { state: { [session.id]: historyNextSeq - 1 } },
+              { state: { [session.id]: historyNextSeq }, cursor: "resume-after-reset" },
+              { state: { [session.id]: historyNextSeq } },
+            ])
+            expect(yield* sessionSequence(session.id)).toBe(historyNextSeq + 1)
+            yield* workspace.remove(info.id)
           }),
         { git: true },
       )
@@ -1459,7 +1635,8 @@ describe("workspace sync state", () => {
                 false,
               ),
             )
-          if (url.pathname === "/sse-forward/sync/history") return HttpServerResponse.fromWeb(Response.json([]))
+          if (url.pathname === "/sse-forward/sync/history/page")
+            return HttpServerResponse.fromWeb(Response.json({ events: [], next: null }))
           return HttpServerResponse.text("unexpected", { status: 500 })
         }),
       )
@@ -1542,7 +1719,8 @@ describe("workspace sync state", () => {
                 false,
               ),
             )
-          if (url.pathname === "/sse-sync/sync/history") return HttpServerResponse.fromWeb(Response.json([]))
+          if (url.pathname === "/sse-sync/sync/history/page")
+            return HttpServerResponse.fromWeb(Response.json({ events: [], next: null }))
           return HttpServerResponse.text("unexpected", { status: 500 })
         }),
       )
@@ -1727,55 +1905,52 @@ describe("workspace waitForSync", () => {
 })
 
 describe("workspace warpToHub", () => {
-  it.live(
-    "warps a fresh session into the hub workspace and leaves other workspaces untouched",
-    () => {
-      const calls: Array<{ method: string; url: URL; json: unknown }> = []
-      return Effect.gen(function* () {
-        yield* HttpServer.serveEffect()(
+  it.live("warps a fresh session into the hub workspace and leaves other workspaces untouched", () => {
+    const calls: Array<{ method: string; url: URL; json: unknown }> = []
+    return Effect.gen(function* () {
+      yield* HttpServer.serveEffect()(
+        Effect.gen(function* () {
+          const req = yield* HttpServerRequest.HttpServerRequest
+          const bodyText = yield* req.text
+          const url = new URL(req.url, "http://localhost")
+          calls.push({ method: req.method, url, json: bodyText ? JSON.parse(bodyText) : undefined })
+          if (url.pathname === "/warp-hub/sync/replay") return yield* HttpServerResponse.json({ sessionID: "ok" })
+          if (url.pathname === "/warp-hub/sync/steal") return yield* HttpServerResponse.json({ sessionID: "ok" })
+          return HttpServerResponse.text("unexpected", { status: 500 })
+        }),
+      )
+      const url = yield* serverUrl()
+      yield* provideTmpdirInstance(
+        () =>
           Effect.gen(function* () {
-            const req = yield* HttpServerRequest.HttpServerRequest
-            const bodyText = yield* req.text
-            const url = new URL(req.url, "http://localhost")
-            calls.push({ method: req.method, url, json: bodyText ? JSON.parse(bodyText) : undefined })
-            if (url.pathname === "/warp-hub/sync/replay") return yield* HttpServerResponse.json({ sessionID: "ok" })
-            if (url.pathname === "/warp-hub/sync/steal") return yield* HttpServerResponse.json({ sessionID: "ok" })
-            return HttpServerResponse.text("unexpected", { status: 500 })
+            const workspace = yield* Workspace.Service
+            const sessionSvc = yield* SessionNs.Service
+            const instance = yield* requireInstance
+            const { db } = yield* Database.Service
+            const hubWorkspace = workspaceInfo(instance.project.id, "hub", {
+              name: unique("hub"),
+              extra: { url: `${url}/warp-hub` },
+            })
+            yield* insertWorkspace(hubWorkspace)
+            const session = yield* sessionSvc.create({ title: "to warp" })
+
+            yield* workspace.warpToHub(instance.project, session.id)
+
+            const replay = calls.filter((call) => call.url.pathname === "/warp-hub/sync/replay")
+            const steal = calls.filter((call) => call.url.pathname === "/warp-hub/sync/steal")
+            expect(replay.length).toBeGreaterThan(0)
+            expect(steal.length).toBe(1)
+            expect(calls.map((call) => call.method)).not.toContain("GET")
+            const stored = yield* db
+              .select({ workspaceID: SessionTable.workspace_id })
+              .from(SessionTable)
+              .where(eq(SessionTable.id, session.id))
+              .get()
+              .pipe(Effect.orDie)
+            expect(stored).toEqual({ workspaceID: hubWorkspace.id })
           }),
-        )
-        const url = yield* serverUrl()
-        yield* provideTmpdirInstance(
-          () =>
-            Effect.gen(function* () {
-              const workspace = yield* Workspace.Service
-              const sessionSvc = yield* SessionNs.Service
-              const instance = yield* requireInstance
-              const { db } = yield* Database.Service
-              const hubWorkspace = workspaceInfo(instance.project.id, "hub", {
-                name: unique("hub"),
-                extra: { url: `${url}/warp-hub` },
-              })
-              yield* insertWorkspace(hubWorkspace)
-              const session = yield* sessionSvc.create({ title: "to warp" })
-
-              yield* workspace.warpToHub(instance.project, session.id)
-
-              const replay = calls.filter((call) => call.url.pathname === "/warp-hub/sync/replay")
-              const steal = calls.filter((call) => call.url.pathname === "/warp-hub/sync/steal")
-              expect(replay.length).toBeGreaterThan(0)
-              expect(steal.length).toBe(1)
-              expect(calls.map((call) => call.method)).not.toContain("GET")
-              const stored = yield* db
-                .select({ workspaceID: SessionTable.workspace_id })
-                .from(SessionTable)
-                .where(eq(SessionTable.id, session.id))
-                .get()
-                .pipe(Effect.orDie)
-              expect(stored).toEqual({ workspaceID: hubWorkspace.id })
-            }),
-          { git: true },
-        )
-      })
-    },
-  )
+        { git: true },
+      )
+    })
+  })
 })

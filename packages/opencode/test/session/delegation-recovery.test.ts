@@ -126,6 +126,37 @@ it.instance("settles only the exact completed child reply and redelivers idempot
   }),
 )
 
+it.instance("does not reload transcripts for delivered runs", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const database = yield* Database.Service
+    const parent = yield* sessions.create({})
+    const child = yield* sessions.create({ parentID: parent.id })
+    yield* sessions.stampDelegation({
+      sessionID: child.id,
+      record: record(parent.id, "msg_delivered", {
+        phase: "settled",
+        outcome: "completed",
+        completedAt: 2,
+        deliveryOutcome: "delivered",
+      }),
+    })
+    let transcriptReads = 0
+    const recovery = yield* SessionDelegationRecovery.make({
+      database,
+      sessions: {
+        ...sessions,
+        messages: (input) => Effect.sync(() => transcriptReads++).pipe(Effect.andThen(sessions.messages(input))),
+      },
+      notify: () => Effect.die(new Error("delivered runs must not notify")),
+      refresh: () => Effect.void,
+    })
+
+    yield* recovery.recover()
+    expect(transcriptReads).toBe(0)
+  }),
+)
+
 it.instance("abandons a dead run without an exact terminal reply and marks failed delivery for retry", () =>
   Effect.gen(function* () {
     const sessions = yield* Session.Service

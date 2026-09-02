@@ -44,6 +44,7 @@ export function make(deps: Deps) {
             const child = found.value
             const record = delegationRecord(child.metadata)
             if (!record) return
+            if (record.phase === "settled" && record.deliveryOutcome === "delivered") return
             const parent = yield* deps.sessions.get(SessionID.make(record.parentSessionID)).pipe(Effect.option)
             const parentPart =
               parent._tag === "Some" ? yield* taskPart(deps.sessions, record, parent.value.id) : undefined
@@ -56,9 +57,10 @@ export function make(deps: Deps) {
                 parentPart.state.metadata?.background === true)
             if (record.mode !== "background" && !legacyBackground) return
             const message = record.childMessageID
-              ? (yield* deps.sessions.messages({ sessionID: child.id })).find(
-                  (item) => item.info.role === "assistant" && item.info.parentID === record.childMessageID,
-                )
+              ? (yield* deps.sessions.messageWithChildren({
+                  sessionID: child.id,
+                  messageID: MessageID.make(record.childMessageID),
+                })).find((item) => item.info.role === "assistant" && item.info.parentID === record.childMessageID)
               : undefined
             const reportText = message?.parts
               .flatMap((part) =>
@@ -168,7 +170,7 @@ export function make(deps: Deps) {
           }).pipe(
             Effect.catchCause((cause) => Effect.logWarning("delegation recovery failed", { child: row.id, cause })),
           ),
-        { concurrency: "unbounded", discard: true },
+        { concurrency: 4, discard: true },
       )
     })
     return { recover }
@@ -181,9 +183,10 @@ const taskPart = Effect.fn("SessionDelegationRecovery.taskPart")(function* (
   parentSessionID: SessionID,
 ) {
   if (!record.parentMessageID || !record.toolCallID) return undefined
-  const message = (yield* sessions.messages({ sessionID: parentSessionID })).find(
-    (item) => item.info.id === record.parentMessageID,
-  )
+  const message = (yield* sessions.messageWithChildren({
+    sessionID: parentSessionID,
+    messageID: MessageID.make(record.parentMessageID),
+  })).find((item) => item.info.id === record.parentMessageID)
   const part = message?.parts.find(
     (item): item is SessionLegacy.ToolPart =>
       item.type === "tool" && item.tool === "task" && item.callID === record.toolCallID,

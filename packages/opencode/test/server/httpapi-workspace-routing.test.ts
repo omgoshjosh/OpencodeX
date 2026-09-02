@@ -118,7 +118,7 @@ const eventStreamResponse = () =>
 const syncResponse = (request: HttpServerRequest.HttpServerRequest) => {
   const url = requestURL(request)
   if (url.pathname === "/base/global/event") return Effect.succeed(eventStreamResponse())
-  if (url.pathname === "/base/sync/history") return HttpServerResponse.json([])
+  if (url.pathname === "/base/sync/history/page") return HttpServerResponse.json({ events: [] })
   return undefined
 }
 
@@ -145,7 +145,7 @@ const createRemoteWorkspace = (input: {
   headers?: HeadersInit
 }) =>
   // Workspace.create starts the remote sync loop. The test upstream exposes
-  // /global/event and /sync/history so middleware proxying sees the remote
+  // /global/event and /sync/history/page so middleware proxying sees the remote
   // workspace as active, just like production would.
   createWorkspace({
     projectID: input.projectID,

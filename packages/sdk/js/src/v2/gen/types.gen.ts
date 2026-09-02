@@ -10897,6 +10897,50 @@ export type SyncHistoryListResponses = {
 
 export type SyncHistoryListResponse = SyncHistoryListResponses[keyof SyncHistoryListResponses]
 
+export type SyncHistoryPageData = {
+  body?: {
+    state: {
+      [key: string]: number
+    }
+    cursor?: string
+  }
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/sync/history/page"
+}
+
+export type SyncHistoryPageErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+}
+
+export type SyncHistoryPageError = SyncHistoryPageErrors[keyof SyncHistoryPageErrors]
+
+export type SyncHistoryPageResponses = {
+  /**
+   * Bounded sync event page
+   */
+  200: {
+    events: Array<{
+      id: string
+      aggregate_id: string
+      seq: number
+      type: string
+      data: {
+        [key: string]: unknown
+      }
+    }>
+    next: string | null
+  }
+}
+
+export type SyncHistoryPageResponse = SyncHistoryPageResponses[keyof SyncHistoryPageResponses]
+
 export type TuiOpenHelpData = {
   body?: never
   path?: never

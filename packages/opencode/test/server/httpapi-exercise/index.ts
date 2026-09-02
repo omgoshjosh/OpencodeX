@@ -463,6 +463,14 @@ const scenarios: Scenario[] = [
     .at((ctx) => ({ path: "/sync/history", headers: ctx.headers(), body: {} }))
     .json(200, array),
   http.protected
+    .post("/sync/history/page", "sync.history.page")
+    .at((ctx) => ({ path: "/sync/history/page", headers: ctx.headers(), body: { state: {} } }))
+    .json(200, (body) => {
+      object(body)
+      array(body.events)
+      check(body.next === null, "empty history page should have a terminal cursor")
+    }),
+  http.protected
     .post("/sync/replay", "sync.replay")
     .at((ctx) => ({ path: "/sync/replay", headers: ctx.headers(), body: { directory: ctx.directory, events: [] } }))
     .status(400),

@@ -1,6 +1,7 @@
 import { expect } from "bun:test"
 import { BackgroundJob } from "@/background/job"
 import { EventV2Bridge } from "@/event-v2-bridge"
+import { InstanceState } from "@/effect/instance-state"
 import { Permission } from "@/permission"
 import { PermissionID } from "@/permission/schema"
 import { Question } from "@/question"
@@ -9,7 +10,6 @@ import { SessionRunState } from "@/session/run-state"
 import { MessageID, SessionID } from "@/session/schema"
 import { SessionStatus } from "@/session/status"
 import * as PromptClaim from "@/session/prompt-claim"
-import { ensureRunID } from "@opencode-ai/core/util/opencode-process"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Database } from "@opencode-ai/core/database/database"
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
@@ -22,7 +22,7 @@ import {
   SessionStatusTable,
 } from "@opencode-ai/core/session/sql"
 import { and, eq } from "drizzle-orm"
-import { Context, Effect, Exit, Fiber, Latch, Layer, Ref, Scope } from "effect"
+import { Context, Duration, Effect, Exit, Fiber, Latch, Layer, Ref, Scope } from "effect"
 import { pollWithTimeout, testEffect } from "../lib/effect"
 
 const env = Layer.mergeAll(
@@ -104,11 +104,22 @@ const buildQuestionGraph = Effect.fn("DurableExecutionTest.buildQuestionGraph")(
   return Context.get(context, Question.Service)
 })
 
-const buildPromptClaim = Effect.fn("DurableExecutionTest.buildPromptClaim")(function* (loop = Effect.succeed(output)) {
+const buildPromptClaim = Effect.fn("DurableExecutionTest.buildPromptClaim")(function* (
+  loop = Effect.succeed(output),
+  recoveryInterval?: Duration.Input,
+  beforeExecutionAdmission?: PromptClaim.Deps["beforeExecutionAdmission"],
+) {
   const database = yield* Database.Service
   const events = yield* EventV2Bridge.Service
   const scope = yield* Scope.Scope
-  return yield* PromptClaim.make({ database, events, scope, loop: () => loop })
+  return yield* PromptClaim.make({
+    database,
+    events,
+    scope,
+    loop: () => loop,
+    recoveryInterval,
+    beforeExecutionAdmission,
+  })
 })
 
 const insertCommand = Effect.fn("DurableExecutionTest.insertCommand")(function* (input: {
@@ -117,17 +128,20 @@ const insertCommand = Effect.fn("DurableExecutionTest.insertCommand")(function* 
   owner?: string
   leaseExpiresAt?: number
   generation?: number
+  sessionID?: SessionID
+  createdAt?: number
 }) {
   const { db } = yield* Database.Service
-  const now = Date.now()
+  const ctx = yield* InstanceState.context
+  const now = input.createdAt ?? Date.now()
   yield* db
     .insert(SessionCommandTable)
     .values({
       id: input.id,
-      session_id: sessionID,
+      session_id: input.sessionID ?? sessionID,
       message_id: MessageID.make(`msg_${input.id}`),
       project_id: "prj_test",
-      directory: ".",
+      directory: ctx.directory,
       status: input.status ?? "queued",
       owner_id: input.owner,
       lease_expires_at: input.leaseExpiresAt,
@@ -343,37 +357,19 @@ it.instance("recovers a dead owner and stale busy status", () =>
   }),
 )
 
-it.instance("reclaims a dead command lease immediately and leaves a live owner untouched", () =>
+it.instance("does not reclaim a running or unknown owner before its lease expires", () =>
   Effect.gen(function* () {
     const claim = yield* buildPromptClaim()
+    const { db } = yield* Database.Service
     const now = Date.now()
     yield* insertCommand({
       id: "sec_dead_command",
       status: "running",
-      owner: "local:999999:dead:command",
+      owner: "unknown:owner",
       leaseExpiresAt: now + 60_000,
       generation: 1,
     })
-    yield* insertCommand({
-      id: "sec_live_command",
-      status: "running",
-      owner: `local:${process.pid}:${ensureRunID()}:command`,
-      leaseExpiresAt: now + 60_000,
-      generation: 1,
-    })
-    yield* insertCommand({
-      id: "sec_legacy_live_command",
-      status: "running",
-      owner: `local:${process.pid}:prompt:legacy`,
-      leaseExpiresAt: now + 60_000,
-      generation: 1,
-    })
-
-    expect(yield* claim.claimCommandTurn("sec_dead_command")).toMatchObject({ state: "ready" })
-    expect(yield* claim.claimCommandTurn("sec_live_command")).toEqual({ state: "waiting" })
-    expect(yield* claim.claimCommandTurn("sec_legacy_live_command")).toEqual({ state: "waiting" })
-
-    const { db } = yield* Database.Service
+    expect(yield* claim.claimCommandTurn("sec_dead_command")).toEqual({ state: "waiting" })
     yield* db
       .insert(SessionExecutionTable)
       .values({
@@ -381,7 +377,7 @@ it.instance("reclaims a dead command lease immediately and leaves a live owner u
         project_id: "prj_test",
         directory: ".",
         state: "running",
-        owner_id: "local:999999:dead:execution",
+        owner_id: "unknown:execution",
         generation: 1,
         lease_expires_at: now + 60_000,
         time_created: now,
@@ -389,7 +385,21 @@ it.instance("reclaims a dead command lease immediately and leaves a live owner u
       })
       .run()
       .pipe(Effect.orDie)
-    expect(yield* claim.waitForExecutionTurn("sec_dead_command", sessionID)).toBe(true)
+    expect(yield* claim.waitForExecutionTurn("sec_dead_command", sessionID)).toBe(false)
+    yield* db
+      .update(SessionCommandTable)
+      .set({ lease_expires_at: now - 1 })
+      .where(eq(SessionCommandTable.id, "sec_dead_command"))
+      .run()
+      .pipe(Effect.orDie)
+    expect(yield* claim.claimCommandTurn("sec_dead_command")).toMatchObject({ state: "waiting" })
+    yield* db
+      .update(SessionExecutionTable)
+      .set({ lease_expires_at: now - 1 })
+      .where(eq(SessionExecutionTable.session_id, sessionID))
+      .run()
+      .pipe(Effect.orDie)
+    expect(yield* claim.claimCommandTurn("sec_dead_command")).toMatchObject({ state: "ready" })
   }),
 )
 
@@ -400,8 +410,8 @@ it.instance("only one recoverer reclaims a dead command lease", () =>
     yield* insertCommand({
       id: "sec_dead_race",
       status: "running",
-      owner: "local:999999:dead:race",
-      leaseExpiresAt: Date.now() + 60_000,
+      owner: "unknown:race",
+      leaseExpiresAt: Date.now() - 1,
       generation: 1,
     })
 
@@ -413,6 +423,320 @@ it.instance("only one recoverer reclaims a dead command lease", () =>
     )
     expect(results.filter((result) => result.state === "ready")).toHaveLength(1)
     expect(results.filter((result) => result.state === "waiting")).toHaveLength(1)
+  }),
+)
+
+it.instance("sweeps a queued command without status after bootstrap", () =>
+  Effect.gen(function* () {
+    const claim = yield* buildPromptClaim()
+    const { db } = yield* Database.Service
+    yield* insertCommand({ id: "sec_missing_status" })
+
+    yield* claim.recover()
+    yield* pollWithTimeout(
+      db
+        .select({ status: SessionCommandTable.status })
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.id, "sec_missing_status"))
+        .get()
+        .pipe(
+          Effect.orDie,
+          Effect.map((row) => (row?.status === "succeeded" ? true : undefined)),
+        ),
+      "queued command was not recovered",
+    )
+  }),
+)
+
+it.instance("starts one per-instance recovery timer under instance context", () =>
+  Effect.gen(function* () {
+    const launches = yield* Ref.make(0)
+    const claim = yield* buildPromptClaim(
+      Ref.update(launches, (count) => count + 1).pipe(Effect.as(output)),
+      "1 millis",
+    )
+    const { db } = yield* Database.Service
+    yield* insertCommand({ id: "sec_timer_context" })
+
+    yield* Effect.all([claim.start(), claim.start()], { concurrency: "unbounded" })
+    yield* pollWithTimeout(
+      db
+        .select({ status: SessionCommandTable.status })
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.id, "sec_timer_context"))
+        .get()
+        .pipe(
+          Effect.orDie,
+          Effect.map((row) => (row?.status === "succeeded" ? true : undefined)),
+        ),
+      "per-instance recovery timer did not run",
+    )
+    expect(yield* Ref.get(launches)).toBe(1)
+  }),
+)
+
+it.instance("stops the per-instance recovery timer when its scope closes", () =>
+  Effect.gen(function* () {
+    const recoveryScope = yield* Scope.make()
+    const claim = yield* buildPromptClaim(Effect.succeed(output), "1 millis").pipe(
+      Effect.provideService(Scope.Scope, recoveryScope),
+    )
+    const { db } = yield* Database.Service
+    yield* claim.start()
+    yield* Scope.close(recoveryScope, Exit.void)
+    yield* insertCommand({ id: "sec_timer_disposed" })
+    yield* Effect.sleep("20 millis")
+
+    expect(
+      yield* db
+        .select({ status: SessionCommandTable.status })
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.id, "sec_timer_disposed"))
+        .get()
+        .pipe(Effect.orDie),
+    ).toEqual({ status: "queued" })
+  }),
+)
+
+it.instance("does not starve a later session behind a backlog larger than one batch", () =>
+  Effect.gen(function* () {
+    const claim = yield* buildPromptClaim()
+    const { db } = yield* Database.Service
+    const now = Date.now()
+    const commands = Array.from({ length: 33 }, (_, index) => ({
+      id: `sec_fifo_${index.toString().padStart(2, "0")}`,
+      sessionID: SessionID.make("ses_fifo_backlog"),
+      createdAt: now + index,
+    }))
+    yield* Effect.forEach(commands, insertCommand, { discard: true })
+    yield* insertCommand({ id: "sec_fifo_later", sessionID: SessionID.make("ses_fifo_later"), createdAt: now + 34 })
+
+    yield* claim.recover()
+    yield* pollWithTimeout(
+      db
+        .select({ status: SessionCommandTable.status })
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.id, "sec_fifo_later"))
+        .get()
+        .pipe(
+          Effect.orDie,
+          Effect.map((row) => (row?.status === "succeeded" ? true : undefined)),
+        ),
+      "later session was starved by a backlog larger than one batch",
+    )
+    expect(
+      yield* db
+        .select({ status: SessionCommandTable.status })
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.id, "sec_fifo_00"))
+        .get()
+        .pipe(Effect.orDie),
+    ).toEqual({ status: "succeeded" })
+    expect(
+      yield* db
+        .select({ status: SessionCommandTable.status })
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.id, "sec_fifo_01"))
+        .get()
+        .pipe(Effect.orDie),
+    ).toEqual({ status: "queued" })
+  }),
+)
+
+it.instance("concurrent sweepers launch one durable command exactly once", () =>
+  Effect.gen(function* () {
+    const launches = yield* Ref.make(0)
+    const loop = Ref.update(launches, (count) => count + 1).pipe(Effect.as(output))
+    const first = yield* buildPromptClaim(loop)
+    const second = yield* buildPromptClaim(loop)
+    const { db } = yield* Database.Service
+    yield* insertCommand({ id: "sec_sweep_race" })
+
+    yield* Effect.all([first.recover(), second.recover()], { concurrency: "unbounded" })
+    yield* pollWithTimeout(
+      db
+        .select({ status: SessionCommandTable.status })
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.id, "sec_sweep_race"))
+        .get()
+        .pipe(
+          Effect.orDie,
+          Effect.map((row) => (row?.status === "succeeded" ? true : undefined)),
+        ),
+      "concurrent sweepers did not settle command",
+    )
+    expect(yield* Ref.get(launches)).toBe(1)
+  }),
+)
+
+it.instance("sweep never revives a cancelled command", () =>
+  Effect.gen(function* () {
+    const claim = yield* buildPromptClaim()
+    const { db } = yield* Database.Service
+    yield* insertCommand({ id: "sec_sweep_cancelled", status: "cancelled" })
+
+    yield* claim.recover()
+    expect(
+      yield* db
+        .select({ status: SessionCommandTable.status })
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.id, "sec_sweep_cancelled"))
+        .get()
+        .pipe(Effect.orDie),
+    ).toEqual({ status: "cancelled" })
+  }),
+)
+
+it.instance("periodic recovery does not reclaim a running command before lease expiry", () =>
+  Effect.gen(function* () {
+    const claim = yield* buildPromptClaim()
+    const { db } = yield* Database.Service
+    yield* insertCommand({
+      id: "sec_periodic_running",
+      status: "running",
+      owner: "unknown:owner",
+      leaseExpiresAt: Date.now() + 60_000,
+    })
+
+    yield* claim.recover()
+    expect(
+      yield* db
+        .select({ status: SessionCommandTable.status, owner: SessionCommandTable.owner_id })
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.id, "sec_periodic_running"))
+        .get()
+        .pipe(Effect.orDie),
+    ).toEqual({ status: "running", owner: "unknown:owner" })
+  }),
+)
+
+it.instance("periodic recovery reclaims an expired running command", () =>
+  Effect.gen(function* () {
+    const claim = yield* buildPromptClaim()
+    const { db } = yield* Database.Service
+    yield* insertCommand({
+      id: "sec_periodic_expired",
+      status: "running",
+      owner: "unknown:owner",
+      leaseExpiresAt: Date.now() - 1,
+    })
+
+    yield* claim.recover()
+    yield* pollWithTimeout(
+      db
+        .select({ status: SessionCommandTable.status })
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.id, "sec_periodic_expired"))
+        .get()
+        .pipe(
+          Effect.orDie,
+          Effect.map((row) => (row?.status === "succeeded" ? true : undefined)),
+        ),
+      "expired running command was not recovered",
+    )
+  }),
+)
+
+it.instance("requeues its own command claim when execution admission loses a race", () =>
+  Effect.gen(function* () {
+    const { db } = yield* Database.Service
+    const ctx = yield* InstanceState.context
+    const claim = yield* buildPromptClaim(Effect.succeed(output), undefined, ({ sessionID }) =>
+      db
+        .insert(SessionExecutionTable)
+        .values({
+          session_id: sessionID,
+          project_id: "prj_test",
+          directory: ctx.directory,
+          state: "running",
+          owner_id: "foreign:execution",
+          generation: 1,
+          lease_expires_at: Date.now() + 60_000,
+          time_created: Date.now(),
+          time_updated: Date.now(),
+        })
+        .run()
+        .pipe(Effect.orDie),
+    )
+    yield* insertCommand({ id: "sec_admission_race" })
+
+    yield* claim.executeCommand("sec_admission_race")
+    expect(
+      yield* db
+        .select({ status: SessionCommandTable.status, owner: SessionCommandTable.owner_id })
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.id, "sec_admission_race"))
+        .get()
+        .pipe(Effect.orDie),
+    ).toEqual({ status: "queued", owner: null })
+  }),
+)
+
+it.instance("admission requeue never overwrites a newer command claimant", () =>
+  Effect.gen(function* () {
+    const { db } = yield* Database.Service
+    const claim = yield* buildPromptClaim(Effect.succeed(output), undefined, ({ commandID }) =>
+      db
+        .update(SessionCommandTable)
+        .set({ owner_id: "foreign:newer", claim_generation: 2, time_updated: Date.now() })
+        .where(eq(SessionCommandTable.id, commandID))
+        .run()
+        .pipe(Effect.orDie),
+    )
+    yield* insertCommand({ id: "sec_admission_newer" })
+
+    yield* claim.executeCommand("sec_admission_newer")
+    expect(
+      yield* db
+        .select({
+          status: SessionCommandTable.status,
+          owner: SessionCommandTable.owner_id,
+          generation: SessionCommandTable.claim_generation,
+        })
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.id, "sec_admission_newer"))
+        .get()
+        .pipe(Effect.orDie),
+    ).toEqual({ status: "running", owner: "foreign:newer", generation: 2 })
+  }),
+)
+
+it.instance("sweep restores an interrupted execution with a new generation", () =>
+  Effect.gen(function* () {
+    const graph = yield* buildRunGraph()
+    const claim = yield* buildPromptClaim(
+      graph.run.ensureRunning(sessionID, Effect.succeed(output), Effect.succeed(output)),
+    )
+    const { db } = yield* Database.Service
+    const now = Date.now()
+    yield* insertCommand({ id: "sec_interrupted_execution" })
+    yield* db
+      .insert(SessionExecutionTable)
+      .values({
+        session_id: sessionID,
+        project_id: "prj_test",
+        directory: (yield* InstanceState.context).directory,
+        state: "interrupted",
+        generation: 7,
+        time_created: now,
+        time_updated: now,
+      })
+      .run()
+      .pipe(Effect.orDie)
+
+    yield* claim.recover()
+    yield* pollWithTimeout(
+      db
+        .select({ generation: SessionExecutionTable.generation })
+        .from(SessionExecutionTable)
+        .where(eq(SessionExecutionTable.session_id, sessionID))
+        .get()
+        .pipe(
+          Effect.orDie,
+          Effect.map((row) => (row?.generation === 8 ? true : undefined)),
+        ),
+      "interrupted execution was not reclaimed with a new generation",
+    )
   }),
 )
 

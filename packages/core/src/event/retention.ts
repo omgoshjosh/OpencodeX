@@ -1,7 +1,7 @@
 export * as EventRetention from "./retention"
 
 import { sql } from "drizzle-orm"
-import { Duration, Effect, Schedule } from "effect"
+import { Cause, Duration, Effect, Schedule } from "effect"
 import type { Database } from "../database/database"
 
 /**
@@ -32,6 +32,8 @@ const MAINTENANCE_INTERVAL_MS = 60_000
 const MAINTENANCE_BATCH_SIZE = 5_000
 const AGGREGATES_PER_PASS = 64
 const DELETE_CHUNK = 500
+
+let retentionInstances = 0
 
 const PART_UPDATED = "message.part.updated.1"
 const MESSAGE_UPDATED = "message.updated.1"
@@ -90,6 +92,44 @@ export interface Retention {
 
 type Barrier = <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>
 
+type Pass = {
+  instance: string
+  pass: number
+  durationMs: number
+  cursorBefore: string
+  cursorAfter: string
+  windowFirst: string
+  windowLast: string
+  aggregateCount: number
+  candidateCount: number
+  deletedCount: number
+  activeLeaseCount: number
+  blockReason: string
+  cursorAction: string
+  batchSize: number
+  failure: string
+}
+
+export const formatPass = (pass: Pass) =>
+  [
+    "event_retention_pass",
+    `instance=${JSON.stringify(pass.instance)}`,
+    `pass=${pass.pass}`,
+    `duration_ms=${pass.durationMs}`,
+    `cursor_before=${JSON.stringify(pass.cursorBefore)}`,
+    `cursor_after=${JSON.stringify(pass.cursorAfter)}`,
+    `window_first=${JSON.stringify(pass.windowFirst)}`,
+    `window_last=${JSON.stringify(pass.windowLast)}`,
+    `aggregate_count=${pass.aggregateCount}`,
+    `candidate_count=${pass.candidateCount}`,
+    `deleted_count=${pass.deletedCount}`,
+    `active_lease_count=${pass.activeLeaseCount}`,
+    `block_reason=${JSON.stringify(pass.blockReason)}`,
+    `cursor_action=${JSON.stringify(pass.cursorAction)}`,
+    `batch_size=${pass.batchSize}`,
+    `failure=${JSON.stringify(pass.failure)}`,
+  ].join(" ")
+
 export const make = Effect.fn("EventRetention.make")(function* (
   db: Database.Interface["db"],
   barrier: Barrier,
@@ -107,6 +147,10 @@ export const make = Effect.fn("EventRetention.make")(function* (
   // window is still shedding a full batch so a backlogged aggregate drains at
   // batch-size per pass instead of once per full rotation.
   let cursor = ""
+  const instance = `pid-${process.pid}-${++retentionInstances}`
+  let passes = 0
+  let passStarted = 0
+  let passCursor = ""
 
   const window = Effect.fnUntraced(function* () {
     const rows = yield* db
@@ -132,11 +176,31 @@ export const make = Effect.fn("EventRetention.make")(function* (
   const superseded = (aggregates: string[]) =>
     db.all<{ id: string }>(supersededQuery(aggregates, settings.maintenanceBatchSize)).pipe(Effect.orDie)
 
-  const compact = Effect.fn("EventRetention.compact")(function* () {
+  const compactResult = Effect.fn("EventRetention.compactResult")(function* () {
+    const pass = ++passes
+    const started = Date.now()
+    const cursorBefore = cursor
+    passStarted = started
+    passCursor = cursorBefore
+    const finish = (result: Omit<Pass, "instance" | "pass" | "durationMs">) =>
+      ({ instance, pass, durationMs: Date.now() - started, ...result }) satisfies Pass
     const aggregates = yield* window()
     if (aggregates.length === 0) {
       cursor = ""
-      return 0
+      return finish({
+        cursorBefore,
+        cursorAfter: cursor,
+        windowFirst: "",
+        windowLast: "",
+        aggregateCount: 0,
+        candidateCount: 0,
+        deletedCount: 0,
+        activeLeaseCount: 0,
+        blockReason: "no_aggregates",
+        cursorAction: "reset",
+        batchSize: settings.maintenanceBatchSize,
+        failure: "none",
+      })
     }
     // The read runs outside the write transaction on purpose: a concurrent
     // append can only add a higher sequence, which cannot turn a row already
@@ -144,37 +208,95 @@ export const make = Effect.fn("EventRetention.make")(function* (
     const doomed = yield* superseded(aggregates)
     if (doomed.length === 0) {
       advance(aggregates)
-      return 0
+      return finish({
+        cursorBefore,
+        cursorAfter: cursor,
+        windowFirst: aggregates[0] ?? "",
+        windowLast: aggregates.at(-1) ?? "",
+        aggregateCount: aggregates.length,
+        candidateCount: 0,
+        deletedCount: 0,
+        activeLeaseCount: 0,
+        blockReason: "no_candidates",
+        cursorAction: "advance",
+        batchSize: settings.maintenanceBatchSize,
+        failure: "none",
+      })
     }
     const ids = doomed.map((row) => row.id)
-    const deleted = yield* barrier(
+    const deletion = yield* barrier(
       db
         .transaction(
           (transaction) =>
             Effect.gen(function* () {
               const now = Date.now()
               yield* transaction.run(sql`DELETE FROM event_cursor_lease WHERE expires_at <= ${now}`)
-              const lease = yield* transaction.get<{ active: number }>(
-                sql`SELECT EXISTS(SELECT 1 FROM event_cursor_lease WHERE expires_at > ${now}) AS active`,
+              const lease = yield* transaction.get<{ count: number }>(
+                sql`SELECT COUNT(*) AS count FROM event_cursor_lease WHERE expires_at > ${now}`,
               )
-              if (lease?.active) return 0
+              if ((lease?.count ?? 0) > 0) return { deleted: 0, activeLeaseCount: lease?.count ?? 0 }
               for (let index = 0; index < ids.length; index += DELETE_CHUNK) {
                 yield* transaction.run(sql`DELETE FROM event WHERE id IN ${ids.slice(index, index + DELETE_CHUNK)}`)
               }
-              return ids.length
+              return { deleted: ids.length, activeLeaseCount: 0 }
             }),
           { behavior: "immediate" },
         )
         .pipe(Effect.orDie),
     )
-    if (deleted === 0) return 0
+    if (deletion.deleted === 0) {
+      return finish({
+        cursorBefore,
+        cursorAfter: cursor,
+        windowFirst: aggregates[0] ?? "",
+        windowLast: aggregates.at(-1) ?? "",
+        aggregateCount: aggregates.length,
+        candidateCount: ids.length,
+        deletedCount: 0,
+        activeLeaseCount: deletion.activeLeaseCount,
+        blockReason: "active_lease",
+        cursorAction: "hold",
+        batchSize: settings.maintenanceBatchSize,
+        failure: "none",
+      })
+    }
     // A saturated batch means this window still has more to shed, so hold the
     // cursor rather than waiting a full rotation to come back to it.
     if (ids.length < settings.maintenanceBatchSize) advance(aggregates)
-    return deleted
+    return finish({
+      cursorBefore,
+      cursorAfter: cursor,
+      windowFirst: aggregates[0] ?? "",
+      windowLast: aggregates.at(-1) ?? "",
+      aggregateCount: aggregates.length,
+      candidateCount: ids.length,
+      deletedCount: deletion.deleted,
+      activeLeaseCount: 0,
+      blockReason: "none",
+      cursorAction: ids.length < settings.maintenanceBatchSize ? "advance" : "hold",
+      batchSize: settings.maintenanceBatchSize,
+      failure: "none",
+    })
   })
 
-  return { compact } satisfies Retention
+  const compact = Effect.fn("EventRetention.compact")(function* () {
+    return (yield* compactResult()).deletedCount
+  })
+
+  return {
+    compact,
+    compactResult,
+    instance,
+    currentPass: () => passes,
+    passStarted: () => passStarted,
+    passCursor: () => passCursor,
+  } satisfies Retention & {
+    compactResult: () => Effect.Effect<Pass>
+    instance: string
+    currentPass: () => number
+    passStarted: () => number
+    passCursor: () => string
+  }
 })
 
 /** Starts the background compaction loop in the current scope. */
@@ -186,14 +308,36 @@ export const start = Effect.fnUntraced(function* (
   const retention = yield* make(db, barrier, options)
   const interval = Math.max(1, options?.maintenanceIntervalMs ?? MAINTENANCE_INTERVAL_MS)
   const batchSize = Math.max(1, options?.maintenanceBatchSize ?? MAINTENANCE_BATCH_SIZE)
-  yield* Effect.logInfo("event retention scheduled", { intervalMs: interval, batchSize })
+  yield* Effect.logInfo(
+    `event_retention_scheduled instance=${JSON.stringify(retention.instance)} interval_ms=${interval} batch_size=${batchSize}`,
+  )
   yield* Effect.sleep(Duration.millis(interval)).pipe(
-    Effect.andThen(retention.compact()),
-    Effect.tap((deleted) => Effect.logInfo("event retention pass complete", { deleted, batchSize })),
+    Effect.andThen(retention.compactResult()),
+    Effect.tap((pass) => Effect.logInfo(formatPass(pass))),
     // A failed pass (e.g. SQLITE_BUSY outliving the busy timeout in
     // multi-process use) must not kill the loop for the life of the process;
     // log it and try again next interval.
-    Effect.catchCause((cause) => Effect.logWarning("event retention pass failed", { cause })),
+    Effect.catchCause((cause) =>
+      Effect.logWarning(
+        formatPass({
+          instance: retention.instance,
+          pass: retention.currentPass(),
+          durationMs: Date.now() - retention.passStarted(),
+          cursorBefore: retention.passCursor(),
+          cursorAfter: retention.passCursor(),
+          windowFirst: "",
+          windowLast: "",
+          aggregateCount: 0,
+          candidateCount: 0,
+          deletedCount: 0,
+          activeLeaseCount: 0,
+          blockReason: "failure",
+          cursorAction: "hold",
+          batchSize,
+          failure: Cause.pretty(cause).replace(/\s+/g, " "),
+        }),
+      ),
+    ),
     Effect.repeat(Schedule.forever),
     Effect.forkScoped,
   )

@@ -23,6 +23,7 @@ export interface Deps {
   readonly scope: Scope.Scope
   readonly loop: (input: LoopInput) => Effect.Effect<SessionLegacy.WithParts>
   readonly recoveryInterval?: Duration.Input
+  readonly beforeExecutionAdmission?: (input: { sessionID: SessionID; commandID: string }) => Effect.Effect<void>
 }
 
 /**
@@ -33,7 +34,7 @@ export interface Deps {
  */
 export function make(deps: Deps) {
   return Effect.gen(function* () {
-    const { database, events, scope, loop } = deps
+    const { database, events, scope, loop, beforeExecutionAdmission } = deps
     const { db } = database
     const processRunID = ensureRunID()
     const commandOwner = `local:${process.pid}:${processRunID}:${crypto.randomUUID()}`
@@ -200,7 +201,34 @@ export function make(deps: Deps) {
       yield* diagnostic(commandID, "claim", claimed.state).pipe(Effect.catchCause(() => Effect.void))
       if (claimed.state !== "ready") return
       const command = claimed.command
-      if (!(yield* waitForExecutionTurn(commandID, command.session_id))) return
+      const requeue = Effect.fnUntraced(function* () {
+        const completedAt = Date.now()
+        yield* db
+          .update(SessionCommandTable)
+          .set({
+            status: "queued",
+            owner_id: null,
+            lease_expires_at: null,
+            error: null,
+            completed_at: null,
+            time_updated: completedAt,
+          })
+          .where(
+            and(
+              eq(SessionCommandTable.id, commandID),
+              eq(SessionCommandTable.status, "running"),
+              eq(SessionCommandTable.owner_id, commandOwner),
+              eq(SessionCommandTable.claim_generation, command.claim_generation),
+            ),
+          )
+          .run()
+          .pipe(Effect.orDie)
+      })
+      if (beforeExecutionAdmission) yield* beforeExecutionAdmission({ sessionID: command.session_id, commandID })
+      if (!(yield* waitForExecutionTurn(commandID, command.session_id))) {
+        yield* requeue()
+        return
+      }
       const admitted = yield* db
         .select({ id: SessionCommandTable.id })
         .from(SessionCommandTable)
@@ -235,29 +263,6 @@ export function make(deps: Deps) {
         Effect.repeat(Schedule.forever),
         Effect.forkIn(scope),
       )
-      const requeue = Effect.fnUntraced(function* () {
-        const completedAt = Date.now()
-        yield* db
-          .update(SessionCommandTable)
-          .set({
-            status: "queued",
-            owner_id: null,
-            lease_expires_at: null,
-            error: null,
-            completed_at: null,
-            time_updated: completedAt,
-          })
-          .where(
-            and(
-              eq(SessionCommandTable.id, commandID),
-              eq(SessionCommandTable.status, "running"),
-              eq(SessionCommandTable.owner_id, commandOwner),
-              eq(SessionCommandTable.claim_generation, command.claim_generation),
-            ),
-          )
-          .run()
-          .pipe(Effect.orDie)
-      })
       const exit = yield* Effect.uninterruptibleMask((restore) =>
         restore(
           loop({ sessionID: command.session_id, messageID: command.message_id }).pipe(
@@ -342,8 +347,10 @@ export function make(deps: Deps) {
         .where(
           and(
             eq(SessionCommandTable.directory, ctx.directory),
-            eq(SessionCommandTable.status, "queued"),
-            isNull(SessionCommandTable.owner_id),
+            or(
+              and(eq(SessionCommandTable.status, "queued"), isNull(SessionCommandTable.owner_id)),
+              and(eq(SessionCommandTable.status, "running"), lt(SessionCommandTable.lease_expires_at, Date.now())),
+            ),
           ),
         )
         .groupBy(SessionCommandTable.session_id)
@@ -361,8 +368,10 @@ export function make(deps: Deps) {
               and(
                 eq(SessionCommandTable.session_id, session.sessionID),
                 eq(SessionCommandTable.directory, ctx.directory),
-                eq(SessionCommandTable.status, "queued"),
-                isNull(SessionCommandTable.owner_id),
+                or(
+                  and(eq(SessionCommandTable.status, "queued"), isNull(SessionCommandTable.owner_id)),
+                  and(eq(SessionCommandTable.status, "running"), lt(SessionCommandTable.lease_expires_at, Date.now())),
+                ),
               ),
             )
             .orderBy(asc(SessionCommandTable.time_created), asc(SessionCommandTable.id))

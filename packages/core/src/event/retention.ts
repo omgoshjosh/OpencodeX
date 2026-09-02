@@ -36,6 +36,7 @@ const DELETE_CHUNK = 500
 const PART_UPDATED = "message.part.updated.1"
 const MESSAGE_UPDATED = "message.updated.1"
 const SESSION_UPDATED = "session.updated.1"
+const scheduled = new WeakSet<object>()
 
 /**
  * Types whose rows are revisions of an entity, and therefore compactable.
@@ -133,10 +134,15 @@ export const make = Effect.fn("EventRetention.make")(function* (
     db.all<{ id: string }>(supersededQuery(aggregates, settings.maintenanceBatchSize)).pipe(Effect.orDie)
 
   const compact = Effect.fn("EventRetention.compact")(function* () {
+    return (yield* pass()).deleted
+  })
+
+  const pass = Effect.fn("EventRetention.pass")(function* () {
+    const started = Date.now()
     const aggregates = yield* window()
     if (aggregates.length === 0) {
       cursor = ""
-      return 0
+      return { deleted: 0, candidates: 0, aggregates: 0, cursor, durationMs: Date.now() - started }
     }
     // The read runs outside the write transaction on purpose: a concurrent
     // append can only add a higher sequence, which cannot turn a row already
@@ -144,7 +150,13 @@ export const make = Effect.fn("EventRetention.make")(function* (
     const doomed = yield* superseded(aggregates)
     if (doomed.length === 0) {
       advance(aggregates)
-      return 0
+      return {
+        deleted: 0,
+        candidates: 0,
+        aggregates: aggregates.length,
+        cursor,
+        durationMs: Date.now() - started,
+      }
     }
     const ids = doomed.map((row) => row.id)
     const deleted = yield* barrier(
@@ -158,23 +170,40 @@ export const make = Effect.fn("EventRetention.make")(function* (
                 sql`SELECT EXISTS(SELECT 1 FROM event_cursor_lease WHERE expires_at > ${now}) AS active`,
               )
               if (lease?.active) return 0
+              let deleted = 0
               for (let index = 0; index < ids.length; index += DELETE_CHUNK) {
                 yield* transaction.run(sql`DELETE FROM event WHERE id IN ${ids.slice(index, index + DELETE_CHUNK)}`)
+                deleted +=
+                  (yield* transaction.get<{ count: number }>(sql`SELECT changes() AS count`))?.count ?? 0
               }
-              return ids.length
+              return deleted
             }),
           { behavior: "immediate" },
         )
         .pipe(Effect.orDie),
     )
-    if (deleted === 0) return 0
+    if (deleted === 0) {
+      return {
+        deleted,
+        candidates: ids.length,
+        aggregates: aggregates.length,
+        cursor,
+        durationMs: Date.now() - started,
+      }
+    }
     // A saturated batch means this window still has more to shed, so hold the
     // cursor rather than waiting a full rotation to come back to it.
     if (ids.length < settings.maintenanceBatchSize) advance(aggregates)
-    return deleted
+    return {
+      deleted,
+      candidates: ids.length,
+      aggregates: aggregates.length,
+      cursor,
+      durationMs: Date.now() - started,
+    }
   })
 
-  return { compact } satisfies Retention
+  return { compact, pass } satisfies Retention & { pass: typeof pass }
 })
 
 /** Starts the background compaction loop in the current scope. */
@@ -184,16 +213,32 @@ export const start = Effect.fnUntraced(function* (
   options?: RetentionOptions,
 ) {
   const retention = yield* make(db, barrier, options)
+  if (scheduled.has(db)) return retention
+  scheduled.add(db)
+  yield* Effect.addFinalizer(() => Effect.sync(() => scheduled.delete(db)))
   const interval = Math.max(1, options?.maintenanceIntervalMs ?? MAINTENANCE_INTERVAL_MS)
   const batchSize = Math.max(1, options?.maintenanceBatchSize ?? MAINTENANCE_BATCH_SIZE)
-  yield* Effect.logInfo("event retention scheduled", { intervalMs: interval, batchSize })
+  yield* Effect.logInfo("event retention scheduled").pipe(Effect.annotateLogs({ intervalMs: interval, batchSize }))
   yield* Effect.sleep(Duration.millis(interval)).pipe(
-    Effect.andThen(retention.compact()),
-    Effect.tap((deleted) => Effect.logInfo("event retention pass complete", { deleted, batchSize })),
+    Effect.andThen(retention.pass()),
+    Effect.tap((pass) =>
+      Effect.logInfo("event retention pass complete").pipe(
+        Effect.annotateLogs({
+          actualRowsCompacted: pass.deleted,
+          candidates: pass.candidates,
+          aggregatesScanned: pass.aggregates,
+          durationMs: pass.durationMs,
+          batchSize,
+          cursor: pass.cursor,
+        }),
+      ),
+    ),
     // A failed pass (e.g. SQLITE_BUSY outliving the busy timeout in
     // multi-process use) must not kill the loop for the life of the process;
     // log it and try again next interval.
-    Effect.catchCause((cause) => Effect.logWarning("event retention pass failed", { cause })),
+    Effect.catchCause((cause) =>
+      Effect.logWarning("event retention pass failed").pipe(Effect.annotateLogs("cause", cause)),
+    ),
     Effect.repeat(Schedule.forever),
     Effect.forkScoped,
   )

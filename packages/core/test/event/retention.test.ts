@@ -286,6 +286,35 @@ describe("EventRetention", () => {
     }),
   )
 
+  it.effect("reports bounded pass fields and exact concurrent deletion counts", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const ids = yield* seed(events, db)
+      const first = yield* EventRetention.make(db, events.barrier, { aggregatesPerPass: 1_000 })
+      const second = yield* EventRetention.make(db, events.barrier, { aggregatesPerPass: 1_000 })
+      const initial = yield* first.pass()
+
+      for (const text of ["concurrent one", "concurrent two", "concurrent three"]) {
+        yield* events.publish(SessionLegacy.Event.PartUpdated, {
+          sessionID: ids.sessionID,
+          part: textPart(ids.sessionID, ids.messageID, ids.other, text),
+          time: 9_000,
+        })
+      }
+      const before = yield* journal(db, ids.sessionID)
+      const concurrent = yield* Effect.all([first.compact(), second.compact()], { concurrency: "unbounded" })
+      const after = yield* journal(db, ids.sessionID)
+
+      expect(initial.aggregates).toBeGreaterThan(0)
+      expect(typeof initial.cursor).toBe("string")
+      expect(initial.durationMs).toBeGreaterThanOrEqual(0)
+      expect(initial.deleted).toBeGreaterThan(0)
+      expect(initial.deleted).toBeLessThanOrEqual(initial.candidates)
+      expect(concurrent[0] + concurrent[1]).toBe(before.length - after.length)
+    }),
+  )
+
   it.effect("never deletes created, deleted or removed events", () =>
     Effect.gen(function* () {
       const events = yield* EventV2.Service

@@ -134,11 +134,11 @@ export function make(deps: Deps) {
               }
             }
             if (settled.deliveryOutcome === "delivered" || foreground) return
-            const claimed = yield* deps.sessions.claimDelegationDelivery({ sessionID: child.id, runID: settled.runID })
+            const claim = yield* deps.sessions.claimDelegationDelivery({ sessionID: child.id, runID: settled.runID })
             // `promptAsync` owns one command per deterministic message ID. The
             // durable claim prevents concurrent recovery passes from entering
             // it twice before that unique insertion can arbitrate.
-            if (!claimed) return
+            if (!claim) return
             const text = [
               `Background delegation recovery for child ${child.id}, run ${settled.runID}.`,
               report ?? settled.summary ?? `The child run is recorded as ${settled.outcome}.`,
@@ -178,6 +178,7 @@ export function make(deps: Deps) {
               sessionID: child.id,
               runID: settled.runID,
               outcome: delivered ? "delivered" : "failed",
+              claimToken: claim,
             })
             yield* deps.refresh(parent.value.id)
           }).pipe(

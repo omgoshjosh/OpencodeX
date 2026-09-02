@@ -34,11 +34,13 @@ import { ProjectV2 } from "@opencode-ai/core/project"
 import { WorkspaceV2 } from "@opencode-ai/core/workspace"
 import { SessionID, MessageID, PartID } from "./schema"
 import {
+  DELEGATION_DELIVERY_CLAIM_GRACE,
   delegationRecord,
   withDelegationRecord,
   withoutDelegationRecord,
   type DelegationRecord,
 } from "./delegation-outcome"
+import { Identifier } from "@/id/id"
 
 import type { Provider } from "@/provider/provider"
 import { Permission } from "@/permission"
@@ -506,6 +508,7 @@ export interface Interface {
     sessionID: SessionID
     runID: string
     outcome: "delivered" | "failed"
+    claimToken?: string
     at?: number
   }) => Effect.Effect<boolean>
   /** Claims one pending report delivery before its idempotent notification write. */
@@ -513,7 +516,8 @@ export interface Interface {
     sessionID: SessionID
     runID: string
     at?: number
-  }) => Effect.Effect<boolean>
+    token?: string
+  }) => Effect.Effect<string | undefined>
   readonly setPermission: (input: { sessionID: SessionID; permission: Permission.Ruleset }) => Effect.Effect<void>
   readonly setRevert: (input: {
     sessionID: SessionID
@@ -1102,11 +1106,13 @@ export const layer: Layer.Layer<
       sessionID: SessionID
       runID: string
       outcome: "delivered" | "failed"
+      claimToken?: string
       at?: number
     }) {
       return yield* mutate(input.sessionID, (current) => {
         const stored = delegationRecord(current.metadata)
         if (!stored || stored.runID !== input.runID) return undefined
+        if (stored.deliveryOutcome === "delivering" && stored.deliveryClaimToken !== input.claimToken) return undefined
         // Delivery is monotonic: a late failed retry can never erase proof that
         // the parent already durably received this run's result.
         if (stored.deliveryOutcome === "delivered" && input.outcome === "failed") return undefined
@@ -1116,6 +1122,7 @@ export const layer: Layer.Layer<
             ...stored,
             deliveryOutcome: input.outcome,
             deliveryClaimedAt: undefined,
+            deliveryClaimToken: undefined,
             ...(input.outcome === "delivered" ? { deliveredAt: input.at ?? Date.now() } : {}),
           }),
           time: { ...current.time, updated: Date.now() },
@@ -1127,21 +1134,34 @@ export const layer: Layer.Layer<
       sessionID: SessionID
       runID: string
       at?: number
+      token?: string
     }) {
+      const token = input.token ?? Identifier.ascending("run")
       return yield* mutate(input.sessionID, (current) => {
         const stored = delegationRecord(current.metadata)
         if (!stored || stored.runID !== input.runID) return undefined
-        if (stored.deliveryOutcome === "delivering" || stored.deliveryOutcome === "delivered") return undefined
+        const at = input.at ?? Date.now()
+        if (stored.deliveryOutcome === "delivered") return undefined
+        if (
+          stored.deliveryOutcome === "delivering" &&
+          stored.deliveryClaimedAt !== undefined &&
+          at - stored.deliveryClaimedAt < DELEGATION_DELIVERY_CLAIM_GRACE
+        )
+          return undefined
         return {
           ...current,
           metadata: withDelegationRecord(current.metadata, {
             ...stored,
             deliveryOutcome: "delivering",
-            deliveryClaimedAt: input.at ?? Date.now(),
+            deliveryClaimedAt: at,
+            deliveryClaimToken: token,
           }),
           time: { ...current.time, updated: Date.now() },
         }
-      }).pipe(Effect.orDie)
+      }).pipe(
+        Effect.map((claimed) => (claimed ? token : undefined)),
+        Effect.orDie,
+      )
     })
 
     const setPermission = Effect.fn("Session.setPermission")(function* (input: {

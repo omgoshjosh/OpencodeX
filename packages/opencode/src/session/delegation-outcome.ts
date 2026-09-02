@@ -29,6 +29,9 @@ export type DelegationOutcome = "completed" | "errored" | "cancelled" | "abandon
 
 export type DelegationDelivery = "pending" | "delivering" | "delivered" | "failed"
 
+/** A crashed recovery claimant is reclaimable after this bounded grace. */
+export const DELEGATION_DELIVERY_CLAIM_GRACE = 30_000
+
 export type DelegationRecord = {
   version: typeof DELEGATION_RECORD_VERSION
   /** Unique per delegation attempt; stale runs lose compare-and-set writes. */
@@ -58,6 +61,7 @@ export type DelegationRecord = {
   /** Whether the parent workflow durably received the report. */
   deliveryOutcome?: DelegationDelivery
   deliveryClaimedAt?: number
+  deliveryClaimToken?: string
   deliveredAt?: number
 }
 
@@ -172,6 +176,7 @@ export function delegationRecord(metadata: Record<string, unknown> | undefined |
       raw.completedAt !== undefined ||
       raw.deliveryOutcome !== undefined ||
       raw.deliveryClaimedAt !== undefined ||
+      raw.deliveryClaimToken !== undefined ||
       raw.deliveredAt !== undefined)
   )
     return undefined
@@ -195,6 +200,9 @@ export function delegationRecord(metadata: Record<string, unknown> | undefined |
     ...(raw.deliveryOutcome !== undefined ? { deliveryOutcome: raw.deliveryOutcome } : {}),
     ...(typeof raw.deliveryClaimedAt === "number" && Number.isFinite(raw.deliveryClaimedAt)
       ? { deliveryClaimedAt: raw.deliveryClaimedAt }
+      : {}),
+    ...(typeof raw.deliveryClaimToken === "string" && raw.deliveryClaimToken
+      ? { deliveryClaimToken: raw.deliveryClaimToken }
       : {}),
     ...(typeof raw.deliveredAt === "number" && Number.isFinite(raw.deliveredAt)
       ? { deliveredAt: raw.deliveredAt }

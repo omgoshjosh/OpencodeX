@@ -3,7 +3,12 @@ import { BackgroundJob } from "@/background/job"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { SessionDelegationRecovery } from "@/session/delegation-recovery"
-import { delegationRecord, DELEGATION_RECORD_VERSION, type DelegationRecord } from "@/session/delegation-outcome"
+import {
+  DELEGATION_DELIVERY_CLAIM_GRACE,
+  delegationRecord,
+  DELEGATION_RECORD_VERSION,
+  type DelegationRecord,
+} from "@/session/delegation-outcome"
 import { MessageID, PartID, SessionID } from "@/session/schema"
 import { Session } from "@/session/session"
 import { Database } from "@opencode-ai/core/database/database"
@@ -419,5 +424,105 @@ it.instance("recovers a pre-mode background record from durable parent metadata"
       deliveryOutcome: "delivered",
     })
     expect(yield* Ref.get(notices)).toBe(1)
+  }),
+)
+
+it.instance("reclaims a stale crashed delivery claim but excludes fresh and old claimants", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const parent = yield* sessions.create({})
+    const child = yield* sessions.create({ parentID: parent.id })
+    yield* sessions.stampDelegation({
+      sessionID: child.id,
+      record: record(parent.id, "msg_claim", {
+        phase: "settled",
+        outcome: "completed",
+        completedAt: 2,
+        deliveryOutcome: "pending",
+      }),
+    })
+    expect(
+      yield* sessions.claimDelegationDelivery({ sessionID: child.id, runID: "run_recovery", at: 100, token: "old" }),
+    ).toBe("old")
+    expect(
+      yield* sessions.claimDelegationDelivery({
+        sessionID: child.id,
+        runID: "run_recovery",
+        at: 100 + DELEGATION_DELIVERY_CLAIM_GRACE - 1,
+        token: "fresh",
+      }),
+    ).toBeUndefined()
+    expect(
+      yield* sessions.claimDelegationDelivery({
+        sessionID: child.id,
+        runID: "run_recovery",
+        at: 100 + DELEGATION_DELIVERY_CLAIM_GRACE,
+        token: "new",
+      }),
+    ).toBe("new")
+    expect(
+      yield* sessions.stampDelegationDelivery({
+        sessionID: child.id,
+        runID: "run_recovery",
+        outcome: "delivered",
+        claimToken: "old",
+      }),
+    ).toBe(false)
+    expect(
+      yield* sessions.stampDelegationDelivery({
+        sessionID: child.id,
+        runID: "run_recovery",
+        outcome: "delivered",
+        claimToken: "new",
+      }),
+    ).toBe(true)
+    const concurrent = yield* sessions.create({ parentID: parent.id })
+    yield* sessions.stampDelegation({
+      sessionID: concurrent.id,
+      record: record(parent.id, "msg_concurrent_claim", {
+        phase: "settled",
+        outcome: "completed",
+        completedAt: 2,
+        deliveryOutcome: "pending",
+      }),
+    })
+    const claims = yield* Effect.all(
+      [
+        sessions.claimDelegationDelivery({ sessionID: concurrent.id, runID: "run_recovery", at: 100, token: "one" }),
+        sessions.claimDelegationDelivery({ sessionID: concurrent.id, runID: "run_recovery", at: 100, token: "two" }),
+      ],
+      { concurrency: "unbounded" },
+    )
+    expect(claims.filter(Boolean)).toHaveLength(1)
+  }),
+)
+
+it.instance("replays a stale crash claim once while concurrent fresh claimants remain exclusive", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const database = yield* Database.Service
+    const parent = yield* sessions.create({})
+    const child = yield* sessions.create({ parentID: parent.id })
+    yield* sessions.stampDelegation({
+      sessionID: child.id,
+      record: record(parent.id, "msg_crashed_claim", {
+        phase: "settled",
+        outcome: "abandoned",
+        completedAt: 2,
+        deliveryOutcome: "delivering",
+        deliveryClaimedAt: Date.now() - DELEGATION_DELIVERY_CLAIM_GRACE,
+        deliveryClaimToken: "crashed",
+      }),
+    })
+    const notices = yield* Ref.make(0)
+    const recovery = yield* SessionDelegationRecovery.make({
+      database,
+      sessions,
+      notify: () => Ref.update(notices, (count) => count + 1),
+      refresh: () => Effect.void,
+    })
+    yield* Effect.all([recovery.recover(), recovery.recover()], { concurrency: "unbounded", discard: true })
+    expect(yield* Ref.get(notices)).toBe(1)
+    expect(delegationRecord((yield* sessions.get(child.id)).metadata)).toMatchObject({ deliveryOutcome: "delivered" })
   }),
 )

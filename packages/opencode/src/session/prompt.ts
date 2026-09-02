@@ -79,7 +79,36 @@ function isOrphanedInterruptedTool(part: SessionLegacy.ToolPart) {
   return part.state.status === "error" && part.state.metadata?.interrupted === true
 }
 
+/**
+ * Steps allowed PAST an agent's configured `steps` before the turn is killed
+ * outright. `agent.steps` only ever appended the MAX_STEPS hint to the model
+ * messages -- it never broke the loop -- so a turn that kept failing the exit
+ * predicate ran forever. On 2026-09-01 one turn reached step=387 over 44 minutes
+ * and emitted 288 identical assistant messages before an abort ended it.
+ * This budget exists so the model gets a few turns to wind down after the hint,
+ * and no more.
+ */
+const HARD_STEP_BUDGET = 10
+
 const AUTO_CONTINUE_LIMIT = 3
+
+/**
+ * A user message that carries no human-authored content.
+ *
+ * Delegation-recovery and task-completion messages are injected asynchronously
+ * with `role: "user"` and fresh ascending IDs. The loop's exit predicate asks
+ * `lastUser.id < lastAssistant.id` to mean "the model has answered everything the
+ * user asked"; an injected message newer than the last assistant makes that false
+ * and skips the entire exit block -- including the AUTO_CONTINUE_LIMIT cap that
+ * lives inside it, so the cap is never reached rather than exceeded.
+ *
+ * Every part of an injected message is `synthetic`. A real turn always carries at
+ * least one non-synthetic part, even when reminders append synthetic ones to it,
+ * so "all parts synthetic" separates the two without special-casing message IDs.
+ */
+function isSyntheticOnly(msg: SessionLegacy.WithParts) {
+  return msg.parts.length > 0 && msg.parts.every((part) => part.type === "text" && part.synthetic === true)
+}
 const UNFINISHED_TODO_STATUS = new Set(["pending", "in_progress"])
 const STEERING_REMINDER = [
   "<system-reminder>",
@@ -434,6 +463,11 @@ export const layer = Layer.effect(
         let structured: unknown
         let step = 0
         let autoContinues = 0
+        // The loop's own auto-continue writes a synthetic user message and relies
+        // on it to win the ordering test for exactly one iteration, so it gets
+        // another model turn. That is legitimate and already bounded by
+        // AUTO_CONTINUE_LIMIT -- only EXTERNAL synthetic injections must be ignored.
+        let autoContinueID: string | undefined
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
 
         while (true) {
@@ -459,11 +493,31 @@ export const layer = Layer.effect(
               (part) => part.type === "tool" && !part.metadata?.providerExecuted && !isOrphanedInterruptedTool(part),
             ) ?? false
 
+          // Ordering test uses the newest message with real human content, not
+          // simply the newest user-role message, so injected synthetic messages
+          // cannot suppress termination.
+          // Two internal producers write synthetic-only user messages on purpose and
+          // depend on them winning this test for one iteration: the loop's own
+          // auto-continue (bounded by AUTO_CONTINUE_LIMIT) and compaction's
+          // follow-up (tagged compaction_continue). Both are allowed through.
+          // Anything else synthetic-only arrived from outside the turn.
+          const isInternalContinuation = (m: SessionLegacy.WithParts) =>
+            m.info.id === autoContinueID ||
+            m.parts.some((part) => part.type === "text" && part.metadata?.compaction_continue === true)
+
+          const lastHumanUser =
+            msgs.findLast((m) => m.info.role === "user" && (!isSyntheticOnly(m) || isInternalContinuation(m)))?.info ??
+            lastUser
+
           if (
             lastAssistant?.finish &&
             !["tool-calls"].includes(lastAssistant.finish) &&
             !hasToolCalls &&
-            lastAssistant.parentID === lastUser.id
+            // Both fixes at once: the assistant must be the direct reply to the
+            // anchor message (upstream's wrapped-replay fix), and the anchor is
+            // the newest message with real human content, not simply the newest
+            // user-role message (this commit's runaway fix).
+            lastAssistant.parentID === lastHumanUser.id
           ) {
             const orphan = lastAssistantMsg?.parts.find(
               (part): part is SessionLegacy.ToolPart => part.type === "tool" && isOrphanedInterruptedTool(part),
@@ -516,6 +570,7 @@ export const layer = Layer.effect(
                   agent: lastUser.agent,
                   model: lastUser.model,
                 }
+                autoContinueID = continueMsg.id
                 yield* sessions.updateMessage(continueMsg)
                 yield* sessions.updatePart({
                   id: PartID.ascending(),
@@ -581,6 +636,22 @@ export const layer = Layer.effect(
           }
           const maxSteps = agent.steps ?? Infinity
           const isLastStep = step >= maxSteps
+
+          // The MAX_STEPS hint is advice to the model, not a control-flow bound.
+          // These two are the actual bound: warn once the agent is past its budget
+          // so the class is countable, and terminate unconditionally shortly after
+          // so no predicate -- however it is defeated -- can spin forever.
+          if (Number.isFinite(maxSteps) && step === maxSteps + 1) {
+            yield* slog.warn("step budget exceeded; winding down", { step, maxSteps })
+          }
+          if (Number.isFinite(maxSteps) && step > maxSteps + HARD_STEP_BUDGET) {
+            yield* slog.error("hard step ceiling reached; terminating turn", {
+              step,
+              maxSteps,
+              budget: HARD_STEP_BUDGET,
+            })
+            break
+          }
           msgs = yield* SessionReminders.apply({ messages: msgs, agent, session }).pipe(
             Effect.provideService(RuntimeFlags.Service, flags),
             Effect.provideService(AppFileSystem.Service, fsys),
@@ -691,7 +762,11 @@ export const layer = Layer.effect(
               parentSessionID: session.parentID,
               system,
               messages: [...modelMsgs, ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS }] : [])],
-              tools,
+              // MAX_STEPS tells the model "tools are disabled"; make that true.
+              // Previously the hint claimed it while the full tool map was still
+              // passed, so a model that ignored the prose could keep calling tools
+              // and keep the turn alive past its budget.
+              tools: isLastStep ? {} : tools,
               model,
               toolChoice: format.type === "json_schema" ? "required" : undefined,
             })

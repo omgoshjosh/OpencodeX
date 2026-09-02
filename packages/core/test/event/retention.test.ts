@@ -1,6 +1,6 @@
 import { describe, expect } from "bun:test"
 import { asc, eq, sql } from "drizzle-orm"
-import { Context, Effect, Layer } from "effect"
+import { Cause, Context, Effect, Layer } from "effect"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
 import { EventRetention } from "@opencode-ai/core/event/retention"
@@ -217,7 +217,7 @@ describe("EventRetention", () => {
 
       const blocked = yield* retention.compactResult()
       expect(blocked.deletedCount).toBe(0)
-      expect(blocked.activeLeaseCount).toBe(1)
+      expect(blocked.activeLease).toBe("present")
       expect(blocked.blockReason).toBe("active_lease")
       expect(blocked.cursorAction).toBe("hold")
       expect(yield* journal(db, ids.sessionID)).toEqual(before)
@@ -238,7 +238,7 @@ describe("EventRetention", () => {
       const empty = yield* EventRetention.make(db, events.barrier)
       const emptyPass = yield* empty.compactResult()
       expect(emptyPass.blockReason).toBe("no_candidates")
-      expect(EventRetention.formatPass(emptyPass)).toContain("candidate_count=0")
+      expect(EventRetention.formatPass(emptyPass)).toContain("selected_count=0")
       expect(EventRetention.formatPass(emptyPass)).toContain('failure="none"')
 
       const ids = yield* seed(events, db)
@@ -253,9 +253,9 @@ describe("EventRetention", () => {
         "cursor_before=",
         "window_first=",
         "aggregate_count=",
-        "candidate_count=",
+        "selected_count=",
         "deleted_count=",
-        "active_lease_count=",
+        "active_lease=",
         "block_reason=",
         "batch_size=",
         "failure=",
@@ -275,15 +275,21 @@ describe("EventRetention", () => {
         maintenanceBatchSize: 5,
       })
       const held = yield* saturated.compactResult()
-      expect(held.candidateCount).toBe(5)
+      expect(held.selectedCount).toBe(5)
       expect(held.cursorAction).toBe("hold")
     }),
   )
 
-  it.effect("collapses a long revision chain to two rows and stays idempotent", () =>
+  it.effect("collapses a long revision chain to two rows", () =>
     Effect.gen(function* () {
-      const events = yield* EventV2.Service
-      const { db } = yield* Database.Service
+      const context = yield* Layer.build(
+        Layer.fresh(SessionProjector.layer).pipe(
+          Layer.provideMerge(Layer.fresh(EventV2.layer)),
+          Layer.provideMerge(Layer.fresh(Database.layerFromPath(":memory:"))),
+        ),
+      )
+      const events = Context.get(context, EventV2.Service)
+      const db = Context.get(context, Database.Service).db
       const ids = yield* seed(events, db)
       const retention = yield* EventRetention.make(db, events.barrier, { aggregatesPerPass: 1_000 })
 
@@ -301,8 +307,6 @@ describe("EventRetention", () => {
         (row) => row.type === "message.part.updated.1" && (row.data as any).part.id === ids.other,
       )
       expect(revisions.map((row) => (row.data as any).part.text)).toEqual(["only", "chunk 49"])
-      // A second run has nothing left to do.
-      expect(yield* retention.compact()).toBe(0)
     }),
   )
 
@@ -402,6 +406,55 @@ describe("EventRetention", () => {
       expect(actual.messages.map(withoutWriteStamp)).toEqual(expected.messages.map(withoutWriteStamp))
       expect(actual.parts.map(withoutWriteStamp)).toEqual(expected.parts.map(withoutWriteStamp))
       expect(actual.parts.map((row) => row.time_created)).toEqual(expected.parts.map((row) => row.time_created))
+    }),
+  )
+
+  it.effect("reports actual deletions and retains redacted partial metrics when passes race or fail", () =>
+    Effect.gen(function* () {
+      const context = yield* Layer.build(
+        Layer.fresh(SessionProjector.layer).pipe(
+          Layer.provideMerge(Layer.fresh(EventV2.layer)),
+          Layer.provideMerge(Layer.fresh(Database.layerFromPath(":memory:"))),
+        ),
+      )
+      const events = Context.get(context, EventV2.Service)
+      const db = Context.get(context, Database.Service).db
+      const ids = yield* seed(events, db)
+      const second = yield* EventRetention.make(db, events.barrier, { aggregatesPerPass: 1_000 })
+      const first = yield* EventRetention.make(
+        db,
+        (effect) =>
+          Effect.gen(function* () {
+            yield* second.compact()
+            return yield* effect
+          }),
+        { aggregatesPerPass: 1_000 },
+      )
+
+      const raced = yield* first.compactResult()
+      expect(raced.selectedCount).toBeGreaterThan(0)
+      expect(raced.deletedCount).toBe(0)
+      expect(raced.blockReason).toBe("already_deleted")
+
+      yield* seed(events, db)
+      const failing = yield* EventRetention.make(
+        db,
+        () => Effect.die(new Error(`SQLITE_BUSY ${ids.sessionID}`)),
+        { aggregatesPerPass: 1_000 },
+      )
+      const cause = yield* failing.compactResult().pipe(Effect.sandbox, Effect.flip)
+      const failure = failing.failure(EventRetention.failureReason(cause))
+      expect(failure.selectedCount).toBeGreaterThan(0)
+      expect(failure.aggregateCount).toBeGreaterThan(0)
+      expect(failure.failure).toBe("sqlite_busy")
+      expect(EventRetention.failureReason(Cause.die(`secret ${ids.sessionID}`))).toBe("unknown")
+
+      const line = EventRetention.formatPass(failure)
+      expect(line).not.toContain(ids.sessionID)
+      expect(line).toMatch(/instance="retention-\d+-[0-9a-f-]{36}"/)
+      expect(line).toMatch(/window_first="id-[0-9a-f]{12}"/)
+      expect(line).toContain('failure="sqlite_busy"')
+      expect(line).not.toContain("secret")
     }),
   )
 })

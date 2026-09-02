@@ -2,6 +2,7 @@ export * as EventRetention from "./retention"
 
 import { sql } from "drizzle-orm"
 import { Cause, Duration, Effect, Schedule } from "effect"
+import { createHash } from "crypto"
 import type { Database } from "../database/database"
 
 /**
@@ -101,13 +102,26 @@ type Pass = {
   windowFirst: string
   windowLast: string
   aggregateCount: number
-  candidateCount: number
+  selectedCount: number
   deletedCount: number
-  activeLeaseCount: number
+  activeLease: string
   blockReason: string
   cursorAction: string
   batchSize: number
   failure: string
+}
+
+type PassDetails = Omit<Pass, "instance" | "pass" | "durationMs">
+
+const opaque = (value: string) =>
+  value ? `id-${createHash("sha256").update(value).digest("hex").slice(0, 12)}` : "none"
+
+export const failureReason = (cause: Cause.Cause<unknown>) => {
+  const message = Cause.pretty(cause).toLowerCase()
+  if (message.includes("sqlite_busy")) return "sqlite_busy"
+  if (message.includes("sqlite")) return "sqlite_error"
+  if (message.includes("interrupt")) return "interrupted"
+  return "unknown"
 }
 
 export const formatPass = (pass: Pass) =>
@@ -121,9 +135,9 @@ export const formatPass = (pass: Pass) =>
     `window_first=${JSON.stringify(pass.windowFirst)}`,
     `window_last=${JSON.stringify(pass.windowLast)}`,
     `aggregate_count=${pass.aggregateCount}`,
-    `candidate_count=${pass.candidateCount}`,
+    `selected_count=${pass.selectedCount}`,
     `deleted_count=${pass.deletedCount}`,
-    `active_lease_count=${pass.activeLeaseCount}`,
+    `active_lease=${JSON.stringify(pass.activeLease)}`,
     `block_reason=${JSON.stringify(pass.blockReason)}`,
     `cursor_action=${JSON.stringify(pass.cursorAction)}`,
     `batch_size=${pass.batchSize}`,
@@ -147,10 +161,23 @@ export const make = Effect.fn("EventRetention.make")(function* (
   // window is still shedding a full batch so a backlogged aggregate drains at
   // batch-size per pass instead of once per full rotation.
   let cursor = ""
-  const instance = `pid-${process.pid}-${++retentionInstances}`
+  const instance = `retention-${++retentionInstances}-${crypto.randomUUID()}`
   let passes = 0
   let passStarted = 0
-  let passCursor = ""
+  let partial: PassDetails = {
+    cursorBefore: "none",
+    cursorAfter: "none",
+    windowFirst: "none",
+    windowLast: "none",
+    aggregateCount: 0,
+    selectedCount: 0,
+    deletedCount: 0,
+    activeLease: "absent",
+    blockReason: "failure",
+    cursorAction: "hold",
+    batchSize: settings.maintenanceBatchSize,
+    failure: "none",
+  }
 
   const window = Effect.fnUntraced(function* () {
     const rows = yield* db
@@ -181,21 +208,22 @@ export const make = Effect.fn("EventRetention.make")(function* (
     const started = Date.now()
     const cursorBefore = cursor
     passStarted = started
-    passCursor = cursorBefore
-    const finish = (result: Omit<Pass, "instance" | "pass" | "durationMs">) =>
-      ({ instance, pass, durationMs: Date.now() - started, ...result }) satisfies Pass
+    const finish = (result: PassDetails) => {
+      partial = result
+      return { instance, pass, durationMs: Date.now() - started, ...result } satisfies Pass
+    }
     const aggregates = yield* window()
     if (aggregates.length === 0) {
       cursor = ""
       return finish({
-        cursorBefore,
-        cursorAfter: cursor,
-        windowFirst: "",
-        windowLast: "",
+        cursorBefore: opaque(cursorBefore),
+        cursorAfter: opaque(cursor),
+        windowFirst: "none",
+        windowLast: "none",
         aggregateCount: 0,
-        candidateCount: 0,
+        selectedCount: 0,
         deletedCount: 0,
-        activeLeaseCount: 0,
+        activeLease: "absent",
         blockReason: "no_aggregates",
         cursorAction: "reset",
         batchSize: settings.maintenanceBatchSize,
@@ -206,17 +234,20 @@ export const make = Effect.fn("EventRetention.make")(function* (
     // append can only add a higher sequence, which cannot turn a row already
     // classified as superseded back into the first or last revision.
     const doomed = yield* superseded(aggregates)
+    partial = {
+      ...partial,
+      cursorBefore: opaque(cursorBefore),
+      cursorAfter: opaque(cursor),
+      windowFirst: opaque(aggregates[0] ?? ""),
+      windowLast: opaque(aggregates.at(-1) ?? ""),
+      aggregateCount: aggregates.length,
+      selectedCount: doomed.length,
+    }
     if (doomed.length === 0) {
       advance(aggregates)
       return finish({
-        cursorBefore,
-        cursorAfter: cursor,
-        windowFirst: aggregates[0] ?? "",
-        windowLast: aggregates.at(-1) ?? "",
-        aggregateCount: aggregates.length,
-        candidateCount: 0,
-        deletedCount: 0,
-        activeLeaseCount: 0,
+        ...partial,
+        cursorAfter: opaque(cursor),
         blockReason: "no_candidates",
         cursorAction: "advance",
         batchSize: settings.maintenanceBatchSize,
@@ -231,29 +262,29 @@ export const make = Effect.fn("EventRetention.make")(function* (
             Effect.gen(function* () {
               const now = Date.now()
               yield* transaction.run(sql`DELETE FROM event_cursor_lease WHERE expires_at <= ${now}`)
-              const lease = yield* transaction.get<{ count: number }>(
-                sql`SELECT COUNT(*) AS count FROM event_cursor_lease WHERE expires_at > ${now}`,
+              const lease = yield* transaction.get<{ active: number }>(
+                sql`SELECT EXISTS(SELECT 1 FROM event_cursor_lease WHERE expires_at > ${now}) AS active`,
               )
-              if ((lease?.count ?? 0) > 0) return { deleted: 0, activeLeaseCount: lease?.count ?? 0 }
+              if (lease?.active) return { deleted: 0, activeLease: "present" }
+              let deleted = 0
               for (let index = 0; index < ids.length; index += DELETE_CHUNK) {
-                yield* transaction.run(sql`DELETE FROM event WHERE id IN ${ids.slice(index, index + DELETE_CHUNK)}`)
+                deleted += (
+                  yield* transaction.all<{ id: string }>(
+                    sql`DELETE FROM event WHERE id IN ${ids.slice(index, index + DELETE_CHUNK)} RETURNING id`,
+                  )
+                ).length
               }
-              return { deleted: ids.length, activeLeaseCount: 0 }
+              return { deleted, activeLease: "absent" }
             }),
           { behavior: "immediate" },
         )
         .pipe(Effect.orDie),
     )
-    if (deletion.deleted === 0) {
+    if (deletion.activeLease === "present") {
       return finish({
-        cursorBefore,
-        cursorAfter: cursor,
-        windowFirst: aggregates[0] ?? "",
-        windowLast: aggregates.at(-1) ?? "",
-        aggregateCount: aggregates.length,
-        candidateCount: ids.length,
+        ...partial,
         deletedCount: 0,
-        activeLeaseCount: deletion.activeLeaseCount,
+        activeLease: "present",
         blockReason: "active_lease",
         cursorAction: "hold",
         batchSize: settings.maintenanceBatchSize,
@@ -264,15 +295,11 @@ export const make = Effect.fn("EventRetention.make")(function* (
     // cursor rather than waiting a full rotation to come back to it.
     if (ids.length < settings.maintenanceBatchSize) advance(aggregates)
     return finish({
-      cursorBefore,
-      cursorAfter: cursor,
-      windowFirst: aggregates[0] ?? "",
-      windowLast: aggregates.at(-1) ?? "",
-      aggregateCount: aggregates.length,
-      candidateCount: ids.length,
+      ...partial,
+      cursorAfter: opaque(cursor),
       deletedCount: deletion.deleted,
-      activeLeaseCount: 0,
-      blockReason: "none",
+      activeLease: "absent",
+      blockReason: deletion.deleted === 0 ? "already_deleted" : "none",
       cursorAction: ids.length < settings.maintenanceBatchSize ? "advance" : "hold",
       batchSize: settings.maintenanceBatchSize,
       failure: "none",
@@ -287,15 +314,18 @@ export const make = Effect.fn("EventRetention.make")(function* (
     compact,
     compactResult,
     instance,
-    currentPass: () => passes,
-    passStarted: () => passStarted,
-    passCursor: () => passCursor,
+    failure: (failure: string) => ({
+      instance,
+      pass: passes,
+      durationMs: Date.now() - passStarted,
+      ...partial,
+      blockReason: "failure",
+      failure,
+    }),
   } satisfies Retention & {
     compactResult: () => Effect.Effect<Pass>
     instance: string
-    currentPass: () => number
-    passStarted: () => number
-    passCursor: () => string
+    failure: (failure: string) => Pass
   }
 })
 
@@ -319,23 +349,7 @@ export const start = Effect.fnUntraced(function* (
     // log it and try again next interval.
     Effect.catchCause((cause) =>
       Effect.logWarning(
-        formatPass({
-          instance: retention.instance,
-          pass: retention.currentPass(),
-          durationMs: Date.now() - retention.passStarted(),
-          cursorBefore: retention.passCursor(),
-          cursorAfter: retention.passCursor(),
-          windowFirst: "",
-          windowLast: "",
-          aggregateCount: 0,
-          candidateCount: 0,
-          deletedCount: 0,
-          activeLeaseCount: 0,
-          blockReason: "failure",
-          cursorAction: "hold",
-          batchSize,
-          failure: Cause.pretty(cause).replace(/\s+/g, " "),
-        }),
+        formatPass(retention.failure(failureReason(cause))),
       ),
     ),
     Effect.repeat(Schedule.forever),

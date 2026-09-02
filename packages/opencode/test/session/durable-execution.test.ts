@@ -10,7 +10,6 @@ import { SessionRunState } from "@/session/run-state"
 import { MessageID, SessionID } from "@/session/schema"
 import { SessionStatus } from "@/session/status"
 import * as PromptClaim from "@/session/prompt-claim"
-import { ensureRunID } from "@opencode-ai/core/util/opencode-process"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Database } from "@opencode-ai/core/database/database"
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
@@ -350,37 +349,19 @@ it.instance("recovers a dead owner and stale busy status", () =>
   }),
 )
 
-it.instance("reclaims a dead command lease immediately and leaves a live owner untouched", () =>
+it.instance("does not reclaim a running or unknown owner before its lease expires", () =>
   Effect.gen(function* () {
     const claim = yield* buildPromptClaim()
+    const { db } = yield* Database.Service
     const now = Date.now()
     yield* insertCommand({
       id: "sec_dead_command",
       status: "running",
-      owner: "local:999999:dead:command",
+      owner: "unknown:owner",
       leaseExpiresAt: now + 60_000,
       generation: 1,
     })
-    yield* insertCommand({
-      id: "sec_live_command",
-      status: "running",
-      owner: `local:${process.pid}:${ensureRunID()}:command`,
-      leaseExpiresAt: now + 60_000,
-      generation: 1,
-    })
-    yield* insertCommand({
-      id: "sec_legacy_live_command",
-      status: "running",
-      owner: `local:${process.pid}:prompt:legacy`,
-      leaseExpiresAt: now + 60_000,
-      generation: 1,
-    })
-
-    expect(yield* claim.claimCommandTurn("sec_dead_command")).toMatchObject({ state: "ready" })
-    expect(yield* claim.claimCommandTurn("sec_live_command")).toEqual({ state: "waiting" })
-    expect(yield* claim.claimCommandTurn("sec_legacy_live_command")).toEqual({ state: "waiting" })
-
-    const { db } = yield* Database.Service
+    expect(yield* claim.claimCommandTurn("sec_dead_command")).toEqual({ state: "waiting" })
     yield* db
       .insert(SessionExecutionTable)
       .values({
@@ -388,7 +369,7 @@ it.instance("reclaims a dead command lease immediately and leaves a live owner u
         project_id: "prj_test",
         directory: ".",
         state: "running",
-        owner_id: "local:999999:dead:execution",
+        owner_id: "unknown:execution",
         generation: 1,
         lease_expires_at: now + 60_000,
         time_created: now,
@@ -396,7 +377,21 @@ it.instance("reclaims a dead command lease immediately and leaves a live owner u
       })
       .run()
       .pipe(Effect.orDie)
-    expect(yield* claim.waitForExecutionTurn("sec_dead_command", sessionID)).toBe(true)
+    expect(yield* claim.waitForExecutionTurn("sec_dead_command", sessionID)).toBe(false)
+    yield* db
+      .update(SessionCommandTable)
+      .set({ lease_expires_at: now - 1 })
+      .where(eq(SessionCommandTable.id, "sec_dead_command"))
+      .run()
+      .pipe(Effect.orDie)
+    expect(yield* claim.claimCommandTurn("sec_dead_command")).toMatchObject({ state: "waiting" })
+    yield* db
+      .update(SessionExecutionTable)
+      .set({ lease_expires_at: now - 1 })
+      .where(eq(SessionExecutionTable.session_id, sessionID))
+      .run()
+      .pipe(Effect.orDie)
+    expect(yield* claim.claimCommandTurn("sec_dead_command")).toMatchObject({ state: "ready" })
   }),
 )
 
@@ -407,8 +402,8 @@ it.instance("only one recoverer reclaims a dead command lease", () =>
     yield* insertCommand({
       id: "sec_dead_race",
       status: "running",
-      owner: "local:999999:dead:race",
-      leaseExpiresAt: Date.now() + 60_000,
+      owner: "unknown:race",
+      leaseExpiresAt: Date.now() - 1,
       generation: 1,
     })
 
@@ -495,53 +490,48 @@ it.instance("stops the per-instance recovery timer when its scope closes", () =>
   }),
 )
 
-it.instance("recovers more than one batch in deterministic session FIFO order", () =>
+it.instance("does not starve a later session behind a backlog larger than one batch", () =>
   Effect.gen(function* () {
     const claim = yield* buildPromptClaim()
     const { db } = yield* Database.Service
     const now = Date.now()
     const commands = Array.from({ length: 33 }, (_, index) => ({
       id: `sec_fifo_${index.toString().padStart(2, "0")}`,
-      sessionID: SessionID.make(`ses_fifo_${index.toString().padStart(2, "0")}`),
+      sessionID: SessionID.make("ses_fifo_backlog"),
       createdAt: now + index,
     }))
     yield* Effect.forEach(commands, insertCommand, { discard: true })
+    yield* insertCommand({ id: "sec_fifo_later", sessionID: SessionID.make("ses_fifo_later"), createdAt: now + 34 })
 
     yield* claim.recover()
     yield* pollWithTimeout(
       db
         .select({ status: SessionCommandTable.status })
         .from(SessionCommandTable)
-        .where(eq(SessionCommandTable.id, "sec_fifo_31"))
+        .where(eq(SessionCommandTable.id, "sec_fifo_later"))
         .get()
         .pipe(
           Effect.orDie,
           Effect.map((row) => (row?.status === "succeeded" ? true : undefined)),
         ),
-      "first fair recovery batch did not settle",
+      "later session was starved by a backlog larger than one batch",
     )
     expect(
       yield* db
         .select({ status: SessionCommandTable.status })
         .from(SessionCommandTable)
-        .where(eq(SessionCommandTable.id, "sec_fifo_32"))
+        .where(eq(SessionCommandTable.id, "sec_fifo_00"))
+        .get()
+        .pipe(Effect.orDie),
+    ).toEqual({ status: "succeeded" })
+    expect(
+      yield* db
+        .select({ status: SessionCommandTable.status })
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.id, "sec_fifo_01"))
         .get()
         .pipe(Effect.orDie),
     ).toEqual({ status: "queued" })
-
-    yield* claim.recover()
-    yield* pollWithTimeout(
-      db
-        .select({ status: SessionCommandTable.status })
-        .from(SessionCommandTable)
-        .where(eq(SessionCommandTable.id, "sec_fifo_32"))
-        .get()
-        .pipe(
-          Effect.orDie,
-          Effect.map((row) => (row?.status === "succeeded" ? true : undefined)),
-        ),
-      "next fair recovery batch did not settle",
-    )
   }),
 )
 
@@ -586,6 +576,29 @@ it.instance("sweep never revives a cancelled command", () =>
         .get()
         .pipe(Effect.orDie),
     ).toEqual({ status: "cancelled" })
+  }),
+)
+
+it.instance("periodic recovery does not reclaim a running command before lease expiry", () =>
+  Effect.gen(function* () {
+    const claim = yield* buildPromptClaim()
+    const { db } = yield* Database.Service
+    yield* insertCommand({
+      id: "sec_periodic_running",
+      status: "running",
+      owner: "unknown:owner",
+      leaseExpiresAt: Date.now() + 60_000,
+    })
+
+    yield* claim.recover()
+    expect(
+      yield* db
+        .select({ status: SessionCommandTable.status, owner: SessionCommandTable.owner_id })
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.id, "sec_periodic_running"))
+        .get()
+        .pipe(Effect.orDie),
+    ).toEqual({ status: "running", owner: "unknown:owner" })
   }),
 )
 

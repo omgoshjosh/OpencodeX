@@ -15,7 +15,6 @@ import { InstanceState } from "@/effect/instance-state"
 import { MessageID, SessionID } from "./schema"
 import type { LoopInput } from "./prompt-schema"
 import * as Session from "./session"
-import { SessionExecutionOwner } from "./execution-owner"
 import { ensureRunID } from "@opencode-ai/core/util/opencode-process"
 
 export interface Deps {
@@ -45,7 +44,7 @@ export function make(deps: Deps) {
     const commandLeaseMillis = deps.commandLeaseMillis ?? 30_000
     const clock = deps.clock ?? Date.now
     const recoveryBatchSize = 32
-    const recoveryInterval = deps.recoveryInterval ?? "15 seconds"
+    const recoveryInterval = deps.recoveryInterval ?? "20 seconds"
     const launching = new Set<string>()
 
     const diagnostic = Effect.fnUntraced(function* (
@@ -120,22 +119,10 @@ export function make(deps: Deps) {
                 .from(SessionExecutionTable)
                 .where(eq(SessionExecutionTable.session_id, current.session_id))
                 .get()
-              if (
-                execution?.state === "running" &&
-                execution.owner &&
-                execution.leaseExpiresAt &&
-                execution.leaseExpiresAt > now &&
-                SessionExecutionOwner.alive(execution.owner, processRunID)
-              ) {
+              if (execution?.state === "running" && execution.leaseExpiresAt && execution.leaseExpiresAt > now) {
                 return { state: "waiting" as const }
               }
-              if (
-                current.status === "running" &&
-                current.owner_id &&
-                current.lease_expires_at &&
-                current.lease_expires_at > now &&
-                SessionExecutionOwner.alive(current.owner_id, processRunID)
-              ) {
+              if (current.status === "running" && current.lease_expires_at && current.lease_expires_at > now) {
                 return { state: "waiting" as const }
               }
               const active = yield* transaction
@@ -158,7 +145,6 @@ export function make(deps: Deps) {
                     (item.created === current.time_created && item.id.localeCompare(current.id) < 0)),
               )
               if (blocked) return { state: "waiting" as const }
-              const runningOwner = current.status === "running" ? current.owner_id : undefined
               const claimed = yield* transaction
                 .update(SessionCommandTable)
                 .set({
@@ -174,7 +160,9 @@ export function make(deps: Deps) {
                     eq(SessionCommandTable.id, commandID),
                     eq(SessionCommandTable.status, current.status),
                     eq(SessionCommandTable.claim_generation, current.claim_generation),
-                    runningOwner ? eq(SessionCommandTable.owner_id, runningOwner) : undefined,
+                    current.status === "running"
+                      ? or(isNull(SessionCommandTable.lease_expires_at), lt(SessionCommandTable.lease_expires_at, now))
+                      : undefined,
                   ),
                 )
                 .returning()
@@ -191,40 +179,25 @@ export function make(deps: Deps) {
       commandID: string,
       sessionID: SessionID,
     ) {
-      while (true) {
-        const [command, execution] = yield* Effect.all(
-          [
-            db
-              .select({ status: SessionCommandTable.status })
-              .from(SessionCommandTable)
-              .where(eq(SessionCommandTable.id, commandID))
-              .get()
-              .pipe(Effect.orDie),
-            db
-              .select({
-                state: SessionExecutionTable.state,
-                owner: SessionExecutionTable.owner_id,
-                leaseExpiresAt: SessionExecutionTable.lease_expires_at,
-              })
-              .from(SessionExecutionTable)
-              .where(eq(SessionExecutionTable.session_id, sessionID))
-              .get()
-              .pipe(Effect.orDie),
-          ],
-          { concurrency: "unbounded" },
-        )
-        if (!command || ["succeeded", "failed", "cancelled"].includes(command.status)) return false
-        if (
-          execution?.state !== "running" ||
-          !execution.owner ||
-          !execution.leaseExpiresAt ||
-          execution.leaseExpiresAt <= clock() ||
-          !SessionExecutionOwner.alive(execution.owner, processRunID)
-        ) {
-          return true
-        }
-        yield* Effect.sleep("200 millis")
-      }
+      const [command, execution] = yield* Effect.all(
+        [
+          db
+            .select({ status: SessionCommandTable.status })
+            .from(SessionCommandTable)
+            .where(eq(SessionCommandTable.id, commandID))
+            .get()
+            .pipe(Effect.orDie),
+          db
+            .select({ state: SessionExecutionTable.state, leaseExpiresAt: SessionExecutionTable.lease_expires_at })
+            .from(SessionExecutionTable)
+            .where(eq(SessionExecutionTable.session_id, sessionID))
+            .get()
+            .pipe(Effect.orDie),
+        ],
+        { concurrency: "unbounded" },
+      )
+      if (!command || ["succeeded", "failed", "cancelled"].includes(command.status)) return false
+      return execution?.state !== "running" || !execution.leaseExpiresAt || execution.leaseExpiresAt <= clock()
     })
 
     const executeCommand = Effect.fn("SessionPrompt.executeCommand")(function* (commandID: string) {
@@ -402,7 +375,8 @@ export function make(deps: Deps) {
         .where(
           and(
             eq(SessionCommandTable.directory, ctx.directory),
-            inArray(SessionCommandTable.status, ["queued", "running"]),
+            eq(SessionCommandTable.status, "queued"),
+            isNull(SessionCommandTable.owner_id),
           ),
         )
         .groupBy(SessionCommandTable.session_id)
@@ -420,7 +394,8 @@ export function make(deps: Deps) {
               and(
                 eq(SessionCommandTable.session_id, session.sessionID),
                 eq(SessionCommandTable.directory, ctx.directory),
-                inArray(SessionCommandTable.status, ["queued", "running"]),
+                eq(SessionCommandTable.status, "queued"),
+                isNull(SessionCommandTable.owner_id),
               ),
             )
             .orderBy(asc(SessionCommandTable.time_created), asc(SessionCommandTable.id))

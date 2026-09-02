@@ -771,12 +771,13 @@ export const layer = Layer.effect(
       },
     )
 
-    const { launchCommand, recover } = yield* PromptClaim.make({
+    const { launchCommand, recover, startPeriodicRecovery } = yield* PromptClaim.make({
       database,
       events,
       scope,
       loop: (input) => loop(input),
     })
+    yield* startPeriodicRecovery()
 
     const promptAsync = Effect.fn("SessionPrompt.promptAsync")(function* (input: PromptInput) {
       if (input.messageID) {
@@ -879,6 +880,7 @@ export const layer = Layer.effect(
           { behavior: "immediate" },
         )
         .pipe(Effect.orDie)
+      yield* Effect.logDebug("prompt_async accepted", { sessionID: input.sessionID, commandID: acceptedCommandID })
       const steering = input.delivery === "immediate" && (yield* state.interrupt(input.sessionID))
       if (steering) yield* markSteering(message)
       if (input.noReply !== true) yield* launchCommand(acceptedCommandID)

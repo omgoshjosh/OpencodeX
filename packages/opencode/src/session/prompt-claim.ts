@@ -1,5 +1,5 @@
-import { and, eq, inArray } from "drizzle-orm"
-import { Cause, Context, Effect, Exit, Fiber, Schedule, Scope } from "effect"
+import { and, asc, eq, inArray, isNull } from "drizzle-orm"
+import { Cause, Context, Duration, Effect, Exit, Fiber, Schedule, Scope } from "effect"
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
 import { Database } from "@opencode-ai/core/database/database"
 import { NamedError } from "@opencode-ai/core/util/error"
@@ -32,6 +32,8 @@ export function make(deps: Deps) {
     const processRunID = ensureRunID()
     const commandOwner = `local:${process.pid}:${processRunID}:${crypto.randomUUID()}`
     const commandLeaseMillis = 30_000
+    const sweepMillis = 20_000
+    const launching = new Set<string>()
 
     const claimCommandTurn = Effect.fn("SessionPrompt.claimCommandTurn")(function* (commandID: string) {
       const now = Date.now()
@@ -45,6 +47,7 @@ export function make(deps: Deps) {
                 .where(eq(SessionCommandTable.id, commandID))
                 .get()
               if (!current || ["succeeded", "failed", "cancelled"].includes(current.status)) {
+                yield* Effect.logDebug("prompt_async claim", { decision: "done", commandID })
                 return { state: "done" as const }
               }
               if (
@@ -54,6 +57,7 @@ export function make(deps: Deps) {
                 current.lease_expires_at > now &&
                 SessionExecutionOwner.alive(current.owner_id, processRunID)
               ) {
+                yield* Effect.logDebug("prompt_async claim", { decision: "live_owner", commandID })
                 return { state: "waiting" as const }
               }
               const active = yield* transaction
@@ -75,7 +79,10 @@ export function make(deps: Deps) {
                   (item.created < current.time_created ||
                     (item.created === current.time_created && item.id.localeCompare(current.id) < 0)),
               )
-              if (blocked) return { state: "waiting" as const }
+              if (blocked) {
+                yield* Effect.logDebug("prompt_async claim", { decision: "blocked", commandID })
+                return { state: "waiting" as const }
+              }
               const runningOwner = current.status === "running" ? current.owner_id : undefined
               const claimed = yield* transaction
                 .update(SessionCommandTable)
@@ -97,7 +104,11 @@ export function make(deps: Deps) {
                 )
                 .returning()
                 .get()
-              if (!claimed) return { state: "waiting" as const }
+              if (!claimed) {
+                yield* Effect.logDebug("prompt_async claim", { decision: "cas_lost", commandID })
+                return { state: "waiting" as const }
+              }
+              yield* Effect.logDebug("prompt_async claim", { decision: "claimed", commandID })
               return { state: "ready" as const, command: claimed }
             }),
           { behavior: "immediate" },
@@ -278,8 +289,15 @@ export function make(deps: Deps) {
     })
 
     const launchCommand = Effect.fn("SessionPrompt.launchCommand")(function* (commandID: string) {
+      if (launching.has(commandID)) {
+        yield* Effect.logDebug("prompt_async wake", { decision: "deduplicated", commandID })
+        return
+      }
+      launching.add(commandID)
+      yield* Effect.logDebug("prompt_async wake", { decision: "launched", commandID })
       yield* executeCommand(commandID).pipe(
         Effect.catchCause((cause) => Effect.logError("prompt_async recovery failed", { commandID, cause })),
+        Effect.ensuring(Effect.sync(() => launching.delete(commandID))),
         Effect.forkIn(scope, { startImmediately: true }),
       )
     })
@@ -298,6 +316,52 @@ export function make(deps: Deps) {
         .all()
         .pipe(Effect.orDie)
       yield* Effect.forEach(commands, (command) => launchCommand(command.id), { discard: true })
+      yield* Effect.logDebug("prompt_async recovery", { decision: "startup", commands: commands.length })
+    })
+    const sweep = Effect.fn("SessionPrompt.sweep")(function* () {
+      const ctx = yield* InstanceState.context
+      const candidates = yield* db
+        .select({
+          id: SessionCommandTable.id,
+          sessionID: SessionCommandTable.session_id,
+          queuedAt: SessionCommandTable.time_created,
+        })
+        .from(SessionCommandTable)
+        .where(
+          and(
+            eq(SessionCommandTable.directory, ctx.directory),
+            eq(SessionCommandTable.status, "queued"),
+            isNull(SessionCommandTable.owner_id),
+          ),
+        )
+        .orderBy(asc(SessionCommandTable.time_created), asc(SessionCommandTable.id))
+        .limit(64)
+        .all()
+        .pipe(Effect.orDie)
+      const sessions = new Set<SessionID>()
+      const commands = candidates.filter((command) => {
+        if (sessions.has(command.sessionID)) return false
+        sessions.add(command.sessionID)
+        return true
+      })
+      yield* Effect.forEach(
+        commands,
+        (command) =>
+          Effect.logDebug("prompt_async recovery", {
+            decision: "wake",
+            commandID: command.id,
+            sessionID: command.sessionID,
+            queueAgeMillis: Date.now() - command.queuedAt,
+          }).pipe(Effect.andThen(launchCommand(command.id))),
+        { discard: true },
+      )
+    })
+    const startPeriodicRecovery = Effect.fn("SessionPrompt.startPeriodicRecovery")(function* () {
+      yield* sweep().pipe(
+        Effect.catchCause((cause) => Effect.logError("prompt_async periodic recovery failed", { cause })),
+        Effect.repeat(Schedule.spaced(Duration.millis(sweepMillis))),
+        Effect.forkIn(scope),
+      )
     })
     yield* Effect.addFinalizer(() =>
       db
@@ -323,6 +387,8 @@ export function make(deps: Deps) {
       executeCommand,
       launchCommand,
       recover,
+      sweep,
+      startPeriodicRecovery,
     }
   })
 }

@@ -189,7 +189,7 @@ describe("EventRetention", () => {
         partRevisions(before)[0]!.seq,
         partRevisions(before).at(-1)!.seq,
       ])
-      expect(after.map((row) => row.seq)).toEqual([...after.map((row) => row.seq)].sort((a, b) => a - b))
+      expect(after.map((row) => row.seq)).toEqual(after.map((row) => row.seq).sort((a, b) => a - b))
       expect(after.length).toBeLessThan(before.length)
 
       // Two revisions each for the message and the session, and the part that

@@ -377,8 +377,8 @@ export function make(deps: Deps) {
    * the command recovery that runs first, so this only has to wait for the
    * child to go quiet, read its report, and wake the parent - the same
    * delivery the lost in-memory job would have made. A record still
-   * `running` is settled from the transcript; a settled record with delivery
-   * `pending` is delivered as is.
+   * `running` is settled from the transcript; every settled record without
+   * durable delivery evidence is retried through its deterministic command.
    */
   const recoverBackgroundDelegations = Effect.fn("PromptSwarm.recoverBackgroundDelegations")(function* () {
     if (!deps.background) return
@@ -392,7 +392,7 @@ export function make(deps: Deps) {
     for (const row of rows) {
       const record = delegationRecord(row.metadata)
       if (!record?.background || !row.parentID) continue
-      const undelivered = record.phase === "running" || record.deliveryOutcome === "pending"
+       const undelivered = record.phase === "running" || record.deliveryOutcome !== "delivered"
       if (!undelivered) continue
       const childID = row.id
       const parentID = row.parentID

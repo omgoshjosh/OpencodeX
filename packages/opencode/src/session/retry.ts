@@ -120,9 +120,9 @@ export function policy(opts: {
   /** A stream with visible output cannot safely be replayed. */
   canRetry?: () => boolean
 }) {
-  let startedAt: number | undefined
   return Schedule.fromStepWithMetadata(
     Effect.succeed((meta: Schedule.InputMetadata<unknown>) => {
+      if (opts.canRetry && !opts.canRetry()) return Cause.done(meta.attempt)
       const error = opts.parse(meta.input)
       const retry = retryable(error)
       if (!retry || meta.attempt >= RETRY_MAX_ATTEMPTS) return Cause.done(meta.attempt)

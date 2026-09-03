@@ -118,6 +118,26 @@ describe("session.retry.delay", () => {
     }),
   )
 
+  test("policy does not schedule a retry when visible output makes replay unsafe", async () => {
+    const error = apiError({ "retry-after-ms": "0" })
+    const updates: number[] = []
+    const step = await Effect.runPromise(
+      Schedule.toStepWithMetadata(
+        SessionRetry.policy({
+          parse: Schema.decodeUnknownSync(SessionLegacy.APIError.Schema),
+          canRetry: () => false,
+          set: (info) => Effect.sync(() => updates.push(info.attempt)),
+        }),
+      ),
+    )
+
+    await expect(Promise.resolve().then(() => Effect.runPromise(step(error)))).rejects.toMatchObject({
+      _tag: "Done",
+      value: 1,
+    })
+    expect(updates).toEqual([])
+  })
+
 })
 
 describe("session.retry.retryable", () => {

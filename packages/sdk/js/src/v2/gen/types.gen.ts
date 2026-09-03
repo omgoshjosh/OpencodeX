@@ -2500,6 +2500,12 @@ export type OpencodeXJob = {
   timeUpdated: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
 }
 
+export type OpencodeXSwarmFallbackModel = {
+  providerID: string
+  modelID: string
+  variant?: string
+}
+
 export type OpencodeXSwarmRole = {
   id: string
   swarmID: string
@@ -2508,11 +2514,7 @@ export type OpencodeXSwarmRole = {
   skill?: string
   providerID?: string
   modelID?: string
-  fallbackModels?: Array<{
-    providerID: string
-    modelID: string
-    variant?: string
-  }>
+  fallbackModels?: Array<OpencodeXSwarmFallbackModel>
   variant?: string
   modelProfile?: string
   status: "planned" | "queued" | "running" | "cancelling" | "blocked" | "failed" | "completed" | "cancelled"
@@ -2865,11 +2867,7 @@ export type OpencodeXSwarmRoleInput = {
   skill?: string
   providerID?: string
   modelID?: string
-  fallbackModels?: Array<{
-    providerID: string
-    modelID: string
-    variant?: string
-  }>
+  fallbackModels?: Array<OpencodeXSwarmFallbackModel>
   variant?: string
   modelProfile?: string
   instructions: string
@@ -2913,11 +2911,7 @@ export type OpencodeXSwarmUpdateRoleInput = {
   skill?: string
   providerID?: string
   modelID?: string
-  fallbackModels?: Array<{
-    providerID: string
-    modelID: string
-    variant?: string
-  }>
+  fallbackModels?: Array<OpencodeXSwarmFallbackModel>
   variant?: string
   modelProfile?: string
   instructions?: string

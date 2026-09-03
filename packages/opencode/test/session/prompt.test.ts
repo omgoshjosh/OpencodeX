@@ -536,7 +536,11 @@ const boot = Effect.fn("test.boot")(function* (input?: { title?: string }) {
  * A user-role message whose every part is synthetic -- the shape of
  * msg_delegation_recovery_* and task-completion injections.
  */
-const injectSynthetic = Effect.fn("test.injectSynthetic")(function* (sessionID: SessionID, text: string) {
+const injectSynthetic = Effect.fn("test.injectSynthetic")(function* (
+  sessionID: SessionID,
+  text: string,
+  metadata?: Record<string, unknown>,
+) {
   const session = yield* Session.Service
   const msg = yield* session.updateMessage({
     id: MessageID.ascending(),
@@ -552,6 +556,7 @@ const injectSynthetic = Effect.fn("test.injectSynthetic")(function* (sessionID: 
     sessionID,
     type: "text",
     synthetic: true,
+    ...(metadata ? { metadata } : {}),
     text,
   })
   return msg
@@ -585,6 +590,42 @@ noLLMServer.instance(
       expect(assistants.length).toBe(1)
     }),
   { config: cfg },
+)
+
+/**
+ * The other half of the runaway fix. A background task or swarm-role report is
+ * delivered as a synthetic-only user message too, but it is tagged
+ * `task_report` by its producer and the orchestrator must answer it: on
+ * 2026-09-03 the untagged predicate made the loop exit in 27ms on every report,
+ * so background Goombas finished and nobody ever read their results. The tagged
+ * message earns exactly one model turn, and a second loop call adds nothing.
+ */
+it.instance("loop answers a tagged background task report exactly once", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    yield* seed(chat.id, { finish: "stop" })
+    const wake = yield* injectSynthetic(
+      chat.id,
+      '<task id="ses_child" state="completed">\n<task_result>\nLUNA\n</task_result>\n</task>',
+      { task_report: true },
+    )
+    yield* llm.text("acknowledged")
+
+    const result = yield* prompt.loop({ sessionID: chat.id })
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role === "assistant") expect(result.info.parentID).toBe(wake.id)
+    expect(yield* llm.hits).toHaveLength(1)
+
+    // Answered once: the report is now behind an assistant reply, so the next
+    // loop has nothing to do and must not call the model again.
+    yield* prompt.loop({ sessionID: chat.id })
+    expect(yield* llm.hits).toHaveLength(1)
+    const assistants = (yield* sessions.messages({ sessionID: chat.id })).filter((m) => m.info.role === "assistant")
+    expect(assistants.length).toBe(2)
+  }),
 )
 
 noLLMServer.instance(

@@ -278,6 +278,8 @@ export function make(deps: Deps) {
           {
             type: "text",
             synthetic: true,
+            // See the task tool: the loop answers tagged reports exactly once.
+            metadata: { task_report: true },
             text: backgroundDelegationMessage({
               childSessionID: input.childSessionID,
               role: input.role,

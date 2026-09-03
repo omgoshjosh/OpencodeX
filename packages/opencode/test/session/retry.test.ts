@@ -410,6 +410,9 @@ describe("session.message-v2.fromError", () => {
     const result = MessageV2.fromError(
       new ProviderError.ResponseStreamError("stream failed", {
         statusCode: 503,
+        // Zero backoff: the policy's real delays (2s, 4s) are what this test
+        // was timing out on; the attempt cap is what it asserts.
+        responseHeaders: { "retry-after-ms": "0" },
         responseBody: '{"error":"unavailable"}',
       }),
       { providerID },

@@ -1,10 +1,6 @@
 import { OpencodeXProject } from "@/opencodex/project"
 import { OpencodeXSessionState } from "@/opencodex/session-state"
-import { OpencodeXTerminalSession } from "@/opencodex/terminal-session"
-import { OpencodeXView } from "@/opencodex/view"
-import { Permission } from "@/permission"
 import { Project } from "@/project/project"
-import { Question } from "@/question"
 import { SessionID } from "@/session/schema"
 import { Session } from "@/session/session"
 import { SessionStatus } from "@/session/status"
@@ -12,7 +8,6 @@ import { Effect } from "effect"
 import { HttpApiError } from "effect/unstable/httpapi"
 import { ConflictError, notFound, ProjectNotFoundError } from "../errors"
 import {
-  SessionSyncQuery,
   UpdateProjectPayload,
   UpdateSessionStatePayload,
 } from "../groups/opencodex"
@@ -21,12 +16,7 @@ import * as SessionError from "./session-errors"
 export const makeOpencodeXSessionHandlers = Effect.fn("OpencodeXHttpApi.makeSessionHandlers")(function* () {
   const projects = yield* OpencodeXProject.Service
   const sessions = yield* Session.Service
-  const statuses = yield* SessionStatus.Service
-  const permissions = yield* Permission.Service
-  const questions = yield* Question.Service
   const sessionState = yield* OpencodeXSessionState.Service
-  const terminalSessions = yield* OpencodeXTerminalSession.Service
-  const views = yield* OpencodeXView.Service
 
   const listProjects = Effect.fn("OpencodeXHttpApi.listProjects")(function* () {
     return yield* projects.list()
@@ -141,20 +131,6 @@ function mapProjectErrors<A, R>(effect: Effect.Effect<A, OpencodeXProject.Invali
   )
 }
 
-function mergeSessions(sessions: readonly Session.Info[], projects: readonly OpencodeXProject.Info[]): Session.Info[] {
-  return [
-    ...new Map(
-      [...sessions.map(asSessionInfo), ...projects.flatMap((project) => project.sessions.map(asSessionInfo))].map(
-        (session): [SessionID, Session.Info] => [session.id, session],
-      ),
-    ).values(),
-  ].sort((left, right) => right.time.updated - left.time.updated || String(right.id).localeCompare(String(left.id)))
-}
-
-function asSessionInfo(session: Session.Info | OpencodeXProject.Info["sessions"][number]): Session.Info {
-  return stripSessionSummaryDiffs(session) as unknown as Session.Info
-}
-
 function stripSessionSummaryDiffs<
   T extends { summary?: { additions: number; deletions: number; files: number; diffs?: unknown } },
 >(session: T): T {
@@ -167,13 +143,4 @@ function stripSessionSummaryDiffs<
       files: session.summary.files,
     },
   } as T
-}
-
-function groupBySession<T extends { sessionID: SessionID }>(items: readonly T[]) {
-  return items.reduce<Record<string, T[]>>((result, item) => {
-    const group = result[item.sessionID] ?? []
-    group.push(item)
-    result[item.sessionID] = group
-    return result
-  }, {})
 }

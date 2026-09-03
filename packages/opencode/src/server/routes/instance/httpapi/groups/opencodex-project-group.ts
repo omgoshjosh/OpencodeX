@@ -12,7 +12,6 @@ import { ApiNotFoundError, ConflictError, ProjectNotFoundError } from "../errors
 import { described } from "./metadata"
 import {
   OPENCODEX_ROOT,
-  SessionSyncQuery,
   StateEventQuery,
   StateQuery,
   StateSessionCardQuery,

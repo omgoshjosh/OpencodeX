@@ -3,7 +3,6 @@ import { ConfigPlugin } from "@/config/plugin"
 import { directories, fileInDirectory, files } from "@/config/paths"
 import { InstanceState } from "@/effect/instance-state"
 import { EffectBridge } from "@/effect/bridge"
-import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { OpencodeXPlugin } from "@/opencodex/plugin"
 import { installPlugin, patchPluginConfig, readPluginManifest } from "@/plugin/install"
@@ -26,7 +25,6 @@ import path from "path"
 export const makeOpencodeXPluginHandlers = Effect.fn("OpencodeXHttpApi.makePluginHandlers")(function* () {
   const config = yield* Config.Service
   const fs = yield* AppFileSystem.Service
-  const runtimeFlags = yield* RuntimeFlags.Service
   const events = yield* EventV2Bridge.Service
   const flock = yield* EffectFlock.Service
   const bridge = yield* EffectBridge.make()

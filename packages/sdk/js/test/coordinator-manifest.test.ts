@@ -444,8 +444,10 @@ describe("escalating health retry", () => {
 
   test("escalates the deadline on every attempt", async () => {
     const deadlines: number[] = []
+    // Measured with wall-clock aborts, so the base must dwarf timer jitter:
+    // Windows CI resolved a 20ms deadline as 68ms and a 40ms one as 56ms.
     await probeCoordinatorHealthWithRetry(manifest(), {
-      timeout: 20,
+      timeout: 120,
       delay: nowait,
       fetch: async (_url, init) => {
         const started = Date.now()

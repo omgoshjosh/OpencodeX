@@ -871,17 +871,20 @@ describe("tool.task", () => {
           extra: {
             promptOps: {
               ...stubOps(),
+              // Persisted, not just returned: the tool classifies the durable
+              // assistant turn, so a mock that never writes one has nothing to
+              // classify.
               prompt: (input: SessionPrompt.PromptInput) => {
                 overrides.push(input)
                 const failed = reply(input, "")
-                return Effect.succeed({
+                return persistAssistantResult(sessions, {
                   ...failed,
                   info: {
                     ...failed.info,
                     error: new SessionLegacy.APIError({ message: "quota exceeded", isRetryable: false }),
                   },
                   parts: [],
-                })
+                } as unknown as SessionLegacy.WithParts)
               },
             },
           },

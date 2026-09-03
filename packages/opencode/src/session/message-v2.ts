@@ -786,6 +786,34 @@ function fromStreamError(e: unknown) {
   ).toObject()
 }
 
+function fromAPICallError(e: APICallError, ctx: { providerID: ProviderV2.ID }) {
+  const parsed = ProviderError.parseAPICallError({
+    providerID: ctx.providerID,
+    error: e,
+  })
+  if (parsed.type === "context_overflow") {
+    return new ContextOverflowError(
+      {
+        message: parsed.message,
+        responseBody: parsed.responseBody,
+      },
+      { cause: e },
+    ).toObject()
+  }
+
+  return new APIError(
+    {
+      message: parsed.message,
+      statusCode: parsed.statusCode,
+      isRetryable: parsed.isRetryable,
+      responseHeaders: parsed.responseHeaders,
+      responseBody: parsed.responseBody,
+      metadata: parsed.metadata,
+    },
+    { cause: e },
+  ).toObject()
+}
+
 export function fromError(
   e: unknown,
   ctx: { providerID: ProviderV2.ID; aborted?: boolean },
@@ -849,6 +877,21 @@ export function fromError(
         { cause: e },
       ).toObject()
     case e instanceof ProviderError.ResponseStreamError:
+      if (APICallError.isInstance(e.cause)) return fromAPICallError(e.cause, ctx)
+      if (e.statusCode !== undefined) {
+        return fromAPICallError(
+          new APICallError({
+            message: e.message,
+            url: "",
+            requestBodyValues: {},
+            statusCode: e.statusCode,
+            responseHeaders: e.responseHeaders ?? {},
+            responseBody: e.responseBody,
+            isRetryable: e.isRetryable ?? e.statusCode >= 500,
+          }),
+          ctx,
+        )
+      }
       const streamError = fromStreamError(e)
       if (streamError) return streamError
       return new APIError(
@@ -862,31 +905,7 @@ export function fromError(
         { cause: e },
       ).toObject()
     case APICallError.isInstance(e):
-      const parsed = ProviderError.parseAPICallError({
-        providerID: ctx.providerID,
-        error: e,
-      })
-      if (parsed.type === "context_overflow") {
-        return new ContextOverflowError(
-          {
-            message: parsed.message,
-            responseBody: parsed.responseBody,
-          },
-          { cause: e },
-        ).toObject()
-      }
-
-      return new APIError(
-        {
-          message: parsed.message,
-          statusCode: parsed.statusCode,
-          isRetryable: parsed.isRetryable,
-          responseHeaders: parsed.responseHeaders,
-          responseBody: parsed.responseBody,
-          metadata: parsed.metadata,
-        },
-        { cause: e },
-      ).toObject()
+      return fromAPICallError(e, ctx)
     default:
       try {
         const streamError = fromStreamError(e)

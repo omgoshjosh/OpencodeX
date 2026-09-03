@@ -13,6 +13,27 @@ export class HeaderTimeoutError extends Error {
 
 export class ResponseStreamError extends Error {
   public override readonly name = "ProviderResponseStreamError"
+
+  constructor(
+    message: string,
+    options?: ErrorOptions & {
+      statusCode?: number
+      responseHeaders?: Record<string, string>
+      responseBody?: string
+      isRetryable?: boolean
+    },
+  ) {
+    super(message, options)
+    this.statusCode = options?.statusCode
+    this.responseHeaders = options?.responseHeaders
+    this.responseBody = options?.responseBody
+    this.isRetryable = options?.isRetryable
+  }
+
+  public readonly statusCode?: number
+  public readonly responseHeaders?: Record<string, string>
+  public readonly responseBody?: string
+  public readonly isRetryable?: boolean
 }
 
 // Adapted from overflow detection patterns in:
@@ -38,13 +59,6 @@ const OVERFLOW_PATTERNS = [
   /too large for model with \d+ maximum context length/i, // Mistral
   /model_context_window_exceeded/i, // z.ai non-standard finish_reason surfaced as error text
 ]
-
-function isOpenAiErrorRetryable(e: APICallError) {
-  const status = e.statusCode
-  if (!status) return e.isRetryable
-  // openai sometimes returns 404 for models that are actually available
-  return status === 404 || e.isRetryable
-}
 
 // Providers not reliably handled in this function:
 // - z.ai: can accept overflow silently (needs token-count/context-window checks)
@@ -221,7 +235,13 @@ export function parseAPICallError(input: { providerID: ProviderV2.ID; error: API
     type: "api_error",
     message: m,
     statusCode: input.error.statusCode,
-    isRetryable: input.providerID.startsWith("openai") ? isOpenAiErrorRetryable(input.error) : input.error.isRetryable,
+    isRetryable:
+      input.error.statusCode !== undefined &&
+      input.error.statusCode >= 400 &&
+      input.error.statusCode < 500 &&
+      ![408, 409, 429].includes(input.error.statusCode)
+        ? false
+        : input.error.isRetryable,
     responseHeaders: input.error.responseHeaders,
     responseBody: input.error.responseBody,
     metadata,

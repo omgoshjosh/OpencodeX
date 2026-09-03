@@ -452,9 +452,11 @@ describe("HttpApi SDK", () => {
           swarms: false,
         },
       })
-      // Restart readiness ignores reusable definitions without changing the
-      // existing health activity contract for non-terminal swarm records.
-      expect(health.data).toMatchObject({ active: true })
+      // A reusable planned swarm is a definition, not executing work, for both
+      // contracts: restart readiness ignores it, and idle health has ignored
+      // dormant swarms since d2f590c5ab (ACTIVE_SWARM_STATUSES excludes
+      // "planned"), so the daemon reports inactive once everything settles.
+      expect(health.data).toMatchObject({ active: false })
       expect(
         yield* Effect.promise(() =>
           waitForRestartReadiness(sdk, {

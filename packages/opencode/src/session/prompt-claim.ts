@@ -251,19 +251,25 @@ export function make(deps: Deps) {
 
       const heartbeat = yield* Effect.sleep(Math.floor(commandLeaseMillis / 3)).pipe(
         Effect.andThen(
-          db
-            .update(SessionCommandTable)
-            .set({ lease_expires_at: clock() + commandLeaseMillis, time_updated: clock() })
-            .where(
-              and(
-                eq(SessionCommandTable.id, commandID),
-                eq(SessionCommandTable.status, "running"),
-                eq(SessionCommandTable.owner_id, commandOwner),
-                eq(SessionCommandTable.claim_generation, command.claim_generation),
-              ),
-            )
-            .run()
-            .pipe(Effect.orDie),
+          // Suspended so the clock is read on EVERY beat. Built eagerly, drizzle
+          // bakes the first timestamp into the statement and every later beat
+          // rewrites the same already-expiring lease.
+          Effect.suspend(() => {
+            const now = clock()
+            return db
+              .update(SessionCommandTable)
+              .set({ lease_expires_at: now + commandLeaseMillis, time_updated: now })
+              .where(
+                and(
+                  eq(SessionCommandTable.id, commandID),
+                  eq(SessionCommandTable.status, "running"),
+                  eq(SessionCommandTable.owner_id, commandOwner),
+                  eq(SessionCommandTable.claim_generation, command.claim_generation),
+                ),
+              )
+              .run()
+              .pipe(Effect.orDie)
+          }),
         ),
         Effect.repeat(Schedule.forever),
         Effect.forkIn(scope),
@@ -276,13 +282,25 @@ export function make(deps: Deps) {
         ).pipe(Effect.exit, Effect.ensuring(Fiber.interrupt(heartbeat))),
       )
       const completedAt = clock()
+      // A turn that returns an errored assistant message is a FAILED command,
+      // not a succeeded one: the effect succeeded, but the work did not. The
+      // error itself was already published by the loop, so this only records
+      // the durable outcome (an abort is a cancellation, not a failure).
+      const assistantError =
+        Exit.isSuccess(exit) &&
+        exit.value?.info.role === "assistant" &&
+        exit.value.info.error &&
+        exit.value.info.error.name !== "MessageAbortedError"
+          ? JSON.stringify(exit.value.info.error)
+          : undefined
       if (Exit.isSuccess(exit)) {
         yield* db
           .update(SessionCommandTable)
           .set({
-            status: "succeeded",
+            status: assistantError ? "failed" : "succeeded",
             owner_id: null,
             lease_expires_at: null,
+            ...(assistantError ? { error: assistantError } : {}),
             completed_at: completedAt,
             time_updated: completedAt,
           })

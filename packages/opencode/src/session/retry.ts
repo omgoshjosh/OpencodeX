@@ -18,7 +18,7 @@ export const RETRY_MAX_DELAY = 2_147_483_647 // max 32-bit signed integer for se
 export const RETRY_MAX_ATTEMPTS = 3
 
 function cap(ms: number) {
-  return Math.min(ms, RETRY_MAX_DELAY)
+  return Math.max(0, Math.min(ms, RETRY_MAX_DELAY))
 }
 
 export function delay(attempt: number, error?: SessionLegacy.APIError) {

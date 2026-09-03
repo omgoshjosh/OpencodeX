@@ -59,6 +59,15 @@ const scenarios: Scenario[] = [
       check(body.healthy === true, "server should report healthy")
     }),
   http.protected
+    .get("/global/restart-readiness", "global.restartReadiness")
+    .global()
+    .json(200, (body) => {
+      object(body)
+      check(typeof body.ready === "boolean", "restart readiness should report a boolean ready flag")
+      object(body.blockers)
+      check(body.ready === true, "an idle exerciser instance should be ready to restart")
+    }),
+  http.protected
     .post("/session/{sessionID}/child/{childSessionID}/retry", "session.child.retry")
     .authParity()
     .seeded((ctx) =>
@@ -518,6 +527,14 @@ const scenarios: Scenario[] = [
     .at((ctx) => ({ path: "/sync/history", headers: ctx.headers(), body: {} }))
     .json(200, array),
   http.protected
+    .post("/sync/history/page", "sync.history.page")
+    .at((ctx) => ({ path: "/sync/history/page", headers: ctx.headers(), body: { state: {} } }))
+    .json(200, (body) => {
+      object(body)
+      check(Array.isArray(body.events), "history page should return an events array")
+      check(body.next === null || typeof body.next === "string", "history page cursor should be null or a string")
+    }),
+  http.protected
     .post("/sync/replay", "sync.replay")
     .at((ctx) => ({ path: "/sync/replay", headers: ctx.headers(), body: { directory: ctx.directory, events: [] } }))
     .status(400),
@@ -831,6 +848,20 @@ const scenarios: Scenario[] = [
     .at((ctx) => ({ path: route("/session/{sessionID}/abort", { sessionID: ctx.state.id }), headers: ctx.headers() }))
     .json(200, (body) => {
       check(body === true, "abort should return true")
+    }),
+  http.protected
+    .post("/session/{sessionID}/message/{messageID}/cancel", "session.cancelQueued.missing")
+    .seeded((ctx) => ctx.session({ title: "Cancel queued" }))
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/message/{messageID}/cancel", {
+        sessionID: ctx.state.id,
+        messageID: "msg_httpapi_missing",
+      }),
+      headers: ctx.headers(),
+    }))
+    .json(200, (body) => {
+      object(body)
+      check(body.outcome === "missing", "cancelling a message nobody queued should report missing")
     }),
   http.protected
     .post("/session/{sessionID}/abort", "session.abort.missing")

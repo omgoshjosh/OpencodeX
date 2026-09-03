@@ -305,7 +305,7 @@ describe("session.message-v2.fromError", () => {
     expect(retryable).toEqual({ message: "Connection reset by server" })
   })
 
-  test("marks OpenAI 404 status codes as retryable", () => {
+  test("does not retry stream-wrapped 404 API errors and preserves their body", async () => {
     const error = new APICallError({
       message: "boom",
       url: "https://api.openai.com/v1/chat/completions",
@@ -315,9 +315,54 @@ describe("session.message-v2.fromError", () => {
       responseBody: '{"error":"boom"}',
       isRetryable: false,
     })
-    const result = MessageV2.fromError(error, { providerID: ProviderV2.ID.make("openai") })
+    const result = MessageV2.fromError(new ProviderError.ResponseStreamError("stream failed", { cause: error }), {
+      providerID: ProviderV2.ID.make("openai"),
+    })
     if (!SessionLegacy.APIError.isInstance(result)) throw new Error("expected APIError")
-    expect(result.data.isRetryable).toBe(true)
+    expect(result.data.isRetryable).toBe(false)
+    expect(result.data.responseBody).toBe('{"error":"boom"}')
+    expect(SessionRetry.retryable(result)).toBeUndefined()
+    const step = await Effect.runPromise(
+      Schedule.toStepWithMetadata(
+        SessionRetry.policy({
+          parse: Schema.decodeUnknownSync(SessionLegacy.APIError.Schema),
+          set: () => Effect.void,
+        }),
+      ),
+    )
+    await expect(Promise.resolve().then(() => Effect.runPromise(step(result)))).rejects.toMatchObject({
+      _tag: "Done",
+      value: 1,
+    })
+  })
+
+  test("retries stream-wrapped 503 API errors only to the attempt cap", async () => {
+    const result = MessageV2.fromError(
+      new ProviderError.ResponseStreamError("stream failed", {
+        statusCode: 503,
+        responseBody: '{"error":"unavailable"}',
+      }),
+      { providerID },
+    )
+    if (!SessionLegacy.APIError.isInstance(result)) throw new Error("expected APIError")
+    expect(result.data.responseBody).toBe('{"error":"unavailable"}')
+    expect(SessionRetry.retryable(result)).toEqual({ message: "stream failed" })
+    const attempts: number[] = []
+    const step = await Effect.runPromise(
+      Schedule.toStepWithMetadata(
+        SessionRetry.policy({
+          parse: Schema.decodeUnknownSync(SessionLegacy.APIError.Schema),
+          set: (info) => Effect.sync(() => attempts.push(info.attempt)),
+        }),
+      ),
+    )
+    await Effect.runPromise(step(result))
+    await Effect.runPromise(step(result))
+    await expect(Promise.resolve().then(() => Effect.runPromise(step(result)))).rejects.toMatchObject({
+      _tag: "Done",
+      value: 3,
+    })
+    expect(attempts).toEqual([1, 2])
   })
 
   test("converts OpenAI server_error stream chunks to retryable APIError", () => {

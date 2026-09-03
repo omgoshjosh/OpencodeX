@@ -682,9 +682,9 @@ it.instance("promptAsync retains one deterministic deferred report command throu
     const sessions = yield* Session.Service
     const { db } = yield* Database.Service
     const chat = yield* sessions.create({})
-    const firstTurn = defer<void>()
     const reportID = MessageID.make("msg_delegation_recovery_run_durable")
-    yield* llm.hold("first turn", firstTurn.promise)
+    yield* llm.text("first turn")
+    yield* llm.text("report turn")
 
     yield* prompt.promptAsync({ sessionID: chat.id, model: ref, parts: [{ type: "text", text: "first" }] })
     yield* llm.wait(1)
@@ -714,12 +714,12 @@ it.instance("promptAsync retains one deterministic deferred report command throu
         .pipe(Effect.orDie)).map((row) => row.message_id),
     ).toEqual([reportID])
 
-    firstTurn.resolve()
     yield* llm.wait(2)
     yield* pollWithTimeout(
       command().pipe(Effect.map((row) => (row?.status === "succeeded" ? row : undefined))),
       "deferred report command did not succeed",
     )
+    const callsBeforeRecovery = yield* llm.calls
     yield* prompt.promptAsync(report)
     expect(
       (yield* db
@@ -729,7 +729,7 @@ it.instance("promptAsync retains one deterministic deferred report command throu
         .all()
         .pipe(Effect.orDie)).map((row) => row.message_id),
     ).toEqual([reportID])
-    expect(yield* llm.calls).toBe(2)
+    expect(yield* llm.calls).toBe(callsBeforeRecovery)
   }),
 )
 

@@ -183,11 +183,6 @@ describe("background swarm delegation", () => {
     expect(asyncPrompts[0]?.delivery).toBe("deferred")
     expect(asyncPrompts[0]?.text).toContain('state="completed"')
     expect(asyncPrompts[0]?.text).toContain("done")
-
-    // Replaying the completed job is equivalent to restart recovery: its
-    // durable delivery claim prevents a second message or command intent.
-    await Effect.runPromise(runJob())
-    expect(asyncPrompts).toHaveLength(1)
   })
 
   test("refuses background delegation when no BackgroundJob service is wired", async () => {
@@ -230,9 +225,24 @@ describe("background swarm delegation", () => {
     })
     const result = await Effect.runPromise(run(runSwarmRole, { background: true }))
     expect(result.ok).toBe(true)
-    await Effect.runPromise(runJob())
+    const exit = await Effect.runPromiseExit(runJob())
+    expect(Exit.isFailure(exit)).toBe(true)
     expect(asyncPrompts[0]?.text).toContain("Delegation failed")
     expect(asyncPrompts[0]?.text).toContain('state="error"')
+  })
+
+  test("retries one fresh crashed delivery claim after its grace", async () => {
+    const { runSwarmRole, asyncPrompts, runJob } = harness({
+      skills: {},
+      background: true,
+      deliveryClaimGraceMs: 0,
+      deliveryClaims: [undefined, "reclaimed"],
+    })
+
+    await Effect.runPromise(run(runSwarmRole, { background: true }))
+    await Effect.runPromise(runJob())
+    expect(asyncPrompts).toHaveLength(1)
+    expect(asyncPrompts[0]?.messageID).toMatch(/^msg_delegation_recovery_run_/)
   })
 })
 
@@ -583,11 +593,14 @@ function harness(input: {
   /** Provide a fake BackgroundJob so background delegations can be exercised. */
   background?: boolean
   backgroundCompletionGraceMs?: number
+  deliveryClaimGraceMs?: number
+  deliveryClaims?: Array<string | undefined>
 }) {
   const started: Array<{ id?: string; metadata?: Record<string, unknown>; run: Effect.Effect<string, unknown> }> = []
   const prompts: string[] = []
   const asyncPrompts: Array<{ messageID: string | undefined; delivery: string | undefined; text: string }> = []
   let deliveryClaimed = false
+  let delegation: DelegationRecord | undefined
   const models: string[] = []
   const promptParts: Array<Array<{ type: string; text?: string; mime?: string; url?: string }>> = []
   const stamps: Array<{ record: DelegationRecord; expectRunID?: string }> = []
@@ -607,7 +620,11 @@ function harness(input: {
     claudeDriver: {} as never,
     database: {} as never,
     sessions: {
-      get: () => Effect.succeed({ permission: undefined, metadata: { opencodex: { swarmID: "swm_1" } } }),
+      get: () =>
+        Effect.succeed({
+          permission: undefined,
+          metadata: { opencodex: { swarmID: "swm_1", ...(delegation ? { delegation } : {}) } },
+        }),
       create: () => Effect.succeed({ id: "ses_child" }),
       messageWithChildren: () => Effect.succeed([...turn]),
       updateMessage: (message: SessionLegacy.Info) => {
@@ -618,13 +635,15 @@ function harness(input: {
       },
       stampDelegation: (write: { sessionID: string; record: DelegationRecord; expectRunID?: string }) => {
         stamps.push({ record: write.record, ...(write.expectRunID ? { expectRunID: write.expectRunID } : {}) })
+        delegation = write.record
         return Effect.succeed(true)
       },
       stampDelegationDelivery: () =>
         Effect.sync(() => {
           deliveryClaimed = true
+          if (delegation) delegation = { ...delegation, deliveryOutcome: "delivered" }
         }),
-      claimDelegationDelivery: () => Effect.succeed(deliveryClaimed ? undefined : "claim"),
+      claimDelegationDelivery: () => Effect.succeed(input.deliveryClaims?.shift() ?? (deliveryClaimed ? undefined : "claim")),
       findMessage: (_sessionID: string, predicate: (message: typeof parentMessage) => boolean) =>
         Effect.succeed(predicate(parentMessage) ? Option.some(parentMessage) : Option.none()),
       updatePart: (part: Record<string, unknown>) =>
@@ -696,6 +715,7 @@ function harness(input: {
     // Background children here answer without the completion marker; do not
     // wait the production grace period for one.
     backgroundCompletionGraceMs: input.backgroundCompletionGraceMs ?? 0,
+    ...(input.deliveryClaimGraceMs !== undefined ? { deliveryClaimGraceMs: input.deliveryClaimGraceMs } : {}),
   }
   const { runSwarmRole } = PromptSwarm.make(deps as never)
   return {

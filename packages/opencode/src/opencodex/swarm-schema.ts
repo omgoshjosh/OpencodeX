@@ -38,6 +38,12 @@ export const ModelRef = Schema.Struct({
   modelID: ProviderV2.ModelID,
 })
 
+export const FallbackModel = Schema.Struct({
+  providerID: ProviderV2.ID,
+  modelID: ProviderV2.ModelID,
+  variant: Schema.optional(Schema.String),
+})
+
 export const Event = Schema.Struct({
   id: Schema.String,
   swarmID: Schema.String,
@@ -77,7 +83,7 @@ export const Role = Schema.Struct({
   skill: Schema.optional(Schema.String),
   providerID: Schema.optional(ProviderV2.ID),
   modelID: Schema.optional(ProviderV2.ModelID),
-  fallbackModels: Schema.optional(Schema.Array(ModelRef)),
+  fallbackModels: Schema.optional(Schema.Array(FallbackModel)),
   /** The model variant (effort level) this role runs at, when one is chosen. */
   variant: Schema.optional(Schema.String),
   modelProfile: Schema.optional(Schema.String),
@@ -118,7 +124,7 @@ export const RoleInput = Schema.Struct({
   skill: Schema.optional(Schema.String),
   providerID: Schema.optional(ProviderV2.ID),
   modelID: Schema.optional(ProviderV2.ModelID),
-  fallbackModels: Schema.optional(Schema.Array(ModelRef)),
+  fallbackModels: Schema.optional(Schema.Array(FallbackModel)),
   /** The model variant (effort level) to run this role at. */
   variant: Schema.optional(Schema.String),
   modelProfile: Schema.optional(Schema.String),
@@ -156,7 +162,7 @@ export const UpdateRoleInput = Schema.Struct({
   skill: Schema.optional(Schema.String),
   providerID: Schema.optional(Schema.String),
   modelID: Schema.optional(Schema.String),
-  fallbackModels: Schema.optional(Schema.Array(ModelRef)),
+  fallbackModels: Schema.optional(Schema.Array(FallbackModel)),
   variant: Schema.optional(Schema.String),
   modelProfile: Schema.optional(Schema.String),
   instructions: Schema.optional(Schema.String),

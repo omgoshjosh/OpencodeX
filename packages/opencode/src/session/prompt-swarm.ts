@@ -265,7 +265,7 @@ export function make(deps: Deps) {
       text: string
     },
     retried = false,
-  ) =>
+  ): Effect.Effect<void, Image.Error> =>
     Effect.gen(function* () {
       const parent = yield* sessions.get(input.parentSessionID).pipe(Effect.orDie)
       const claim = yield* sessions.claimDelegationDelivery({

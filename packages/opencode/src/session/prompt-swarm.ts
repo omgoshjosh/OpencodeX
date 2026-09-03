@@ -264,24 +264,21 @@ export function make(deps: Deps) {
       state: "completed" | "error"
       text: string
     },
-    retried = false,
   ): Effect.Effect<void, Image.Error> =>
     Effect.gen(function* () {
       const parent = yield* sessions.get(input.parentSessionID).pipe(Effect.orDie)
-      const claim = yield* sessions.claimDelegationDelivery({
-        sessionID: input.childSessionID,
-        runID: input.runID,
-      })
-      if (!claim) {
+      let claim: string | undefined
+      while (!claim) {
+        claim = yield* sessions.claimDelegationDelivery({
+          sessionID: input.childSessionID,
+          runID: input.runID,
+        })
+        if (claim) break
         const current = yield* sessions.get(input.childSessionID).pipe(Effect.option)
         if (Option.isSome(current) && delegationRecord(current.value.metadata)?.deliveryOutcome === "delivered") return
-        if (retried) return
-        // A restart can observe the former process's fresh claim after it wrote
-        // promptAsync's command but before it stamped delivery. Retry once after
-        // the claim grace; the deterministic message/command makes this safe.
+        // A crashed claimant is reclaimable after this bounded sleep. This
+        // remains in the background job's scope and never spins actively.
         yield* Effect.sleep(deps.deliveryClaimGraceMs ?? DELEGATION_DELIVERY_CLAIM_GRACE)
-        yield* Effect.suspend(() => deliverReport(input, true))
-        return
       }
       const messageID = MessageID.make(`msg_delegation_recovery_${input.runID}`)
       yield* deps

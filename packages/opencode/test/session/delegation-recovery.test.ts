@@ -14,6 +14,8 @@ import { Session } from "@/session/session"
 import { Database } from "@opencode-ai/core/database/database"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
+import { SessionCommandTable, SessionTable } from "@opencode-ai/core/session/sql"
+import { eq } from "drizzle-orm"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Context, Effect, Layer, Ref } from "effect"
 import { Storage } from "@/storage/storage"
@@ -524,5 +526,74 @@ it.instance("replays a stale crash claim once while concurrent fresh claimants r
     yield* Effect.all([recovery.recover(), recovery.recover()], { concurrency: "unbounded", discard: true })
     expect(yield* Ref.get(notices)).toBe(1)
     expect(delegationRecord((yield* sessions.get(child.id)).metadata)).toMatchObject({ deliveryOutcome: "delivered" })
+  }),
+)
+
+it.instance("stamps a recovered report delivered when its deterministic command already succeeded", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const database = yield* Database.Service
+    const parent = yield* sessions.create({})
+    const child = yield* sessions.create({ parentID: parent.id })
+    const messageID = MessageID.make("msg_delegation_recovery_run_recovery")
+    const parentRow = yield* database.db.select().from(SessionTable).where(eq(SessionTable.id, parent.id)).get().pipe(Effect.orDie)
+    if (!parentRow) return yield* Effect.die(new Error("missing parent session row"))
+    yield* sessions.updateMessage({
+      id: messageID,
+      sessionID: parent.id,
+      role: "user",
+      time: { created: 1 },
+      agent: "build",
+      model: { providerID: ProviderV2.ID.make("test"), modelID: ProviderV2.ModelID.make("test") },
+    })
+    yield* database.db
+      .insert(SessionCommandTable)
+      .values({
+        id: "sec_delegation_recovery_succeeded",
+        session_id: parent.id,
+        message_id: messageID,
+        project_id: parentRow.project_id,
+        directory: parentRow.directory,
+        status: "succeeded",
+        completed_at: 2,
+        time_created: 1,
+        time_updated: 2,
+      })
+      .run()
+      .pipe(Effect.orDie)
+    yield* sessions.stampDelegation({
+      sessionID: child.id,
+      record: record(parent.id, "msg_recovered", {
+        phase: "settled",
+        outcome: "completed",
+        completedAt: 2,
+        deliveryOutcome: "pending",
+        summary: "already persisted",
+      }),
+    })
+    const executions = yield* Ref.make(0)
+    const recovery = yield* SessionDelegationRecovery.make({
+      database,
+      sessions,
+      notify: (input) =>
+        Effect.gen(function* () {
+          expect(input.messageID).toBe(messageID)
+          const existing = yield* database.db
+            .select({ status: SessionCommandTable.status })
+            .from(SessionCommandTable)
+            .where(eq(SessionCommandTable.message_id, input.messageID))
+            .get()
+            .pipe(Effect.orDie)
+          if (!existing || existing.status !== "succeeded") yield* Ref.update(executions, (count) => count + 1)
+        }),
+      refresh: () => Effect.void,
+    })
+    yield* recovery.recover()
+    expect(yield* Ref.get(executions)).toBe(0)
+    expect(
+      yield* database.db.select().from(SessionCommandTable).where(eq(SessionCommandTable.message_id, messageID)).all().pipe(Effect.orDie),
+    ).toHaveLength(1)
+    expect((yield* sessions.messages({ sessionID: parent.id })).filter((message) => message.info.id === messageID)).toHaveLength(1)
+    expect(delegationRecord((yield* sessions.get(child.id)).metadata)?.deliveryOutcome).toBe("delivered")
   }),
 )

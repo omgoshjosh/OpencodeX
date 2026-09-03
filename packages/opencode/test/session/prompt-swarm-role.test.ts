@@ -231,12 +231,12 @@ describe("background swarm delegation", () => {
     expect(asyncPrompts[0]?.text).toContain('state="error"')
   })
 
-  test("retries one fresh crashed delivery claim after its grace", async () => {
+  test("reclaims multiple fresh crashed delivery claims after their grace", async () => {
     const { runSwarmRole, asyncPrompts, runJob } = harness({
       skills: {},
       background: true,
       deliveryClaimGraceMs: 0,
-      deliveryClaims: [undefined, "reclaimed"],
+      deliveryClaims: [undefined, undefined, "reclaimed"],
     })
 
     await Effect.runPromise(run(runSwarmRole, { background: true }))

@@ -20,6 +20,7 @@ import { MessageID, PartID, SessionID } from "./schema"
 import type { PromptInput } from "./prompt-schema"
 import {
   DELEGATION_RECORD_VERSION,
+  DELEGATION_DELIVERY_CLAIM_GRACE,
   delegationRecord,
   settleDelegation,
   type DelegationOutcome,
@@ -88,6 +89,8 @@ export interface Deps {
    * delivered anyway. Defaults to 30 minutes; tests set 0.
    */
   readonly backgroundCompletionGraceMs?: number
+  /** Bounded wait before retrying a fresh delivery claim after restart. */
+  readonly deliveryClaimGraceMs?: number
 }
 
 /**
@@ -252,21 +255,34 @@ export function make(deps: Deps) {
    * concurrent workers; the message identity lets recovery resume after a
    * crash between the command write and the delivery stamp.
    */
-  const deliverReport = (input: {
-    parentSessionID: SessionID
-    childSessionID: SessionID
-    runID: string
-    role: string
-    state: "completed" | "error"
-    text: string
-  }) =>
+  const deliverReport = (
+    input: {
+      parentSessionID: SessionID
+      childSessionID: SessionID
+      runID: string
+      role: string
+      state: "completed" | "error"
+      text: string
+    },
+    retried = false,
+  ) =>
     Effect.gen(function* () {
       const parent = yield* sessions.get(input.parentSessionID).pipe(Effect.orDie)
       const claim = yield* sessions.claimDelegationDelivery({
         sessionID: input.childSessionID,
         runID: input.runID,
       })
-      if (!claim) return
+      if (!claim) {
+        const current = yield* sessions.get(input.childSessionID).pipe(Effect.option)
+        if (Option.isSome(current) && delegationRecord(current.value.metadata)?.deliveryOutcome === "delivered") return
+        if (retried) return
+        // A restart can observe the former process's fresh claim after it wrote
+        // promptAsync's command but before it stamped delivery. Retry once after
+        // the claim grace; the deterministic message/command makes this safe.
+        yield* Effect.sleep(deps.deliveryClaimGraceMs ?? DELEGATION_DELIVERY_CLAIM_GRACE)
+        yield* Effect.suspend(() => deliverReport(input, true))
+        return
+      }
       const messageID = MessageID.make(`msg_delegation_recovery_${input.runID}`)
       yield* deps
         .promptAsync({

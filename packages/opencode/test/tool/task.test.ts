@@ -975,6 +975,7 @@ describe("tool.task", () => {
   background.instance("background tasks complete through the background job service", () =>
     Effect.gen(function* () {
       const jobs = yield* BackgroundJob.Service
+      const prompts: SessionPrompt.PromptInput[] = []
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
       const def = yield* tool.init()
@@ -992,7 +993,7 @@ describe("tool.task", () => {
           directory: chat.directory,
           agent: "build",
           abort: new AbortController().signal,
-          extra: { promptOps: stubOps({ text: "background done" }) },
+          extra: { promptOps: stubOps({ text: "background done", onPrompt: (input) => prompts.push(input) }) },
           messages: [],
           metadata: () => Effect.void,
           ask: () => Effect.void,
@@ -1003,6 +1004,19 @@ describe("tool.task", () => {
       expect(waited.timedOut).toBe(false)
       expect(waited.info?.status).toBe("completed")
       expect(waited.info?.output).toBe("background done")
+
+      // The report that wakes the parent is a synthetic-only user message; the
+      // prompt loop only answers it because of this tag (2026-09-03: without
+      // it every background subagent finished and nobody read the result).
+      const report = prompts.find((input) => input.sessionID === chat.id)
+      expect(report).toBeDefined()
+      const part = report?.parts[0]
+      expect(part?.type).toBe("text")
+      if (part?.type === "text") {
+        expect(part.synthetic).toBe(true)
+        expect(part.metadata).toMatchObject({ task_report: true })
+        expect(part.text).toContain('state="completed"')
+      }
     }),
   )
 

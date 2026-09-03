@@ -275,7 +275,10 @@ export function make(deps: Deps) {
         })
         if (claim) break
         const current = yield* sessions.get(input.childSessionID).pipe(Effect.option)
-        if (Option.isSome(current) && delegationRecord(current.value.metadata)?.deliveryOutcome === "delivered") return
+        if (Option.isNone(current)) return
+        const record = delegationRecord(current.value.metadata)
+        if (!record || record.runID !== input.runID || record.deliveryOutcome === "delivered") return
+        if (record.deliveryOutcome !== "pending" && record.deliveryOutcome !== "delivering") return
         // A crashed claimant is reclaimable after this bounded sleep. This
         // remains in the background job's scope and never spins actively.
         yield* Effect.sleep(deps.deliveryClaimGraceMs ?? DELEGATION_DELIVERY_CLAIM_GRACE)

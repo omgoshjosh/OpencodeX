@@ -244,6 +244,20 @@ describe("background swarm delegation", () => {
     expect(asyncPrompts).toHaveLength(1)
     expect(asyncPrompts[0]?.messageID).toMatch(/^msg_delegation_recovery_run_/)
   })
+
+  test.each(["missing", "superseded"] as const)("stops reclaiming when the child is %s", async (deliveryChild) => {
+    const { runSwarmRole, asyncPrompts, runJob } = harness({
+      skills: {},
+      background: true,
+      deliveryClaimGraceMs: 0,
+      deliveryClaims: [undefined],
+      deliveryChild,
+    })
+
+    await Effect.runPromise(run(runSwarmRole, { background: true }))
+    await Effect.runPromise(runJob())
+    expect(asyncPrompts).toHaveLength(0)
+  })
 })
 
 describe("swarm role delegation validation", () => {
@@ -595,6 +609,7 @@ function harness(input: {
   backgroundCompletionGraceMs?: number
   deliveryClaimGraceMs?: number
   deliveryClaims?: Array<string | undefined>
+  deliveryChild?: "missing" | "superseded"
 }) {
   const started: Array<{ id?: string; metadata?: Record<string, unknown>; run: Effect.Effect<string, unknown> }> = []
   const prompts: string[] = []
@@ -620,11 +635,17 @@ function harness(input: {
     claudeDriver: {} as never,
     database: {} as never,
     sessions: {
-      get: () =>
-        Effect.succeed({
+      get: (sessionID: string) => {
+        if (sessionID === "ses_child" && input.deliveryChild === "missing") return Effect.fail(new Error("missing child"))
+        const childDelegation =
+          sessionID === "ses_child" && input.deliveryChild === "superseded" && delegation
+            ? { ...delegation, runID: "run_superseded" }
+            : delegation
+        return Effect.succeed({
           permission: undefined,
-          metadata: { opencodex: { swarmID: "swm_1", ...(delegation ? { delegation } : {}) } },
-        }),
+          metadata: { opencodex: { swarmID: "swm_1", ...(childDelegation ? { delegation: childDelegation } : {}) } },
+        })
+      },
       create: () => Effect.succeed({ id: "ses_child" }),
       messageWithChildren: () => Effect.succeed([...turn]),
       updateMessage: (message: SessionLegacy.Info) => {
@@ -643,7 +664,14 @@ function harness(input: {
           deliveryClaimed = true
           if (delegation) delegation = { ...delegation, deliveryOutcome: "delivered" }
         }),
-      claimDelegationDelivery: () => Effect.succeed(input.deliveryClaims?.shift() ?? (deliveryClaimed ? undefined : "claim")),
+      claimDelegationDelivery: () =>
+        Effect.succeed(
+          input.deliveryClaims && input.deliveryClaims.length > 0
+            ? input.deliveryClaims.shift()
+            : deliveryClaimed
+              ? undefined
+              : "claim",
+        ),
       findMessage: (_sessionID: string, predicate: (message: typeof parentMessage) => boolean) =>
         Effect.succeed(predicate(parentMessage) ? Option.some(parentMessage) : Option.none()),
       updatePart: (part: Record<string, unknown>) =>

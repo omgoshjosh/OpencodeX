@@ -43,6 +43,8 @@ import { SessionSummary } from "../../src/session/summary"
 import { Instruction } from "../../src/session/instruction"
 import { SessionProcessor } from "../../src/session/processor"
 import { SessionPrompt } from "../../src/session/prompt"
+import { SessionDelegationRecovery } from "../../src/session/delegation-recovery"
+import { DELEGATION_RECORD_VERSION, delegationRecord } from "../../src/session/delegation-outcome"
 import { PromptClaim } from "../../src/session/prompt-claim"
 import { SessionRevert } from "../../src/session/revert"
 import { SessionRunState } from "../../src/session/run-state"
@@ -729,6 +731,61 @@ it.instance("promptAsync retains one deterministic deferred report command throu
     ).toEqual([reportID])
     expect(yield* llm.calls).toBe(1)
     yield* prompt.cancel(chat.id)
+  }),
+)
+
+it.instance("recovery stamps delivery when real promptAsync finds a succeeded report command", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const database = yield* Database.Service
+    const parent = yield* sessions.create({})
+    const messageID = MessageID.make("msg_delegation_recovery_run_succeeded")
+    yield* prompt.promptAsync({
+      sessionID: parent.id,
+      messageID,
+      model: ref,
+      noReply: true,
+      parts: [{ type: "text", synthetic: true, metadata: { task_report: true }, text: "persisted report" }],
+    })
+    const child = yield* sessions.create({ parentID: parent.id })
+    yield* sessions.stampDelegation({
+      sessionID: child.id,
+      record: {
+        version: DELEGATION_RECORD_VERSION,
+        runID: "run_succeeded",
+        parentSessionID: parent.id,
+        attempt: 1,
+        phase: "settled",
+        outcome: "completed",
+        startedAt: 1,
+        completedAt: 2,
+        mode: "background",
+        deliveryOutcome: "pending",
+        summary: "persisted report",
+      },
+    })
+    const recovery = yield* SessionDelegationRecovery.make({
+      database,
+      sessions,
+      notify: (input) =>
+        prompt.promptAsync({
+          sessionID: input.sessionID,
+          messageID: input.messageID,
+          model: ref,
+          noReply: input.noReply,
+          parts: [{ type: "text", synthetic: true, metadata: { task_report: true }, text: input.text }],
+        }).pipe(Effect.orDie),
+      refresh: () => Effect.void,
+    })
+    yield* recovery.recover()
+    expect(
+      yield* database.db.select().from(SessionCommandTable).where(eq(SessionCommandTable.message_id, messageID)).all().pipe(Effect.orDie),
+    ).toHaveLength(1)
+    expect((yield* sessions.messages({ sessionID: parent.id })).filter((message) => message.info.id === messageID)).toHaveLength(1)
+    expect(yield* llm.calls).toBe(0)
+    expect(delegationRecord((yield* sessions.get(child.id)).metadata)?.deliveryOutcome).toBe("delivered")
   }),
 )
 

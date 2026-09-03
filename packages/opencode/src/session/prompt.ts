@@ -632,10 +632,18 @@ export const layer = Layer.effect(
           // depend on them winning this test for one iteration: the loop's own
           // auto-continue (bounded by AUTO_CONTINUE_LIMIT) and compaction's
           // follow-up (tagged compaction_continue). Both are allowed through.
-          // Anything else synthetic-only arrived from outside the turn.
+          // A background task or swarm-role report (tagged task_report by the
+          // task tool and deliverReport) is the third: it is delivered exactly
+          // once per child run and the orchestrator must answer it, or a
+          // background delegation never comes back. Anything else
+          // synthetic-only arrived from outside the turn.
           const isInternalContinuation = (m: SessionLegacy.WithParts) =>
             m.info.id === autoContinueID ||
-            m.parts.some((part) => part.type === "text" && part.metadata?.compaction_continue === true)
+            m.parts.some(
+              (part) =>
+                part.type === "text" &&
+                (part.metadata?.compaction_continue === true || part.metadata?.task_report === true),
+            )
 
           const lastHumanUser =
             msgs.findLast((m) => m.info.role === "user" && (!isSyntheticOnly(m) || isInternalContinuation(m)))?.info ??

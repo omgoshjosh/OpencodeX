@@ -577,6 +577,9 @@ export const TaskTool = Tool.define(
                 {
                   type: "text",
                   synthetic: true,
+                  // The prompt loop only answers a synthetic-only message it
+                  // recognises; this tag is how a report earns its turn.
+                  metadata: { task_report: true },
                   text: backgroundMessage({
                     sessionID: nextSession.id,
                     description: params.description,

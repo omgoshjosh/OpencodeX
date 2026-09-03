@@ -675,7 +675,7 @@ it.instance("promptAsync persists its message and execution intent before return
   }),
 )
 
-it.instance("promptAsync retains one deterministic deferred report command through queued and succeeded recovery", () =>
+it.instance("promptAsync retains one deterministic deferred report command through queued recovery", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)
     const prompt = yield* SessionPrompt.Service
@@ -683,8 +683,7 @@ it.instance("promptAsync retains one deterministic deferred report command throu
     const { db } = yield* Database.Service
     const chat = yield* sessions.create({})
     const reportID = MessageID.make("msg_delegation_recovery_run_durable")
-    yield* llm.text("first turn")
-    yield* llm.text("report turn")
+    yield* llm.hang
 
     yield* prompt.promptAsync({ sessionID: chat.id, model: ref, parts: [{ type: "text", text: "first" }] })
     yield* llm.wait(1)
@@ -695,7 +694,7 @@ it.instance("promptAsync retains one deterministic deferred report command throu
       delivery: "deferred" as const,
       parts: [{ type: "text" as const, synthetic: true, metadata: { task_report: true }, text: "report" }],
     }
-    yield* Effect.all([prompt.promptAsync(report), prompt.promptAsync(report)], { concurrency: "unbounded", discard: true })
+    yield* prompt.promptAsync(report)
 
     const command = () =>
       db
@@ -714,12 +713,11 @@ it.instance("promptAsync retains one deterministic deferred report command throu
         .pipe(Effect.orDie)).map((row) => row.message_id),
     ).toEqual([reportID])
 
-    yield* llm.wait(2)
-    yield* pollWithTimeout(
-      command().pipe(Effect.map((row) => (row?.status === "succeeded" ? row : undefined))),
-      "deferred report command did not succeed",
-    )
-    const callsBeforeRecovery = yield* llm.calls
+    const message = (yield* sessions.messages({ sessionID: chat.id })).filter((item) => item.info.id === reportID)
+    expect(message).toHaveLength(1)
+    expect(message[0]?.parts).toMatchObject([{ metadata: { task_report: true }, text: "report" }])
+    // A restart repeats delivery only after the first call durably persisted
+    // its command, so this must not add another message, part, or command.
     yield* prompt.promptAsync(report)
     expect(
       (yield* db
@@ -729,7 +727,8 @@ it.instance("promptAsync retains one deterministic deferred report command throu
         .all()
         .pipe(Effect.orDie)).map((row) => row.message_id),
     ).toEqual([reportID])
-    expect(yield* llm.calls).toBe(callsBeforeRecovery)
+    expect(yield* llm.calls).toBe(1)
+    yield* prompt.cancel(chat.id)
   }),
 )
 

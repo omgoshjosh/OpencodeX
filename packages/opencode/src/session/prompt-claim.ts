@@ -395,7 +395,6 @@ export function make(deps: Deps) {
           )
           .run()
           .pipe(Effect.orDie)
-        yield* Effect.suspend(() => wakeSession(command.session_id))
         return
       }
 
@@ -425,7 +424,6 @@ export function make(deps: Deps) {
         )
         .run()
         .pipe(Effect.orDie)
-      yield* Effect.suspend(() => wakeSession(command.session_id))
       yield* Effect.logError("prompt_async failed").pipe(
         Effect.annotateLogs({ sessionID: command.session_id, cause: exit.cause }),
       )

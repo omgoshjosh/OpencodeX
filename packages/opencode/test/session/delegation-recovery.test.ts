@@ -536,8 +536,12 @@ it.instance("stamps a recovered report delivered when its deterministic command 
     const parent = yield* sessions.create({})
     const child = yield* sessions.create({ parentID: parent.id })
     const messageID = MessageID.make("msg_delegation_recovery_run_recovery")
-    const parentRow = yield* database.db.select().from(SessionTable).where(eq(SessionTable.id, parent.id)).get().pipe(Effect.orDie)
-    if (!parentRow) return yield* Effect.die(new Error("missing parent session row"))
+    const parentRow = yield* database.db
+      .select()
+      .from(SessionTable)
+      .where(eq(SessionTable.id, parent.id))
+      .get()
+      .pipe(Effect.flatMap((row) => (row ? Effect.succeed(row) : Effect.die(new Error("missing parent session row")))))
     yield* sessions.updateMessage({
       id: messageID,
       sessionID: parent.id,

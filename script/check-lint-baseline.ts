@@ -31,9 +31,19 @@ export async function checkLintBaseline(command: string[], baselineWarnings: num
 }
 
 if (import.meta.main) {
-  const baseline = JSON.parse(await Bun.file(import.meta.dir + "/../.oxlint-baseline.json").text())
-  if (!record(baseline) || typeof baseline.warnings !== "number") throw new Error("Invalid .oxlint-baseline.json")
-  await checkLintBaseline(["bunx", "oxlint", "--format", "json"], baseline.warnings)
+  await checkLintBaseline(
+    ["bunx", "oxlint", "--format", "json"],
+    lintBaselineWarnings(JSON.parse(await Bun.file(import.meta.dir + "/../.oxlint-baseline.json").text())),
+  )
+}
+
+export function lintBaselineWarnings(baseline: unknown, platform = globalThis.process.platform) {
+  if (!record(baseline)) throw new Error("Invalid .oxlint-baseline.json")
+  if (typeof baseline.warnings === "number") return baseline.warnings
+  if (!record(baseline.warnings)) throw new Error("Invalid .oxlint-baseline.json")
+  const warnings = baseline.warnings[platform] ?? baseline.warnings.default
+  if (typeof warnings !== "number") throw new Error("Invalid .oxlint-baseline.json")
+  return warnings
 }
 
 function record(value: unknown): value is Record<string, unknown> {

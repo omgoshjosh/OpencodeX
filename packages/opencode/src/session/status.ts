@@ -3,28 +3,38 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
 import { NonNegativeInt } from "@opencode-ai/core/schema"
-import { SessionExecutionTable, SessionStatusTable } from "@opencode-ai/core/session/sql"
+import { SessionExecutionTable, SessionStatusTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { ensureRunID } from "@opencode-ai/core/util/opencode-process"
 import { and, eq } from "drizzle-orm"
 import { Context, Duration, Effect, Layer, Option, Schedule, Schema } from "effect"
 import { SessionID } from "./schema"
 import { SessionExecutionOwner } from "./execution-owner"
+import { delegationRecord } from "./delegation-outcome"
+
+const Background = Schema.Struct({
+  running: Schema.Boolean,
+  jobs: Schema.Array(Schema.Struct({ role: Schema.String, title: Schema.String, owner: Schema.String })),
+})
 
 export const Info = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("idle"),
+    background: Schema.optional(Background),
   }),
   Schema.Struct({
     type: Schema.Literal("retry"),
     attempt: NonNegativeInt,
     message: Schema.String,
     next: NonNegativeInt,
+    background: Schema.optional(Background),
   }),
   Schema.Struct({
     type: Schema.Literal("busy"),
+    background: Schema.optional(Background),
   }),
   Schema.Struct({
     type: Schema.Literal("blocked"),
+    background: Schema.optional(Background),
     childSessionID: SessionID,
     attemptedModels: Schema.Array(Schema.String),
     error: Schema.String,
@@ -32,6 +42,7 @@ export const Info = Schema.Union([
   }),
   Schema.Struct({
     type: Schema.Literal("monitoring"),
+    background: Schema.optional(Background),
     childSessionID: Schema.optional(SessionID),
     monitorID: Schema.optional(Schema.String),
     since: Schema.optional(NonNegativeInt),
@@ -66,6 +77,7 @@ export interface Interface {
   readonly list: () => Effect.Effect<Map<SessionID, Info>>
   readonly set: (sessionID: SessionID, status: Info) => Effect.Effect<void>
   readonly setForGeneration: (sessionID: SessionID, generation: number, status: Info) => Effect.Effect<boolean>
+  readonly refresh: (sessionID: SessionID) => Effect.Effect<void>
   readonly claimBlockedRetry: (input: { sessionID: SessionID; childSessionID: SessionID }) => Effect.Effect<boolean>
   readonly settleMonitoring: (input: {
     sessionID: SessionID
@@ -90,6 +102,37 @@ export const layer = Layer.effect(
     const events = yield* EventV2Bridge.Service
     const { db } = yield* Database.Service
     const processRunID = ensureRunID()
+
+    const backgrounds = Effect.fnUntraced(function* () {
+      const rows = yield* db
+        .select({ metadata: SessionTable.metadata, title: SessionTable.title })
+        .from(SessionTable)
+        .all()
+        .pipe(Effect.orDie)
+      return rows.reduce((result, row) => {
+        const record = delegationRecord(row.metadata)
+        if (!record?.background || record.phase !== "running" || !record.ownerID) return result
+        if (!SessionExecutionOwner.alive(record.ownerID, processRunID)) return result
+        const parentID = SessionID.make(record.parentSessionID)
+        const jobs = result.get(parentID) ?? []
+        jobs.push({ role: record.role ?? "Background task", title: record.title ?? row.title, owner: record.ownerID })
+        result.set(parentID, jobs)
+        return result
+      }, new Map<SessionID, { role: string; title: string; owner: string }[]>())
+    })
+
+    const withBackground = (status: Info, jobs: { role: string; title: string; owner: string }[] | undefined): Info =>
+      jobs?.length
+        ? {
+            ...status,
+            background: {
+              running: true,
+              jobs: jobs.toSorted((a, b) =>
+                `${a.role}\u0000${a.title}\u0000${a.owner}`.localeCompare(`${b.role}\u0000${b.title}\u0000${b.owner}`),
+              ),
+            },
+          }
+        : status
 
     // `sessionID` scopes the scan to one row. Reads take that path so a status
     // lookup stays an indexed point query instead of two full table scans in an
@@ -171,7 +214,10 @@ export const layer = Layer.effect(
         .where(eq(SessionStatusTable.session_id, sessionID))
         .get()
         .pipe(Effect.orDie)
-      return row ? Option.getOrElse(decode(row.status), () => ({ type: "idle" as const })) : { type: "idle" as const }
+      const status = row
+        ? Option.getOrElse(decode(row.status), () => ({ type: "idle" as const }))
+        : { type: "idle" as const }
+      return withBackground(status, (yield* backgrounds()).get(sessionID))
     })
 
     const list = Effect.fn("SessionStatus.list")(function* () {
@@ -181,17 +227,22 @@ export const layer = Layer.effect(
         .from(SessionStatusTable)
         .all()
         .pipe(Effect.orDie)
-      return new Map(
+      const result = new Map<SessionID, Info>(
         rows.flatMap((row) => {
           const status = Option.getOrUndefined(decode(row.status))
           return status && status.type !== "idle" ? [[row.sessionID, status] as const] : []
         }),
       )
+      for (const [sessionID, jobs] of yield* backgrounds()) {
+        result.set(sessionID, withBackground(result.get(sessionID) ?? { type: "idle" }, jobs))
+      }
+      return result
     })
 
     const write = Effect.fnUntraced(function* (sessionID: SessionID, status: Info, generation?: number) {
       const ctx = yield* InstanceState.context
       const now = Date.now()
+      const { background: _background, ...persisted } = status
       const committed = yield* events.barrier(
         db
           .transaction(
@@ -224,7 +275,7 @@ export const layer = Layer.effect(
                     session_id: sessionID,
                     project_id: ctx.project.id,
                     directory: ctx.directory,
-                    status,
+                    status: persisted,
                     time_created: now,
                     time_updated: now,
                   })
@@ -233,13 +284,13 @@ export const layer = Layer.effect(
                     set: {
                       project_id: ctx.project.id,
                       directory: ctx.directory,
-                      status,
+                      status: persisted,
                       time_updated: now,
                     },
                   })
                   .run()
                 return {
-                  status: yield* events.commit(Event.Status, { sessionID, status }),
+                  status: yield* events.commit(Event.Status, { sessionID, status: persisted }),
                   idle: status.type === "idle" ? yield* events.commit(Event.Idle, { sessionID }) : undefined,
                 }
               }),
@@ -268,6 +319,10 @@ export const layer = Layer.effect(
         return
       }
       yield* write(sessionID, status)
+    })
+
+    const refresh = Effect.fn("SessionStatus.refresh")(function* (sessionID: SessionID) {
+      yield* events.publish(Event.Status, { sessionID, status: yield* get(sessionID) })
     })
 
     const claimBlockedRetry = Effect.fn("SessionStatus.claimBlockedRetry")(function* (input: {
@@ -361,7 +416,7 @@ export const layer = Layer.effect(
       Effect.forkScoped,
     )
 
-    return Service.of({ get, list, set, setForGeneration, claimBlockedRetry, settleMonitoring })
+    return Service.of({ get, list, set, setForGeneration, refresh, claimBlockedRetry, settleMonitoring })
   }),
 )
 

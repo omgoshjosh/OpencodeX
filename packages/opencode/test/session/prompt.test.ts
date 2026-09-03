@@ -1196,7 +1196,7 @@ it.instance("preserves live reservations and fences stale Claude offers", () =>
       .run()
       .pipe(Effect.orDie)
 
-    expect(yield* claim.claimCommandTurn("sec_unoffered_live")).toEqual({ state: "occupied" })
+    expect(yield* claim.claimCommandTurn("sec_unoffered_live")).toEqual({ state: "waiting" })
     expect(
       yield* database.db
         .select({ owner: SessionCommandTable.adopted_by, generation: SessionCommandTable.adopted_generation })
@@ -1245,7 +1245,7 @@ it.instance("preserves live reservations and fences stale Claude offers", () =>
       .where(eq(SessionCommandTable.id, "sec_unoffered_live"))
       .run()
       .pipe(Effect.orDie)
-    expect(yield* claim.claimCommandTurn("sec_unoffered_live")).toEqual({ state: "occupied" })
+    expect(yield* claim.claimCommandTurn("sec_unoffered_live")).toEqual({ state: "waiting" })
     expect(
       yield* database.db
         .select({ status: SessionCommandTable.status, offeredAt: SessionCommandTable.offered_at })

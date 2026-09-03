@@ -958,7 +958,14 @@ export const layer = Layer.effect(
         .pipe(Effect.orDie)
       const steering = input.delivery === "immediate" && (yield* state.interrupt(input.sessionID))
       if (steering) yield* markSteering(message)
-      if (input.noReply !== true) yield* wakeSession(input.sessionID)
+      if (input.noReply !== true) {
+        // Arm the recovery sweep alongside the direct launch. `wakeSession`
+        // only starts what is launchable RIGHT NOW; a predecessor still
+        // holding an unexpired lease from a dead process becomes launchable
+        // later, and the periodic sweep is the only thing that notices.
+        yield* start()
+        yield* wakeSession(input.sessionID)
+      }
     })
 
     const delegationRecovery = yield* SessionDelegationRecovery.make({
@@ -1118,7 +1125,10 @@ export const layer = Layer.effect(
         }),
       prompt,
       promptAsync,
-      recover,
+      // Also arms the periodic sweep, which is what reclaims a command whose
+      // FOREIGN owner died: nothing else polls for an expired lease, so a
+      // caller that recovers once and then waits would wait forever.
+      recover: () => start().pipe(Effect.andThen(recover)),
       loop,
       shell,
       command,

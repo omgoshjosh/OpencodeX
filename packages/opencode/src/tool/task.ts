@@ -667,6 +667,25 @@ export const TaskTool = Tool.define(
           }),
           () =>
             Effect.gen(function* () {
+              // Already aborted before the task started: cancel and settle
+              // without ever prompting the child. (Upstream 7eb4fedeb; a
+              // signal that fired before `addEventListener` never calls the
+              // listener, so the `acquire` above fires it by hand.) A
+              // cancellation raised MID-flight is different: that one lets
+              // `runTask` finish so the persisted outcome is delivered.
+              if (cancelState.requested) {
+                yield* cancel
+                const cancelled = {
+                  state: "cancelled",
+                  text: "The subagent was cancelled.",
+                } satisfies TaskRunResult
+                yield* settleResult(cancelled)
+                return {
+                  title: params.description,
+                  metadata,
+                  output: output(nextSession.id, cancelled),
+                }
+              }
               const result = yield* runTask()
               const final = cancelState.requested
                 ? ({ state: "cancelled", text: "The subagent was cancelled." } satisfies TaskRunResult)

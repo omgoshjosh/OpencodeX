@@ -42,7 +42,7 @@ export const FallbackModel = Schema.Struct({
   providerID: ProviderV2.ID,
   modelID: ProviderV2.ModelID,
   variant: Schema.optional(Schema.String),
-})
+}).annotate({ identifier: "OpencodeXSwarmFallbackModel" })
 
 export const Event = Schema.Struct({
   id: Schema.String,

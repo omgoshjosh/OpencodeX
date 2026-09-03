@@ -65,6 +65,11 @@ describe("instance HttpApi", () => {
       expect(yield* response.json).toMatchObject({
         openapi: expect.any(String),
         info: expect.any(Object),
+        components: {
+          schemas: {
+            OpencodeXSwarmFallbackModel: expect.any(Object),
+          },
+        },
         paths: expect.objectContaining({
           "/global/health": expect.any(Object),
           "/global/restart-readiness": expect.any(Object),

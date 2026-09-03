@@ -80,7 +80,7 @@ export function mergeRoleFallbacks(roles: readonly RoleInput[], existing: readon
   // chain, so only a rename or deletion of a chain-carrying role is a
   // compatibility question.
   const incompatible = existing.some((previous) => {
-    if (!previous.fallbackModels.length) return false
+    if (!previous.fallbackModels?.length) return false
     if (explicit) return false
     return !roles.some((role) => roleName(previous.name) === roleName(role.name))
   })
@@ -199,10 +199,6 @@ export function hydrateRole(row: typeof OpencodeXSwarmRoleTable.$inferSelect): R
     skill: row.skill ?? undefined,
     providerID: row.provider_id ? ProviderV2.ID.make(row.provider_id) : undefined,
     modelID: row.model_id ? ProviderV2.ModelID.make(row.model_id) : undefined,
-    fallbackModels: row.fallback_models?.map((model) => ({
-      providerID: ProviderV2.ID.make(model.providerID),
-      modelID: ProviderV2.ModelID.make(model.modelID),
-    })),
     variant: row.variant ?? undefined,
     fallbackModels:
       row.sort_order === 0

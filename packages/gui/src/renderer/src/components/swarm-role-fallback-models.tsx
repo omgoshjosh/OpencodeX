@@ -1,30 +1,35 @@
-import type { OpencodeXSwarmFallbackModel, OpencodeXSwarmRoleInput, Provider } from "@opencode-ai/sdk/v2/client"
+import type { OpencodeXSwarmRoleInput, Provider } from "@opencode-ai/sdk/v2/client"
 import { For, Show, createMemo } from "solid-js"
-import { canAddSwarmRoleFallback, moveSwarmRoleFallback, removeSwarmRoleFallback } from "../lib/swarm-role-fallbacks"
+import {
+  canAddSwarmRoleFallback,
+  moveSwarmRoleFallback,
+  removeSwarmRoleFallback,
+  type SwarmRoleFallbackModel,
+} from "../lib/swarm-role-fallbacks"
 import { Button, IconButton, Select } from "./ui"
 
 export function SwarmRoleFallbackModels(props: {
   role: OpencodeXSwarmRoleInput
   providers: Provider[]
   connectedProviderIDs: string[]
-  update: (fallbackModels: OpencodeXSwarmFallbackModel[]) => void
+  update: (fallbackModels: SwarmRoleFallbackModel[]) => void
   openModelPicker: (index: number | "new") => void
 }) {
   const fallbacks = createMemo(() => props.role.fallbackModels ?? [])
-  const summary = (fallback: OpencodeXSwarmFallbackModel) => {
+  const summary = (fallback: SwarmRoleFallbackModel) => {
     const provider = props.providers.find((item) => item.id === fallback.providerID)
     return {
       provider: provider?.name ?? fallback.providerID,
       model: provider?.models[fallback.modelID]?.name ?? fallback.modelID,
     }
   }
-  const variants = (fallback: OpencodeXSwarmFallbackModel) => {
+  const variants = (fallback: SwarmRoleFallbackModel) => {
     const model = props.providers.find((provider) => provider.id === fallback.providerID)?.models[fallback.modelID]
     return ["default", ...Object.keys(model?.variants ?? {})]
   }
   const effortLabel = (value: string) => (value === "default" ? "Default" : value.charAt(0).toUpperCase() + value.slice(1))
 
-  function updateFallback(index: number, update: (model: OpencodeXSwarmFallbackModel) => OpencodeXSwarmFallbackModel) {
+  function updateFallback(index: number, update: (model: SwarmRoleFallbackModel) => SwarmRoleFallbackModel) {
     props.update(fallbacks().map((model, currentIndex) => (currentIndex === index ? update(model) : model)))
   }
 

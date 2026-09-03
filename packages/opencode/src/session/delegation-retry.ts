@@ -11,6 +11,7 @@ import { SessionPrompt } from "./prompt"
 import { SessionStatus } from "./status"
 import { SessionID } from "./schema"
 import { DELEGATION_RECORD_VERSION, delegationAttempts, delegationRecord } from "./delegation-outcome"
+import { hydrateFallbackModels } from "@/opencodex/swarm-model"
 
 export type Result = {
   childSessionID: SessionID
@@ -65,7 +66,10 @@ export const retryBlockedChild = Effect.fn("DelegationRetry.retryBlockedChild")(
     .pipe(Effect.orDie)
   if (!role?.providerID || !role.modelID)
     return yield* new RetryError({ message: "Swarm role has no current primary model." })
-  const routes = [{ providerID: role.providerID, modelID: role.modelID }, ...(role.fallbackModels ?? [])]
+  const routes = [
+    { providerID: role.providerID, modelID: role.modelID, ...(role.variant ? { variant: role.variant } : {}) },
+    ...hydrateFallbackModels(role.fallbackModels, { providerID: role.providerID, modelID: role.modelID }),
+  ]
   const selected = selectUntriedRoute(routes, blocked.attemptedModels)
   if (!selected)
     return yield* new RetryError({
@@ -96,7 +100,7 @@ export const retryBlockedChild = Effect.fn("DelegationRetry.retryBlockedChild")(
       sessionID: child.id,
       model: { providerID: ProviderV2.ID.make(selected.providerID), modelID: ProviderV2.ModelID.make(selected.modelID) },
       ...(role.agent ? { agent: role.agent } : {}),
-      ...(role.variant && role.variant !== "default" ? { variant: role.variant } : {}),
+      ...(selected.variant && selected.variant !== "default" ? { variant: selected.variant } : {}),
       parts,
     })
     .pipe(
@@ -123,8 +127,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
-export function selectUntriedRoute(
-  routes: readonly { providerID: string; modelID: string }[],
+export function selectUntriedRoute<T extends { providerID: string; modelID: string }>(
+  routes: readonly T[],
   attemptedModels: readonly string[],
 ) {
   return routes.find((route) => !attemptedModels.includes(`${route.providerID}/${route.modelID}`))

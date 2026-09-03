@@ -33,9 +33,6 @@ export type Event =
   | EventLspUpdated
   | EventOpencodexJobCreated
   | EventOpencodexJobTransitioned
-  | EventOpencodexSwarmCreated
-  | EventOpencodexSwarmUpdated
-  | EventOpencodexSwarmDeleted
   | EventTuiPromptAppend2
   | EventTuiCommandExecute2
   | EventTuiToastShow2
@@ -57,6 +54,9 @@ export type Event =
   | EventOpencodexGoalUpdated
   | EventOpencodexGoalDeleted
   | EventOpencodexGuiBridgeRequest
+  | EventOpencodexSwarmCreated
+  | EventOpencodexSwarmUpdated
+  | EventOpencodexSwarmDeleted
   | EventWorkspaceReady
   | EventWorkspaceFailed
   | EventWorkspaceStatus
@@ -667,6 +667,14 @@ export type SessionStatus =
     }
   | {
       type: "blocked"
+      background?: {
+        running: boolean
+        jobs: Array<{
+          role: string
+          title: string
+          owner: string
+        }>
+      }
       childSessionID: string
       attemptedModels: Array<string>
       error: string
@@ -674,6 +682,14 @@ export type SessionStatus =
     }
   | {
       type: "monitoring"
+      background?: {
+        running: boolean
+        jobs: Array<{
+          role: string
+          title: string
+          owner: string
+        }>
+      }
       childSessionID?: string
       monitorID?: string
       since?: number
@@ -992,27 +1008,6 @@ export type GlobalEvent = {
       }
     | {
         id: string
-        type: "opencodex.swarm.created"
-        properties: {
-          swarmID: string
-        }
-      }
-    | {
-        id: string
-        type: "opencodex.swarm.updated"
-        properties: {
-          swarmID: string
-        }
-      }
-    | {
-        id: string
-        type: "opencodex.swarm.deleted"
-        properties: {
-          swarmID: string
-        }
-      }
-    | {
-        id: string
         type: "tui.prompt.append"
         properties: {
           text: string
@@ -1224,6 +1219,27 @@ export type GlobalEvent = {
       }
     | {
         id: string
+        type: "opencodex.swarm.created"
+        properties: {
+          swarmID: string
+        }
+      }
+    | {
+        id: string
+        type: "opencodex.swarm.updated"
+        properties: {
+          swarmID: string
+        }
+      }
+    | {
+        id: string
+        type: "opencodex.swarm.deleted"
+        properties: {
+          swarmID: string
+        }
+      }
+    | {
+        id: string
         type: "workspace.ready"
         properties: {
           name: string
@@ -1342,9 +1358,6 @@ export type GlobalEvent = {
     | SyncEventSessionStatus
     | SyncEventOpencodexJobCreated
     | SyncEventOpencodexJobTransitioned
-    | SyncEventOpencodexSwarmCreated
-    | SyncEventOpencodexSwarmUpdated
-    | SyncEventOpencodexSwarmDeleted
     | SyncEventOpencodexTerminalSessionCreated
     | SyncEventOpencodexTerminalSessionUpdated
     | SyncEventOpencodexTerminalSessionDeleted
@@ -1356,6 +1369,9 @@ export type GlobalEvent = {
     | SyncEventOpencodexGoalCreated
     | SyncEventOpencodexGoalUpdated
     | SyncEventOpencodexGoalDeleted
+    | SyncEventOpencodexSwarmCreated
+    | SyncEventOpencodexSwarmUpdated
+    | SyncEventOpencodexSwarmDeleted
     | SyncEventOpencodexViewCreated
     | SyncEventOpencodexViewUpdated
     | SyncEventOpencodexViewReordered
@@ -2484,12 +2500,6 @@ export type OpencodeXJob = {
   timeUpdated: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
 }
 
-export type OpencodeXSwarmFallbackModel = {
-  providerID: string
-  modelID: string
-  variant?: string
-}
-
 export type OpencodeXSwarmRole = {
   id: string
   swarmID: string
@@ -2501,9 +2511,9 @@ export type OpencodeXSwarmRole = {
   fallbackModels?: Array<{
     providerID: string
     modelID: string
+    variant?: string
   }>
   variant?: string
-  fallbackModels: Array<OpencodeXSwarmFallbackModel>
   modelProfile?: string
   status: "planned" | "queued" | "running" | "cancelling" | "blocked" | "failed" | "completed" | "cancelled"
   instructions: string
@@ -2858,9 +2868,9 @@ export type OpencodeXSwarmRoleInput = {
   fallbackModels?: Array<{
     providerID: string
     modelID: string
+    variant?: string
   }>
   variant?: string
-  fallbackModels?: Array<OpencodeXSwarmFallbackModel>
   modelProfile?: string
   instructions: string
   metadata?: {
@@ -2906,9 +2916,9 @@ export type OpencodeXSwarmUpdateRoleInput = {
   fallbackModels?: Array<{
     providerID: string
     modelID: string
+    variant?: string
   }>
   variant?: string
-  fallbackModels?: Array<OpencodeXSwarmFallbackModel>
   modelProfile?: string
   instructions?: string
   metadata?: {
@@ -3493,39 +3503,6 @@ export type SyncEventOpencodexJobTransitioned = {
   }
 }
 
-export type SyncEventOpencodexSwarmCreated = {
-  type: "sync"
-  name: "opencodex.swarm.created.1"
-  id: string
-  seq: number
-  aggregateID: "swarmID"
-  data: {
-    swarmID: string
-  }
-}
-
-export type SyncEventOpencodexSwarmUpdated = {
-  type: "sync"
-  name: "opencodex.swarm.updated.1"
-  id: string
-  seq: number
-  aggregateID: "swarmID"
-  data: {
-    swarmID: string
-  }
-}
-
-export type SyncEventOpencodexSwarmDeleted = {
-  type: "sync"
-  name: "opencodex.swarm.deleted.1"
-  id: string
-  seq: number
-  aggregateID: "swarmID"
-  data: {
-    swarmID: string
-  }
-}
-
 export type SyncEventOpencodexTerminalSessionCreated = {
   type: "sync"
   name: "opencodex.terminal_session.created.1"
@@ -3645,6 +3622,39 @@ export type SyncEventOpencodexGoalDeleted = {
   aggregateID: "goalID"
   data: {
     goalID: string
+  }
+}
+
+export type SyncEventOpencodexSwarmCreated = {
+  type: "sync"
+  name: "opencodex.swarm.created.1"
+  id: string
+  seq: number
+  aggregateID: "swarmID"
+  data: {
+    swarmID: string
+  }
+}
+
+export type SyncEventOpencodexSwarmUpdated = {
+  type: "sync"
+  name: "opencodex.swarm.updated.1"
+  id: string
+  seq: number
+  aggregateID: "swarmID"
+  data: {
+    swarmID: string
+  }
+}
+
+export type SyncEventOpencodexSwarmDeleted = {
+  type: "sync"
+  name: "opencodex.swarm.deleted.1"
+  id: string
+  seq: number
+  aggregateID: "swarmID"
+  data: {
+    swarmID: string
   }
 }
 
@@ -4087,30 +4097,6 @@ export type EventOpencodexJobTransitioned = {
   }
 }
 
-export type EventOpencodexSwarmCreated = {
-  id: string
-  type: "opencodex.swarm.created"
-  properties: {
-    swarmID: string
-  }
-}
-
-export type EventOpencodexSwarmUpdated = {
-  id: string
-  type: "opencodex.swarm.updated"
-  properties: {
-    swarmID: string
-  }
-}
-
-export type EventOpencodexSwarmDeleted = {
-  id: string
-  type: "opencodex.swarm.deleted"
-  properties: {
-    swarmID: string
-  }
-}
-
 export type EventMcpToolsChanged = {
   id: string
   type: "mcp.tools.changed"
@@ -4286,6 +4272,30 @@ export type EventOpencodexGuiBridgeRequest = {
       | {
           expectedURL: string
         }
+  }
+}
+
+export type EventOpencodexSwarmCreated = {
+  id: string
+  type: "opencodex.swarm.created"
+  properties: {
+    swarmID: string
+  }
+}
+
+export type EventOpencodexSwarmUpdated = {
+  id: string
+  type: "opencodex.swarm.updated"
+  properties: {
+    swarmID: string
+  }
+}
+
+export type EventOpencodexSwarmDeleted = {
+  id: string
+  type: "opencodex.swarm.deleted"
+  properties: {
+    swarmID: string
   }
 }
 

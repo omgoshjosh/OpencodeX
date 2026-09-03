@@ -76,15 +76,15 @@ describe("session.retry.delay", () => {
     expect(SessionRetry.delay(1, error)).toBe(2000)
   })
 
-  test("caps retry-after values to the interactive retry budget", () => {
+  test("uses retry-after values even when exceeding 10 minutes with headers", () => {
     const error = apiError({ "retry-after": "50" })
-    expect(SessionRetry.delay(1, error)).toBe(SessionRetry.RETRY_MAX_DELAY)
+    expect(SessionRetry.delay(1, error)).toBe(50000)
 
     const longError = apiError({ "retry-after-ms": "700000" })
-    expect(SessionRetry.delay(1, longError)).toBe(SessionRetry.RETRY_MAX_DELAY)
+    expect(SessionRetry.delay(1, longError)).toBe(700000)
   })
 
-  test("caps oversized header delays to the retry budget", () => {
+  test("caps oversized header delays to the runtime timer limit", () => {
     const error = apiError({ "retry-after-ms": "999999999999" })
     expect(SessionRetry.delay(1, error)).toBe(SessionRetry.RETRY_MAX_DELAY)
   })

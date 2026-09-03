@@ -1,1 +1,0 @@
-ALTER TABLE `opencodex_swarm_role` ADD `fallback_models` text;

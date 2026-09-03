@@ -1285,7 +1285,7 @@ describe("tool.task", () => {
             mode: "background",
             ownerID: index === 2 ? "local:999999:dead:run" : `local:${process.pid}:${ensureRunID()}:run_${index}`,
             role: "general",
-            title: ["zeta", "alpha", "dead"][index]!,
+            title: ["zeta", "alpha", "dead"][index],
             attempt: 1,
             phase: "running",
             startedAt: 1,

@@ -45,7 +45,7 @@ import { Identifier } from "@/id/id"
 import type { Provider } from "@/provider/provider"
 import { Permission } from "@/permission"
 import { Global } from "@opencode-ai/core/global"
-import { Duration, Effect, Layer, Option, Context, Schedule, Schema, Types } from "effect"
+import { Effect, Layer, Option, Context, Schema, Types } from "effect"
 import { AbsolutePath, NonNegativeInt, optionalOmitUndefined } from "@opencode-ai/core/schema"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
@@ -323,11 +323,6 @@ export type GlobalListInput = {
   archived?: boolean
 }
 
-const CreatedEventSchema = Schema.Struct({
-  sessionID: SessionID,
-  info: Info,
-})
-
 const UpdatedTime = Schema.Struct({
   created: Schema.optional(Schema.NullOr(NonNegativeInt)),
   updated: Schema.optional(Schema.NullOr(NonNegativeInt)),
@@ -354,11 +349,6 @@ const UpdatedInfo = Schema.Struct({
   time: Schema.optional(UpdatedTime),
   permission: Schema.optional(Schema.NullOr(Permission.Ruleset)),
   revert: Schema.optional(Schema.NullOr(Revert)),
-})
-
-const UpdatedEventSchema = Schema.Struct({
-  sessionID: SessionID,
-  info: UpdatedInfo,
 })
 
 export const Event = {
@@ -686,7 +676,7 @@ export const layer: Layer.Layer<
               eq(SessionTable.title, "New session"),
               like(SessionTable.title, `${parentTitlePrefix}%`),
               like(SessionTable.title, `${childTitlePrefix}%`),
-            )!,
+            ),
           ),
         )
         .all()
@@ -1398,7 +1388,7 @@ function listByProject(
 
       conditions.push(
         input.directory
-          ? or(...conds, and(isNull(SessionTable.path), eq(SessionTable.directory, input.directory))!)!
+          ? or(...conds, and(isNull(SessionTable.path), eq(SessionTable.directory, input.directory)))!
           : or(...conds)!,
       )
     }

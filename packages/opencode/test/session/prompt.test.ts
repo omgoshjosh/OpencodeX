@@ -675,6 +675,64 @@ it.instance("promptAsync persists its message and execution intent before return
   }),
 )
 
+it.instance("promptAsync retains one deterministic deferred report command through queued and succeeded recovery", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const { db } = yield* Database.Service
+    const chat = yield* sessions.create({})
+    const firstTurn = defer<void>()
+    const reportID = MessageID.make("msg_delegation_recovery_run_durable")
+    yield* llm.hold("first turn", firstTurn.promise)
+
+    yield* prompt.promptAsync({ sessionID: chat.id, model: ref, parts: [{ type: "text", text: "first" }] })
+    yield* llm.wait(1)
+    const report = {
+      sessionID: chat.id,
+      messageID: reportID,
+      model: ref,
+      delivery: "deferred" as const,
+      parts: [{ type: "text" as const, synthetic: true, metadata: { task_report: true }, text: "report" }],
+    }
+    yield* Effect.all([prompt.promptAsync(report), prompt.promptAsync(report)], { concurrency: "unbounded", discard: true })
+
+    const command = () =>
+      db
+        .select()
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.message_id, reportID))
+        .get()
+        .pipe(Effect.orDie)
+    expect((yield* command())?.status).toMatch(/queued|running/)
+    expect(
+      (yield* db
+        .select()
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.message_id, reportID))
+        .all()
+        .pipe(Effect.orDie)).map((row) => row.message_id),
+    ).toEqual([reportID])
+
+    firstTurn.resolve()
+    yield* llm.wait(2)
+    yield* pollWithTimeout(
+      command().pipe(Effect.map((row) => (row?.status === "succeeded" ? row : undefined))),
+      "deferred report command did not succeed",
+    )
+    yield* prompt.promptAsync(report)
+    expect(
+      (yield* db
+        .select()
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.message_id, reportID))
+        .all()
+        .pipe(Effect.orDie)).map((row) => row.message_id),
+    ).toEqual([reportID])
+    expect(yield* llm.calls).toBe(2)
+  }),
+)
+
 it.instance("cancelQueued withdraws a waiting message and leaves running turns to abort", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)

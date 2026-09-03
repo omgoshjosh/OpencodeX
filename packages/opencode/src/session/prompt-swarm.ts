@@ -55,8 +55,8 @@ export interface Deps {
   readonly sessions: Context.Service.Shape<typeof Session.Service>
   readonly skills: Context.Service.Shape<typeof Skill.Service>
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionLegacy.WithParts, Image.Error>
-  /** Queues a prompt without waiting for its turn; absent (tests), orphan approvals are not adopted. */
-  readonly promptAsync?: (input: PromptInput) => Effect.Effect<void, Image.Error>
+  /** Queues a prompt without waiting for its turn, with durable message and command intent. */
+  readonly promptAsync: (input: PromptInput) => Effect.Effect<void, Image.Error>
   readonly loop: (input: {
     sessionID: SessionID
     messageID?: MessageID
@@ -247,13 +247,10 @@ export function make(deps: Deps) {
   })
 
   /**
-   * Wakes the parent with a background report and stamps the delivery. The
-   * parent is prompted through the ordinary session loop, which for a
-   * Claude-hosted orchestrator opens a real turn on its persistent channel.
-   * Attributed to the parent's own agent, as the native task tool does: an
-   * unattributed prompt would resolve the default agent's model and could
-   * knock the orchestrator off the swarm facade. A report that never reached
-   * the parent is a failed job, not a completed one.
+   * Wakes the parent with a background report and stamps delivery once its
+   * deterministic message and command are durable. The delivery claim protects
+   * concurrent workers; the message identity lets recovery resume after a
+   * crash between the command write and the delivery stamp.
    */
   const deliverReport = (input: {
     parentSessionID: SessionID
@@ -265,54 +262,55 @@ export function make(deps: Deps) {
   }) =>
     Effect.gen(function* () {
       const parent = yield* sessions.get(input.parentSessionID).pipe(Effect.orDie)
-      const wakeID = MessageID.ascending()
-      yield* deps.prompt({
-        sessionID: input.parentSessionID,
-        messageID: wakeID,
-        // Deferred: the default "immediate" delivery interrupts an in-flight
-        // turn to steer it, which would abort whatever the orchestrator is
-        // doing right now. A report queues behind the current turn.
-        delivery: "deferred",
-        ...(parent.agent ? { agent: parent.agent } : {}),
-        parts: [
-          {
-            type: "text",
-            synthetic: true,
-            // See the task tool: the loop answers tagged reports exactly once.
-            metadata: { task_report: true },
-            text: backgroundDelegationMessage({
-              childSessionID: input.childSessionID,
-              role: input.role,
-              state: input.state,
-              text: input.text,
-            }),
-          },
-        ],
+      const claim = yield* sessions.claimDelegationDelivery({
+        sessionID: input.childSessionID,
+        runID: input.runID,
       })
-      // If the parent was mid-turn, prompt() only awaited that run and the
-      // wake message sat unanswered in the transcript; run its turn now so
-      // the report is never silently orphaned.
-      const answered = yield* sessions
-        .messageWithChildren({ sessionID: input.parentSessionID, messageID: wakeID })
+      if (!claim) return
+      const messageID = MessageID.make(`msg_delegation_recovery_${input.runID}`)
+      yield* deps
+        .promptAsync({
+          sessionID: input.parentSessionID,
+          messageID,
+          // Deferred: the default "immediate" delivery interrupts an in-flight
+          // turn to steer it, which would abort whatever the orchestrator is
+          // doing right now. A report queues behind the current turn.
+          delivery: "deferred",
+          ...(parent.agent ? { agent: parent.agent } : {}),
+          parts: [
+            {
+              type: "text",
+              synthetic: true,
+              // See the task tool: the loop answers tagged reports exactly once.
+              metadata: { task_report: true },
+              text: backgroundDelegationMessage({
+                childSessionID: input.childSessionID,
+                role: input.role,
+                state: input.state,
+                text: input.text,
+              }),
+            },
+          ],
+        })
         .pipe(
-          Effect.map((turn) =>
-            turn.some((message) => message.info.role === "assistant" && message.info.parentID === wakeID),
+          Effect.catchCause((cause) =>
+            sessions
+              .stampDelegationDelivery({
+                sessionID: input.childSessionID,
+                runID: input.runID,
+                outcome: "failed",
+                claimToken: claim,
+              })
+              .pipe(Effect.ignore, Effect.andThen(Effect.failCause(cause))),
           ),
-          Effect.orElseSucceed(() => true),
         )
-      if (!answered) yield* deps.loop({ sessionID: input.parentSessionID, messageID: wakeID })
-    }).pipe(
-      Effect.matchCauseEffect({
-        onSuccess: () =>
-          sessions
-            .stampDelegationDelivery({ sessionID: input.childSessionID, runID: input.runID, outcome: "delivered" })
-            .pipe(Effect.ignore),
-        onFailure: () =>
-          sessions
-            .stampDelegationDelivery({ sessionID: input.childSessionID, runID: input.runID, outcome: "failed" })
-            .pipe(Effect.ignore, Effect.andThen(Effect.fail(new Error("Delegation report was not delivered")))),
-      }),
-    )
+      yield* sessions.stampDelegationDelivery({
+        sessionID: input.childSessionID,
+        runID: input.runID,
+        outcome: "delivered",
+        claimToken: claim,
+      })
+    })
 
   /**
    * Waits for a background child that ended a turn without the completion
@@ -518,7 +516,15 @@ export function make(deps: Deps) {
       })
       .pipe(
         Effect.catchCause((cause) =>
-          Effect.sync(() => log.error("swarm delegate stamp failed", { sessionID: input.sessionID, cause })),
+          Effect.logError("swarm delegate stamp failed").pipe(
+            Effect.annotateLogs({
+              sessionID: input.sessionID,
+              messageID: part.messageID,
+              action: "stamp-delegate-tool-part",
+              state: part.state.status,
+              cause,
+            }),
+          ),
         ),
       )
   })
@@ -626,10 +632,10 @@ export function make(deps: Deps) {
     const stamp = (record: DelegationRecord, expectRunID?: string) =>
       sessions.stampDelegation({ sessionID: child.id, record, ...(expectRunID ? { expectRunID } : {}) }).pipe(
         Effect.catchCause((cause) =>
-          Effect.sync(() => {
-            log.error("swarm delegation stamp failed", { sessionID: child.id, runID, cause })
-            return false
-          }),
+          Effect.logError("swarm delegation stamp failed").pipe(
+            Effect.annotateLogs({ sessionID: child.id, action: "stamp-delegation", runID, state: record.phase, cause }),
+            Effect.as(false),
+          ),
         ),
       )
     const settle = (outcome: DelegationOutcome, summary?: string) =>
@@ -921,26 +927,22 @@ export function make(deps: Deps) {
       // has to say why; `synthetic` keeps it out of titles and summaries.
       // Delivered through the ordinary prompt path (not "immediate"), so it
       // never interrupts the in-flight work it is adopting.
-      ...(deps.promptAsync
-        ? {
-            adoptOrphan: (orphan: { toolName: string }) =>
-              deps.promptAsync!({
-                sessionID,
-                parts: [
-                  {
-                    type: "text",
-                    synthetic: true,
-                    text: [
-                      "<system-reminder>",
-                      `OpencodeX adopted work this session started outside a turn (a peer message woke it; first gated tool: ${orphan.toolName}).`,
-                      "Finish that work, then reply briefly with what was done. Approvals you see here belong to that work.",
-                      "</system-reminder>",
-                    ].join("\n"),
-                  },
-                ],
-              }).pipe(Effect.orDie),
-          }
-        : {}),
+      adoptOrphan: (orphan: { toolName: string }) =>
+        deps.promptAsync({
+          sessionID,
+          parts: [
+            {
+              type: "text",
+              synthetic: true,
+              text: [
+                "<system-reminder>",
+                `OpencodeX adopted work this session started outside a turn (a peer message woke it; first gated tool: ${orphan.toolName}).`,
+                "Finish that work, then reply briefly with what was done. Approvals you see here belong to that work.",
+                "</system-reminder>",
+              ].join("\n"),
+            },
+          ],
+        }).pipe(Effect.orDie),
       directory: session.directory,
       providerID: turnProviderID,
       modelID: turnModelID,

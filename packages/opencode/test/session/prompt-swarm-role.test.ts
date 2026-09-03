@@ -156,7 +156,7 @@ describe("swarm role model fallback", () => {
 
 describe("background swarm delegation", () => {
   test("returns at once, runs the role under BackgroundJob, and wakes the parent with the report", async () => {
-    const { runSwarmRole, prompts, started, stamps, runJob } = harness({ skills: {}, background: true })
+    const { runSwarmRole, prompts, asyncPrompts, started, stamps, runJob } = harness({ skills: {}, background: true })
 
     const result = await Effect.runPromise(run(runSwarmRole, { background: true }))
     expect(result.ok).toBe(true)
@@ -176,12 +176,18 @@ describe("background swarm delegation", () => {
     })
 
     await Effect.runPromise(runJob())
-    // The child's prompt ran, then the parent was woken with the report.
+    // The child's prompt ran, then one deterministic durable wake was queued.
     expect(prompts.some((text) => text.includes("Do the task."))).toBe(true)
-    const wake = prompts.find((text) => text.includes("Delegation completed"))
-    expect(wake).toBeDefined()
-    expect(wake).toContain('state="completed"')
-    expect(wake).toContain("done")
+    expect(asyncPrompts).toHaveLength(1)
+    expect(asyncPrompts[0]?.messageID).toMatch(/^msg_delegation_recovery_run_/)
+    expect(asyncPrompts[0]?.delivery).toBe("deferred")
+    expect(asyncPrompts[0]?.text).toContain('state="completed"')
+    expect(asyncPrompts[0]?.text).toContain("done")
+
+    // Replaying the completed job is equivalent to restart recovery: its
+    // durable delivery claim prevents a second message or command intent.
+    await Effect.runPromise(runJob())
+    expect(asyncPrompts).toHaveLength(1)
   })
 
   test("refuses background delegation when no BackgroundJob service is wired", async () => {
@@ -195,7 +201,7 @@ describe("background swarm delegation", () => {
   })
 
   test("tells the child how to mark completion and strips the marker from the report", async () => {
-    const { runSwarmRole, prompts, runJob } = harness({
+    const { runSwarmRole, prompts, asyncPrompts, runJob } = harness({
       skills: {},
       background: true,
       promptResult: Effect.succeed({
@@ -206,9 +212,8 @@ describe("background swarm delegation", () => {
     await Effect.runPromise(run(runSwarmRole, { background: true }))
     await Effect.runPromise(runJob())
     expect(prompts[0]).toContain(PromptSwarm.DELEGATION_COMPLETE_MARKER)
-    const wake = prompts.find((text) => text.includes("Delegation completed"))
-    expect(wake).toContain("All green.")
-    expect(wake).not.toContain(PromptSwarm.DELEGATION_COMPLETE_MARKER)
+    expect(asyncPrompts[0]?.text).toContain("All green.")
+    expect(asyncPrompts[0]?.text).not.toContain(PromptSwarm.DELEGATION_COMPLETE_MARKER)
   })
 
   test("a foreground delegation is not told about the marker", async () => {
@@ -218,7 +223,7 @@ describe("background swarm delegation", () => {
   })
 
   test("wakes the parent with an error when the role itself fails", async () => {
-    const { runSwarmRole, prompts, runJob } = harness({
+    const { runSwarmRole, asyncPrompts, runJob } = harness({
       skills: {},
       background: true,
       promptResult: Effect.fail(new Error("provider exploded")),
@@ -226,9 +231,8 @@ describe("background swarm delegation", () => {
     const result = await Effect.runPromise(run(runSwarmRole, { background: true }))
     expect(result.ok).toBe(true)
     await Effect.runPromise(runJob())
-    const wake = prompts.find((text) => text.includes("Delegation failed"))
-    expect(wake).toBeDefined()
-    expect(wake).toContain('state="error"')
+    expect(asyncPrompts[0]?.text).toContain("Delegation failed")
+    expect(asyncPrompts[0]?.text).toContain('state="error"')
   })
 })
 
@@ -582,6 +586,8 @@ function harness(input: {
 }) {
   const started: Array<{ id?: string; metadata?: Record<string, unknown>; run: Effect.Effect<string, unknown> }> = []
   const prompts: string[] = []
+  const asyncPrompts: Array<{ messageID: string | undefined; delivery: string | undefined; text: string }> = []
+  let deliveryClaimed = false
   const models: string[] = []
   const promptParts: Array<Array<{ type: string; text?: string; mime?: string; url?: string }>> = []
   const stamps: Array<{ record: DelegationRecord; expectRunID?: string }> = []
@@ -614,7 +620,11 @@ function harness(input: {
         stamps.push({ record: write.record, ...(write.expectRunID ? { expectRunID: write.expectRunID } : {}) })
         return Effect.succeed(true)
       },
-      stampDelegationDelivery: () => Effect.void,
+      stampDelegationDelivery: () =>
+        Effect.sync(() => {
+          deliveryClaimed = true
+        }),
+      claimDelegationDelivery: () => Effect.succeed(deliveryClaimed ? undefined : "claim"),
       findMessage: (_sessionID: string, predicate: (message: typeof parentMessage) => boolean) =>
         Effect.succeed(predicate(parentMessage) ? Option.some(parentMessage) : Option.none()),
       updatePart: (part: Record<string, unknown>) =>
@@ -667,6 +677,18 @@ function harness(input: {
         parts: [{ type: "text", text: "done", synthetic: false }],
       })
     },
+    promptAsync: (promptInput: {
+      messageID?: string
+      delivery?: string
+      parts: Array<{ type: string; text?: string }>
+    }) =>
+      Effect.sync(() => {
+        asyncPrompts.push({
+          messageID: promptInput.messageID,
+          delivery: promptInput.delivery,
+          text: promptInput.parts.flatMap((part) => (part.type === "text" && part.text ? [part.text] : [])).join("\n"),
+        })
+      }),
     loop: (loopInput: { messageID?: string }) => {
       loopCount++
       return Effect.succeed(record(input.promptResults?.shift() ?? success("done"), loopInput.messageID ?? "msg_user"))
@@ -679,6 +701,7 @@ function harness(input: {
   return {
     runSwarmRole,
     prompts,
+    asyncPrompts,
     promptParts,
     models,
     stamps,

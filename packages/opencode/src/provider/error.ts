@@ -235,11 +235,9 @@ export function parseAPICallError(input: { providerID: ProviderV2.ID; error: API
     type: "api_error",
     message: m,
     statusCode: input.error.statusCode,
-    isRetryable:
-      input.error.statusCode !== undefined &&
-      input.error.statusCode >= 400 &&
-      input.error.statusCode < 500 &&
-      ![408, 409, 429].includes(input.error.statusCode)
+    isRetryable: [408, 409, 429].includes(input.error.statusCode ?? 0)
+      ? true
+      : input.error.statusCode !== undefined && input.error.statusCode >= 400 && input.error.statusCode < 500
         ? false
         : input.error.isRetryable,
     responseHeaders: input.error.responseHeaders,

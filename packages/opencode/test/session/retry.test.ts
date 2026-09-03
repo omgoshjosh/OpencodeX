@@ -42,6 +42,11 @@ describe("session.retry.delay", () => {
     expect(SessionRetry.delay(4, error)).toBe(1500)
   })
 
+  test("clamps negative retry hints to zero", () => {
+    expect(SessionRetry.delay(1, apiError({ "retry-after-ms": "-1" }))).toBe(0)
+    expect(SessionRetry.delay(1, apiError({ "retry-after": "-1" }))).toBe(0)
+  })
+
   test("uses retry-after seconds when reasonable", () => {
     const error = apiError({ "retry-after": "30" })
     expect(SessionRetry.delay(3, error)).toBe(30000)
@@ -333,6 +338,33 @@ describe("session.message-v2.fromError", () => {
     await expect(Promise.resolve().then(() => Effect.runPromise(step(result)))).rejects.toMatchObject({
       _tag: "Done",
       value: 1,
+    })
+  })
+
+  test("classifies direct and stream 4xx status exceptions independently of SDK retryability", () => {
+    const cases = [
+      [400, false],
+      [404, false],
+      [408, true],
+      [409, true],
+      [429, true],
+    ] as const
+    cases.forEach(([statusCode, isRetryable]) => {
+      const error = new APICallError({
+        message: "failed",
+        url: "https://example.com",
+        requestBodyValues: {},
+        statusCode,
+        responseHeaders: {},
+        isRetryable: false,
+      })
+      const direct = MessageV2.fromError(error, { providerID })
+      const stream = MessageV2.fromError(new ProviderError.ResponseStreamError("failed", { statusCode }), { providerID })
+      if (!SessionLegacy.APIError.isInstance(direct) || !SessionLegacy.APIError.isInstance(stream)) {
+        throw new Error("expected APIError")
+      }
+      expect(direct.data.isRetryable).toBe(isRetryable)
+      expect(stream.data.isRetryable).toBe(isRetryable)
     })
   })
 

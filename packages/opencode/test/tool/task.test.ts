@@ -1034,7 +1034,8 @@ describe("tool.task", () => {
           extra: {
             promptOps: {
               ...stubOps(),
-              prompt: (input) => Effect.promise(() => started.promise).pipe(Effect.map(() => reply(input, "done"))),
+              prompt: (input: SessionPrompt.PromptInput) =>
+                Effect.promise(() => started.promise).pipe(Effect.map(() => reply(input, "done"))),
             },
           },
           messages: [],

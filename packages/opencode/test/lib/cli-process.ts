@@ -52,17 +52,24 @@ function cliArgv(args: string[]) {
  * Default ceiling for a single CLI invocation.
  *
  * This is a backstop against a genuinely wedged child, not an assertion about
- * speed - no test here is trying to prove the CLI is fast. It was 30s, which
- * the Windows runner overshot by 1-3% on the three run-process cases that make
- * an LLM round trip, turning "slower machine" into a red build. Give it real
- * headroom and let the per-test `timeoutMs` opt down when a test is
- * specifically asserting promptness.
+ * speed - no test here is trying to prove the CLI is fast. Hosted Windows can
+ * take longer than 45s to start the bundled CLI under load, so it gets 90s of
+ * headroom while other platforms retain the measured 45s default. Per-test
+ * `timeoutMs` can still opt down when a test is specifically asserting
+ * promptness.
  *
  * Kept below the 60s bun per-test timeout these suites declare, deliberately:
  * this path kills the child through the scope finalizer, whereas bun expiring
  * first would fail the test and leak the subprocess.
  */
-const defaultTimeoutMs = Number(process.env["OPENCODE_TEST_CLI_TIMEOUT_MS"] ?? 45_000)
+export function cliProcessDefaultTimeout(
+  platform = process.platform,
+  configured = process.env["OPENCODE_TEST_CLI_TIMEOUT_MS"],
+) {
+  return Number(configured ?? (platform === "win32" ? 90_000 : 45_000))
+}
+
+const defaultTimeoutMs = cliProcessDefaultTimeout()
 
 /*
  * Budget for "the child got far enough to do the thing", where the thing is
@@ -237,10 +244,9 @@ export function withCliFixture<A, E>(
      * a leftover temp directory is not worth failing a green test over.
      */
     const home = yield* Effect.acquireRelease(fs.makeTempDirectory({ prefix: "oc-cli-" }), (dir) =>
-      fs.remove(dir, { recursive: true }).pipe(
-        Effect.retry({ times: 20, schedule: Schedule.spaced(Duration.millis(100)) }),
-        Effect.ignore,
-      ),
+      fs
+        .remove(dir, { recursive: true })
+        .pipe(Effect.retry({ times: 20, schedule: Schedule.spaced(Duration.millis(100)) }), Effect.ignore),
     )
 
     const configJson = JSON.stringify(testProviderConfig(llm.url))

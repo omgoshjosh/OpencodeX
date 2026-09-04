@@ -7,7 +7,7 @@ import { ChildProcessSpawner } from "effect/unstable/process"
 import { AppFileSystem } from "@opencode-ai/core/filesystem"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Flag } from "@opencode-ai/core/flag/flag"
-import { createOpencodeClient, waitForRestartReadiness } from "@opencode-ai/sdk/v2"
+import { createOpencodeClient } from "@opencode-ai/sdk/v2"
 import { validateSession } from "../../src/cli/cmd/tui/validate-session"
 import { InstanceBootstrap } from "../../src/project/bootstrap-service"
 import { InstanceStore } from "../../src/project/instance-store"
@@ -468,7 +468,10 @@ describe("HttpApi SDK", () => {
         })
         .run()
         .pipe(Effect.orDie)
-      expect((yield* call(() => sdk.global.restartReadiness())).data?.ready).toBe(true)
+      expect((yield* call(() => sdk.global.restartReadiness())).data).toMatchObject({
+        ready: false,
+        blockers: { sessionInteractions: true },
+      })
       expect(
         yield* db
           .select({ state: SessionInteractionTable.state })
@@ -476,20 +479,12 @@ describe("HttpApi SDK", () => {
           .where(eq(SessionInteractionTable.id, "interaction_restart_orphan"))
           .get()
           .pipe(Effect.orDie),
-      ).toEqual({ state: "rejected" })
+      ).toEqual({ state: "pending" })
       // A reusable planned swarm is a definition, not executing work, for both
       // contracts: restart readiness ignores it, and idle health has ignored
       // dormant swarms since d2f590c5ab (ACTIVE_SWARM_STATUSES excludes
       // "planned"), so the daemon reports inactive once everything settles.
       expect(health.data).toMatchObject({ active: false })
-      expect(
-        yield* Effect.promise(() =>
-          waitForRestartReadiness(sdk, {
-            consecutiveSamples: 1,
-            intervalMs: 0,
-          }),
-        ),
-      ).toMatchObject({ ready: true })
     }),
   )
 

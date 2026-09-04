@@ -5,10 +5,8 @@ import { MessageID, SessionID } from "@/session/schema"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
 import { PartTable, SessionExecutionTable, SessionInteractionTable } from "@opencode-ai/core/session/sql"
-import { ensureRunID } from "@opencode-ai/core/util/opencode-process"
 import { and, eq } from "drizzle-orm"
 import { Effect, Option, Schema } from "effect"
-import { SessionExecutionOwner } from "./execution-owner"
 import { SessionInteractionEvent } from "./interaction-event"
 
 const Tool = Schema.Struct({ messageID: MessageID, callID: Schema.String })
@@ -31,7 +29,6 @@ export const recoverWith = Effect.fn("SessionInteractionRecovery.recoverWith")(f
 }) {
   const { db } = input.database
   const { events, sessionID } = input
-  const processRunID = ensureRunID()
   const now = Date.now()
   const committed = yield* events.barrier(
     db
@@ -58,13 +55,8 @@ export const recoverWith = Effect.fn("SessionInteractionRecovery.recoverWith")(f
               const request = record(row.request_json) ? row.request_json : undefined
               const generation = typeof request?.executionGeneration === "number" ? request.executionGeneration : undefined
               const execution = executions.get(row.session_id)
-              const live =
-                execution?.state === "running" &&
-                !!execution.owner_id &&
-                !!execution.lease_expires_at &&
-                execution.lease_expires_at > now &&
-                execution.generation === generation &&
-                SessionExecutionOwner.alive(execution.owner_id, processRunID)
+              const cancelled =
+                generation !== undefined && execution?.generation === generation && !!execution.cancel_requested_at
               const tool = Option.getOrUndefined(decodeTool(request?.tool))
               const terminalTool =
                 !!tool &&
@@ -76,7 +68,7 @@ export const recoverWith = Effect.fn("SessionInteractionRecovery.recoverWith")(f
                   const decoded = decodeToolPart(part.data)
                   return decoded._tag === "Some" && decoded.value.callID === tool.callID
                 })
-              if (!terminalTool && (generation === undefined || live)) continue
+              if (!terminalTool && !cancelled) continue
               const updated = yield* transaction
                 .update(SessionInteractionTable)
                 .set({

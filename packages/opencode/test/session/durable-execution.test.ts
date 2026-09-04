@@ -13,13 +13,17 @@ import { SessionInteractionRecovery } from "@/session/interaction-recovery"
 import * as PromptClaim from "@/session/prompt-claim"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Database } from "@opencode-ai/core/database/database"
+import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import {
   PermissionTable,
+  PartTable,
+  MessageTable,
   SessionCommandTable,
   SessionExecutionTable,
   SessionInteractionTable,
+  SessionTable,
   SessionStatusTable,
 } from "@opencode-ai/core/session/sql"
 import { and, eq, sql } from "drizzle-orm"
@@ -154,7 +158,7 @@ const insertCommand = Effect.fn("DurableExecutionTest.insertCommand")(function* 
     .pipe(Effect.orDie)
 })
 
-it.instance("recovers only orphaned interactions and emits one terminal event", () =>
+it.instance("preserves recoverable interactions and rejects terminal interactions once", () =>
   Effect.gen(function* () {
     const { db } = yield* Database.Service
     const events = yield* EventV2Bridge.Service
@@ -163,6 +167,8 @@ it.instance("recovers only orphaned interactions and emits one terminal event", 
     const crashed = SessionID.make("ses_recovery_crashed")
     const leased = SessionID.make("ses_recovery_leased")
     const deadOwner = SessionID.make("ses_recovery_dead_owner")
+    const cancelled = SessionID.make("ses_recovery_cancelled")
+    const terminal = SessionID.make("ses_recovery_terminal")
     const standalone = SessionID.make("ses_recovery_standalone")
     const rejected = yield* Ref.make(0)
     const unsubscribe = yield* events.listen((event) =>
@@ -203,6 +209,17 @@ it.instance("recovers only orphaned interactions and emits one terminal event", 
           owner_id: "local:999999:dead:recovery",
           generation: 5,
           lease_expires_at: now + 60_000,
+          time_created: now,
+          time_updated: now,
+        },
+        {
+          session_id: cancelled,
+          project_id: "prj_test",
+          directory: ctx.directory,
+          state: "interrupted",
+          generation: 6,
+          cancel_requested_at: now,
+          completed_at: now,
           time_created: now,
           time_updated: now,
         },
@@ -280,6 +297,42 @@ it.instance("recovers only orphaned interactions and emits one terminal event", 
           time_updated: now,
         },
         {
+          id: "per_recovery_cancelled",
+          kind: "permission",
+          session_id: cancelled,
+          project_id: "prj_test",
+          directory: ctx.directory,
+          state: "pending",
+          request_json: {
+            id: "per_recovery_cancelled",
+            sessionID: cancelled,
+            permission: "bash",
+            patterns: [],
+            metadata: {},
+            always: [],
+            executionGeneration: 6,
+          },
+          time_created: now,
+          time_updated: now,
+        },
+        {
+          id: "que_recovery_terminal",
+          kind: "question",
+          session_id: terminal,
+          project_id: "prj_test",
+          directory: ctx.directory,
+          state: "pending",
+          request_json: {
+            id: "que_recovery_terminal",
+            sessionID: terminal,
+            questions: [],
+            executionGeneration: 7,
+            tool: { messageID: "msg_recovery_terminal", callID: "call_recovery_terminal" },
+          },
+          time_created: now,
+          time_updated: now,
+        },
+        {
           id: "que_recovery_legacy",
           kind: "question",
           session_id: standalone,
@@ -304,6 +357,59 @@ it.instance("recovers only orphaned interactions and emits one terminal event", 
       ])
       .run()
       .pipe(Effect.orDie)
+    yield* db
+      .insert(ProjectTable)
+      .values({
+        id: "prj_test" as never,
+        worktree: ctx.directory,
+        sandboxes: [],
+        time_created: now,
+        time_updated: now,
+      })
+      .onConflictDoNothing()
+      .run()
+      .pipe(Effect.orDie)
+    yield* db
+      .insert(SessionTable)
+      .values({
+        id: terminal,
+        project_id: "prj_test" as never,
+        slug: "recovery-terminal",
+        directory: ctx.directory,
+        title: "Recovery terminal",
+        version: "test",
+        time_created: now,
+        time_updated: now,
+      })
+      .run()
+      .pipe(Effect.orDie)
+    yield* db
+      .insert(MessageTable)
+      .values({
+        id: "msg_recovery_terminal" as MessageID,
+        session_id: terminal,
+        data: { role: "assistant" } as never,
+        time_created: now,
+        time_updated: now,
+      })
+      .run()
+      .pipe(Effect.orDie)
+    yield* db
+      .insert(PartTable)
+      .values({
+        id: "prt_recovery_terminal" as never,
+        message_id: "msg_recovery_terminal" as MessageID,
+        session_id: terminal,
+        data: {
+          type: "tool",
+          callID: "call_recovery_terminal",
+          state: { status: "completed" },
+        } as never,
+        time_created: now,
+        time_updated: now,
+      })
+      .run()
+      .pipe(Effect.orDie)
     yield* Effect.all(
       [
         { id: "que_recovery_null", request: sql`'null'` },
@@ -322,15 +428,14 @@ it.instance("recovers only orphaned interactions and emits one terminal event", 
     )
     yield* SessionInteractionRecovery.recover()
     const rows = yield* db.select().from(SessionInteractionTable).all().pipe(Effect.orDie)
-    expect(rows.filter((row) => row.id.includes("crashed") || row.id.includes("dead_owner")).map((row) => row.state)).toEqual([
-      "rejected",
+    expect(rows.filter((row) => row.id.includes("cancelled") || row.id.includes("terminal")).map((row) => row.state)).toEqual([
       "rejected",
       "rejected",
     ])
-    expect(rows.filter((row) => row.id.includes("leased") || row.id.includes("legacy") || row.id.includes("null") || row.id.includes("array") || row.id.includes("primitive") || row.id.includes("malformed")).every((row) => row.state === "pending")).toBe(true)
-    expect(rows.find((row) => row.id === "per_recovery_crashed")?.response_json).toEqual({ reply: "reject" })
-    expect(rows.filter((row) => row.id.includes("crashed") || row.id.includes("dead_owner")).every((row) => row.responded_at && row.time_updated >= now)).toBe(true)
-    expect(yield* Ref.get(rejected)).toBe(3)
+    expect(rows.filter((row) => row.id.includes("crashed") || row.id.includes("dead_owner") || row.id.includes("leased") || row.id.includes("legacy") || row.id.includes("null") || row.id.includes("array") || row.id.includes("primitive") || row.id.includes("malformed")).every((row) => row.state === "pending")).toBe(true)
+    expect(rows.find((row) => row.id === "per_recovery_cancelled")?.response_json).toEqual({ reply: "reject" })
+    expect(rows.filter((row) => row.id.includes("cancelled") || row.id.includes("terminal")).every((row) => row.responded_at && row.time_updated >= now)).toBe(true)
+    expect(yield* Ref.get(rejected)).toBe(2)
   }),
 )
 

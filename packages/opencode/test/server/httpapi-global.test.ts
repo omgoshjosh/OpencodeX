@@ -1,5 +1,5 @@
 import { NodeHttpServer } from "@effect/platform-node"
-import { describe, expect, test } from "bun:test"
+import { describe, expect } from "bun:test"
 import { Context, Deferred, Effect, Fiber, Layer, Option } from "effect"
 import { HttpBody, HttpClient, HttpClientRequest, HttpRouter } from "effect/unstable/http"
 import { HttpApiBuilder } from "effect/unstable/httpapi"

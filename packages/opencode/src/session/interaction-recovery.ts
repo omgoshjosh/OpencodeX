@@ -60,7 +60,7 @@ export const recoverWith = Effect.fn("SessionInteractionRecovery.recoverWith")(f
               const tool = Option.getOrUndefined(decodeTool(request?.tool))
               const terminalTool =
                 !!tool &&
-                !!(yield* transaction
+                (yield* transaction
                   .select({ data: PartTable.data })
                   .from(PartTable)
                   .where(and(eq(PartTable.session_id, row.session_id), eq(PartTable.message_id, tool.messageID)))

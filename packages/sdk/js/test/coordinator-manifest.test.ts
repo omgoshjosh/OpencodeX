@@ -518,18 +518,23 @@ describe("escalating health retry", () => {
 
   test("stops before an attempt that would overrun the total wall cap", async () => {
     let calls = 0
+    let now = 0
     const result = await probeCoordinatorHealthWithRetry(manifest(), {
       timeout: 100,
       totalTimeout: 600,
-      delay: nowait,
-      fetch: (url, init) => {
+      clock: () => now,
+      delay: async (ms) => {
+        now += ms
+      },
+      fetch: async () => {
         calls += 1
-        return stalls(url, init)
+        now += calls * 100
+        throw Object.assign(new Error("aborted"), { name: "AbortError" })
       },
     })
 
-    /* Attempt 3 would need 400ms of backoff plus a 300ms deadline on top of
-       ~300ms already spent, so it never starts. */
+    /* Two timed-out attempts and the second backoff consume 400ms. Attempt 3
+       needs 400ms more backoff plus a 300ms deadline, so it never starts. */
     expect(calls).toBe(2)
     expect(result.attempts).toBe(2)
     expect(result.probe.kind).toBe("timeout")

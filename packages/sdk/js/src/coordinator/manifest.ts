@@ -313,6 +313,8 @@ export type CoordinatorProbeRetryOptions = CoordinatorProbeOptions & {
   totalTimeout?: number
   /** Injected for tests so backoff does not cost real time. */
   delay?: (ms: number) => Promise<void>
+  /** Injected for tests so wall-cap accounting does not depend on timer scheduling. */
+  clock?: () => number
   env?: NodeJS.ProcessEnv
 }
 
@@ -419,7 +421,8 @@ export async function probeCoordinatorHealthWithRetry(
   const attempts = options?.attempts ?? positiveInteger(env[COORDINATOR_HEALTH_ATTEMPTS_ENV]) ?? HEALTH_ATTEMPTS
   const total = options?.totalTimeout ?? HEALTH_TOTAL_TIMEOUT
   const delay = options?.delay ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
-  const started = Date.now()
+  const clock = options?.clock ?? Date.now
+  const started = clock()
 
   let attempt = 0
   let probe: CoordinatorProbe = { kind: "unknown", detail: "health probe was never attempted" }
@@ -430,14 +433,14 @@ export async function probeCoordinatorHealthWithRetry(
     /* The first attempt always runs — a caller who raised the per-attempt
        timeout past the wall cap still deserves one probe. Later attempts must
        fit entirely inside the cap, deadline included, or they do not start. */
-    if (attempt > 0 && Date.now() - started + backoff + budget > total) break
+    if (attempt > 0 && clock() - started + backoff + budget > total) break
     if (backoff > 0) await delay(backoff)
     probe = await probeCoordinatorHealth(manifest, { timeout: budget, fetch: options?.fetch })
     attempt += 1
     if (!isAmbiguousCoordinatorProbe(probe)) break
   }
 
-  return { probe, attempts: attempt, elapsedMs: Date.now() - started }
+  return { probe, attempts: attempt, elapsedMs: clock() - started }
 }
 
 function positiveInteger(value: string | undefined) {

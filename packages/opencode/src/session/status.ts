@@ -10,6 +10,7 @@ import { Context, Duration, Effect, Layer, Option, Schedule, Schema } from "effe
 import { SessionID } from "./schema"
 import { SessionExecutionOwner } from "./execution-owner"
 import { delegationRecord } from "./delegation-outcome"
+import { SessionInteractionRecovery } from "./interaction-recovery"
 
 const Background = Schema.Struct({
   running: Schema.Boolean,
@@ -204,6 +205,7 @@ export const layer = Layer.effect(
           .pipe(Effect.orDie),
       )
       yield* Effect.forEach(broadcasts, events.broadcast, { discard: true })
+      yield* SessionInteractionRecovery.recover(sessionID)
     })
 
     const get = Effect.fn("SessionStatus.get")(function* (sessionID: SessionID) {

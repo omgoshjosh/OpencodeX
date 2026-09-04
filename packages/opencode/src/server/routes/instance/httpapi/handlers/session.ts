@@ -130,12 +130,12 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
         search: ctx.query.search,
         limit: ctx.query.limit,
       })
-      const children = yield* Effect.forEach(roots, (root) => session.children(root.id), { concurrency: "unbounded" })
-      const projected = yield* activity.project([...roots, ...children.flat()])
+      const children = yield* session.childrenByParents(roots.map((root) => root.id))
+      const projected = yield* activity.project([...roots, ...children.values().flatMap((items) => items)])
       const byID = new Map(projected.map((item) => [item.session.id, item]))
-      return roots.map((root, index) => ({
+      return roots.map((root) => ({
         ...byID.get(root.id)!.session,
-        children: children[index]!
+        children: (children.get(root.id) ?? [])
           .map((child) => byID.get(child.id)!)
           .filter((child) => ctx.query.live === false || child.live)
           .map((child) => child.session),

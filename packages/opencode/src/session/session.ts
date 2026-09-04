@@ -531,6 +531,7 @@ export interface Interface {
     messageID: MessageID
   }) => Effect.Effect<SessionLegacy.WithParts[]>
   readonly children: (parentID: SessionID) => Effect.Effect<Info[]>
+  readonly childrenByParents: (parentIDs: readonly SessionID[]) => Effect.Effect<Map<SessionID, Info[]>>
   readonly remove: (sessionID: SessionID) => Effect.Effect<void, NotFound>
   readonly updateMessage: <T extends SessionLegacy.Info>(msg: T) => Effect.Effect<T>
   readonly removeMessage: (input: { sessionID: SessionID; messageID: MessageID }) => Effect.Effect<MessageID>
@@ -800,6 +801,25 @@ export const layer: Layer.Layer<
         .all()
         .pipe(Effect.orDie)
       return rows.map(fromRow)
+    })
+
+    const childrenByParents = Effect.fn("Session.childrenByParents")(function* (parentIDs: readonly SessionID[]) {
+      const ids = [...new Set(parentIDs)]
+      if (ids.length === 0) return new Map<SessionID, Info[]>()
+      const rows = yield* db
+        .select()
+        .from(SessionTable)
+        .where(inArray(SessionTable.parent_id, ids))
+        .all()
+        .pipe(Effect.orDie)
+      return rows.reduce((result, row) => {
+        if (!row.parent_id) return result
+        const parentID = SessionID.make(row.parent_id)
+        const children = result.get(parentID) ?? []
+        children.push(fromRow(row))
+        result.set(parentID, children)
+        return result
+      }, new Map<SessionID, Info[]>())
     })
 
     const remove: Interface["remove"] = Effect.fnUntraced(function* (sessionID: SessionID) {
@@ -1348,6 +1368,7 @@ export const layer: Layer.Layer<
       messages,
       messageWithChildren,
       children,
+      childrenByParents,
       remove,
       updateMessage,
       removeMessage,

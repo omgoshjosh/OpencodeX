@@ -37,6 +37,9 @@ export const layer = Layer.effect(
     const project = Effect.fn("SessionActivity.project")(function* (sessions: readonly Session.Info[]) {
       const ids = sessions.map((session) => session.id)
       if (ids.length === 0) return []
+      // Recovery mutates execution and status rows, so complete it before this
+      // read-only batch takes the projection snapshot.
+      yield* status.recover()
       const [executions, interactions, statuses] = yield* Effect.all([
         db
           .select({ sessionID: SessionExecutionTable.session_id, state: SessionExecutionTable.state })
@@ -50,7 +53,7 @@ export const layer = Layer.effect(
           .where(inArray(SessionInteractionTable.session_id, ids))
           .all()
           .pipe(Effect.orDie),
-        status.list(),
+        status.snapshot(),
       ])
       const execution = new Map(executions.map((row) => [row.sessionID, row.state]))
       const interaction = new Map(

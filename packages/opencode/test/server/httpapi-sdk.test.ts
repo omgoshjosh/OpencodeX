@@ -29,6 +29,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { Database } from "@opencode-ai/core/database/database"
 import { OpencodeXJobTable, OpencodeXSwarmTable } from "@opencode-ai/core/opencodex/sql"
 import { SessionCommandTable, SessionExecutionTable, SessionInteractionTable } from "@opencode-ai/core/session/sql"
+import { eq } from "drizzle-orm"
 import { httpApiLayer } from "./httpapi-layer"
 
 const noopBootstrap = Layer.succeed(InstanceBootstrap.Service, InstanceBootstrap.Service.of({ run: Effect.void }))
@@ -452,6 +453,30 @@ describe("HttpApi SDK", () => {
           swarms: false,
         },
       })
+      yield* db
+        .insert(SessionInteractionTable)
+        .values({
+          id: "interaction_restart_orphan",
+          kind: "question",
+          session_id: sessionID,
+          project_id: "project",
+          directory: ".",
+          state: "pending",
+          request_json: { id: "interaction_restart_orphan", sessionID, questions: [], executionGeneration: 99 },
+          time_created: now,
+          time_updated: now,
+        })
+        .run()
+        .pipe(Effect.orDie)
+      expect((yield* call(() => sdk.global.restartReadiness())).data?.ready).toBe(true)
+      expect(
+        yield* db
+          .select({ state: SessionInteractionTable.state })
+          .from(SessionInteractionTable)
+          .where(eq(SessionInteractionTable.id, "interaction_restart_orphan"))
+          .get()
+          .pipe(Effect.orDie),
+      ).toEqual({ state: "rejected" })
       // A reusable planned swarm is a definition, not executing work, for both
       // contracts: restart readiness ignores it, and idle health has ignored
       // dormant swarms since d2f590c5ab (ACTIVE_SWARM_STATUSES excludes

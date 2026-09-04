@@ -1,18 +1,33 @@
 import { EventV2Bridge } from "@/event-v2-bridge"
-import { Permission } from "@/permission"
 import { PermissionID } from "@/permission/schema"
-import { Question } from "@/question"
 import { QuestionID } from "@/question/schema"
-import { SessionID } from "@/session/schema"
+import { MessageID, SessionID } from "@/session/schema"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
 import { PartTable, SessionExecutionTable, SessionInteractionTable } from "@opencode-ai/core/session/sql"
+import { ensureRunID } from "@opencode-ai/core/util/opencode-process"
 import { and, eq } from "drizzle-orm"
-import { Effect } from "effect"
+import { Effect, Option, Schema } from "effect"
+import { SessionExecutionOwner } from "./execution-owner"
+import { SessionInteractionEvent } from "./interaction-event"
 
-export const recover = Effect.fn("SessionInteractionRecovery.recover")(function* (sessionID?: SessionID) {
-  const { db } = yield* Database.Service
-  const events = yield* EventV2Bridge.Service
+const Tool = Schema.Struct({ messageID: MessageID, callID: Schema.String })
+const ToolPart = Schema.Struct({
+  type: Schema.Literal("tool"),
+  callID: Schema.String,
+  state: Schema.Struct({ status: Schema.Literals(["completed", "error"]) }),
+})
+const decodeTool = Schema.decodeUnknownOption(Tool)
+const decodeToolPart = Schema.decodeUnknownOption(ToolPart)
+
+export const recoverWith = Effect.fn("SessionInteractionRecovery.recoverWith")(function* (input: {
+  database: Database.Interface
+  events: EventV2.Interface
+  sessionID?: SessionID
+}) {
+  const { db } = input.database
+  const { events, sessionID } = input
+  const processRunID = ensureRunID()
   const now = Date.now()
   const committed = yield* events.barrier(
     db
@@ -44,23 +59,19 @@ export const recover = Effect.fn("SessionInteractionRecovery.recover")(function*
                 !!execution.owner_id &&
                 !!execution.lease_expires_at &&
                 execution.lease_expires_at > now &&
-                execution.generation === generation
-              const tool = request.tool
+                execution.generation === generation &&
+                SessionExecutionOwner.alive(execution.owner_id, processRunID)
+              const tool = Option.getOrUndefined(decodeTool(request.tool))
               const terminalTool =
-                typeof tool === "object" &&
-                tool !== null &&
-                typeof tool.messageID === "string" &&
-                typeof tool.callID === "string" &&
+                !!tool &&
                 !!(yield* transaction
                   .select({ data: PartTable.data })
                   .from(PartTable)
                   .where(and(eq(PartTable.session_id, row.session_id), eq(PartTable.message_id, tool.messageID)))
-                  .all()).find(
-                  (part) =>
-                    part.data.type === "tool" &&
-                    part.data.callID === tool.callID &&
-                    (part.data.state.status === "completed" || part.data.state.status === "error"),
-                )
+                  .all()).some((part) => {
+                  const decoded = decodeToolPart(part.data)
+                  return decoded._tag === "Some" && decoded.value.callID === tool.callID
+                })
               if (!terminalTool && (generation === undefined || live)) continue
               const updated = yield* transaction
                 .update(SessionInteractionTable)
@@ -76,7 +87,7 @@ export const recover = Effect.fn("SessionInteractionRecovery.recover")(function*
               if (!updated) continue
               if (row.kind === "question") {
                 result.push(
-                  yield* events.commit(Question.Event.Rejected, {
+                  yield* events.commit(SessionInteractionEvent.QuestionRejected, {
                     sessionID: SessionID.make(row.session_id),
                     requestID: QuestionID.make(row.id),
                   }),
@@ -84,7 +95,7 @@ export const recover = Effect.fn("SessionInteractionRecovery.recover")(function*
                 continue
               }
               result.push(
-                yield* events.commit(Permission.Event.Replied, {
+                yield* events.commit(SessionInteractionEvent.PermissionReplied, {
                   sessionID: SessionID.make(row.session_id),
                   requestID: PermissionID.make(row.id),
                   reply: "reject",
@@ -98,6 +109,14 @@ export const recover = Effect.fn("SessionInteractionRecovery.recover")(function*
       .pipe(Effect.orDie),
   )
   yield* Effect.forEach(committed, events.broadcast, { discard: true })
+})
+
+export const recover = Effect.fn("SessionInteractionRecovery.recover")(function* (sessionID?: SessionID) {
+  yield* recoverWith({
+    database: yield* Database.Service,
+    events: yield* EventV2Bridge.Service,
+    sessionID,
+  })
 })
 
 export * as SessionInteractionRecovery from "./interaction-recovery"

@@ -9,6 +9,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { SessionExecutionTable, SessionInteractionTable } from "@opencode-ai/core/session/sql"
 import { and, eq } from "drizzle-orm"
 import { SessionStatus } from "@/session/status"
+import { SessionInteractionEvent } from "@/session/interaction-event"
 
 const log = Log.create({ service: "question" })
 const encodeQuestionID = Schema.encodeSync(QuestionID)
@@ -114,7 +115,7 @@ export const Rejected = Schema.Struct({
 export const Event = {
   Asked: EventV2.define({ type: "question.asked", schema: Request.fields }),
   Replied: EventV2.define({ type: "question.replied", schema: Replied.fields }),
-  Rejected: EventV2.define({ type: "question.rejected", schema: Rejected.fields }),
+  Rejected: SessionInteractionEvent.QuestionRejected,
 }
 
 export class RejectedError extends Schema.TaggedErrorClass<RejectedError>()("QuestionRejectedError", {}) {

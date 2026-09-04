@@ -162,6 +162,7 @@ it.instance("recovers only orphaned interactions and emits one terminal event", 
     const now = Date.now()
     const crashed = SessionID.make("ses_recovery_crashed")
     const leased = SessionID.make("ses_recovery_leased")
+    const deadOwner = SessionID.make("ses_recovery_dead_owner")
     const standalone = SessionID.make("ses_recovery_standalone")
     const rejected = yield* Ref.make(0)
     const unsubscribe = yield* events.listen((event) =>
@@ -190,6 +191,17 @@ it.instance("recovers only orphaned interactions and emits one terminal event", 
           state: "running",
           owner_id: "live:owner",
           generation: 4,
+          lease_expires_at: now + 60_000,
+          time_created: now,
+          time_updated: now,
+        },
+        {
+          session_id: deadOwner,
+          project_id: "prj_test",
+          directory: ctx.directory,
+          state: "running",
+          owner_id: "local:999999:dead:recovery",
+          generation: 5,
           lease_expires_at: now + 60_000,
           time_created: now,
           time_updated: now,
@@ -252,6 +264,22 @@ it.instance("recovers only orphaned interactions and emits one terminal event", 
           time_updated: now,
         },
         {
+          id: "que_recovery_dead_owner",
+          kind: "question",
+          session_id: deadOwner,
+          project_id: "prj_test",
+          directory: ctx.directory,
+          state: "pending",
+          request_json: {
+            id: "que_recovery_dead_owner",
+            sessionID: deadOwner,
+            questions: [],
+            executionGeneration: 5,
+          },
+          time_created: now,
+          time_updated: now,
+        },
+        {
           id: "que_recovery_legacy",
           kind: "question",
           session_id: standalone,
@@ -267,14 +295,18 @@ it.instance("recovers only orphaned interactions and emits one terminal event", 
       .pipe(Effect.orDie)
     yield* SessionInteractionRecovery.recover()
     const rows = yield* db.select().from(SessionInteractionTable).all().pipe(Effect.orDie)
-    expect(rows.filter((row) => row.id.includes("crashed")).map((row) => row.state)).toEqual(["rejected", "rejected"])
+    expect(rows.filter((row) => row.id.includes("crashed") || row.id.includes("dead_owner")).map((row) => row.state)).toEqual([
+      "rejected",
+      "rejected",
+      "rejected",
+    ])
     expect(rows.filter((row) => row.id.includes("leased") || row.id.includes("legacy")).map((row) => row.state)).toEqual([
       "pending",
       "pending",
     ])
     expect(rows.find((row) => row.id === "per_recovery_crashed")?.response_json).toEqual({ reply: "reject" })
-    expect(rows.filter((row) => row.id.includes("crashed")).every((row) => row.responded_at && row.time_updated >= now)).toBe(true)
-    expect(yield* Ref.get(rejected)).toBe(2)
+    expect(rows.filter((row) => row.id.includes("crashed") || row.id.includes("dead_owner")).every((row) => row.responded_at && row.time_updated >= now)).toBe(true)
+    expect(yield* Ref.get(rejected)).toBe(3)
   }),
 )
 

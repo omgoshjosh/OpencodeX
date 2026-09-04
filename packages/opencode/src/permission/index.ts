@@ -14,6 +14,7 @@ import { PermissionID } from "./schema"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { EventV2 } from "@opencode-ai/core/event"
 import { SessionStatus } from "@/session/status"
+import { SessionInteractionEvent } from "@/session/interaction-event"
 
 const log = Log.create({ service: "permission" })
 const encodePermissionID = Schema.encodeSync(PermissionID)
@@ -87,14 +88,7 @@ export type Approval = Schema.Schema.Type<typeof Approval>
 
 export const Event = {
   Asked: EventV2.define({ type: "permission.asked", schema: Request.fields }),
-  Replied: EventV2.define({
-    type: "permission.replied",
-    schema: {
-      sessionID: SessionID,
-      requestID: PermissionID,
-      reply: Reply,
-    },
-  }),
+  Replied: SessionInteractionEvent.PermissionReplied,
 }
 
 export class RejectedError extends Schema.TaggedErrorClass<RejectedError>()("PermissionRejectedError", {}) {

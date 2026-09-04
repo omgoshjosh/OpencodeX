@@ -18,6 +18,7 @@ import { makeGuiBridgeHandlers } from "./gui-bridge"
 import { Database } from "@opencode-ai/core/database/database"
 import { OpencodeXJobTable, OpencodeXSwarmTable } from "@opencode-ai/core/opencodex/sql"
 import { SessionCommandTable, SessionExecutionTable, SessionInteractionTable } from "@opencode-ai/core/session/sql"
+import { SessionStatus } from "@/session/status"
 import { and, eq, gt, inArray, or } from "drizzle-orm"
 import { ensureProcessMetadata } from "@opencode-ai/core/util/opencode-process"
 
@@ -89,8 +90,10 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
     const bridge = yield* EffectBridge.make()
     const guiBridge = yield* makeGuiBridgeHandlers()
     const { db } = yield* Database.Service
+    const status = yield* SessionStatus.Service
     const processMetadata = ensureProcessMetadata("main")
     const databaseID = Bun.hash(Database.path()).toString(36)
+    yield* status.recover()
 
     const activity = Effect.fn("GlobalHttpApi.activity")(function* () {
       const now = Date.now()
@@ -157,6 +160,7 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
     })
 
     const restartReadiness = Effect.fn("GlobalHttpApi.restartReadiness")(function* () {
+      yield* status.recover()
       const result = yield* activity().pipe(
         Effect.catch(() =>
           Effect.succeed({

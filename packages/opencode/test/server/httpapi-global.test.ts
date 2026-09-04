@@ -11,6 +11,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { OpencodeXSwarmTable } from "@opencode-ai/core/opencodex/sql"
 import { GuiBridge } from "../../src/opencodex/gui-bridge"
 import { SessionID } from "../../src/session/schema"
+import { SessionStatus } from "../../src/session/status"
 import { ServerAuth } from "../../src/server/auth"
 import { RootHttpApi } from "../../src/server/routes/instance/httpapi/api"
 import { GlobalPaths } from "../../src/server/routes/instance/httpapi/groups/global"
@@ -44,6 +45,7 @@ const apiLayer = HttpRouter.serve(
     }),
   ),
   Layer.provide(ServerAuth.Config.layer({ password: Option.none(), username: "opencode" })),
+  Layer.provideMerge(SessionStatus.layer),
   Layer.provideMerge(guiBridgeLayer),
   Layer.provideMerge(Database.defaultLayer),
 )

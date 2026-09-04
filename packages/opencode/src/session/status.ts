@@ -74,6 +74,7 @@ export const Event = {
 }
 
 export interface Interface {
+  readonly recover: (sessionID?: SessionID) => Effect.Effect<void>
   readonly get: (sessionID: SessionID) => Effect.Effect<Info>
   readonly list: () => Effect.Effect<Map<SessionID, Info>>
   readonly set: (sessionID: SessionID, status: Info) => Effect.Effect<void>
@@ -205,7 +206,7 @@ export const layer = Layer.effect(
           .pipe(Effect.orDie),
       )
       yield* Effect.forEach(broadcasts, events.broadcast, { discard: true })
-      yield* SessionInteractionRecovery.recover(sessionID)
+      yield* SessionInteractionRecovery.recoverWith({ database: { db }, events, sessionID })
     })
 
     const get = Effect.fn("SessionStatus.get")(function* (sessionID: SessionID) {
@@ -418,7 +419,7 @@ export const layer = Layer.effect(
       Effect.forkScoped,
     )
 
-    return Service.of({ get, list, set, setForGeneration, refresh, claimBlockedRetry, settleMonitoring })
+    return Service.of({ recover, get, list, set, setForGeneration, refresh, claimBlockedRetry, settleMonitoring })
   }),
 )
 

@@ -9,7 +9,7 @@ import { and, eq } from "drizzle-orm"
 import { Context, Duration, Effect, Layer, Option, Schedule, Schema } from "effect"
 import { SessionID } from "./schema"
 import { SessionExecutionOwner } from "./execution-owner"
-import { delegationRecord } from "./delegation-outcome"
+import { delegationRecord, isLiveDelegation } from "./delegation-outcome"
 import { SessionInteractionRecovery } from "./interaction-recovery"
 
 const Background = Schema.Struct({
@@ -113,11 +113,10 @@ export const layer = Layer.effect(
         .pipe(Effect.orDie)
       return rows.reduce((result, row) => {
         const record = delegationRecord(row.metadata)
-        if (!record?.background || record.phase !== "running" || !record.ownerID) return result
-        if (!SessionExecutionOwner.alive(record.ownerID, processRunID)) return result
+        if (!record?.background || !isLiveDelegation(record, processRunID)) return result
         const parentID = SessionID.make(record.parentSessionID)
         const jobs = result.get(parentID) ?? []
-        jobs.push({ role: record.role ?? "Background task", title: record.title ?? row.title, owner: record.ownerID })
+        jobs.push({ role: record.role ?? "Background task", title: record.title ?? row.title, owner: record.ownerID! })
         result.set(parentID, jobs)
         return result
       }, new Map<SessionID, { role: string; title: string; owner: string }[]>())

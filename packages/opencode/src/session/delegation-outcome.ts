@@ -1,3 +1,5 @@
+import { SessionExecutionOwner } from "./execution-owner"
+
 /**
  * The durable record of how a delegation run ended.
  *
@@ -88,6 +90,15 @@ export type DelegationFailure = {
   error: string
   occurredAt: number
   retryAt?: number
+}
+
+export function isLiveDelegation(record: DelegationRecord | undefined, runID: string) {
+  return !!(
+    record &&
+    (record.phase === "running" || record.phase === "monitoring") &&
+    record.ownerID &&
+    SessionExecutionOwner.alive(record.ownerID, runID)
+  )
 }
 
 /**

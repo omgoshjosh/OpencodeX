@@ -4,7 +4,6 @@ import { inArray } from "drizzle-orm"
 import { Context, Effect, Layer } from "effect"
 import { delegationRecord, isLiveDelegation } from "./delegation-outcome"
 import { Session } from "./session"
-import { SessionID } from "./schema"
 import { SessionStatus } from "./status"
 import { ensureRunID } from "@opencode-ai/core/util/opencode-process"
 

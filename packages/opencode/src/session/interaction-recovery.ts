@@ -20,6 +20,10 @@ const ToolPart = Schema.Struct({
 const decodeTool = Schema.decodeUnknownOption(Tool)
 const decodeToolPart = Schema.decodeUnknownOption(ToolPart)
 
+function record(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
 export const recoverWith = Effect.fn("SessionInteractionRecovery.recoverWith")(function* (input: {
   database: Database.Interface
   events: EventV2.Interface
@@ -51,8 +55,8 @@ export const recoverWith = Effect.fn("SessionInteractionRecovery.recoverWith")(f
             )
             const result: EventV2.Payload[] = []
             for (const row of rows) {
-              const request = row.request_json
-              const generation = typeof request.executionGeneration === "number" ? request.executionGeneration : undefined
+              const request = record(row.request_json) ? row.request_json : undefined
+              const generation = typeof request?.executionGeneration === "number" ? request.executionGeneration : undefined
               const execution = executions.get(row.session_id)
               const live =
                 execution?.state === "running" &&
@@ -61,7 +65,7 @@ export const recoverWith = Effect.fn("SessionInteractionRecovery.recoverWith")(f
                 execution.lease_expires_at > now &&
                 execution.generation === generation &&
                 SessionExecutionOwner.alive(execution.owner_id, processRunID)
-              const tool = Option.getOrUndefined(decodeTool(request.tool))
+              const tool = Option.getOrUndefined(decodeTool(request?.tool))
               const terminalTool =
                 !!tool &&
                 !!(yield* transaction

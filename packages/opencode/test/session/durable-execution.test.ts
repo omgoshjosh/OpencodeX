@@ -22,7 +22,7 @@ import {
   SessionInteractionTable,
   SessionStatusTable,
 } from "@opencode-ai/core/session/sql"
-import { and, eq } from "drizzle-orm"
+import { and, eq, sql } from "drizzle-orm"
 import { Context, Duration, Effect, Exit, Fiber, Latch, Layer, Ref, Scope } from "effect"
 import { pollWithTimeout, testEffect } from "../lib/effect"
 
@@ -290,9 +290,36 @@ it.instance("recovers only orphaned interactions and emits one terminal event", 
           time_created: now,
           time_updated: now,
         },
+        ...["null", "array", "primitive", "malformed"].map((kind) => ({
+          id: `que_recovery_${kind}`,
+          kind: "question" as const,
+          session_id: standalone,
+          project_id: "prj_test",
+          directory: ctx.directory,
+          state: "pending" as const,
+          request_json: {},
+          time_created: now,
+          time_updated: now,
+        })),
       ])
       .run()
       .pipe(Effect.orDie)
+    yield* Effect.all(
+      [
+        { id: "que_recovery_null", request: sql`'null'` },
+        { id: "que_recovery_array", request: sql`'[]'` },
+        { id: "que_recovery_primitive", request: sql`'"legacy"'` },
+        { id: "que_recovery_malformed", request: sql`'{"executionGeneration":"old","tool":[]}'` },
+      ].map((item) =>
+        db
+          .update(SessionInteractionTable)
+          .set({ request_json: item.request })
+          .where(eq(SessionInteractionTable.id, item.id))
+          .run()
+          .pipe(Effect.orDie),
+      ),
+      { concurrency: "unbounded" },
+    )
     yield* SessionInteractionRecovery.recover()
     const rows = yield* db.select().from(SessionInteractionTable).all().pipe(Effect.orDie)
     expect(rows.filter((row) => row.id.includes("crashed") || row.id.includes("dead_owner")).map((row) => row.state)).toEqual([
@@ -300,10 +327,7 @@ it.instance("recovers only orphaned interactions and emits one terminal event", 
       "rejected",
       "rejected",
     ])
-    expect(rows.filter((row) => row.id.includes("leased") || row.id.includes("legacy")).map((row) => row.state)).toEqual([
-      "pending",
-      "pending",
-    ])
+    expect(rows.filter((row) => row.id.includes("leased") || row.id.includes("legacy") || row.id.includes("null") || row.id.includes("array") || row.id.includes("primitive") || row.id.includes("malformed")).every((row) => row.state === "pending")).toBe(true)
     expect(rows.find((row) => row.id === "per_recovery_crashed")?.response_json).toEqual({ reply: "reject" })
     expect(rows.filter((row) => row.id.includes("crashed") || row.id.includes("dead_owner")).every((row) => row.responded_at && row.time_updated >= now)).toBe(true)
     expect(yield* Ref.get(rejected)).toBe(3)

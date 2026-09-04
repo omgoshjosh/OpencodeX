@@ -77,6 +77,7 @@ export interface Interface {
   readonly recover: (sessionID?: SessionID) => Effect.Effect<void>
   readonly get: (sessionID: SessionID) => Effect.Effect<Info>
   readonly list: () => Effect.Effect<Map<SessionID, Info>>
+  readonly snapshot: () => Effect.Effect<Map<SessionID, Info>>
   readonly set: (sessionID: SessionID, status: Info) => Effect.Effect<void>
   readonly setForGeneration: (sessionID: SessionID, generation: number, status: Info) => Effect.Effect<boolean>
   readonly refresh: (sessionID: SessionID) => Effect.Effect<void>
@@ -222,8 +223,7 @@ export const layer = Layer.effect(
       return withBackground(status, (yield* backgrounds()).get(sessionID))
     })
 
-    const list = Effect.fn("SessionStatus.list")(function* () {
-      yield* recover()
+    const snapshot = Effect.fn("SessionStatus.snapshot")(function* () {
       const rows = yield* db
         .select({ sessionID: SessionStatusTable.session_id, status: SessionStatusTable.status })
         .from(SessionStatusTable)
@@ -239,6 +239,11 @@ export const layer = Layer.effect(
         result.set(sessionID, withBackground(result.get(sessionID) ?? { type: "idle" }, jobs))
       }
       return result
+    })
+
+    const list = Effect.fn("SessionStatus.list")(function* () {
+      yield* recover()
+      return yield* snapshot()
     })
 
     const write = Effect.fnUntraced(function* (sessionID: SessionID, status: Info, generation?: number) {
@@ -418,7 +423,7 @@ export const layer = Layer.effect(
       Effect.forkScoped,
     )
 
-    return Service.of({ recover, get, list, set, setForGeneration, refresh, claimBlockedRetry, settleMonitoring })
+    return Service.of({ recover, get, list, snapshot, set, setForGeneration, refresh, claimBlockedRetry, settleMonitoring })
   }),
 )
 

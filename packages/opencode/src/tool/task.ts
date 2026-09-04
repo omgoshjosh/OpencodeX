@@ -29,6 +29,7 @@ import { OpencodeXSwarmRoleTable } from "@opencode-ai/core/opencodex/sql"
 import { SwarmBriefing } from "@/opencodex/swarm-briefing"
 import { isSwarmProvider } from "@/provider/swarm-provider"
 import { SessionStatus } from "@/session/status"
+import { ensureRunID } from "@opencode-ai/core/util/opencode-process"
 
 const log = Log.create({ service: "tool.task" })
 
@@ -414,12 +415,19 @@ export const TaskTool = Tool.define(
       // previous outcome, and every later write compare-and-sets on the runID
       // so a stale run can never overwrite a newer one.
       const runID = Identifier.ascending("run")
+      const childMessageID = MessageID.ascending()
       const started: DelegationRecord = {
         version: DELEGATION_RECORD_VERSION,
         runID,
         parentSessionID: ctx.sessionID,
         parentMessageID: ctx.messageID,
         ...(ctx.callID ? { toolCallID: ctx.callID } : {}),
+        ...(runInBackground ? { background: true as const } : {}),
+        ownerID: `local:${process.pid}:${ensureRunID()}:${runID}`,
+        role: next.name,
+        title: params.description,
+        mode: runInBackground ? "background" : "foreground",
+        childMessageID,
         attempt: delegationAttempts(nextSession.metadata) + 1,
         phase: "running",
         startedAt: Date.now(),
@@ -515,7 +523,7 @@ export const TaskTool = Tool.define(
         const runTask = Effect.fn("TaskTool.runTask")(function* () {
           const parts = yield* ops.resolvePromptParts(params.prompt)
           const result = yield* ops.prompt({
-            messageID: MessageID.ascending(),
+            messageID: childMessageID,
             sessionID: nextSession.id,
             model: {
               modelID: model.modelID,
@@ -750,11 +758,12 @@ export const TaskTool = Tool.define(
               // subagent error, defect, or interruption - nothing leaves the
               // child stamped `running` short of the process dying.
               Effect.onExit((exit) =>
-                Exit.isSuccess(exit)
+                (Exit.isSuccess(exit)
                   ? settleResult(exit.value)
                   : Cause.hasInterruptsOnly(exit.cause)
                     ? settle("cancelled")
-                    : settleFailure(Cause.squash(exit.cause)),
+                    : settleFailure(Cause.squash(exit.cause))
+                ).pipe(Effect.andThen(status.refresh(ctx.sessionID))),
               ),
               // A subagent that finished on an assistant error is a failed
               // job, not a completed one: the job state, the notification, and
@@ -771,6 +780,7 @@ export const TaskTool = Tool.define(
               }),
             ),
           })
+          yield* status.refresh(ctx.sessionID)
 
           return {
             title: params.description,

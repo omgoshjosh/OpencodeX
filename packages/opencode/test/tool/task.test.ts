@@ -972,6 +972,94 @@ describe("tool.task", () => {
     }),
   )
 
+  background.instance("persists recovery metadata for a running background task", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+
+      const result = yield* def.execute(
+        {
+          description: "inspect cache key",
+          prompt: "look into the cache key path",
+          subagent_type: "general",
+          background: true,
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          directory: chat.directory,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps: { ...stubOps(), prompt: () => Effect.never } },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      const record = delegationRecord((yield* sessions.get(SessionID.make(result.metadata.sessionId))).metadata)
+      expect(record).toMatchObject({
+        runID: result.metadata.runID,
+        parentSessionID: chat.id,
+        parentMessageID: assistant.id,
+        background: true,
+        role: "general",
+        title: "inspect cache key",
+        mode: "background",
+      })
+      expect(record?.ownerID).toMatch(new RegExp(`^local:${process.pid}:.+?:${record?.runID}$`))
+      expect(record?.childMessageID).toBeTruthy()
+    }),
+  )
+
+  background.instance("exposes and clears parent background jobs as a child runs and settles", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const status = yield* SessionStatus.Service
+      const started = defer<void>()
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+
+      const result = yield* def.execute(
+        { description: "inspect cache key", prompt: "look into it", subagent_type: "general", background: true },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          directory: chat.directory,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: {
+            promptOps: {
+              ...stubOps(),
+              prompt: (input) => Effect.promise(() => started.promise).pipe(Effect.map(() => reply(input, "done"))),
+            },
+          },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      expect(yield* status.get(chat.id)).toMatchObject({
+        type: "idle",
+        background: { running: true, jobs: [{ role: "general", title: "inspect cache key" }] },
+      })
+      expect((yield* status.list()).get(chat.id)).toMatchObject({
+        type: "idle",
+        background: { running: true, jobs: [{ role: "general", title: "inspect cache key" }] },
+      })
+
+      started.resolve()
+      expect((yield* jobs.wait({ id: result.metadata.sessionId, timeout: 1_000 })).info?.status).toBe("completed")
+
+      expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
+      expect((yield* status.list()).has(chat.id)).toBe(false)
+    }),
+  )
+
   background.instance("background tasks complete through the background job service", () =>
     Effect.gen(function* () {
       const jobs = yield* BackgroundJob.Service

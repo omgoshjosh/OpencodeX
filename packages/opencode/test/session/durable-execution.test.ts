@@ -9,6 +9,7 @@ import { QuestionID } from "@/question/schema"
 import { SessionRunState } from "@/session/run-state"
 import { MessageID, SessionID } from "@/session/schema"
 import { SessionStatus } from "@/session/status"
+import { SessionInteractionRecovery } from "@/session/interaction-recovery"
 import * as PromptClaim from "@/session/prompt-claim"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Database } from "@opencode-ai/core/database/database"
@@ -152,6 +153,130 @@ const insertCommand = Effect.fn("DurableExecutionTest.insertCommand")(function* 
     .run()
     .pipe(Effect.orDie)
 })
+
+it.instance("recovers only orphaned interactions and emits one terminal event", () =>
+  Effect.gen(function* () {
+    const { db } = yield* Database.Service
+    const events = yield* EventV2Bridge.Service
+    const ctx = yield* InstanceState.context
+    const now = Date.now()
+    const crashed = SessionID.make("ses_recovery_crashed")
+    const leased = SessionID.make("ses_recovery_leased")
+    const standalone = SessionID.make("ses_recovery_standalone")
+    const rejected = yield* Ref.make(0)
+    const unsubscribe = yield* events.listen((event) =>
+      event.type === Question.Event.Rejected.type || event.type === Permission.Event.Replied.type
+        ? Ref.update(rejected, (count) => count + 1)
+        : Effect.void,
+    )
+    yield* Effect.addFinalizer(() => unsubscribe)
+    yield* db
+      .insert(SessionExecutionTable)
+      .values([
+        {
+          session_id: crashed,
+          project_id: "prj_test",
+          directory: ctx.directory,
+          state: "interrupted",
+          generation: 3,
+          completed_at: now,
+          time_created: now,
+          time_updated: now,
+        },
+        {
+          session_id: leased,
+          project_id: "prj_test",
+          directory: ctx.directory,
+          state: "running",
+          owner_id: "live:owner",
+          generation: 4,
+          lease_expires_at: now + 60_000,
+          time_created: now,
+          time_updated: now,
+        },
+      ])
+      .run()
+      .pipe(Effect.orDie)
+    yield* db
+      .insert(SessionInteractionTable)
+      .values([
+        {
+          id: "que_recovery_crashed",
+          kind: "question",
+          session_id: crashed,
+          project_id: "prj_test",
+          directory: ctx.directory,
+          state: "pending",
+          request_json: {
+            id: "que_recovery_crashed",
+            sessionID: crashed,
+            questions: [],
+            executionGeneration: 3,
+          },
+          time_created: now,
+          time_updated: now,
+        },
+        {
+          id: "per_recovery_crashed",
+          kind: "permission",
+          session_id: crashed,
+          project_id: "prj_test",
+          directory: ctx.directory,
+          state: "pending",
+          request_json: {
+            id: "per_recovery_crashed",
+            sessionID: crashed,
+            permission: "bash",
+            patterns: [],
+            metadata: {},
+            always: [],
+            executionGeneration: 3,
+          },
+          time_created: now,
+          time_updated: now,
+        },
+        {
+          id: "que_recovery_leased",
+          kind: "question",
+          session_id: leased,
+          project_id: "prj_test",
+          directory: ctx.directory,
+          state: "pending",
+          request_json: {
+            id: "que_recovery_leased",
+            sessionID: leased,
+            questions: [],
+            executionGeneration: 4,
+          },
+          time_created: now,
+          time_updated: now,
+        },
+        {
+          id: "que_recovery_legacy",
+          kind: "question",
+          session_id: standalone,
+          project_id: "prj_test",
+          directory: ctx.directory,
+          state: "pending",
+          request_json: { id: "que_recovery_legacy", sessionID: standalone, questions: [] },
+          time_created: now,
+          time_updated: now,
+        },
+      ])
+      .run()
+      .pipe(Effect.orDie)
+    yield* SessionInteractionRecovery.recover()
+    const rows = yield* db.select().from(SessionInteractionTable).all().pipe(Effect.orDie)
+    expect(rows.filter((row) => row.id.includes("crashed")).map((row) => row.state)).toEqual(["rejected", "rejected"])
+    expect(rows.filter((row) => row.id.includes("leased") || row.id.includes("legacy")).map((row) => row.state)).toEqual([
+      "pending",
+      "pending",
+    ])
+    expect(rows.find((row) => row.id === "per_recovery_crashed")?.response_json).toEqual({ reply: "reject" })
+    expect(rows.filter((row) => row.id.includes("crashed")).every((row) => row.responded_at && row.time_updated >= now)).toBe(true)
+    expect(yield* Ref.get(rejected)).toBe(2)
+  }),
+)
 
 it.instance("allows one lease winner and makes a foreign caller join", () =>
   Effect.gen(function* () {

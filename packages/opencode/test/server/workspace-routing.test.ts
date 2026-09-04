@@ -24,6 +24,11 @@ describe("isLocalWorkspaceRoute", () => {
     expect(isLocalWorkspaceRoute("POST", "/session/status")).toBe(false)
   })
 
+  test("GET /session/tree is local", () => {
+    expect(isLocalWorkspaceRoute("GET", "/session/tree")).toBe(true)
+    expect(isLocalWorkspaceRoute("POST", "/session/tree")).toBe(false)
+  })
+
   test("unrecognized paths are not local", () => {
     expect(isLocalWorkspaceRoute("GET", "/config")).toBe(false)
     expect(isLocalWorkspaceRoute("POST", "/session/ses_abc/message")).toBe(false)
@@ -49,6 +54,10 @@ describe("getWorkspaceRouteSessionID", () => {
   test("returns null for /session/status", () => {
     const url = new URL("http://localhost/session/status")
     expect(getWorkspaceRouteSessionID(url)).toBeNull()
+  })
+
+  test("returns null for /session/tree", () => {
+    expect(getWorkspaceRouteSessionID(new URL("http://localhost/session/tree"))).toBeNull()
   })
 
   test("returns null for non-session paths", () => {

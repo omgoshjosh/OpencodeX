@@ -672,15 +672,52 @@ describe("HttpApi SDK", () => {
   serverPathParity("matches generated SDK session lifecycle routes", (serverPath) =>
     withStandardProject(serverPath, ({ sdk }) =>
       Effect.gen(function* () {
+        const { db } = yield* Database.Service
         const parent = yield* capture(() => sdk.session.create({ title: "parent" }))
         const parentID = String(record(parent.data).id)
         const child = yield* capture(() => sdk.session.create({ title: "child", parentID }))
         const childID = String(record(child.data).id)
+        const childInfo = record(child.data)
+        const now = Date.now()
+        yield* db
+          .insert(SessionExecutionTable)
+          .values({
+            session_id: SessionID.make(childID),
+            project_id: String(childInfo.projectID),
+            directory: String(childInfo.directory),
+            state: "running",
+            owner_id: "remote-owner",
+            generation: 1,
+            lease_expires_at: now + 60_000,
+            started_at: now,
+            time_created: now,
+            time_updated: now,
+          })
+          .run()
+          .pipe(Effect.orDie)
+        const runningDelegation = {
+          opencodex: {
+            delegation: {
+              version: 2,
+              runID: "task8-live-child",
+              parentSessionID: parentID,
+              attempt: 1,
+              phase: "running",
+              ownerID: "remote-owner",
+              background: true,
+              startedAt: now,
+            },
+          },
+        }
+        yield* capture(() => sdk.session.update({ sessionID: childID, metadata: runningDelegation }))
         const get = yield* capture(() => sdk.session.get({ sessionID: parentID }))
         const update = yield* capture(() => sdk.session.update({ sessionID: parentID, title: "renamed" }))
         const roots = yield* capture(() => sdk.session.list({ roots: true, limit: 10 }))
         const all = yield* capture(() => sdk.session.list({ roots: false, limit: 10 }))
         const children = yield* capture(() => sdk.session.children({ sessionID: parentID }))
+        const liveChildren = yield* capture(() => sdk.session.children({ sessionID: parentID, state: "live" }))
+        const liveTree = yield* capture(() => sdk.session.tree({ live: "true" }))
+        const fullTree = yield* capture(() => sdk.session.tree({ live: "false" }))
         const todo = yield* capture(() => sdk.session.todo({ sessionID: parentID }))
         const status = yield* capture(() => sdk.session.status())
         const messages = yield* capture(() => sdk.session.messages({ sessionID: parentID }))
@@ -689,6 +726,26 @@ describe("HttpApi SDK", () => {
         const invalidCursor = yield* capture(() =>
           sdk.session.messages({ sessionID: parentID, limit: 2, before: "bad" }),
         )
+        yield* db
+          .update(SessionExecutionTable)
+          .set({ state: "idle", owner_id: null, lease_expires_at: null, completed_at: Date.now() })
+          .where(eq(SessionExecutionTable.session_id, SessionID.make(childID)))
+          .run()
+          .pipe(Effect.orDie)
+        yield* capture(() =>
+          sdk.session.update({
+            sessionID: childID,
+            metadata: {
+              opencodex: { delegation: { ...runningDelegation.opencodex.delegation, phase: "settled", completedAt: Date.now() } },
+            },
+          }),
+        )
+        const settledChildren = yield* capture(() => sdk.session.children({ sessionID: parentID, state: "live" }))
+        expect(liveChildren.data).toHaveLength(1)
+        expect(record(array(liveChildren.data)[0]).status).toMatchObject({ type: "idle" })
+        expect(record(array(liveTree.data)[0]).children).toHaveLength(1)
+        expect(record(array(fullTree.data)[0]).children).toHaveLength(1)
+        expect(settledChildren.data).toHaveLength(0)
         const deleted = yield* capture(() => sdk.session.delete({ sessionID: childID }))
         const getDeleted = yield* capture(() => sdk.session.get({ sessionID: childID }))
 
@@ -701,12 +758,16 @@ describe("HttpApi SDK", () => {
             roots,
             all,
             children,
+            liveChildren,
+            liveTree,
+            fullTree,
             todo,
             status,
             messages,
             missingGet,
             missingMessages,
             invalidCursor,
+            settledChildren,
             deleted,
             getDeleted,
           }),
@@ -715,6 +776,11 @@ describe("HttpApi SDK", () => {
           rootTitles: sessionTitles(roots.data),
           allTitles: sessionTitles(all.data),
           childCount: array(children.data).length,
+          liveChildStatus: record(array(liveChildren.data)[0]).status,
+          liveChildCount: array(liveChildren.data).length,
+          liveTreeChildCount: array(record(array(liveTree.data)[0]).children).length,
+          fullTreeChildCount: array(record(array(fullTree.data)[0]).children).length,
+          settledChildCount: array(settledChildren.data).length,
           todoCount: array(todo.data).length,
           messageCount: array(messages.data).length,
         }

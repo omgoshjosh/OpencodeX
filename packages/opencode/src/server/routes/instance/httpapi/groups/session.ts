@@ -35,6 +35,21 @@ export const ListQuery = Schema.Struct({
   search: Schema.optional(Schema.String),
   limit: Schema.optional(Schema.NumberFromString),
 })
+export const ChildrenQuery = Schema.Struct({
+  ...WorkspaceRoutingQueryFields,
+  state: Schema.optional(Schema.Literals(["all", "live"])),
+})
+export const TreeQuery = Schema.Struct({
+  ...WorkspaceRoutingQueryFields,
+  scope: Schema.optional(Schema.Literals(["project"])),
+  path: Schema.optional(Schema.String),
+  start: Schema.optional(Schema.NumberFromString),
+  search: Schema.optional(Schema.String),
+  limit: Schema.optional(Schema.NumberFromString),
+  live: Schema.optional(QueryBoolean),
+})
+export const SessionWithStatus = Schema.Struct({ ...Session.Info.fields, status: SessionStatus.Info })
+export const SessionTree = Schema.Struct({ ...SessionWithStatus.fields, children: Schema.Array(SessionWithStatus) })
 export const DiffQuery = Schema.Struct({
   ...WorkspaceRoutingQueryFields,
   ...Struct.omit(SessionSummary.DiffInput.fields, ["sessionID"]),
@@ -89,6 +104,7 @@ export const PermissionResponsePayload = Schema.Struct({
 export const SessionPaths = {
   list: root,
   status: `${root}/status`,
+  tree: `${root}/tree`,
   get: `${root}/:sessionID`,
   children: `${root}/:sessionID/children`,
   todo: `${root}/:sessionID/todo`,
@@ -141,6 +157,17 @@ export const SessionApi = HttpApi.make("session")
             description: "Retrieve the current status of all sessions, including active, idle, and completed states.",
           }),
         ),
+        HttpApiEndpoint.get("tree", SessionPaths.tree, {
+          query: TreeQuery,
+          success: described(Schema.Array(SessionTree), "List session tree"),
+          error: HttpApiError.BadRequest,
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "session.tree",
+            summary: "Get session tree",
+            description: "Retrieve root sessions with direct children and derived status.",
+          }),
+        ),
         HttpApiEndpoint.get("get", SessionPaths.get, {
           params: { sessionID: SessionID },
           query: WorkspaceRoutingQuery,
@@ -155,14 +182,14 @@ export const SessionApi = HttpApi.make("session")
         ),
         HttpApiEndpoint.get("children", SessionPaths.children, {
           params: { sessionID: SessionID },
-          query: WorkspaceRoutingQuery,
-          success: described(Schema.Array(Session.Info), "List of children"),
+          query: ChildrenQuery,
+          success: described(Schema.Array(SessionWithStatus), "List of children"),
           error: [HttpApiError.BadRequest, ApiNotFoundError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "session.children",
             summary: "Get session children",
-            description: "Retrieve all child sessions that were forked from the specified parent session.",
+            description: "Retrieve direct child sessions with derived status; state=live returns active children only.",
           }),
         ),
         HttpApiEndpoint.post("retryChild", SessionPaths.retryChild, {

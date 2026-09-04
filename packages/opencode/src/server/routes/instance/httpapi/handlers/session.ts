@@ -10,6 +10,7 @@ import { MessageV2 } from "@/session/message-v2"
 import { SessionPrompt } from "@/session/prompt"
 import { SessionRevert } from "@/session/revert"
 import { SessionRunState } from "@/session/run-state"
+import { SessionActivity } from "@/session/activity"
 import { SessionStatus } from "@/session/status"
 import { DelegationRetry } from "@/session/delegation-retry"
 import { SessionSummary } from "@/session/summary"
@@ -25,6 +26,7 @@ import * as Log from "@opencode-ai/core/util/log"
 import { InstanceHttpApi } from "../api"
 import {
   CommandPayload,
+  ChildrenQuery,
   DiffQuery,
   ForkPayload,
   InitPayload,
@@ -35,6 +37,7 @@ import {
   RevertPayload,
   ShellPayload,
   SummarizePayload,
+  TreeQuery,
   UpdatePayload,
 } from "../groups/session"
 import { PermissionNotFoundError } from "../errors"
@@ -59,6 +62,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     const agentSvc = yield* Agent.Service
     const permissionSvc = yield* Permission.Service
     const statusSvc = yield* SessionStatus.Service
+    const activity = yield* SessionActivity.Service
     const todoSvc = yield* Todo.Service
     const summary = yield* SessionSummary.Service
 
@@ -107,9 +111,35 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       return yield* requireSession(ctx.params.sessionID)
     })
 
-    const children = Effect.fn("SessionHttpApi.children")(function* (ctx: { params: { sessionID: SessionID } }) {
+    const children = Effect.fn("SessionHttpApi.children")(function* (ctx: {
+      params: { sessionID: SessionID }
+      query: typeof ChildrenQuery.Type
+    }) {
       yield* requireSession(ctx.params.sessionID)
-      return yield* session.children(ctx.params.sessionID)
+      const projected = yield* activity.project(yield* session.children(ctx.params.sessionID))
+      return projected.filter((child) => ctx.query.state !== "live" || child.live).map((child) => child.session)
+    })
+
+    const tree = Effect.fn("SessionHttpApi.tree")(function* (ctx: { query: typeof TreeQuery.Type }) {
+      const roots = yield* session.list({
+        directory: ctx.query.scope === "project" ? undefined : ctx.query.directory,
+        scope: ctx.query.scope,
+        path: ctx.query.path,
+        roots: true,
+        start: ctx.query.start,
+        search: ctx.query.search,
+        limit: ctx.query.limit,
+      })
+      const children = yield* Effect.forEach(roots, (root) => session.children(root.id), { concurrency: "unbounded" })
+      const projected = yield* activity.project([...roots, ...children.flat()])
+      const byID = new Map(projected.map((item) => [item.session.id, item]))
+      return roots.map((root, index) => ({
+        ...byID.get(root.id)!.session,
+        children: children[index]!
+          .map((child) => byID.get(child.id)!)
+          .filter((child) => ctx.query.live === false || child.live)
+          .map((child) => child.session),
+      }))
     })
 
     const todo = Effect.fn("SessionHttpApi.todo")(function* (ctx: { params: { sessionID: SessionID } }) {
@@ -457,6 +487,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     return handlers
       .handle("list", list)
       .handle("status", status)
+      .handle("tree", tree)
       .handle("get", get)
       .handle("children", children)
       .handle("todo", todo)

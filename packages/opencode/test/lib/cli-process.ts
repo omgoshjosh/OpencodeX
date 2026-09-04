@@ -506,6 +506,8 @@ export const cliIt = {
     body: (input: CliFixture) => Effect.Effect<A, E, Scope.Scope | HttpClient.HttpClient>,
     opts?: number | TestOptions,
   ) => it.live(name, () => withCliFixture(body), opts),
+  // CLI subprocess startup is substantially more contended on Windows. Keep
+  // these serial there while retaining the measured concurrent speedup elsewhere.
   concurrent: <A, E>(
     name: string,
     body: (input: CliFixture) => Effect.Effect<A, E, Scope.Scope | HttpClient.HttpClient>,

@@ -16,11 +16,28 @@ export const cliSubprocessSuites = [
   "test/cli/acp/config-options.test.ts",
   "test/cli/acp/initialize-auth.test.ts",
   "test/cli/acp/lifecycle.test.ts",
+  "test/cli/acp/network-policy.test.ts",
   "test/cli/acp/prompt-content.test.ts",
   "test/cli/acp/skills.test.ts",
   "test/cli/help/help-snapshots.test.ts",
   "test/cli/run/run-process.test.ts",
   "test/cli/serve/authority-attach.test.ts",
+  "test/cli/serve/cross-client.test.ts",
+  "test/cli/serve/serve-authority.test.ts",
   "test/cli/serve/serve-process.test.ts",
   "test/cli/smokes/read-only.test.ts",
 ]
+
+export function cliSubprocessCommand(suite: string, platform = process.platform) {
+  return [
+    "bun",
+    "test",
+    suite,
+    "--timeout",
+    "300000",
+    "--max-concurrency",
+    platform === "win32" ? "1" : "4",
+    "--reporter",
+    "junit",
+  ]
+}

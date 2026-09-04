@@ -14,7 +14,7 @@
  */
 import { mkdir } from "node:fs/promises"
 import path from "node:path"
-import { cliSubprocessSuites as suites } from "./cli-subprocess-suites"
+import { cliSubprocessCommand, cliSubprocessSuites as suites } from "./cli-subprocess-suites"
 
 const dir = path.resolve(import.meta.dir, "..")
 process.chdir(dir)
@@ -43,7 +43,7 @@ for (const suite of suites) {
   const report = path.join(reports, `${suite.replaceAll(/[^a-zA-Z0-9.-]/g, "-")}.xml`)
   const proc = Bun.spawn(
     // prettier-ignore
-    ["bun", "test", suite, "--timeout", "300000", "--max-concurrency", "1", "--reporter", "junit", "--reporter-outfile", report],
+    [...cliSubprocessCommand(suite), "--reporter-outfile", report],
     { cwd: dir, env: { ...process.env, OPENCODE_TEST_CLI_BUNDLE: bundle }, stdout: "pipe", stderr: "pipe" },
   )
   const [, err, code] = await Promise.all([

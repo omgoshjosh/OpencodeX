@@ -18,5 +18,11 @@ bun run --cwd packages/gui check:design-system --staged
 
 files=$(git diff --cached --name-only --diff-filter=ACMR -- '*.ts' '*.tsx' '*.js' '*.jsx')
 if [ -n "$files" ]; then
-  bunx oxlint --quiet --threads=1 $files
+  output=$(bunx oxlint --quiet --threads=1 --format json $files) || {
+    code=$?
+    case "$output" in
+      *'"number_of_files": 0'*) ;;
+      *) printf '%s\n' "$output"; exit "$code" ;;
+    esac
+  }
 fi

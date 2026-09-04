@@ -18,16 +18,16 @@ export type Event =
   | EventMessagePartUpdated
   | EventMessagePartRemoved
   | EventMessagePartDelta
+  | EventQuestionRejected
+  | EventPermissionReplied
   | EventSessionStatus
   | EventSessionIdle
   | EventPermissionAsked
-  | EventPermissionReplied
   | EventSessionDiff
   | EventSessionError
   | EventOpencodexSettingsUpdated
   | EventQuestionAsked
   | EventQuestionReplied
-  | EventQuestionRejected
   | EventTodoUpdated
   | EventSessionCompacted
   | EventLspUpdated
@@ -866,6 +866,23 @@ export type GlobalEvent = {
       }
     | {
         id: string
+        type: "question.rejected"
+        properties: {
+          sessionID: string
+          requestID: string
+        }
+      }
+    | {
+        id: string
+        type: "permission.replied"
+        properties: {
+          sessionID: string
+          requestID: string
+          reply: "once" | "always" | "reject"
+        }
+      }
+    | {
+        id: string
         type: "session.status"
         properties: {
           sessionID: string
@@ -896,15 +913,6 @@ export type GlobalEvent = {
             messageID: string
             callID: string
           }
-        }
-      }
-    | {
-        id: string
-        type: "permission.replied"
-        properties: {
-          sessionID: string
-          requestID: string
-          reply: "once" | "always" | "reject"
         }
       }
     | {
@@ -958,14 +966,6 @@ export type GlobalEvent = {
           sessionID: string
           requestID: string
           answers: Array<QuestionAnswer>
-        }
-      }
-    | {
-        id: string
-        type: "question.rejected"
-        properties: {
-          sessionID: string
-          requestID: string
         }
       }
     | {
@@ -3934,6 +3934,25 @@ export type EventMessagePartDelta = {
   }
 }
 
+export type EventQuestionRejected = {
+  id: string
+  type: "question.rejected"
+  properties: {
+    sessionID: string
+    requestID: string
+  }
+}
+
+export type EventPermissionReplied = {
+  id: string
+  type: "permission.replied"
+  properties: {
+    sessionID: string
+    requestID: string
+    reply: "once" | "always" | "reject"
+  }
+}
+
 export type EventSessionStatus = {
   id: string
   type: "session.status"
@@ -3968,16 +3987,6 @@ export type EventPermissionAsked = {
       messageID: string
       callID: string
     }
-  }
-}
-
-export type EventPermissionReplied = {
-  id: string
-  type: "permission.replied"
-  properties: {
-    sessionID: string
-    requestID: string
-    reply: "once" | "always" | "reject"
   }
 }
 
@@ -4036,15 +4045,6 @@ export type EventQuestionReplied = {
     sessionID: string
     requestID: string
     answers: Array<QuestionAnswer>
-  }
-}
-
-export type EventQuestionRejected = {
-  id: string
-  type: "question.rejected"
-  properties: {
-    sessionID: string
-    requestID: string
   }
 }
 

@@ -696,6 +696,66 @@ const scenarios: Scenario[] = [
       )
     }),
   http.protected
+    .get("/session/{sessionID}/children", "session.children.live")
+    .seeded((ctx) =>
+      Effect.gen(function* () {
+        const parent = yield* ctx.session({ title: "Live parent" })
+        const settled = yield* ctx.session({ title: "Settled child", parentID: parent.id })
+        return { parent, settled }
+      }),
+    )
+    .at((ctx) => ({
+      path: `${route("/session/{sessionID}/children", { sessionID: ctx.state.parent.id })}?state=live`,
+      headers: ctx.headers(),
+    }))
+    .json(200, (body, ctx) => {
+      array(body)
+      check(
+        !body.some((item) => isRecord(item) && item.id === ctx.state.settled.id),
+        "live children should exclude settled children",
+      )
+    }),
+  http.protected
+    .get("/session/tree", "session.tree")
+    .seeded((ctx) =>
+      Effect.gen(function* () {
+        const root = yield* ctx.session({ title: "Tree root" })
+        const child = yield* ctx.session({ title: "Tree child", parentID: root.id })
+        return { root, child }
+      }),
+    )
+    .at((ctx) => ({ path: "/session/tree?live=false", headers: ctx.headers() }))
+    .json(200, (body, ctx) => {
+      array(body)
+      const root = body.find((item) => isRecord(item) && item.id === ctx.state.root.id)
+      if (!isRecord(root)) return check(false, "tree should include its root regardless of liveness")
+      array(root.children)
+      check(
+        root.children.some((item) => isRecord(item) && item.id === ctx.state.child.id),
+        "live=false should include settled direct children",
+      )
+    }),
+  http.protected
+    .get("/session/tree", "session.tree.live")
+    .seeded((ctx) =>
+      Effect.gen(function* () {
+        const root = yield* ctx.session({ title: "Live tree root" })
+        const settled = yield* ctx.session({ title: "Settled tree child", parentID: root.id })
+        return { root, settled }
+      }),
+    )
+    .at((ctx) => ({ path: "/session/tree?live=true", headers: ctx.headers() }))
+    .json(200, (body, ctx) => {
+      array(body)
+      const root = body.find((item) => isRecord(item) && item.id === ctx.state.root.id)
+      if (!isRecord(root)) return check(false, "tree should retain settled roots when live=true")
+      array(root.children)
+      check(
+        !root.children.some((item) => isRecord(item) && item.id === ctx.state.settled.id),
+        "live=true should exclude settled direct children",
+      )
+    }),
+  http.protected
     .get("/session/{sessionID}/todo", "session.todo")
     .seeded((ctx) =>
       Effect.gen(function* () {

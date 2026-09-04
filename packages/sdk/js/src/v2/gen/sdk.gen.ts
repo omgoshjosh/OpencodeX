@@ -409,6 +409,8 @@ import type {
   SessionSummarizeResponses,
   SessionTodoErrors,
   SessionTodoResponses,
+  SessionTreeErrors,
+  SessionTreeResponses,
   SessionUnrevertErrors,
   SessionUnrevertResponses,
   SessionUpdateErrors,
@@ -6091,6 +6093,48 @@ export class Session3 extends HeyApiClient {
   }
 
   /**
+   * Get session tree
+   *
+   * Retrieve root sessions with direct children and derived status.
+   */
+  public tree<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+      scope?: "project"
+      path?: string
+      start?: string
+      search?: string
+      limit?: string
+      live?: "true" | "false"
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "query", key: "scope" },
+            { in: "query", key: "path" },
+            { in: "query", key: "start" },
+            { in: "query", key: "search" },
+            { in: "query", key: "limit" },
+            { in: "query", key: "live" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<SessionTreeResponses, SessionTreeErrors, ThrowOnError>({
+      url: "/session/tree",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
    * Delete session
    *
    * Delete a session and permanently remove all associated data, including messages and history.
@@ -6214,13 +6258,14 @@ export class Session3 extends HeyApiClient {
   /**
    * Get session children
    *
-   * Retrieve all child sessions that were forked from the specified parent session.
+   * Retrieve direct child sessions with derived status; state=live returns active children only.
    */
   public children<ThrowOnError extends boolean = false>(
     parameters: {
       sessionID: string
       directory?: string
       workspace?: string
+      state?: "all" | "live"
     },
     options?: Options<never, ThrowOnError>,
   ) {
@@ -6232,6 +6277,7 @@ export class Session3 extends HeyApiClient {
             { in: "path", key: "sessionID" },
             { in: "query", key: "directory" },
             { in: "query", key: "workspace" },
+            { in: "query", key: "state" },
           ],
         },
       ],

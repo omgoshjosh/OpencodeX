@@ -9979,6 +9979,139 @@ export type SessionStatusResponses = {
 
 export type SessionStatusResponse = SessionStatusResponses[keyof SessionStatusResponses]
 
+export type SessionTreeData = {
+  body?: never
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+    scope?: "project"
+    path?: string
+    start?: string
+    search?: string
+    limit?: string
+    live?: "true" | "false"
+  }
+  url: "/session/tree"
+}
+
+export type SessionTreeErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+}
+
+export type SessionTreeError = SessionTreeErrors[keyof SessionTreeErrors]
+
+export type SessionTreeResponses = {
+  /**
+   * List session tree
+   */
+  200: Array<{
+    id: string
+    slug: string
+    projectID: string
+    workspaceID?: string
+    directory: string
+    path?: string
+    parentID?: string
+    summary?: {
+      additions: number
+      deletions: number
+      files: number
+      diffs?: Array<SnapshotFileDiff>
+    }
+    cost?: number
+    tokens?: {
+      input: number
+      output: number
+      reasoning: number
+      cache: {
+        read: number
+        write: number
+      }
+    }
+    title: string
+    agent?: string
+    model?: {
+      id: string
+      providerID: string
+      variant?: string
+    }
+    version: string
+    metadata?: {
+      [key: string]: unknown
+    }
+    time: {
+      created: number
+      updated: number
+      compacting?: number
+      archived?: number
+    }
+    permission?: PermissionRuleset
+    revert?: {
+      messageID: string
+      partID?: string
+      snapshot?: string
+      diff?: string
+    }
+    status: SessionStatus
+    children: Array<{
+      id: string
+      slug: string
+      projectID: string
+      workspaceID?: string
+      directory: string
+      path?: string
+      parentID?: string
+      summary?: {
+        additions: number
+        deletions: number
+        files: number
+        diffs?: Array<SnapshotFileDiff>
+      }
+      cost?: number
+      tokens?: {
+        input: number
+        output: number
+        reasoning: number
+        cache: {
+          read: number
+          write: number
+        }
+      }
+      title: string
+      agent?: string
+      model?: {
+        id: string
+        providerID: string
+        variant?: string
+      }
+      version: string
+      metadata?: {
+        [key: string]: unknown
+      }
+      time: {
+        created: number
+        updated: number
+        compacting?: number
+        archived?: number
+      }
+      permission?: PermissionRuleset
+      revert?: {
+        messageID: string
+        partID?: string
+        snapshot?: string
+        diff?: string
+      }
+      status: SessionStatus
+    }>
+  }>
+}
+
+export type SessionTreeResponse = SessionTreeResponses[keyof SessionTreeResponses]
+
 export type SessionDeleteData = {
   body?: never
   path: {
@@ -10104,6 +10237,7 @@ export type SessionChildrenData = {
   query?: {
     directory?: string
     workspace?: string
+    state?: "all" | "live"
   }
   url: "/session/{sessionID}/children"
 }
@@ -10125,7 +10259,56 @@ export type SessionChildrenResponses = {
   /**
    * List of children
    */
-  200: Array<Session>
+  200: Array<{
+    id: string
+    slug: string
+    projectID: string
+    workspaceID?: string
+    directory: string
+    path?: string
+    parentID?: string
+    summary?: {
+      additions: number
+      deletions: number
+      files: number
+      diffs?: Array<SnapshotFileDiff>
+    }
+    cost?: number
+    tokens?: {
+      input: number
+      output: number
+      reasoning: number
+      cache: {
+        read: number
+        write: number
+      }
+    }
+    title: string
+    agent?: string
+    model?: {
+      id: string
+      providerID: string
+      variant?: string
+    }
+    version: string
+    metadata?: {
+      [key: string]: unknown
+    }
+    time: {
+      created: number
+      updated: number
+      compacting?: number
+      archived?: number
+    }
+    permission?: PermissionRuleset
+    revert?: {
+      messageID: string
+      partID?: string
+      snapshot?: string
+      diff?: string
+    }
+    status: SessionStatus
+  }>
 }
 
 export type SessionChildrenResponse = SessionChildrenResponses[keyof SessionChildrenResponses]

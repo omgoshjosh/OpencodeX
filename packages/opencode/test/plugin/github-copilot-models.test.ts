@@ -150,7 +150,7 @@ test("records Copilot advertised responses endpoint for non-GPT model IDs", asyn
     ),
   ) as unknown as typeof fetch
 
-  const model = (await CopilotModels.get("https://api.githubcopilot.com"))["mai-code-1-flash-picker"]!
+  const model = (await CopilotModels.get("https://api.githubcopilot.com"))["mai-code-1-flash-picker"]
 
   expect("endpoint" in model.api ? model.api.endpoint : undefined).toBe("responses")
 })

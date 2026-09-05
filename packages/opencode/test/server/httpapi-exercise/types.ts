@@ -71,6 +71,7 @@ export type ScenarioContext = {
   retryChild: (input?: {
     blocked?: boolean
     partialOutput?: boolean
+    background?: boolean
   }) => Effect.Effect<{ parent: SessionInfo; child: SessionInfo }>
 }
 

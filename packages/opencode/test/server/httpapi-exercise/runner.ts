@@ -214,6 +214,15 @@ function withContext<A, E>(
                         version: DELEGATION_RECORD_VERSION,
                         runID: "run_httpapi_retry",
                         parentSessionID: parent.id,
+                        ...(input?.background
+                          ? {
+                              mode: "background" as const,
+                              background: true as const,
+                              ownerID: "httpapi-exercise:owner",
+                              role: "Researcher",
+                              title: "Inspect status",
+                            }
+                          : {}),
                         attempt: 1,
                         phase: "running",
                         startedAt: Date.now(),

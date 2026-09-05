@@ -14,8 +14,18 @@ import { SessionInteractionRecovery } from "./interaction-recovery"
 
 const Background = Schema.Struct({
   running: Schema.Boolean,
-  jobs: Schema.Array(Schema.Struct({ role: Schema.String, title: Schema.String, owner: Schema.String })),
+  jobs: Schema.Array(
+    Schema.Struct({
+      id: SessionID,
+      sessionID: SessionID,
+      status: Schema.Literal("running"),
+      role: Schema.String,
+      title: Schema.String,
+      owner: Schema.String,
+    }),
+  ),
 })
+type BackgroundJob = Schema.Schema.Type<typeof Background>["jobs"][number]
 
 export const Info = Schema.Union([
   Schema.Struct({
@@ -108,7 +118,7 @@ export const layer = Layer.effect(
 
     const backgrounds = Effect.fnUntraced(function* () {
       const rows = yield* db
-        .select({ metadata: SessionTable.metadata, title: SessionTable.title })
+        .select({ id: SessionTable.id, metadata: SessionTable.metadata, title: SessionTable.title })
         .from(SessionTable)
         .all()
         .pipe(Effect.orDie)
@@ -117,21 +127,26 @@ export const layer = Layer.effect(
         if (!record?.background || !isLiveDelegation(record, processRunID)) return result
         const parentID = SessionID.make(record.parentSessionID)
         const jobs = result.get(parentID) ?? []
-        jobs.push({ role: record.role ?? "Background task", title: record.title ?? row.title, owner: record.ownerID! })
+        jobs.push({
+          id: row.id,
+          sessionID: row.id,
+          status: "running",
+          role: record.role ?? "Background task",
+          title: record.title ?? row.title,
+          owner: record.ownerID!,
+        })
         result.set(parentID, jobs)
         return result
-      }, new Map<SessionID, { role: string; title: string; owner: string }[]>())
+      }, new Map<SessionID, BackgroundJob[]>())
     })
 
-    const withBackground = (status: Info, jobs: { role: string; title: string; owner: string }[] | undefined): Info =>
+    const withBackground = (status: Info, jobs: BackgroundJob[] | undefined): Info =>
       jobs?.length
         ? {
             ...status,
             background: {
               running: true,
-              jobs: jobs.toSorted((a, b) =>
-                `${a.role}\u0000${a.title}\u0000${a.owner}`.localeCompare(`${b.role}\u0000${b.title}\u0000${b.owner}`),
-              ),
+              jobs: jobs.toSorted((a, b) => a.id.localeCompare(b.id)),
             },
           }
         : status
@@ -423,7 +438,17 @@ export const layer = Layer.effect(
       Effect.forkScoped,
     )
 
-    return Service.of({ recover, get, list, snapshot, set, setForGeneration, refresh, claimBlockedRetry, settleMonitoring })
+    return Service.of({
+      recover,
+      get,
+      list,
+      snapshot,
+      set,
+      setForGeneration,
+      refresh,
+      claimBlockedRetry,
+      settleMonitoring,
+    })
   }),
 )
 

@@ -105,6 +105,7 @@ function rootSnapshot(): OpencodeXStateSnapshot {
           sessionUiState: {
             "session-1": {
               sessionID: "session-1",
+              revision: 0,
               reviewedFiles: [],
               displayStatus: "input_needed",
               updated: true,

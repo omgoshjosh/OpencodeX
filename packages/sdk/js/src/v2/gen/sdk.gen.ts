@@ -3017,8 +3017,10 @@ export class SessionState extends HeyApiClient {
     parameters: {
       sessionID: string
       expectedReviewedFiles?: Array<string>
+      expectedRevision?: number
       seenAt?: number
       reviewedAt?: number
+      markedUnread?: boolean
       reviewedFiles?: Array<string>
     },
     options?: Options<never, ThrowOnError>,
@@ -3030,8 +3032,10 @@ export class SessionState extends HeyApiClient {
           args: [
             { in: "path", key: "sessionID" },
             { in: "body", key: "expectedReviewedFiles" },
+            { in: "body", key: "expectedRevision" },
             { in: "body", key: "seenAt" },
             { in: "body", key: "reviewedAt" },
+            { in: "body", key: "markedUnread" },
             { in: "body", key: "reviewedFiles" },
           ],
         },

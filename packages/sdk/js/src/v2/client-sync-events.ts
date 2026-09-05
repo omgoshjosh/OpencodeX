@@ -140,6 +140,10 @@ export function applyClientSessionEvent(
                 ...(event.properties.state.reviewedAt === undefined
                   ? {}
                   : { reviewedAt: event.properties.state.reviewedAt }),
+                ...(event.properties.state.markedUnreadAt === undefined
+                  ? {}
+                  : { markedUnreadAt: event.properties.state.markedUnreadAt }),
+                revision: event.properties.state.timeUpdated,
                 reviewedFiles: event.properties.state.reviewedFiles,
                 displayStatus: current.sessionUiState[event.properties.sessionID]?.displayStatus ?? "idle",
                 updated: current.sessionUiState[event.properties.sessionID]?.updated ?? false,
@@ -511,6 +515,8 @@ function reconcileClientSessionUiState(current: ClientStateSyncState, sessionID:
     sessionID,
     ...(previous?.seenAt === undefined ? {} : { seenAt: previous.seenAt }),
     ...(previous?.reviewedAt === undefined ? {} : { reviewedAt: previous.reviewedAt }),
+    ...(previous?.markedUnreadAt === undefined ? {} : { markedUnreadAt: previous.markedUnreadAt }),
+    revision: previous?.revision ?? 0,
     reviewedFiles: previous?.reviewedFiles ?? [],
     // Same core the clients render from, so the persisted value cannot drift
     // from the derived one. The reconciler has no view of a client's optimistic
@@ -523,7 +529,9 @@ function reconcileClientSessionUiState(current: ClientStateSyncState, sessionID:
       reviewedAt: previous?.reviewedAt,
       parentID: session.parentID,
     }),
-    updated: session.time.updated > (previous?.seenAt ?? 0),
+    // Mirrors the server: an explicit mark keeps the session unread regardless
+    // of how recently the reader saw it.
+    updated: previous?.markedUnreadAt !== undefined || session.time.updated > (previous?.seenAt ?? 0),
   }
   if (equalClientSessionUiState(previous, next)) return current
   return { ...current, sessionUiState: { ...current.sessionUiState, [sessionID]: next } }
@@ -537,6 +545,8 @@ function equalClientSessionUiState(
     left?.sessionID === right.sessionID &&
     left.seenAt === right.seenAt &&
     left.reviewedAt === right.reviewedAt &&
+    left.markedUnreadAt === right.markedUnreadAt &&
+    left.revision === right.revision &&
     left.displayStatus === right.displayStatus &&
     left.updated === right.updated &&
     left.reviewedFiles.length === right.reviewedFiles.length &&

@@ -10,6 +10,9 @@ export function markViewedSessionUiState(
     sessionID,
     seenAt: Math.max(time, current?.seenAt ?? 0),
     ...(current?.reviewedAt === undefined ? {} : { reviewedAt: current.reviewedAt }),
+    // Viewing clears an explicit unread mark, matching the server's seen flow.
+    // markedUnreadAt is deliberately dropped here.
+    revision: current?.revision ?? 0,
     reviewedFiles: current?.reviewedFiles ?? [],
     displayStatus: current?.displayStatus ?? "idle",
     updated: sessionUpdated > time,

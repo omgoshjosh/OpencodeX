@@ -765,6 +765,7 @@ export type OpencodeXSessionState = {
   sessionID: string
   seenAt?: number
   reviewedAt?: number
+  markedUnreadAt?: number
   reviewedFiles: Array<string>
   timeUpdated: number
 }
@@ -2392,6 +2393,8 @@ export type OpencodeXSessionUiState = {
   sessionID: string
   seenAt?: number
   reviewedAt?: number
+  markedUnreadAt?: number
+  revision: number
   reviewedFiles: Array<string>
   displayStatus: OpencodeXSessionDisplayStatus
   updated: boolean
@@ -6551,8 +6554,10 @@ export type OpencodexStateEventResponse = OpencodexStateEventResponses[keyof Ope
 export type OpencodexSessionStateUpdateData = {
   body?: {
     expectedReviewedFiles?: Array<string>
+    expectedRevision?: number
     seenAt?: number
     reviewedAt?: number
+    markedUnread?: boolean
     reviewedFiles?: Array<string>
   }
   path: {

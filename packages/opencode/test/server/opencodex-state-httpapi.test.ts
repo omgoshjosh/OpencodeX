@@ -75,6 +75,82 @@ afterEach(async () => {
 })
 
 describe("OpencodeX state HTTP API", () => {
+  it.live("keeps the unread mark server-authoritative against stale clients", () =>
+    Effect.gen(function* () {
+      const directory = yield* tmpdirScoped({ git: true, config: { formatter: false, lsp: false } })
+      const server = yield* HttpServer.HttpServer
+      const base = HttpServer.formatAddress(server.address)
+      const { db } = yield* Database.Service
+      const request = (path: string, init: RequestInit = {}) => {
+        const headers = new Headers(init.headers)
+        headers.set("x-opencode-directory", directory)
+        if (init.body) headers.set("content-type", "application/json")
+        return fetch(new URL(path, base), { ...init, headers })
+      }
+      const created = record(
+        yield* Effect.promise(() =>
+          request("/session", { method: "POST", body: JSON.stringify({ title: "unread state" }) }).then((response) =>
+            response.json(),
+          ),
+        ),
+      )
+      const sessionID = String(created.id)
+      const patch = (body: unknown) =>
+        Effect.promise(() =>
+          request(`/experimental/opencodex/session-state/${sessionID}`, {
+            method: "PATCH",
+            body: JSON.stringify(body),
+          }).then((response) => response.json()),
+        ).pipe(Effect.map(record))
+      // marked_unread_at is written only by the session_state.updated projection,
+      // so reading the row back is an assertion that the event carried the field.
+      const persistedMark = Effect.gen(function* () {
+        const row = yield* db
+          .select()
+          .from(OpencodeXSessionStateTable)
+          .where(eq(OpencodeXSessionStateTable.session_id, sessionID as SessionID))
+          .get()
+          .pipe(Effect.orDie)
+        return row?.marked_unread_at ?? null
+      })
+
+      const marked = yield* patch({ markedUnread: true, expectedRevision: 0 })
+      expect(typeof marked.markedUnreadAt).toBe("number")
+      expect(marked.markedUnreadAt).toBe(marked.timeUpdated)
+      expect(yield* persistedMark).toBe(Number(marked.markedUnreadAt))
+
+      // A retry that still quotes the pre-mark revision must not shift the mark.
+      const duplicate = yield* patch({ markedUnread: true, expectedRevision: 0 })
+      expect(duplicate.markedUnreadAt).toBe(marked.markedUnreadAt)
+
+      // A client whose seenAt predates the mark never saw it and cannot clear it.
+      const staleSeen = yield* patch({ seenAt: 10 })
+      expect(staleSeen.markedUnreadAt).toBe(marked.markedUnreadAt)
+
+      const seenAt = Math.max(Date.now(), Number(marked.markedUnreadAt))
+      const seen = yield* patch({ seenAt, expectedRevision: staleSeen.timeUpdated })
+      expect(seen.markedUnreadAt).toBeUndefined()
+      expect(seen.seenAt).toBe(seenAt)
+      expect(yield* persistedMark).toBeNull()
+
+      // The mark the server already cleared cannot be resurrected from an old revision.
+      const resurrect = yield* patch({ markedUnread: true, expectedRevision: marked.timeUpdated })
+      expect(resurrect.markedUnreadAt).toBeUndefined()
+      expect(yield* persistedMark).toBeNull()
+
+      const remarked = yield* patch({ markedUnread: true, expectedRevision: resurrect.timeUpdated })
+      expect(typeof remarked.markedUnreadAt).toBe("number")
+      const snapshot = record(
+        yield* Effect.promise(() => request("/experimental/opencodex/state").then((response) => response.json())),
+      )
+      const uiState = record(record(record(record(snapshot).payloads).catalog).sessionUiState)[sessionID]
+      expect(record(uiState).markedUnreadAt).toBe(remarked.markedUnreadAt)
+      expect(record(uiState).revision).toBe(remarked.timeUpdated)
+      // Explicitly marked stays unread even though the reader has seen everything.
+      expect(record(uiState).updated).toBe(true)
+    }),
+  )
+
   it.live("rejects stale reviewed-file replacements while merging timestamps", () =>
     Effect.gen(function* () {
       const directory = yield* tmpdirScoped({ git: true, config: { formatter: false, lsp: false } })

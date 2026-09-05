@@ -127,6 +127,8 @@ export interface SearchInput {
   follow?: boolean
   file?: string[]
   signal?: AbortSignal
+  /** Called as each match is parsed, so an aborted search can still report what it found. */
+  onItem?: (item: Item) => void
 }
 
 export interface TreeInput {
@@ -394,6 +396,7 @@ export const layer: Layer.Layer<Service, never, AppFileSystem.Service | ChildPro
                   Stream.filter((item): item is Match => item.type === "match"),
                   Stream.map((item) => row(item.data)),
                   Stream.take((input.limit ?? Number.MAX_SAFE_INTEGER) + 1),
+                  Stream.tap((item) => Effect.sync(() => input.onItem?.(item))),
                   Stream.runCollect,
                   Effect.map((chunk) => [...chunk]),
                 ),

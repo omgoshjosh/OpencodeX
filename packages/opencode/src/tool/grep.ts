@@ -8,7 +8,8 @@ import { assertExternalDirectoryEffect } from "./external-directory"
 import DESCRIPTION from "./grep.txt"
 import * as Tool from "./tool"
 import { Reference } from "@/reference/reference"
-import { withFileToolDeadline } from "./file-deadline"
+import { Config } from "@/config/config"
+import { SEARCH_TOOL_DEADLINE_MS, searchTimeoutNotice, withSearchDeadline } from "./file-deadline"
 
 const MAX_LINE_LENGTH = 2000
 
@@ -28,6 +29,7 @@ export const GrepTool = Tool.define(
     const fs = yield* AppFileSystem.Service
     const rg = yield* Ripgrep.Service
     const reference = yield* Reference.Service
+    const config = yield* Config.Service
 
     return {
       description: DESCRIPTION,
@@ -36,7 +38,7 @@ export const GrepTool = Tool.define(
         Effect.gen(function* () {
           const empty = {
             title: params.pattern,
-            metadata: { matches: 0, truncated: false },
+            metadata: { matches: 0, truncated: false, timedOut: false },
             output: "No files found",
           }
           if (!params.pattern) {
@@ -54,109 +56,147 @@ export const GrepTool = Tool.define(
             },
           })
 
-          return yield* withFileToolDeadline("grep", ctx.abort, (signal) =>
-            Effect.gen(function* () {
-              const ins = yield* InstanceState.context
-              const requested = path.isAbsolute(params.path ?? ins.directory)
-                ? (params.path ?? ins.directory)
-                : path.join(ins.directory, params.path ?? ".")
-              yield* reference.ensure(requested)
-              const requestedInfo = yield* fs.stat(requested).pipe(Effect.catch(() => Effect.succeed(undefined)))
-              yield* assertExternalDirectoryEffect(ctx, requested, {
-                bypass: yield* reference.contains(requested),
-                kind: requestedInfo?.type === "Directory" ? "directory" : "file",
-              })
+          const ins = yield* InstanceState.context
+          const cfg = yield* config.get()
+          const timeoutMs = cfg.experimental?.search_timeout ?? SEARCH_TOOL_DEADLINE_MS
 
-              const search = AppFileSystem.resolve(requested)
-              const info = yield* fs.stat(search).pipe(Effect.catch(() => Effect.succeed(undefined)))
-              const cwd = info?.type === "Directory" ? search : path.dirname(search)
-              const file = info?.type === "Directory" ? undefined : [path.relative(cwd, search)]
+          const limit = 100
+          // Filled as ripgrep parses each match, so a search stopped at the deadline
+          // can still report what it found.
+          const collected: Ripgrep.Item[] = []
+          let cwd = ins.directory
 
-              const limit = 100
-              const result = yield* rg.search({
-                cwd,
-                pattern: params.pattern,
-                glob: params.include ? [params.include] : undefined,
-                file,
-                limit,
-                signal,
-              })
-              if (result.items.length === 0) return empty
+          const toRow = (item: Ripgrep.Item) => ({
+            path: AppFileSystem.resolve(
+              path.isAbsolute(item.path.text) ? item.path.text : path.join(cwd, item.path.text),
+            ),
+            line: item.line_number,
+            text: item.lines.text,
+          })
 
-              const rows = result.items.map((item) => ({
-                path: AppFileSystem.resolve(
-                  path.isAbsolute(item.path.text) ? item.path.text : path.join(cwd, item.path.text),
-                ),
-                line: item.line_number,
-                text: item.lines.text,
-              }))
-              const times = new Map(
-                (yield* Effect.forEach(
-                  [...new Set(rows.map((row) => row.path))],
-                  Effect.fnUntraced(function* (file) {
-                    const info = yield* fs.stat(file).pipe(Effect.catch(() => Effect.succeed(undefined)))
-                    if (!info || info.type === "Directory") return undefined
-                    return [
-                      file,
-                      info.mtime.pipe(
-                        Option.map((time) => time.getTime()),
-                        Option.getOrElse(() => 0),
-                      ) ?? 0,
-                    ] as const
-                  }),
-                  { concurrency: 16 },
-                )).filter((entry): entry is readonly [string, number] => Boolean(entry)),
+          const render = (
+            rows: { path: string; line: number; text: string }[],
+            flags: { truncated: boolean; inaccessible: boolean; timedOut: boolean },
+          ) => {
+            if (rows.length === 0 && !flags.timedOut) return empty
+
+            const total = rows.length
+            const output = [
+              `Found ${flags.truncated ? `at least ${total}` : total} matches${flags.truncated ? ` (showing first ${limit})` : ""}`,
+            ]
+
+            let current = ""
+            for (const match of rows) {
+              if (current !== match.path) {
+                if (current !== "") output.push("")
+                current = match.path
+                output.push(`${match.path}:`)
+              }
+              const text =
+                match.text.length > MAX_LINE_LENGTH ? match.text.substring(0, MAX_LINE_LENGTH) + "..." : match.text
+              output.push(`  Line ${match.line}: ${text}`)
+            }
+
+            if (flags.truncated) {
+              output.push("")
+              output.push(
+                `(Results truncated: showing first ${limit} matches. Consider using a more specific path or pattern.)`,
               )
-              const matches = rows.flatMap((row) => {
-                const mtime = times.get(row.path)
-                if (mtime === undefined) return []
-                return [{ ...row, mtime }]
-              })
+            }
 
-              matches.sort((a, b) => b.mtime - a.mtime)
+            if (flags.inaccessible) {
+              output.push("")
+              output.push("(Some paths were inaccessible and skipped)")
+            }
 
-              const truncated = result.truncated
-              const final = matches
-              if (final.length === 0) return empty
+            if (flags.timedOut) {
+              output.push("")
+              output.push(searchTimeoutNotice(timeoutMs, total, "matches"))
+            }
 
-              const total = matches.length
-              const output = [
-                `Found ${truncated ? `at least ${total}` : total} matches${truncated ? ` (showing first ${limit})` : ""}`,
-              ]
+            return {
+              title: params.pattern,
+              metadata: {
+                matches: total,
+                truncated: flags.truncated,
+                timedOut: flags.timedOut,
+              },
+              output: output.join("\n"),
+            }
+          }
 
-              let current = ""
-              for (const match of final) {
-                if (current !== match.path) {
-                  if (current !== "") output.push("")
-                  current = match.path
-                  output.push(`${match.path}:`)
-                }
-                const text =
-                  match.text.length > MAX_LINE_LENGTH ? match.text.substring(0, MAX_LINE_LENGTH) + "..." : match.text
-                output.push(`  Line ${match.line}: ${text}`)
-              }
+          return yield* withSearchDeadline(
+            "grep",
+            ctx.abort,
+            timeoutMs,
+            (signal) =>
+              Effect.gen(function* () {
+                const requested = path.isAbsolute(params.path ?? ins.directory)
+                  ? (params.path ?? ins.directory)
+                  : path.join(ins.directory, params.path ?? ".")
+                yield* reference.ensure(requested)
+                const requestedInfo = yield* fs.stat(requested).pipe(Effect.catch(() => Effect.succeed(undefined)))
+                yield* assertExternalDirectoryEffect(ctx, requested, {
+                  bypass: yield* reference.contains(requested),
+                  kind: requestedInfo?.type === "Directory" ? "directory" : "file",
+                })
 
-              if (truncated) {
-                output.push("")
-                output.push(
-                  `(Results truncated: showing first ${limit} matches. Consider using a more specific path or pattern.)`,
+                const search = AppFileSystem.resolve(requested)
+                const info = yield* fs.stat(search).pipe(Effect.catch(() => Effect.succeed(undefined)))
+                cwd = info?.type === "Directory" ? search : path.dirname(search)
+                const file = info?.type === "Directory" ? undefined : [path.relative(cwd, search)]
+
+                const result = yield* rg.search({
+                  cwd,
+                  pattern: params.pattern,
+                  glob: params.include ? [params.include] : undefined,
+                  file,
+                  limit,
+                  signal,
+                  onItem: (item) => collected.push(item),
+                })
+                if (result.items.length === 0) return empty
+
+                const rows = result.items.map(toRow)
+                const times = new Map(
+                  (yield* Effect.forEach(
+                    [...new Set(rows.map((row) => row.path))],
+                    Effect.fnUntraced(function* (file) {
+                      const info = yield* fs.stat(file).pipe(Effect.catch(() => Effect.succeed(undefined)))
+                      if (!info || info.type === "Directory") return undefined
+                      return [
+                        file,
+                        info.mtime.pipe(
+                          Option.map((time) => time.getTime()),
+                          Option.getOrElse(() => 0),
+                        ) ?? 0,
+                      ] as const
+                    }),
+                    { concurrency: 16 },
+                  )).filter((entry): entry is readonly [string, number] => Boolean(entry)),
                 )
-              }
+                const matches = rows.flatMap((row) => {
+                  const mtime = times.get(row.path)
+                  if (mtime === undefined) return []
+                  return [{ ...row, mtime }]
+                })
 
-              if (result.partial) {
-                output.push("")
-                output.push("(Some paths were inaccessible and skipped)")
-              }
+                matches.sort((a, b) => b.mtime - a.mtime)
 
-              return {
-                title: params.pattern,
-                metadata: {
-                  matches: total,
-                  truncated,
-                },
-                output: output.join("\n"),
-              }
-            }),
+                return render(matches, {
+                  truncated: result.truncated,
+                  inaccessible: result.partial,
+                  timedOut: false,
+                })
+              }),
+            // Partial output skips the mtime sort: the stats it needs are more
+            // filesystem work, and the deadline has already expired.
+            () =>
+              render(collected.slice(0, limit).map(toRow), {
+                truncated: collected.length > limit,
+                inaccessible: false,
+                timedOut: true,
+              }),
           )
         }).pipe(Effect.orDie),
     }

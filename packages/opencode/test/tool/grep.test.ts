@@ -37,6 +37,7 @@ const toolLayer = (flags: Partial<RuntimeFlags.Info> = {}) =>
     Truncate.defaultLayer,
     Agent.defaultLayer,
     Git.defaultLayer,
+    Config.defaultLayer,
     referenceLayer(flags),
   )
 
@@ -127,6 +128,38 @@ describe("tool.grep", () => {
       expect(result.metadata.matches).toBe(0)
       expect(result.output).toBe("No files found")
     }),
+  )
+
+  it.instance(
+    "returns partial results with a truncation notice when the search runs past its bound",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        yield* Effect.promise(() => Bun.write(path.join(test.directory, "test.txt"), "line1\nline2\nline3"))
+        const info = yield* GrepTool
+        const grep = yield* info.init()
+        const result = yield* grep.execute({ pattern: "line", path: test.directory }, ctx)
+        expect(result.metadata.timedOut).toBe(true)
+        expect(result.output).toContain("Search stopped after")
+        expect(result.output).toContain("narrow the path or pattern")
+      }),
+    { config: { experimental: { search_timeout: 1 } } },
+  )
+
+  it.instance(
+    "leaves a search that finishes inside its bound unannotated",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        yield* Effect.promise(() => Bun.write(path.join(test.directory, "test.txt"), "line1\nline2\nline3"))
+        const info = yield* GrepTool
+        const grep = yield* info.init()
+        const result = yield* grep.execute({ pattern: "line", path: test.directory }, ctx)
+        expect(result.metadata.timedOut).toBe(false)
+        expect(result.metadata.matches).toBe(3)
+        expect(result.output).not.toContain("Search stopped after")
+      }),
+    { config: { experimental: { search_timeout: 60_000 } } },
   )
 
   it.instance("finds matches in tmp instance", () =>

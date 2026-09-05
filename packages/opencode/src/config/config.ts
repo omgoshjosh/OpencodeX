@@ -292,6 +292,10 @@ export const Info = Schema.Struct({
       mcp_timeout: Schema.optional(PositiveInt).annotate({
         description: "Timeout in milliseconds for model context protocol (MCP) requests",
       }),
+      search_timeout: Schema.optional(PositiveInt).annotate({
+        description:
+          "Timeout in milliseconds for the glob and grep tools. On expiry the search stops and returns the partial results gathered so far. Defaults to 60000.",
+      }),
       stream_idle_timeout: Schema.optional(PositiveInt).annotate({
         description:
           "Timeout in milliseconds between events on an LLM stream before the turn fails as retryable. Defaults to 300000.",

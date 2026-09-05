@@ -35,6 +35,7 @@ const toolLayer = (flags: Partial<RuntimeFlags.Info> = {}) =>
     Truncate.defaultLayer,
     Agent.defaultLayer,
     Git.defaultLayer,
+    Config.defaultLayer,
     referenceLayer(flags),
   )
 
@@ -118,6 +119,38 @@ describe("tool.glob", () => {
       expect(result.output).toContain(path.join(test.directory, "a.ts"))
       expect(result.output).not.toContain(path.join(test.directory, "b.txt"))
     }),
+  )
+
+  it.instance(
+    "returns partial results with a truncation notice when the search runs past its bound",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        yield* Effect.promise(() => Bun.write(path.join(test.directory, "a.ts"), "export const a = 1\n"))
+        const info = yield* GlobTool
+        const glob = yield* info.init()
+        const result = yield* glob.execute({ pattern: "*.ts", path: test.directory }, ctx)
+        expect(result.metadata.timedOut).toBe(true)
+        expect(result.output).toContain("Search stopped after")
+        expect(result.output).toContain("narrow the path or pattern")
+      }),
+    { config: { experimental: { search_timeout: 1 } } },
+  )
+
+  it.instance(
+    "leaves a search that finishes inside its bound unannotated",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        yield* Effect.promise(() => Bun.write(path.join(test.directory, "a.ts"), "export const a = 1\n"))
+        const info = yield* GlobTool
+        const glob = yield* info.init()
+        const result = yield* glob.execute({ pattern: "*.ts", path: test.directory }, ctx)
+        expect(result.metadata.timedOut).toBe(false)
+        expect(result.metadata.count).toBe(1)
+        expect(result.output).not.toContain("Search stopped after")
+      }),
+    { config: { experimental: { search_timeout: 60_000 } } },
   )
 
   it.instance("rejects exact file paths", () =>

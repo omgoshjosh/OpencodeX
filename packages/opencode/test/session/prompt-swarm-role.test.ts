@@ -4,7 +4,7 @@ import { SessionLegacy } from "@opencode-ai/core/session/legacy"
 import { EffectBridge } from "../../src/effect/bridge"
 import { ClaudeDelegate } from "../../src/opencodex/claude-delegate"
 import * as PromptSwarm from "../../src/session/prompt-swarm"
-import type { DelegationRecord } from "../../src/session/delegation-outcome"
+import type { DelegationOutcome, DelegationRecord } from "../../src/session/delegation-outcome"
 import { SessionID } from "../../src/session/schema"
 
 /**
@@ -553,6 +553,112 @@ function toolPart(input: { id: string; callID: string }) {
   }
 }
 
+/**
+ * A foreground delegation blocks the orchestrator inside an MCP tool call, so
+ * its only acceptable bad day is "slow", never "never returns" (2026-09-05: a
+ * child settled at 20:11:16, the parent logged nothing until an operator
+ * aborted it at 20:31, and the CLI was by then unresponsive to interrupt).
+ * These pin the durable fallback: whatever becomes of the in-memory hand-off,
+ * a child whose durable record says it settled resolves the handler.
+ */
+describe("foreground delegation never hangs on a lost hand-off", () => {
+  const specialist = [role({ name: "Specialist", skill: null, instructions: "" })]
+
+  const handler = async (runSwarmRole: ReturnType<typeof PromptSwarm.make>["runSwarmRole"]) =>
+    ClaudeDelegate.capability(await Effect.runPromise(EffectBridge.make()), {
+      roles: [{ name: "Specialist" }],
+      run: (callInput) =>
+        runSwarmRole({
+          sessionID: SessionID.make("ses_parent"),
+          swarmID: "swm_1",
+          roles: specialist,
+          role: callInput.role,
+          prompt: callInput.prompt,
+        }),
+    })
+
+  test("returns the fiber's own report when the child settles after the waiter registers", async () => {
+    const gate = await Effect.runPromise(Deferred.make<SessionLegacy.WithParts>())
+    const { runSwarmRole, childReads } = harness({
+      skills: {},
+      promptResult: Deferred.await(gate),
+      foregroundPollIntervalMs: 5,
+    })
+    const call = (await handler(runSwarmRole)).run({ role: "Specialist", prompt: "Do the task." })
+
+    // Many poll ticks pass with the record still `running` and the child
+    // silent: the fallback must never resolve a delegation still working.
+    await Bun.sleep(50)
+    expect(childReads()).toBeGreaterThan(0)
+    await Effect.runPromise(Deferred.succeed(gate, success("live report")))
+
+    expect(await call).toEqual({ ok: true, text: "live report" })
+  })
+
+  test("returns when the child settled durably before the waiter ever registered", async () => {
+    const { runSwarmRole } = harness({
+      skills: {},
+      // The hand-off never arrives; the durable record is already terminal.
+      promptResult: Effect.never,
+      foregroundPollIntervalMs: 1,
+      durableSettleAfterReads: 0,
+      durableSettleText: "report written before the parent looked",
+    })
+    const call = (await handler(runSwarmRole)).run({ role: "Specialist", prompt: "Do the task." })
+
+    expect(await call).toEqual({ ok: true, text: "report written before the parent looked" })
+  })
+
+  test("the poll fallback resolves a suppressed hand-off within a bounded number of ticks", async () => {
+    const { runSwarmRole, childReads } = harness({
+      skills: {},
+      promptResult: Effect.never,
+      foregroundPollIntervalMs: 1,
+      durableSettleAfterReads: 3,
+      durableSettleText: "recovered by polling",
+    })
+    const call = (await handler(runSwarmRole)).run({ role: "Specialist", prompt: "Do the task." })
+
+    expect(await call).toEqual({ ok: true, text: "recovered by polling" })
+    // Bounded: the tick that made the record terminal is the one that returned.
+    expect(childReads()).toBe(4)
+  })
+
+  test("returns from the transcript when the settle stamp itself never lands", async () => {
+    const { runSwarmRole, stamps } = harness({
+      skills: {},
+      // The stall the incident showed: the child's reply is durable, but every
+      // post-turn write - the settle stamp included - is queued behind it.
+      promptResult: Effect.never,
+      foregroundPollIntervalMs: 1,
+      childRepliesWithoutSettling: "the report the parent never received",
+    })
+    const call = (await handler(runSwarmRole)).run({ role: "Specialist", prompt: "Do the task." })
+
+    expect(await call).toEqual({ ok: true, text: "the report the parent never received" })
+    // The poller claimed the outcome, so the interrupted fiber's exit boundary
+    // cannot stamp `cancelled` over a run that actually completed.
+    expect(stamps.map((entry) => entry.record.phase)).toEqual(["running", "settled"])
+    expect(stamps[1]).toMatchObject({
+      record: { phase: "settled", outcome: "completed", summary: "the report the parent never received" },
+      expectRunID: stamps[0].record.runID,
+    })
+  })
+
+  test("a durably errored run resolves as a failure rather than hanging", async () => {
+    const { runSwarmRole } = harness({
+      skills: {},
+      promptResult: Effect.never,
+      foregroundPollIntervalMs: 1,
+      durableSettleAfterReads: 0,
+      durableSettleOutcome: "errored",
+    })
+    const call = (await handler(runSwarmRole)).run({ role: "Specialist", prompt: "Do the task." })
+
+    expect(await call).toEqual({ ok: false, reason: "errored" })
+  })
+})
+
 function run(
   runSwarmRole: ReturnType<typeof PromptSwarm.make>["runSwarmRole"],
   overrides: { roles?: PromptSwarm.SwarmRoleRow[]; role?: string; toolUseID?: string; background?: boolean } = {},
@@ -610,6 +716,21 @@ function harness(input: {
   deliveryClaimGraceMs?: number
   deliveryClaims?: Array<string | undefined>
   deliveryChild?: "missing" | "superseded"
+  /**
+   * Simulates a child that settled durably while the in-memory hand-off never
+   * arrived: after this many reads of the child session its stored record is
+   * the settled successor and its transcript carries the report. 0 settles it
+   * before the foreground waiter's first look.
+   */
+  durableSettleAfterReads?: number
+  durableSettleText?: string
+  durableSettleOutcome?: DelegationOutcome
+  /**
+   * Simulates the live 2026-09-05 stall: the child's reply is persisted, but
+   * the post-turn writes never land, so the record stays `running` forever.
+   */
+  childRepliesWithoutSettling?: string
+  foregroundPollIntervalMs?: number
 }) {
   const started: Array<{ id?: string; metadata?: Record<string, unknown>; run: Effect.Effect<string, unknown> }> = []
   const prompts: string[] = []
@@ -620,6 +741,7 @@ function harness(input: {
   const promptParts: Array<Array<{ type: string; text?: string; mime?: string; url?: string }>> = []
   const stamps: Array<{ record: DelegationRecord; expectRunID?: string }> = []
   const parts: Array<Record<string, unknown>> = []
+  let childReads = 0
   const parentMessage = { info: { id: "msg_1", role: "assistant" }, parts: input.parentParts ?? [] }
   const turn: SessionLegacy.WithParts[] = []
   let loopCount = 0
@@ -637,6 +759,21 @@ function harness(input: {
     sessions: {
       get: (sessionID: string) => {
         if (sessionID === "ses_child" && input.deliveryChild === "missing") return Effect.fail(new Error("missing child"))
+        if (sessionID === "ses_child") {
+          childReads++
+          if (childReads === 1 && input.childRepliesWithoutSettling !== undefined)
+            record(success(input.childRepliesWithoutSettling), "msg_user")
+          if (
+            input.durableSettleAfterReads !== undefined &&
+            childReads > input.durableSettleAfterReads &&
+            delegation?.phase === "running"
+          ) {
+            const text = input.durableSettleText ?? "durable report"
+            const outcome = input.durableSettleOutcome ?? "completed"
+            if (outcome === "completed") record(success(text), "msg_user")
+            delegation = { ...delegation, phase: "settled", outcome, completedAt: 1, summary: text }
+          }
+        }
         const childDelegation =
           sessionID === "ses_child" && input.deliveryChild === "superseded" && delegation
             ? { ...delegation, runID: "run_superseded" }
@@ -647,6 +784,7 @@ function harness(input: {
         })
       },
       create: () => Effect.succeed({ id: "ses_child" }),
+      messages: () => Effect.succeed([...turn]),
       messageWithChildren: () => Effect.succeed([...turn]),
       updateMessage: (message: SessionLegacy.Info) => {
         const index = turn.findIndex((item) => item.info.id === message.id)
@@ -744,10 +882,14 @@ function harness(input: {
     // wait the production grace period for one.
     backgroundCompletionGraceMs: input.backgroundCompletionGraceMs ?? 0,
     ...(input.deliveryClaimGraceMs !== undefined ? { deliveryClaimGraceMs: input.deliveryClaimGraceMs } : {}),
+    ...(input.foregroundPollIntervalMs !== undefined
+      ? { foregroundPollIntervalMs: input.foregroundPollIntervalMs }
+      : {}),
   }
   const { runSwarmRole } = PromptSwarm.make(deps as never)
   return {
     runSwarmRole,
+    childReads: () => childReads,
     prompts,
     asyncPrompts,
     promptParts,

@@ -40,6 +40,7 @@ export type NodePatch = {
   loop?: { exitCheckNodeID: string; maxIterations: number; iteration: number; lastReport?: string }
   startedAt?: number | null
   completedAt?: number | null
+  metadata?: Record<string, unknown> | null
 }
 
 export type GoalPatch = {
@@ -299,6 +300,34 @@ export function createGoalStore(db: Database.Interface["db"], events: EventV2.In
     )
   })
 
+  /** Atomically fences metadata-owned delivery claims against stale sweeps. */
+  const compareAndSetNodeMetadata = Effect.fn("OpencodeXGoal.compareAndSetNodeMetadata")(function* (input: {
+    goalID: string
+    nodeID: string
+    expected: Record<string, unknown>
+    next: Record<string, unknown>
+  }) {
+    let changed = false
+    yield* mutate(input.goalID, (transaction) =>
+      Effect.gen(function* () {
+        const updated = yield* transaction
+          .update(OpencodeXGoalNodeTable)
+          .set({ metadata_json: encode(input.next), time_updated: Date.now() })
+          .where(
+            and(
+              eq(OpencodeXGoalNodeTable.goal_id, input.goalID),
+              eq(OpencodeXGoalNodeTable.id, input.nodeID),
+              eq(OpencodeXGoalNodeTable.metadata_json, JSON.stringify(input.expected)),
+            ),
+          )
+          .returning({ id: OpencodeXGoalNodeTable.id })
+          .get()
+        changed = Boolean(updated)
+      }),
+    )
+    return changed
+  })
+
   const remove = Effect.fn("OpencodeXGoal.remove")(function* (goalID: string) {
     yield* get(goalID)
     const committed = yield* events.barrier(
@@ -317,7 +346,7 @@ export function createGoalStore(db: Database.Interface["db"], events: EventV2.In
     return true
   })
 
-  return { list, get, create, replacePlan, applyPlanUpdate, patchNodes, patchGoal, remove }
+  return { list, get, create, replacePlan, applyPlanUpdate, patchNodes, patchGoal, compareAndSetNodeMetadata, remove }
 }
 
 export type GoalStore = ReturnType<typeof createGoalStore>
@@ -418,6 +447,7 @@ function nodeValues(patch: NodePatch) {
     ...(patch.loop !== undefined ? { loop_json: encode(patch.loop) } : {}),
     ...(patch.startedAt !== undefined ? { started_at: patch.startedAt } : {}),
     ...(patch.completedAt !== undefined ? { completed_at: patch.completedAt } : {}),
+    ...(patch.metadata !== undefined ? { metadata_json: encode(patch.metadata) } : {}),
   }
 }
 

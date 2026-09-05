@@ -6,6 +6,7 @@ import { Effect, Layer } from "effect"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { OpencodeXGoal } from "@/opencodex/goal"
 import { GoalDispatch } from "@/opencodex/goal-dispatch"
+import { GoalStoreService } from "@/opencodex/goal-store"
 import { OpencodeXJob } from "@/opencodex/job"
 import { OpencodeXProject } from "@/opencodex/project"
 import { Project } from "@/project/project"
@@ -94,6 +95,49 @@ function statuses(goal: OpencodeXGoal.Info) {
 }
 
 describe("goal store", () => {
+  it.live("fences concurrent node metadata claims", () =>
+    Effect.gen(function* () {
+      const created = yield* project
+      const goals = yield* OpencodeXGoal.Service
+      const store = yield* GoalStoreService
+      const goal = yield* goals.create({
+        projectID: created.id,
+        statement: "Report an aborted child.",
+        successCriteria: ["Parent receives the report"],
+      })
+      const expected = {
+        childAbort: {
+          source: "child_session",
+          delivery: "pending",
+          messageID: "msg_goal_child_abort_test",
+          error: "Child session was aborted.",
+        },
+      }
+      yield* goals.plan(goal.id, { nodes: [node("child", { metadata: expected })] })
+
+      const claims = yield* Effect.all(
+        ["claim-a", "claim-b"].map((claimToken) =>
+          store.compareAndSetNodeMetadata({
+            goalID: goal.id,
+            nodeID: "child",
+            expected,
+            next: { childAbort: { ...expected.childAbort, delivery: "claimed", claimToken } },
+          }),
+        ),
+        { concurrency: "unbounded" },
+      )
+      expect(claims.filter(Boolean)).toHaveLength(1)
+      expect(
+        yield* store.compareAndSetNodeMetadata({
+          goalID: goal.id,
+          nodeID: "child",
+          expected,
+          next: { childAbort: { ...expected.childAbort, delivery: "delivered" } },
+        }),
+      ).toBe(false)
+    }),
+  )
+
   it.live("round-trips a plan, including loop membership and executors", () =>
     Effect.gen(function* () {
       const created = yield* project

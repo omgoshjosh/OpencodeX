@@ -274,7 +274,7 @@ export function foldStatus(graph: GraphView): FoldedStatus {
   if (graph.nodes.length === 0) return "running"
   if (graph.nodes.some((node) => node.status === "awaiting_approval")) return "blocked"
   if (graph.nodes.some((node) => isPending(node.status))) return "running"
-  return graph.nodes.some((node) => node.status === "failed") ? "failed" : "completed"
+  return graph.nodes.some((node) => node.status === "failed" || node.status === "cancelled") ? "failed" : "completed"
 }
 
 /**

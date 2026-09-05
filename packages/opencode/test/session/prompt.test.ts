@@ -677,6 +677,23 @@ it.instance("promptAsync persists its message and execution intent before return
   }),
 )
 
+it.instance("notifies registered cancellation observers until they unregister", () =>
+  Effect.gen(function* () {
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const first = yield* sessions.create({})
+    const second = yield* sessions.create({})
+    const cancelled: string[] = []
+    const unregister = yield* prompt.onCancel((sessionID) => Effect.sync(() => cancelled.push(sessionID)))
+
+    yield* prompt.cancel(first.id)
+    expect(cancelled).toEqual([first.id])
+    yield* unregister
+    yield* prompt.cancel(second.id)
+    expect(cancelled).toEqual([first.id])
+  }),
+)
+
 it.instance("promptAsync retains one deterministic deferred report command through queued recovery", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)

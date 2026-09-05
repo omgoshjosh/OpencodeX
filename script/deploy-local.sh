@@ -39,6 +39,8 @@ readonly HARD_STOP_GB=10
 readonly KEEP_GENERATIONS=3
 
 REF="${OXD_REF:-fork/dogfood/stack2}"
+REF_EXPLICIT=0
+STAMP_SHA=""
 CHANNEL=""
 STAMP=""
 STAGE=""
@@ -47,6 +49,7 @@ STAGE_ONLY=0
 DRAIN_ONLY=0
 DO_FETCH=1
 SKIP_GUI=0
+GUI_ONLY=0
 FORCE=0
 QUIT_GUI=1
 DRAIN=1
@@ -64,6 +67,11 @@ with ONE version stamp, then installs both and restarts the server drain-safe.
 
   REF                    git ref to deploy (default: $REF)
 
+  --gui-only             rebuild and install ONLY the GUI, to match the server
+                         that is already running: no CLI build, no drain, no
+                         cutover.  REF and --stamp both default to whatever the
+                         live server reports, so the GUI is rebuilt at the
+                         commit the server was built from.
   --stage-only           build and verify stamp equality, install nothing
   --drain-only           only wait for the server to be safe to restart, then exit
   --out DIR              staging directory (default: $STATE_DIR/stage/<stamp>)
@@ -83,7 +91,8 @@ with ONE version stamp, then installs both and restarts the server drain-safe.
   --no-drain             restart without waiting for the server to go idle
   --no-quit-gui          do not quit a running OpencodeX.app before replacing it
 
-Day to day:  $SELF --yes
+Day to day:      $SELF --yes
+After a cutover: $SELF --gui-only --yes
 EOF
 }
 
@@ -99,6 +108,7 @@ while [ "$#" -gt 0 ]; do
     -h | --help) usage; exit 0 ;;
     --stage-only) STAGE_ONLY=1 ;;
     --drain-only) DRAIN_ONLY=1 ;;
+    --gui-only) GUI_ONLY=1 ;;
     --yes | -y) ASSUME_YES=1 ;;
     --force) FORCE=1 ;;
     --no-fetch) DO_FETCH=0 ;;
@@ -114,10 +124,15 @@ while [ "$#" -gt 0 ]; do
     --drain-interval) DRAIN_INTERVAL="${2:?}"; shift ;;
     --drain-timeout) DRAIN_TIMEOUT="${2:?}"; shift ;;
     -*) die "unknown option $1 (try --help)" ;;
-    *) REF="$1" ;;
+    *) REF="$1"; REF_EXPLICIT=1 ;;
   esac
   shift
 done
+
+if [ "$GUI_ONLY" = 1 ]; then
+  [ "$SKIP_GUI" = 0 ] || die "--gui-only and --skip-gui ask for opposite halves of the deploy"
+  [ "$DRAIN_ONLY" = 0 ] || die "--gui-only does not restart the server, so there is nothing to drain for; drop one of --gui-only/--drain-only"
+fi
 
 positive_int --drain-samples "$DRAIN_SAMPLES"
 positive_int --drain-interval "$DRAIN_INTERVAL"
@@ -232,6 +247,47 @@ wait_for_drain() {
 SERVER_VERSION="$(live_version || true)"
 say "server          ${SERVER_VERSION:-<not responding>}"
 
+# ------------------------------------------------------ gui-only targeting --
+# The operator cuts the server over several times a day through
+# ~/.opencode/safe-cutover-v2.sh, which is handed a stamp of the shape
+#   0.0.0-<channel, / replaced by ->-<7-char short sha>-<UTC YYYYMMDDHHMM>
+# (see the EXPECTED_VERSION assignments in ~/.opencode/safe-cutover-*.sh; the
+# cutover consumes that stamp, it does not derive it).  Nobody rebuilds the GUI
+# on those cutovers and the attach gate is exact-match, so the GUI is refused
+# after every one.  --gui-only repairs exactly that: read the stamp the server
+# is actually running and rebuild the GUI half at the commit it names.  The
+# default stamp built at the bottom of "resolve" writes this same format, and
+# this is the parser that reads it back — keep the two in step.
+if [ "$GUI_ONLY" = 1 ]; then
+  [ -n "$STAMP" ] || [ -n "$SERVER_VERSION" ] ||
+    die "--gui-only targets the running server, but it is not responding on port $PORT; pass REF and --stamp explicitly"
+  [ -n "$STAMP" ] || STAMP="$SERVER_VERSION"
+  # The channel may itself contain dashes (dogfood/safe-cutover -> two fields),
+  # so peel the known-shaped tail off the right instead of counting from the
+  # left: the timestamp is the last field and the short sha the one before it.
+  STAMP_BODY="${STAMP#0.0.0-}"
+  STAMP_TS="${STAMP_BODY##*-}"
+  STAMP_HEAD="${STAMP_BODY%-*}"
+  STAMP_SHA="${STAMP_HEAD##*-}"
+  case "$STAMP_TS" in "" | *[!0-9]*) STAMP_SHA="" ;; esac
+  case "$STAMP_SHA" in "" | *[!0-9a-fA-F]*) STAMP_SHA="" ;; esac
+  # No dash left in the head means the stamp carried no channel, so what looks
+  # like a sha is really the channel and there is nothing to build at.
+  [ "$STAMP_HEAD" != "$STAMP_SHA" ] || STAMP_SHA=""
+  [ -n "$STAMP_SHA" ] ||
+    die "cannot read a commit out of the stamp '$STAMP' (expected 0.0.0-<channel>-<short sha>-<UTC timestamp>); pass REF and --stamp explicitly"
+  [ "$REF_EXPLICIT" = 1 ] || REF="$STAMP_SHA"
+  # The channel recovered here has already had its slashes flattened, so a
+  # gui-only rebuild sets OPENCODE_CHANNEL=dogfood-stack2 where the full run
+  # that built the server set dogfood/stack2.  That is safe only because the
+  # channel reaches the attach gate through the database filename, which
+  # applies the same substitution (`InstallationChannel.replace(/[^a-zA-Z0-9._-]/g, "-")`
+  # in packages/core/src/database/database.ts), so both spellings resolve to
+  # opencode-dogfood-stack2.db and coordinatorDatabaseIdentity still matches.
+  # If that sanitiser changes, this has to derive the unflattened channel.
+  [ -n "$CHANNEL" ] || CHANNEL="${STAMP_HEAD%-*}"
+fi
+
 if [ "$DRAIN_ONLY" = 1 ]; then
   wait_for_drain
   exit 0
@@ -265,6 +321,16 @@ fi
 SHA="$(git rev-parse --verify --quiet "${REF}^{commit}")" || die "cannot resolve ref: $REF"
 SUBJECT="$(git log -1 --format=%s "$SHA")"
 
+# An explicit REF suppresses the ref default but not the stamp default, so
+# `--gui-only <other-ref>` would ship a GUI built from one commit wearing the
+# stamp of another.  The attach gate compares stamp strings only, so it would
+# accept that bundle and never notice it is running different code.
+if [ "$GUI_ONLY" = 1 ] && [ "$REF_EXPLICIT" = 1 ] && [ "${SHA#"$STAMP_SHA"}" = "$SHA" ]; then
+  say "WARNING  building $REF ($(git rev-parse --short=7 "$SHA")) but stamping it '$STAMP', which names $STAMP_SHA."
+  say "         The GUI will attach to the running server while containing different code."
+  say "         Pass --stamp too, or drop $REF to build what the server actually runs."
+fi
+
 if [ -z "$CHANNEL" ]; then
   CHANNEL="${REF#refs/remotes/}"
   CHANNEL="${CHANNEL#refs/heads/}"
@@ -283,7 +349,14 @@ if git rev-parse --verify --quiet "${CHANNEL}^{commit}" >/dev/null &&
   die "'$CHANNEL' is a commit-ish, not a branch; pass --channel"
 fi
 
-[ -n "$STAMP" ] || STAMP="0.0.0-${CHANNEL}-$(date -u +%Y%m%d%H%M)"
+# This must produce the same shape the operator's cutovers already run on —
+# 0.0.0-<channel, / replaced by ->-<7-char short sha>-<UTC YYYYMMDDHHMM> — both
+# because the stamp is the only human-readable record of what a live server was
+# built from, and because --gui-only parses the sha back out of it above.
+# safe-cutover-v2.sh takes the stamp as an argument rather than deriving it; the
+# convention is visible in the EXPECTED_VERSION lines of its pinned siblings,
+# e.g. 0.0.0-dogfood-safe-cutover-32206ba-202608311126.
+[ -n "$STAMP" ] || STAMP="0.0.0-${CHANNEL//\//-}-$(git rev-parse --short=7 "$SHA")-$(date -u +%Y%m%d%H%M)"
 case "$STAMP" in
   0.0.0-*) : ;;
   *) die "stamp must start with 0.0.0- or the build treats it as a release channel: $STAMP" ;;
@@ -309,7 +382,9 @@ installed_gui_version() {
 }
 GUI_VERSION="$(installed_gui_version)"
 lockstep_claim() {
-  if [ "$SKIP_GUI" = 1 ]; then
+  if [ "$GUI_ONLY" = 1 ]; then
+    printf 'server=GUI=TUI (GUI rebuilt onto the running server; nothing restarted)'
+  elif [ "$SKIP_GUI" = 1 ]; then
     printf 'server=TUI (GUI skipped, still at %s)' "${GUI_VERSION:-<unstamped>}"
   else
     printf 'server=GUI=TUI'
@@ -319,6 +394,7 @@ lockstep_claim() {
 # ---------------------------------------------------------------- the plan --
 step "plan"
 cat <<EOF
+  mode            $([ "$GUI_ONLY" = 1 ] && echo "GUI only (resolved from the running server)" || echo "CLI + GUI + server cutover")
   ref             $REF
   commit          $SHA
                   $SUBJECT
@@ -328,12 +404,25 @@ cat <<EOF
   stage in        $STAGE
 
   CLI   $CLI_INSTALL
-        ${SERVER_VERSION:-<server not responding>}  ->  $STAMP
+        ${SERVER_VERSION:-<server not responding>}  ->  $([ "$GUI_ONLY" = 1 ] && echo "(unchanged; the server is not restarted)" || echo "$STAMP")
   GUI   $GUI_INSTALL
         ${GUI_VERSION:-<unstamped>}  ->  $([ "$SKIP_GUI" = 1 ] && echo "(skipped)" || echo "$STAMP")
 EOF
 
-if [ "$FORCE" = 0 ] && [ "$STAGE_ONLY" = 0 ] && [ -r "$LAST" ]; then
+# A GUI-only run never writes last-deploy.json, so its "already done" signal is
+# the installed bundle matching the server, not that record.  Both halves have
+# to be checked: with an explicit --stamp that the server does not run, a GUI
+# matching that stamp is precisely the mismatch this command exists to fix, and
+# claiming lockstep for it would turn the LOCKSTEP FAIL the previous run
+# correctly reported into a PASS on the next one.
+if [ "$GUI_ONLY" = 1 ] && [ "$FORCE" = 0 ] && [ "$STAGE_ONLY" = 0 ] &&
+   [ "$GUI_VERSION" = "$STAMP" ] && [ "$SERVER_VERSION" = "$STAMP" ]; then
+  say ""
+  say "LOCKSTEP PASS  $STAMP  $(lockstep_claim)  (GUI already matches; --force to rebuild)"
+  exit 0
+fi
+
+if [ "$GUI_ONLY" = 0 ] && [ "$FORCE" = 0 ] && [ "$STAGE_ONLY" = 0 ] && [ -r "$LAST" ]; then
   if [ "$(jq -r '.commit // empty' "$LAST")" = "$SHA" ] &&
      [ -n "$SERVER_VERSION" ] &&
      [ "$(jq -r '.stamp // empty' "$LAST")" = "$SERVER_VERSION" ] &&
@@ -375,9 +464,13 @@ unset OPENCODEX_GUI_SIDECAR OPENCODEX_GUI_SIDECAR_TARGET
 # The CLI binary is serve + TUI in one artifact.  build.ts starts with
 # `rm -rf dist`, so the CLI has to be copied out of dist before the coordinator
 # build reuses the same directory.
-say "building CLI (serve + TUI)"
-bun run --cwd packages/opencode build --single
-install -m 755 "packages/opencode/dist/$TARGET/bin/opencode" "$STAGED_CLI"
+if [ "$GUI_ONLY" = 1 ]; then
+  say "skipping the CLI build (--gui-only): the server already runs $STAMP"
+else
+  say "building CLI (serve + TUI)"
+  bun run --cwd packages/opencode build --single
+  install -m 755 "packages/opencode/dist/$TARGET/bin/opencode" "$STAGED_CLI"
+fi
 
 if [ "$SKIP_GUI" = 0 ]; then
   say "building GUI coordinator sidecar"
@@ -437,9 +530,11 @@ fi
 # --------------------------------------------------------- lockstep gate ---
 # Nothing installed has been touched yet.  If the artifacts disagree, stop here.
 step "verify artifacts"
-CLI_STAMP="$("$STAGED_CLI" --version 2>/dev/null || true)"
-say "CLI  $CLI_STAMP"
-[ "$CLI_STAMP" = "$STAMP" ] || die "LOCKSTEP FAIL  CLI stamped '$CLI_STAMP', expected '$STAMP'"
+if [ "$GUI_ONLY" = 0 ]; then
+  CLI_STAMP="$("$STAGED_CLI" --version 2>/dev/null || true)"
+  say "CLI  $CLI_STAMP"
+  [ "$CLI_STAMP" = "$STAMP" ] || die "LOCKSTEP FAIL  CLI stamped '$CLI_STAMP', expected '$STAMP'"
+fi
 
 if [ "$SKIP_GUI" = 0 ]; then
   PACKAGED="$STAGED_APP/Contents/Resources/sidecar/opencode-gui-coordinator"
@@ -467,12 +562,13 @@ if [ "$SKIP_GUI" = 0 ]; then
   [ -x "$PACKAGED" ] || die "LOCKSTEP FAIL  packaged app has no executable sidecar coordinator at $PACKAGED"
 fi
 
-CLI_HASH="$(shasum -a 256 "$STAGED_CLI" | cut -d ' ' -f 1)"
+CLI_HASH=""
+[ "$GUI_ONLY" = 1 ] || CLI_HASH="$(shasum -a 256 "$STAGED_CLI" | cut -d ' ' -f 1)"
 say "artifacts agree on $STAMP"
 
 if [ "$STAGE_ONLY" = 1 ]; then
   step "stage only"
-  say "  CLI  $STAGED_CLI  (sha256 $CLI_HASH)"
+  [ "$GUI_ONLY" = 1 ] || say "  CLI  $STAGED_CLI  (sha256 $CLI_HASH)"
   [ "$SKIP_GUI" = 1 ] || say "  GUI  $STAGED_APP"
   say ""
   say "LOCKSTEP PASS (staged)  $STAMP  — nothing installed; re-run without --stage-only to deploy"
@@ -480,7 +576,8 @@ if [ "$STAGE_ONLY" = 1 ]; then
 fi
 
 # ------------------------------------------------------------------- drain --
-wait_for_drain
+# --gui-only never restarts the server, so in-flight turns are never at risk.
+[ "$GUI_ONLY" = 1 ] || wait_for_drain
 
 # ----------------------------------------------------------------- install --
 restore_gui() {
@@ -519,15 +616,17 @@ if [ "$SKIP_GUI" = 0 ]; then
   say "installed  $GUI_INSTALL"
 fi
 
-step "install CLI and restart server"
-say "handing off to $(basename "$CUTOVER") (nonce $CUTOVER_NONCE)"
-ROLLBACK_ARMED=1
-if ! CUTOVER_NONCE="$CUTOVER_NONCE" /bin/bash "$CUTOVER" "$STAGED_CLI" "$CLI_HASH" "$STAMP"; then
-  # The cutover recovers the server to the old binary on its own, so leaving the
-  # new GUI installed would strand it against a version the server no longer
-  # runs — the exact-match attach gate would then refuse every connection.
-  restore_gui
-  die "cutover failed; server and GUI were both returned to their previous versions"
+if [ "$GUI_ONLY" = 0 ]; then
+  step "install CLI and restart server"
+  say "handing off to $(basename "$CUTOVER") (nonce $CUTOVER_NONCE)"
+  ROLLBACK_ARMED=1
+  if ! CUTOVER_NONCE="$CUTOVER_NONCE" /bin/bash "$CUTOVER" "$STAGED_CLI" "$CLI_HASH" "$STAMP"; then
+    # The cutover recovers the server to the old binary on its own, so leaving
+    # the new GUI installed would strand it against a version the server no
+    # longer runs — the exact-match attach gate would refuse every connection.
+    restore_gui
+    die "cutover failed; server and GUI were both returned to their previous versions"
+  fi
 fi
 
 # ------------------------------------------------------------------ verify --
@@ -554,10 +653,14 @@ fi
 
 # ------------------------------------------------------------------ record --
 mkdir -p "$STATE_DIR"
-jq -n --arg commit "$SHA" --arg stamp "$STAMP" --arg ref "$REF" --arg channel "$CHANNEL" \
-  --arg cutover "$CUTOVER_ROOT" --arg guiBackup "$GUI_BACKUP" --arg at "$(date -u '+%FT%TZ')" \
-  '{commit:$commit,stamp:$stamp,ref:$ref,channel:$channel,cutover:$cutover,guiBackup:$guiBackup,at:$at}' \
-  > "$LAST.tmp" && mv "$LAST.tmp" "$LAST"
+# last-deploy.json records what this script put on the server.  A GUI-only run
+# put nothing there, so it must not claim the deploy that the cutover made.
+if [ "$GUI_ONLY" = 0 ]; then
+  jq -n --arg commit "$SHA" --arg stamp "$STAMP" --arg ref "$REF" --arg channel "$CHANNEL" \
+    --arg cutover "$CUTOVER_ROOT" --arg guiBackup "$GUI_BACKUP" --arg at "$(date -u '+%FT%TZ')" \
+    '{commit:$commit,stamp:$stamp,ref:$ref,channel:$channel,cutover:$cutover,guiBackup:$guiBackup,at:$at}' \
+    > "$LAST.tmp" && mv "$LAST.tmp" "$LAST"
+fi
 
 # Keep the newest few rollback points and the one this deploy depends on; drop
 # the rest, because nothing else on this machine ever reclaims them.

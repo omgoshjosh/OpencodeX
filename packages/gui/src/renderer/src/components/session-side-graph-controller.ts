@@ -85,7 +85,9 @@ export function createSessionGraphViewController(input: {
 
   function fit() {
     if (!measured()) return
-    adjusted = false
+    // Explicit fit owns the viewport just like a pan or zoom. Otherwise the
+    // next ResizeObserver tick can immediately replace it with auto-framing.
+    adjusted = true
     // The explicit button means "show me everything", readable or not; the
     // floor applies to automatic framing only.
     setViewport(fitGraphViewport(layout().bounds, size()))

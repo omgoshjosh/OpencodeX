@@ -117,8 +117,17 @@ it.live("drains the newest pending value once per interval", () =>
         for (let index = 0; index < 50; index++) {
           yield* ctx.metadata({ title: `chunk ${index}`, metadata: {} })
         }
-        // Real time so the drain fiber gets a turn regardless of the test clock.
-        yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, INTERVAL_MS * 3)))
+        // The drain fiber is scoped to this call, so the wait has to happen
+        // here, and it has to wait for the drain itself: a fixed sleep is not a
+        // synchronization primitive, and a loaded runner can starve the fiber
+        // past any wall-clock deadline we pick. Poll in real time - so the fiber
+        // gets a turn regardless of the test clock - until the trailing drain
+        // has carried the newest value, bounded so a coalescer that never drains
+        // still fails the assertions below rather than hanging.
+        const deadline = Date.now() + 3_000
+        while (Date.now() < deadline && !(writes.length >= 2 && writes.at(-1)?.title === "chunk 49")) {
+          yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, INTERVAL_MS / 10)))
+        }
       }),
     )
     yield* run(tool)

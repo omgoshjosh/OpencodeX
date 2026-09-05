@@ -174,6 +174,8 @@ function autoContinueText(reason: NonNullable<ReturnType<typeof autoContinueReas
 
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
+  /** Observers use this to connect child-session cancellation to durable work. */
+  readonly onCancel: (listener: (sessionID: SessionID) => Effect.Effect<void>) => Effect.Effect<Effect.Effect<void>>
   /** Withdraws a message still waiting in the queue; running turns need abort. */
   readonly cancelQueued: (input: {
     sessionID: SessionID
@@ -368,6 +370,8 @@ export const layer = Layer.effect(
       } satisfies TaskPromptOps
     })
 
+    const cancelListeners = new Set<(sessionID: SessionID) => Effect.Effect<void>>()
+
     const cancel = Effect.fn("SessionPrompt.cancel")(function* (sessionID: SessionID) {
       yield* elog.info("cancel", { sessionID })
       const generation = yield* state.cancel(sessionID)
@@ -375,6 +379,7 @@ export const layer = Layer.effect(
         [permission.rejectForGeneration(sessionID, generation), question.rejectForGeneration(sessionID, generation)],
         { discard: true },
       )
+      yield* Effect.forEach(cancelListeners, (listener) => listener(sessionID), { concurrency: 1, discard: true })
     })
 
     const { resolvePromptParts, createUserMessage } = PromptUserMessage.make({
@@ -1249,6 +1254,11 @@ export const layer = Layer.effect(
 
     return Service.of({
       cancel,
+      onCancel: (listener) =>
+        Effect.sync(() => {
+          cancelListeners.add(listener)
+          return Effect.sync(() => cancelListeners.delete(listener))
+        }),
       cancelQueued: (input) =>
         Effect.gen(function* () {
           const outcome = yield* cancelCommand(input)

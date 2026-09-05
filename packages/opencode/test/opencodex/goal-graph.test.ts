@@ -477,6 +477,7 @@ describe("status folding", () => {
     ["work remains", ["done", "planned"], "running"],
     ["everything landed", ["done", "done"], "completed"],
     ["one node failed", ["done", "failed"], "failed"],
+    ["a cancelled node fails the goal", ["done", "cancelled"], "failed"],
     ["skips alone do not fail a goal", ["done", "skipped"], "completed"],
   ]
   for (const [name, statuses, expected] of cases) {

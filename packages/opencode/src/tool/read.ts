@@ -10,6 +10,7 @@ import { assertExternalDirectoryEffect } from "./external-directory"
 import { Instruction } from "../session/instruction"
 import { isPdfAttachment, sniffAttachmentMime } from "@/util/media"
 import { Reference } from "@/reference/reference"
+import { withFileToolDeadline } from "./file-deadline"
 
 const DEFAULT_READ_LIMIT = 2000
 const MAX_LINE_LENGTH = 2000
@@ -234,101 +235,109 @@ export const ReadTool = Tool.define(
       if (!stat) return yield* miss(filepath)
 
       if (stat.type === "Directory") {
-        const items = yield* list(filepath)
-        const limit = params.limit ?? DEFAULT_READ_LIMIT
-        const offset = params.offset || 1
-        const start = offset - 1
-        const sliced = items.slice(start, start + limit)
-        const truncated = start + sliced.length < items.length
+        return yield* withFileToolDeadline("read", ctx.abort, () =>
+          Effect.gen(function* () {
+            const items = yield* list(filepath)
+            const limit = params.limit ?? DEFAULT_READ_LIMIT
+            const offset = params.offset || 1
+            const start = offset - 1
+            const sliced = items.slice(start, start + limit)
+            const truncated = start + sliced.length < items.length
 
-        return {
-          title,
-          output: [
-            `<path>${filepath}</path>`,
-            `<type>directory</type>`,
-            `<entries>`,
-            sliced.join("\n"),
-            truncated
-              ? `\n(Showing ${sliced.length} of ${items.length} entries. Use 'offset' parameter to read beyond entry ${offset + sliced.length})`
-              : `\n(${items.length} entries)`,
-            `</entries>`,
-          ].join("\n"),
-          metadata: {
-            preview: sliced.slice(0, 20).join("\n"),
-            truncated,
-            loaded: [] as string[],
-          },
-        }
-      }
-
-      const loaded = yield* instruction.resolve(ctx.messages, filepath, ctx.messageID)
-      const sample = yield* readSample(filepath, Number(stat.size), SAMPLE_BYTES)
-
-      const mime = sniffAttachmentMime(sample, AppFileSystem.mimeType(filepath))
-      const isImage = SUPPORTED_IMAGE_MIMES.has(mime)
-
-      if (isImage || isPdfAttachment(mime)) {
-        const bytes = yield* fs.readFile(filepath)
-        const msg = isPdfAttachment(mime) ? "PDF read successfully" : "Image read successfully"
-        return {
-          title,
-          output: msg,
-          metadata: {
-            preview: msg,
-            truncated: false,
-            loaded: loaded.map((item) => item.filepath),
-          },
-          attachments: [
-            {
-              type: "file" as const,
-              mime,
-              url: `data:${mime};base64,${Buffer.from(bytes).toString("base64")}`,
-            },
-          ],
-        }
-      }
-
-      if (isBinaryFile(filepath, sample)) {
-        return yield* Effect.fail(new Error(`Cannot read binary file: ${filepath}`))
-      }
-
-      const file = yield* lines(filepath, { limit: params.limit ?? DEFAULT_READ_LIMIT, offset: params.offset || 1 })
-      if (file.count < file.offset && !(file.count === 0 && file.offset === 1)) {
-        return yield* Effect.fail(
-          new Error(`Offset ${file.offset} is out of range for this file (${file.count} lines)`),
+            return {
+              title,
+              output: [
+                `<path>${filepath}</path>`,
+                `<type>directory</type>`,
+                `<entries>`,
+                sliced.join("\n"),
+                truncated
+                  ? `\n(Showing ${sliced.length} of ${items.length} entries. Use 'offset' parameter to read beyond entry ${offset + sliced.length})`
+                  : `\n(${items.length} entries)`,
+                `</entries>`,
+              ].join("\n"),
+              metadata: {
+                preview: sliced.slice(0, 20).join("\n"),
+                truncated,
+                loaded: [] as string[],
+              },
+            }
+          }),
         )
       }
 
-      let output = [`<path>${filepath}</path>`, `<type>file</type>`, "<content>\n"].join("\n")
-      output += file.raw.map((line, i) => `${i + file.offset}: ${line}`).join("\n")
+      return yield* withFileToolDeadline("read", ctx.abort, () =>
+        Effect.gen(function* () {
+          const loaded = yield* instruction.resolve(ctx.messages, filepath, ctx.messageID)
+          const sample = yield* readSample(filepath, Number(stat.size), SAMPLE_BYTES)
 
-      const last = file.offset + file.raw.length - 1
-      const next = last + 1
-      const truncated = file.more || file.cut
-      if (file.cut) {
-        output += `\n\n(Output capped at ${MAX_BYTES_LABEL}. Showing lines ${file.offset}-${last}. Use offset=${next} to continue.)`
-      } else if (file.more) {
-        output += `\n\n(Showing lines ${file.offset}-${last} of ${file.count}. Use offset=${next} to continue.)`
-      } else {
-        output += `\n\n(End of file - total ${file.count} lines)`
-      }
-      output += "\n</content>"
+          const mime = sniffAttachmentMime(sample, AppFileSystem.mimeType(filepath))
+          const isImage = SUPPORTED_IMAGE_MIMES.has(mime)
 
-      yield* warm(filepath)
+          if (isImage || isPdfAttachment(mime)) {
+            const bytes = yield* fs.readFile(filepath)
+            const msg = isPdfAttachment(mime) ? "PDF read successfully" : "Image read successfully"
+            return {
+              title,
+              output: msg,
+              metadata: {
+                preview: msg,
+                truncated: false,
+                loaded: loaded.map((item) => item.filepath),
+              },
+              attachments: [
+                {
+                  type: "file" as const,
+                  mime,
+                  url: `data:${mime};base64,${Buffer.from(bytes).toString("base64")}`,
+                },
+              ],
+            }
+          }
 
-      if (loaded.length > 0) {
-        output += `\n\n<system-reminder>\n${loaded.map((item) => item.content).join("\n\n")}\n</system-reminder>`
-      }
+          if (isBinaryFile(filepath, sample)) {
+            return yield* Effect.fail(new Error(`Cannot read binary file: ${filepath}`))
+          }
 
-      return {
-        title,
-        output,
-        metadata: {
-          preview: file.raw.slice(0, 20).join("\n"),
-          truncated,
-          loaded: loaded.map((item) => item.filepath),
-        },
-      }
+          const file = yield* lines(filepath, { limit: params.limit ?? DEFAULT_READ_LIMIT, offset: params.offset || 1 })
+          if (file.count < file.offset && !(file.count === 0 && file.offset === 1)) {
+            return yield* Effect.fail(
+              new Error(`Offset ${file.offset} is out of range for this file (${file.count} lines)`),
+            )
+          }
+
+          let output = [`<path>${filepath}</path>`, `<type>file</type>`, "<content>\n"].join("\n")
+          output += file.raw.map((line, i) => `${i + file.offset}: ${line}`).join("\n")
+
+          const last = file.offset + file.raw.length - 1
+          const next = last + 1
+          const truncated = file.more || file.cut
+          if (file.cut) {
+            output += `\n\n(Output capped at ${MAX_BYTES_LABEL}. Showing lines ${file.offset}-${last}. Use offset=${next} to continue.)`
+          } else if (file.more) {
+            output += `\n\n(Showing lines ${file.offset}-${last} of ${file.count}. Use offset=${next} to continue.)`
+          } else {
+            output += `\n\n(End of file - total ${file.count} lines)`
+          }
+          output += "\n</content>"
+
+          yield* warm(filepath)
+
+          if (loaded.length > 0) {
+            output += `\n\n<system-reminder>\n${loaded.map((item) => item.content).join("\n\n")}\n</system-reminder>`
+          }
+
+          return {
+            title,
+            output,
+            metadata: {
+              preview: file.raw.slice(0, 20).join("\n"),
+              truncated,
+              loaded: loaded.map((item) => item.filepath),
+            },
+          }
+        }),
+      )
     })
 
     return {

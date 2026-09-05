@@ -107,6 +107,7 @@ export type Row = Match["data"]
 export interface SearchResult {
   items: Item[]
   partial: boolean
+  truncated: boolean
 }
 
 export interface FilesInput {
@@ -215,7 +216,6 @@ function searchArgs(input: SearchInput) {
   if (input.glob) {
     for (const glob of input.glob) args.push(`--glob=${glob}`)
   }
-  if (input.limit) args.push(`--max-count=${input.limit}`)
   args.push("--", input.pattern, ...(input.file ?? ["."]))
   return args
 }
@@ -393,6 +393,7 @@ export const layer: Layer.Layer<Service, never, AppFileSystem.Service | ChildPro
                   Stream.mapEffect(parse),
                   Stream.filter((item): item is Match => item.type === "match"),
                   Stream.map((item) => row(item.data)),
+                  Stream.take((input.limit ?? Number.MAX_SAFE_INTEGER) + 1),
                   Stream.runCollect,
                   Effect.map((chunk) => [...chunk]),
                 ),
@@ -407,8 +408,9 @@ export const layer: Layer.Layer<Service, never, AppFileSystem.Service | ChildPro
             }
 
             return {
-              items: code === 1 ? [] : items,
+              items: code === 1 ? [] : items.slice(0, input.limit ?? items.length),
               partial: code === 2,
+              truncated: input.limit !== undefined && items.length > input.limit,
             }
           }),
         )

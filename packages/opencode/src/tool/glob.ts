@@ -1,4 +1,5 @@
 import path from "path"
+import os from "os"
 import { Effect, Option, Schema } from "effect"
 import * as Stream from "effect/Stream"
 import { InstanceState } from "@/effect/instance-state"
@@ -8,6 +9,7 @@ import { assertExternalDirectoryEffect } from "./external-directory"
 import DESCRIPTION from "./glob.txt"
 import * as Tool from "./tool"
 import { Reference } from "@/reference/reference"
+import { withFileToolDeadline } from "./file-deadline"
 
 export const Parameters = Schema.Struct({
   pattern: Schema.String.annotate({ description: "The glob pattern to match files against" }),
@@ -39,64 +41,74 @@ export const GlobTool = Tool.define(
             },
           })
 
-          let search = params.path ?? ins.directory
-          search = path.isAbsolute(search) ? search : path.resolve(ins.directory, search)
-          yield* reference.ensure(search)
-          const info = yield* fs.stat(search).pipe(Effect.catch(() => Effect.succeed(undefined)))
-          if (info?.type === "File") {
-            throw new Error(`glob path must be a directory: ${search}`)
-          }
-          yield* assertExternalDirectoryEffect(ctx, search, {
-            bypass: yield* reference.contains(search),
-            kind: "directory",
-          })
+          return yield* withFileToolDeadline("glob", ctx.abort, (signal) =>
+            Effect.gen(function* () {
+              const requested = params.path ?? ins.directory
+              const search = yield* fs
+                .realPath(path.isAbsolute(requested) ? requested : path.resolve(ins.directory, requested))
+                .pipe(Effect.catch(() => Effect.succeed(path.resolve(ins.directory, requested))))
+              const home = yield* fs.realPath(os.homedir()).pipe(Effect.catch(() => Effect.succeed(os.homedir())))
+              if (search === path.parse(search).root || search === home) {
+                return yield* Effect.fail(new Error("glob path must be narrower than the filesystem or home directory"))
+              }
+              yield* reference.ensure(search)
+              const info = yield* fs.stat(search).pipe(Effect.catch(() => Effect.succeed(undefined)))
+              if (info?.type === "File") {
+                return yield* Effect.fail(new Error(`glob path must be a directory: ${search}`))
+              }
+              yield* assertExternalDirectoryEffect(ctx, search, {
+                bypass: yield* reference.contains(search),
+                kind: "directory",
+              })
 
-          const limit = 100
-          let truncated = false
-          const files = yield* rg.files({ cwd: search, glob: [params.pattern], signal: ctx.abort }).pipe(
-            Stream.mapEffect((file) =>
-              Effect.gen(function* () {
-                const full = path.resolve(search, file)
-                const info = yield* fs.stat(full).pipe(Effect.catch(() => Effect.succeed(undefined)))
-                const mtime =
-                  info?.mtime.pipe(
-                    Option.map((date) => date.getTime()),
-                    Option.getOrElse(() => 0),
-                  ) ?? 0
-                return { path: full, mtime }
-              }),
-            ),
-            Stream.take(limit + 1),
-            Stream.runCollect,
-            Effect.map((chunk) => [...chunk]),
-          )
-
-          if (files.length > limit) {
-            truncated = true
-            files.length = limit
-          }
-          files.sort((a, b) => b.mtime - a.mtime)
-
-          const output = []
-          if (files.length === 0) output.push("No files found")
-          if (files.length > 0) {
-            output.push(...files.map((file) => file.path))
-            if (truncated) {
-              output.push("")
-              output.push(
-                `(Results are truncated: showing first ${limit} results. Consider using a more specific path or pattern.)`,
+              const limit = 100
+              let truncated = false
+              const files = yield* rg.files({ cwd: search, glob: [params.pattern], signal }).pipe(
+                Stream.mapEffect((file) =>
+                  Effect.gen(function* () {
+                    const full = path.resolve(search, file)
+                    const info = yield* fs.stat(full).pipe(Effect.catch(() => Effect.succeed(undefined)))
+                    const mtime =
+                      info?.mtime.pipe(
+                        Option.map((date) => date.getTime()),
+                        Option.getOrElse(() => 0),
+                      ) ?? 0
+                    return { path: full, mtime }
+                  }),
+                ),
+                Stream.take(limit + 1),
+                Stream.runCollect,
+                Effect.map((chunk) => [...chunk]),
               )
-            }
-          }
 
-          return {
-            title: path.relative(ins.worktree, search),
-            metadata: {
-              count: files.length,
-              truncated,
-            },
-            output: output.join("\n"),
-          }
+              if (files.length > limit) {
+                truncated = true
+                files.length = limit
+              }
+              files.sort((a, b) => b.mtime - a.mtime)
+
+              const output = []
+              if (files.length === 0) output.push("No files found")
+              if (files.length > 0) {
+                output.push(...files.map((file) => file.path))
+                if (truncated) {
+                  output.push("")
+                  output.push(
+                    `(Results are truncated: showing first ${limit} results. Consider using a more specific path or pattern.)`,
+                  )
+                }
+              }
+
+              return {
+                title: path.relative(ins.worktree, search),
+                metadata: {
+                  count: files.length,
+                  truncated,
+                },
+                output: output.join("\n"),
+              }
+            }),
+          )
         }).pipe(Effect.orDie),
     }
   }),

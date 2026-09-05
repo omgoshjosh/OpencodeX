@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { deriveUiState } from "../../src/opencodex/session-state"
+import { SessionID } from "../../src/session/schema"
 
 function session(overrides: Partial<{ id: string; parentID: string; updated: number }> = {}) {
   return {
@@ -78,12 +79,12 @@ describe("deriveUiState mark-unread", () => {
       permissions: [],
       questions: [],
       state: {
-        sessionID: "ses_root",
+        sessionID: SessionID.make("ses_root"),
         seenAt: 200,
         markedUnreadAt: 300,
         reviewedFiles: [],
         timeUpdated: 300,
-      } as never,
+      },
     })
     expect(state.markedUnreadAt).toBe(300)
     expect(state.updated).toBe(true)
@@ -94,7 +95,7 @@ describe("deriveUiState mark-unread", () => {
       session: session({ updated: 100 }),
       permissions: [],
       questions: [],
-      state: { sessionID: "ses_root", seenAt: 200, reviewedFiles: [], timeUpdated: 250 } as never,
+      state: { sessionID: SessionID.make("ses_root"), seenAt: 200, reviewedFiles: [], timeUpdated: 250 },
     })
     expect(state.markedUnreadAt).toBeUndefined()
     expect(state.updated).toBe(false)

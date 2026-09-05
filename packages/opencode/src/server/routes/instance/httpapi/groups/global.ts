@@ -7,6 +7,7 @@ import { Schema } from "effect"
 import { HttpApi, HttpApiEndpoint, HttpApiError, HttpApiGroup, HttpApiSchema, OpenApi } from "effect/unstable/httpapi"
 import { described } from "./metadata"
 import { ConflictError, ForbiddenError, InvalidRequestError } from "../errors"
+import { SessionID } from "@/session/schema"
 
 const GlobalHealth = Schema.Struct({
   healthy: Schema.Literal(true),
@@ -29,6 +30,10 @@ const GlobalRestartReadiness = Schema.Struct({
     jobs: Schema.Boolean,
     swarms: Schema.Boolean,
   }),
+})
+
+export const GlobalRestartReadinessQuery = Schema.Struct({
+  excludeSessionID: Schema.optional(SessionID),
 })
 
 const SyncEventSchemas = EventV2.registry
@@ -104,6 +109,7 @@ export const GlobalApi = HttpApi.make("global").add(
         }),
       ),
       HttpApiEndpoint.get("restartReadiness", GlobalPaths.restartReadiness, {
+        query: GlobalRestartReadinessQuery,
         success: described(GlobalRestartReadiness, "Restart readiness information"),
       }).annotateMerge(
         OpenApi.annotations({

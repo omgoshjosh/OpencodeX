@@ -4575,7 +4575,9 @@ export type GlobalHealthResponse = GlobalHealthResponses[keyof GlobalHealthRespo
 export type GlobalRestartReadinessData = {
   body?: never
   path?: never
-  query?: never
+  query?: {
+    excludeSessionID?: string
+  }
   url: "/global/restart-readiness"
 }
 

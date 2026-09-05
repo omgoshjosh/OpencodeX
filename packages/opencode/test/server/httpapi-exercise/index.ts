@@ -61,6 +61,7 @@ const scenarios: Scenario[] = [
   http.protected
     .get("/global/restart-readiness", "global.restartReadiness")
     .global()
+    .at(() => ({ path: "/global/restart-readiness?excludeSessionID=ses_httpapi_self" }))
     .json(200, (body) => {
       object(body)
       check(typeof body.ready === "boolean", "restart readiness should report a boolean ready flag")

@@ -13,13 +13,14 @@ import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import * as Sse from "effect/unstable/encoding/Sse"
 import { RootHttpApi } from "../api"
-import { GlobalUpgradeInput } from "../groups/global"
+import { GlobalRestartReadinessQuery, GlobalUpgradeInput } from "../groups/global"
 import { makeGuiBridgeHandlers } from "./gui-bridge"
 import { Database } from "@opencode-ai/core/database/database"
 import { OpencodeXJobTable, OpencodeXSwarmTable } from "@opencode-ai/core/opencodex/sql"
 import { SessionCommandTable, SessionExecutionTable, SessionInteractionTable } from "@opencode-ai/core/session/sql"
 import { SessionStatus } from "@/session/status"
-import { and, eq, gt, inArray, or } from "drizzle-orm"
+import { SessionID } from "@/session/schema"
+import { and, eq, gt, inArray, isNull, ne, or } from "drizzle-orm"
 import { ensureProcessMetadata } from "@opencode-ai/core/util/opencode-process"
 
 const log = Log.create({ service: "server" })
@@ -95,7 +96,7 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
     const databaseID = Bun.hash(Database.path()).toString(36)
     yield* status.recover()
 
-    const activity = Effect.fn("GlobalHttpApi.activity")(function* () {
+    const activity = Effect.fn("GlobalHttpApi.activity")(function* (excludeSessionID?: typeof SessionID.Type) {
       const now = Date.now()
       const activity = yield* Effect.all(
         {
@@ -103,9 +104,12 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
             .select({ id: SessionExecutionTable.session_id })
             .from(SessionExecutionTable)
             .where(
-              or(
-                eq(SessionExecutionTable.state, "queued"),
-                and(eq(SessionExecutionTable.state, "running"), gt(SessionExecutionTable.lease_expires_at, now)),
+              and(
+                or(
+                  eq(SessionExecutionTable.state, "queued"),
+                  and(eq(SessionExecutionTable.state, "running"), gt(SessionExecutionTable.lease_expires_at, now)),
+                ),
+                excludeSessionID ? ne(SessionExecutionTable.session_id, excludeSessionID) : undefined,
               ),
             )
             .limit(1)
@@ -114,21 +118,38 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
           sessionCommands: db
             .select({ id: SessionCommandTable.id })
             .from(SessionCommandTable)
-            .where(inArray(SessionCommandTable.status, ["queued", "running"]))
+            .where(
+              and(
+                inArray(SessionCommandTable.status, ["queued", "running"]),
+                excludeSessionID ? ne(SessionCommandTable.session_id, excludeSessionID) : undefined,
+              ),
+            )
             .limit(1)
             .get()
             .pipe(Effect.map((row) => row !== undefined)),
           sessionInteractions: db
             .select({ id: SessionInteractionTable.id })
             .from(SessionInteractionTable)
-            .where(eq(SessionInteractionTable.state, "pending"))
+            .where(
+              and(
+                eq(SessionInteractionTable.state, "pending"),
+                excludeSessionID ? ne(SessionInteractionTable.session_id, excludeSessionID) : undefined,
+              ),
+            )
             .limit(1)
             .get()
             .pipe(Effect.map((row) => row !== undefined)),
           jobs: db
             .select({ id: OpencodeXJobTable.id })
             .from(OpencodeXJobTable)
-            .where(inArray(OpencodeXJobTable.status, ["queued", "claimed", "running"]))
+            .where(
+              and(
+                inArray(OpencodeXJobTable.status, ["queued", "claimed", "running"]),
+                excludeSessionID
+                  ? or(isNull(OpencodeXJobTable.session_id), ne(OpencodeXJobTable.session_id, excludeSessionID))
+                  : undefined,
+              ),
+            )
             .limit(1)
             .get()
             .pipe(Effect.map((row) => row !== undefined)),
@@ -159,9 +180,11 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
       }
     })
 
-    const restartReadiness = Effect.fn("GlobalHttpApi.restartReadiness")(function* () {
+    const restartReadiness = Effect.fn("GlobalHttpApi.restartReadiness")(function* (ctx: {
+      query: typeof GlobalRestartReadinessQuery.Type
+    }) {
       yield* status.recover()
-      const result = yield* activity().pipe(
+      const result = yield* activity(ctx.query.excludeSessionID).pipe(
         Effect.catch(() =>
           Effect.succeed({
             checkedAt: Date.now(),

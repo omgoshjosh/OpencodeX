@@ -43,6 +43,34 @@ describe("restart readiness", () => {
 
     await expect(waitForRestartReadiness(client, { intervalMs: 0 })).rejects.toBe(failure)
   })
+
+  test("forwards the caller session exclusion", async () => {
+    const requests: ({ excludeSessionID?: string } | undefined)[] = []
+    const sdk: RestartReadinessClient = {
+      global: {
+        restartReadiness: async (parameters) => {
+          requests.push(parameters)
+          return {
+            data: {
+              ready: true,
+              checkedAt: 1,
+              blockers: {
+                sessionExecutions: false,
+                sessionCommands: false,
+                sessionInteractions: false,
+                jobs: false,
+                swarms: false,
+              },
+            },
+          }
+        },
+      },
+    }
+
+    await waitForRestartReadiness(sdk, { consecutiveSamples: 1, excludeSessionID: "ses_caller" })
+
+    expect(requests).toEqual([{ excludeSessionID: "ses_caller" }])
+  })
 })
 
 function client(samples: boolean[]): RestartReadinessClient {

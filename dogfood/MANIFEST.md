@@ -31,12 +31,12 @@ before applying with `git cat-file -e <sha>^{commit}`.
    commit is `cc85372`; use the hash, not a guessed source branch, for any
    missing intermediate mapping.
 3. Task 7 corrected k5j/dio sequence, oldest to newest:
+   `7495d3a0345add2b9b1663af367626690cc38c28`,
+   `944724bac74118c2bd3a1da12c12c2897415a2b0`,
    `0d7935c9e6ef0de4d4581f7f906cd8448d3c3fb7`,
    `f7c08a5e11214e94a5e56a19a5ebe8e4aae25b8c`,
    `6f790cb105cc2d8193af6a2a278ab8204b187c86`,
-   `3d86b0ea5cc682fe553ab1a892a70307c387df60`,
-   `7495d3a0345add2b9b1663af367626690cc38c28`,
-   `944724bac74118c2bd3a1da12c12c2897415a2b0`.
+   `3d86b0ea5cc682fe553ab1a892a70307c387df60`.
    The identifiable prep branch is `opencode-dogfood-stack2-task7-prep` at
    `6f790cb`; do not invent names for the other commits.
 4. k5j corrected continuation, oldest to newest:

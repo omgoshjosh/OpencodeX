@@ -263,7 +263,7 @@ it.instance("does not republish dead-owner background jobs on the next status wr
       .where(eq(SessionStatusTable.session_id, sessionID))
       .get()
       .pipe(Effect.orDie)
-    expect((row?.status as { background?: unknown })?.background).toBeUndefined()
+    expect(row?.status.background).toBeUndefined()
     expect(yield* graph.status.get(sessionID)).toMatchObject({ type: "busy" })
   }),
 )

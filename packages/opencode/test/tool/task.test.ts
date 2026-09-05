@@ -104,7 +104,11 @@ const seed = Effect.fn("TaskToolTest.seed")(function* (
   return { chat, assistant }
 })
 
-function stubOps(opts?: { onPrompt?: (input: SessionPrompt.PromptInput) => void; text?: string }): TaskPromptOps {
+function stubOps(opts?: {
+  onPrompt?: (input: SessionPrompt.PromptInput) => void
+  onPromptAsync?: (input: SessionPrompt.PromptInput) => void
+  text?: string
+}): TaskPromptOps {
   return {
     cancel: () => Effect.void,
     resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
@@ -112,6 +116,10 @@ function stubOps(opts?: { onPrompt?: (input: SessionPrompt.PromptInput) => void;
       Effect.sync(() => {
         opts?.onPrompt?.(input)
         return reply(input, opts?.text ?? "done")
+      }),
+    promptAsync: (input) =>
+      Effect.sync(() => {
+        opts?.onPromptAsync?.(input)
       }),
   }
 }
@@ -323,6 +331,7 @@ describe("tool.task", () => {
           Effect.sync(() => {
             cancelled.resolve(sessionID)
           }),
+        promptAsync: () => Effect.void,
         resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
         prompt: (input) =>
           Effect.promise(() => {
@@ -375,6 +384,7 @@ describe("tool.task", () => {
           Effect.sync(() => {
             cancelled.resolve(sessionID)
           }),
+        promptAsync: () => Effect.void,
         resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
         prompt: (input) =>
           Effect.sync(() => {
@@ -1065,6 +1075,7 @@ describe("tool.task", () => {
     Effect.gen(function* () {
       const jobs = yield* BackgroundJob.Service
       const prompts: SessionPrompt.PromptInput[] = []
+      const reports: SessionPrompt.PromptInput[] = []
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
       const def = yield* tool.init()
@@ -1082,7 +1093,13 @@ describe("tool.task", () => {
           directory: chat.directory,
           agent: "build",
           abort: new AbortController().signal,
-          extra: { promptOps: stubOps({ text: "background done", onPrompt: (input) => prompts.push(input) }) },
+          extra: {
+            promptOps: stubOps({
+              text: "background done",
+              onPrompt: (input) => prompts.push(input),
+              onPromptAsync: (input) => reports.push(input),
+            }),
+          },
           messages: [],
           metadata: () => Effect.void,
           ask: () => Effect.void,
@@ -1097,8 +1114,17 @@ describe("tool.task", () => {
       // The report that wakes the parent is a synthetic-only user message; the
       // prompt loop only answers it because of this tag (2026-09-03: without
       // it every background subagent finished and nobody read the result).
-      const report = prompts.find((input) => input.sessionID === chat.id)
+      //
+      // It must arrive as a durable, deferred command (promptAsync), never a
+      // live prompt: a live prompt only joins the running turn, and when that
+      // turn dies mid-stream (2026-09-05, ses_f97ad488: 15-minute hang →
+      // ECONNRESET) nothing re-reads the report and no command row exists
+      // for the recovery sweep to find (#38 Task 13).
+      expect(prompts.find((input) => input.sessionID === chat.id)).toBeUndefined()
+      const report = reports.find((input) => input.sessionID === chat.id)
       expect(report).toBeDefined()
+      expect(report?.delivery).toBe("deferred")
+      expect(report?.messageID).toMatch(/^msg_task_report_/)
       const part = report?.parts[0]
       expect(part?.type).toBe("text")
       if (part?.type === "text") {
@@ -1542,6 +1568,7 @@ describe("tool.task", () => {
           Effect.sync(() => {
             cancelled.resolve(sessionID)
           }),
+        promptAsync: () => Effect.void,
         resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
         prompt: (input) =>
           Effect.promise(() => {
@@ -1625,15 +1652,15 @@ describe("tool.task", () => {
       const def = yield* tool.init()
       const notifications: string[] = []
       // The child's turn returns an assistant-level error; the parent's
-      // notification prompt succeeds so the wording can be observed.
+      // notification is queued (promptAsync) so the wording can be observed.
       const promptOps: TaskPromptOps = {
         ...stubOps(),
+        promptAsync: (input) =>
+          Effect.sync(() => {
+            for (const part of input.parts) if (part.type === "text") notifications.push(part.text)
+          }),
         prompt: (input) =>
           Effect.sync(() => {
-            if (input.sessionID === chat.id) {
-              for (const part of input.parts) if (part.type === "text") notifications.push(part.text)
-              return reply(input, "noted")
-            }
             const base = reply(input, "partial output")
             return {
               ...base,

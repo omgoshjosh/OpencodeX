@@ -664,16 +664,31 @@ export const layer = Layer.effect(
             const stream = llm.stream(streamInput)
 
             yield* stream.pipe(
-              Stream.timeoutOrElse({
-                duration: Duration.millis(idleTimeout),
-                orElse: () =>
-                  Stream.fromEffect(
-                    Effect.gen(function* () {
-                      slog.error("stream idle timeout", { timeoutMs: idleTimeout })
-                      return yield* Effect.fail(new ProviderError.StreamIdleTimeoutError(idleTimeout))
-                    }),
+              // Time the pull itself rather than wrapping the stream in
+              // `Stream.timeoutOrElse`: that combinator is built on
+              // `Channel.merge`, which pulls the provider in its own fiber and
+              // buffers ahead of the consumer. That drops the backpressure
+              // `handleEvent` depends on - a tool can start executing and publish
+              // running metadata before its `tool-call` event has been handled,
+              // and `updateToolCall` silently discards updates for a tool call it
+              // has not registered yet. Timing the pull keeps pull-then-handle
+              // sequential in one fiber, and only measures time actually spent
+              // waiting on the provider (not time spent handling an event).
+              (self) =>
+                Stream.transformPull(self, (pull) =>
+                  Effect.succeed(
+                    pull.pipe(
+                      Effect.timeoutOrElse({
+                        duration: Duration.millis(idleTimeout),
+                        orElse: () =>
+                          Effect.gen(function* () {
+                            slog.error("stream idle timeout", { timeoutMs: idleTimeout })
+                            return yield* Effect.fail(new ProviderError.StreamIdleTimeoutError(idleTimeout))
+                          }),
+                      }),
+                    ),
                   ),
-              }),
+                ),
               Stream.tap((event) => handleEvent(event)),
               Stream.takeUntil(() => ctx.needsCompaction),
               Stream.runDrain,

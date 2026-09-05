@@ -1,4 +1,4 @@
-import { Effect, Stream } from "effect"
+import { Effect, Fiber, Stream } from "effect"
 import os from "os"
 import { createWriteStream } from "node:fs"
 import * as Tool from "./tool"
@@ -481,7 +481,7 @@ export const ShellTool = Tool.define(
           yield* Effect.addFinalizer(closeSink)
           const handle = yield* spawner.spawn(cmd(input.shell, input.command, input.cwd, input.env))
 
-          yield* Effect.forkScoped(
+          const capture = yield* Effect.forkScoped(
             Stream.runForEach(Stream.decodeText(handle.all), (chunk) => {
               const size = Buffer.byteLength(chunk, "utf-8")
               list.push({ text: chunk, size })
@@ -553,6 +553,13 @@ export const ShellTool = Tool.define(
             expired = true
             yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
           }
+
+          // `exit` precedes stdio `close`; let ordinary output drain without
+          // allowing an inherited pipe in a surviving descendant to hang us.
+          yield* Fiber.join(capture).pipe(
+            Effect.timeoutOrElse({ duration: "1 second", orElse: () => Effect.void }),
+            Effect.ignore,
+          )
 
           return exit.kind === "exit" ? exit.code : null
         }),

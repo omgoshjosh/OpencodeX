@@ -58,6 +58,23 @@ async function gone(pid: number, timeout = 5_000) {
   return !alive(pid)
 }
 
+async function waitForPid(file: string, timeout = 2_000) {
+  const end = Date.now() + timeout
+  while (Date.now() < end) {
+    const value = await fs.readFile(file, "utf8").catch(() => "")
+    if (value.trim()) return Number(value)
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  throw new Error(`child PID was not written to ${file}`)
+}
+
+async function stop(pid: number) {
+  try {
+    process.kill(pid, "SIGKILL")
+  } catch {}
+  await gone(pid, 1_000)
+}
+
 describe("cross-spawn spawner", () => {
   describe("basic spawning", () => {
     fx.effect(
@@ -282,6 +299,130 @@ describe("cross-spawn spawner", () => {
         yield* handle.exitCode
         const running = yield* handle.isRunning
         expect(running).toBe(false)
+      }),
+    )
+
+    fx.effect(
+      "reports a successful parent exit while its descendant keeps stdout open",
+      Effect.gen(function* () {
+        if (process.platform === "win32") return
+        const tmp = yield* Effect.acquireRelease(
+          Effect.promise(() => tmpdir()),
+          (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+        )
+        const pidFile = path.join(tmp.path, "descendant.pid")
+        const handle = yield* js(
+          [
+            'const { spawn } = require("node:child_process")',
+            'const fs = require("node:fs")',
+            `const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 10000)"], { stdio: ["ignore", "inherit", "inherit"] })`,
+            "child.unref()",
+            `fs.writeFileSync(${JSON.stringify(pidFile)}, String(child.pid))`,
+          ].join(";"),
+        )
+        const pid = yield* Effect.promise(() => waitForPid(pidFile))
+        yield* Effect.addFinalizer(() => Effect.promise(() => stop(pid)))
+        const code = yield* handle.exitCode.pipe(Effect.timeout("1 second"))
+        expect(code).toBe(ChildProcessSpawner.ExitCode(0))
+        expect(alive(pid)).toBe(true)
+      }),
+    )
+
+    fx.effect(
+      "cleans descendants after a nonzero parent exit",
+      Effect.gen(function* () {
+        if (process.platform === "win32") return
+        const tmp = yield* Effect.acquireRelease(
+          Effect.promise(() => tmpdir()),
+          (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+        )
+        const pidFile = path.join(tmp.path, "descendant.pid")
+        let descendantPID = 0
+        yield* Effect.addFinalizer(() =>
+          Effect.promise(() => (descendantPID && alive(descendantPID) ? stop(descendantPID) : Promise.resolve())),
+        )
+        const pid = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const handle = yield* js(
+              [
+                'const { spawn } = require("node:child_process")',
+                'const fs = require("node:fs")',
+                `const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 10000)"], { stdio: "ignore" })`,
+                `fs.writeFileSync(${JSON.stringify(pidFile)}, String(child.pid))`,
+                "process.exit(7)",
+              ].join(";"),
+            )
+            descendantPID = yield* Effect.promise(() => waitForPid(pidFile))
+            expect(yield* handle.exitCode.pipe(Effect.timeout("1 second"))).toBe(ChildProcessSpawner.ExitCode(7))
+            return descendantPID
+          }),
+        )
+        expect(yield* Effect.promise(() => gone(pid))).toBe(true)
+      }),
+    )
+
+    fx.effect(
+      "cleans descendants after a signal-terminated parent exit",
+      Effect.gen(function* () {
+        if (process.platform === "win32") return
+        const tmp = yield* Effect.acquireRelease(
+          Effect.promise(() => tmpdir()),
+          (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+        )
+        const pidFile = path.join(tmp.path, "descendant.pid")
+        let descendantPID = 0
+        yield* Effect.addFinalizer(() =>
+          Effect.promise(() => (descendantPID && alive(descendantPID) ? stop(descendantPID) : Promise.resolve())),
+        )
+        const pid = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const handle = yield* js(
+              [
+                'const { spawn } = require("node:child_process")',
+                'const fs = require("node:fs")',
+                `const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 10000)"], { stdio: "ignore" })`,
+                `fs.writeFileSync(${JSON.stringify(pidFile)}, String(child.pid))`,
+                'process.kill(process.pid, "SIGTERM")',
+              ].join(";"),
+            )
+            descendantPID = yield* Effect.promise(() => waitForPid(pidFile))
+            expect(Exit.isFailure(yield* Effect.exit(handle.exitCode))).toBe(true)
+            return descendantPID
+          }),
+        )
+        expect(yield* Effect.promise(() => gone(pid))).toBe(true)
+      }),
+    )
+
+    fx.effect(
+      "cleans descendants when an unfinished scope is released",
+      Effect.gen(function* () {
+        if (process.platform === "win32") return
+        const tmp = yield* Effect.acquireRelease(
+          Effect.promise(() => tmpdir()),
+          (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+        )
+        const pidFile = path.join(tmp.path, "descendant.pid")
+        let descendantPID = 0
+        yield* Effect.addFinalizer(() =>
+          Effect.promise(() => (descendantPID && alive(descendantPID) ? stop(descendantPID) : Promise.resolve())),
+        )
+        const pid = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* js(
+              [
+                'const { spawn } = require("node:child_process")',
+                'const fs = require("node:fs")',
+                `const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 10000)"], { stdio: "ignore" })`,
+                `fs.writeFileSync(${JSON.stringify(pidFile)}, String(child.pid))`,
+                "setInterval(() => {}, 10000)",
+              ].join(";"),
+            )
+            descendantPID = yield* Effect.promise(() => waitForPid(pidFile))
+            return descendantPID
+          }),
+        )
+        expect(yield* Effect.promise(() => gone(pid))).toBe(true)
       }),
     )
   })

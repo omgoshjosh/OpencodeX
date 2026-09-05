@@ -273,6 +273,9 @@ export const make = Effect.gen(function* () {
       })
       proc.on("exit", (...args) => {
         exit = args
+        if (end) return
+        end = true
+        Deferred.doneUnsafe(signal, Exit.succeed(args))
       })
       proc.on("close", (...args) => {
         if (end) return
@@ -367,27 +370,29 @@ export const make = Effect.gen(function* () {
           const serr = stdio(command.options, "stderr")
           const extra = fds(command.options)
           const dir = yield* cwd(command.options)
+          const detached = command.options.detached ?? process.platform !== "win32"
 
           const [proc, signal] = yield* Effect.acquireRelease(
             spawn(command, {
               cwd: dir,
               env: env(command.options),
               stdio: stdios(sin, sout, serr, extra),
-              detached: command.options.detached ?? process.platform !== "win32",
+              detached,
               shell: command.options.shell,
               windowsHide: process.platform === "win32",
             }),
             Effect.fnUntraced(function* ([proc, signal]) {
               const done = yield* Deferred.isDone(signal)
               const kill = timeout(proc, command, command.options)
+              const terminate = process.platform === "win32" || detached ? killGroup : killOne
               if (done) {
                 const [code] = yield* Deferred.await(signal)
                 if (process.platform === "win32") return yield* Effect.void
-                if (code !== 0 && Predicate.isNotNull(code)) return yield* Effect.ignore(kill(killGroup))
+                if (code !== 0) return yield* Effect.ignore(kill(terminate))
                 return yield* Effect.void
               }
               const send = (s: NodeJS.Signals) =>
-                Effect.catch(killGroup(command, proc, s), () => killOne(command, proc, s))
+                Effect.catch(terminate(command, proc, s), () => killOne(command, proc, s))
               const sig = command.options.killSignal ?? "SIGTERM"
               const attempt = send(sig).pipe(Effect.andThen(Deferred.await(signal)), Effect.asVoid)
               const escalated = command.options.forceKillAfter
@@ -422,17 +427,20 @@ export const make = Effect.gen(function* () {
                 ),
               )
             }),
-            kill: (opts?: ChildProcess.KillOptions) => {
-              const sig = opts?.killSignal ?? "SIGTERM"
-              const send = (s: NodeJS.Signals) =>
-                Effect.catch(killGroup(command, proc, s), () => killOne(command, proc, s))
-              const attempt = send(sig).pipe(Effect.andThen(Deferred.await(signal)), Effect.asVoid)
-              if (!opts?.forceKillAfter) return attempt
-              return Effect.timeoutOrElse(attempt, {
-                duration: opts.forceKillAfter,
-                orElse: () => send("SIGKILL").pipe(Effect.andThen(Deferred.await(signal)), Effect.asVoid),
-              })
-            },
+            kill: (opts?: ChildProcess.KillOptions) =>
+              Effect.gen(function* () {
+                if (yield* Deferred.isDone(signal)) return
+                const sig = opts?.killSignal ?? "SIGTERM"
+                const terminate = process.platform === "win32" || detached ? killGroup : killOne
+                const send = (s: NodeJS.Signals) =>
+                  Effect.catch(terminate(command, proc, s), () => killOne(command, proc, s))
+                const attempt = send(sig).pipe(Effect.andThen(Deferred.await(signal)), Effect.asVoid)
+                if (!opts?.forceKillAfter) return yield* attempt
+                return yield* Effect.timeoutOrElse(attempt, {
+                  duration: opts.forceKillAfter,
+                  orElse: () => send("SIGKILL").pipe(Effect.andThen(Deferred.await(signal)), Effect.asVoid),
+                })
+              }),
             unref: Effect.sync(() => {
               if (ref) {
                 proc.unref()

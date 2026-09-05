@@ -31,7 +31,8 @@ const shellLayer = Layer.mergeAll(
   testInstanceStoreLayer,
 )
 const it = testEffect(shellLayer)
-const timeoutCommand = process.platform === "win32" ? "Write-Output started; Start-Sleep -Seconds 60" : "echo started && sleep 60"
+const timeoutCommand =
+  process.platform === "win32" ? "Write-Output started; Start-Sleep -Seconds 60" : "echo started && sleep 60"
 /*
  * Both timeout cases assert that output produced before the kill survives, so
  * the shell has to actually start and flush "started" first. 500ms was shorter
@@ -1129,6 +1130,36 @@ describe("tool.shell abort", () => {
           expect(result.metadata.exit).toBe(0)
         }),
       ),
+    )
+
+    it.live(
+      "returns after a successful shell exits even when a background child inherits output",
+      () =>
+        Effect.gen(function* () {
+          const directory = yield* tmpdirScoped()
+          const pidFile = path.join(directory, "background.pid")
+          const started = Date.now()
+          const result = yield* runIn(
+            directory,
+            run({
+              command: `sleep 30 & echo $! > ${quote(pidFile)}; echo parent-done`,
+              description: "Background output inheritance",
+              timeout: 3_000,
+            }),
+          )
+          const pid = Number((yield* Effect.promise(() => Bun.file(pidFile).text())).trim())
+          yield* Effect.addFinalizer(() =>
+            Effect.sync(() => {
+              try {
+                process.kill(pid, "SIGKILL")
+              } catch {}
+            }),
+          )
+          expect(result.output).toContain("parent-done")
+          expect(result.metadata.exit).toBe(0)
+          expect(Date.now() - started).toBeLessThan(2_500)
+        }),
+      10_000,
     )
   }
 

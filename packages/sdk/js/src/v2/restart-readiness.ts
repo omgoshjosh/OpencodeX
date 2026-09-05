@@ -7,7 +7,10 @@ export const restartReadinessDefaults = {
 
 export type RestartReadinessClient = {
   global: {
-    restartReadiness(options?: { signal?: AbortSignal }): Promise<{
+    restartReadiness(
+      parameters?: { excludeSessionID?: string },
+      options?: { signal?: AbortSignal },
+    ): Promise<{
       data?: GlobalRestartReadinessResponse
       error?: unknown
     }>
@@ -25,6 +28,7 @@ export async function waitForRestartReadiness(
   options: {
     consecutiveSamples?: number
     intervalMs?: number
+    excludeSessionID?: string
     signal?: AbortSignal
     onSample?: (progress: RestartReadinessProgress) => void
   } = {},
@@ -37,7 +41,10 @@ export async function waitForRestartReadiness(
   let consecutive = 0
   while (true) {
     options.signal?.throwIfAborted()
-    const result = await client.global.restartReadiness({ signal: options.signal })
+    const result = await client.global.restartReadiness(
+      { excludeSessionID: options.excludeSessionID },
+      { signal: options.signal },
+    )
     if (!result.data) throw result.error instanceof Error ? result.error : new Error("Restart readiness check failed")
 
     consecutive = result.data.ready ? consecutive + 1 : 0

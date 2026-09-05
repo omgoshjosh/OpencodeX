@@ -428,6 +428,20 @@ describe("HttpApi SDK", () => {
         },
       })
 
+      const excludingCaller = yield* call(() =>
+        sdk.global.restartReadiness({ excludeSessionID: sessionID }),
+      )
+      expect(excludingCaller.data).toMatchObject({
+        ready: false,
+        blockers: {
+          sessionExecutions: false,
+          sessionCommands: false,
+          sessionInteractions: false,
+          jobs: true,
+          swarms: true,
+        },
+      })
+
       yield* Effect.all(
         [
           db.update(SessionExecutionTable).set({ state: "idle", completed_at: now }),

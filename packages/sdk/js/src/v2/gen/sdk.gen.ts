@@ -938,12 +938,22 @@ export class Global extends HeyApiClient {
    *
    * Check whether authoritative session and automation work is idle before restarting the server.
    */
-  public restartReadiness<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
+  public restartReadiness<ThrowOnError extends boolean = false>(
+    parameters?: {
+      excludeSessionID?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "query", key: "excludeSessionID" }] }])
     return (options?.client ?? this.client).get<
       GlobalRestartReadinessResponses,
       GlobalRestartReadinessErrors,
       ThrowOnError
-    >({ url: "/global/restart-readiness", ...options })
+    >({
+      url: "/global/restart-readiness",
+      ...options,
+      ...params,
+    })
   }
 
   /**

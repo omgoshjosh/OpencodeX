@@ -37,6 +37,7 @@ export interface TaskPromptOps {
   cancel(sessionID: SessionID): Effect.Effect<void>
   resolvePromptParts(template: string): Effect.Effect<SessionPrompt.PromptInput["parts"]>
   prompt(input: SessionPrompt.PromptInput): Effect.Effect<SessionLegacy.WithParts>
+  promptAsync(input: SessionPrompt.PromptInput): Effect.Effect<void>
 }
 
 const id = "task"
@@ -708,9 +709,17 @@ export const TaskTool = Tool.define(
           text: string,
         ) {
           const currentParent = yield* sessions.get(ctx.sessionID)
+          // Durable, deferred delivery (#38 Task 13). `ops.prompt` only writes
+          // the message and joins whatever turn is running; if that turn dies
+          // (2026-09-05: a 15-minute stream hang ended in ECONNRESET) nothing
+          // re-reads the report and the parent sits idle with no
+          // session_command to recover. `promptAsync` queues a command row
+          // behind the current turn, so the sweep can always find it.
           yield* ops
-            .prompt({
+            .promptAsync({
               sessionID: ctx.sessionID,
+              messageID: MessageID.make(`msg_task_report_${runID}`),
+              delivery: "deferred",
               agent: currentParent.agent ?? ctx.agent,
               parts: [
                 {

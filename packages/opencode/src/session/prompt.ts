@@ -367,6 +367,7 @@ export const layer = Layer.effect(
         cancel: (sessionID: SessionID) => cancel(sessionID),
         resolvePromptParts: (template: string) => resolvePromptParts(template),
         prompt: (input: PromptInput) => prompt(input).pipe(Effect.catch(Effect.die)),
+        promptAsync: (input: PromptInput) => promptAsync(input).pipe(Effect.catch(Effect.die)),
       } satisfies TaskPromptOps
     })
 
@@ -949,7 +950,12 @@ export const layer = Layer.effect(
             Effect.ensuring(instruction.clear(handle.message.id)),
             Effect.onInterrupt(() => finalizeInterruptedAssistant),
           )
-          if (outcome === "break") break
+          if (outcome === "break") {
+            // The natural-finish branch above logs its own exit; this is the
+            // error/stop path, which used to leave no trace in the log.
+            yield* slog.info("exiting loop", { reason: "break" })
+            break
+          }
           continue
         }
 

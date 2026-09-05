@@ -164,13 +164,25 @@ export class EffectSQLiteSession<TRelations extends AnyRelations> extends SQLite
                         ),
                       )
                     : this.executeTransactionStatement(connection, `release savepoint effect_sql_${id}`)
-                  : id === 0
-                    ? this.executeTransactionStatement(connection, "rollback")
-                    : this.executeTransactionStatement(connection, `rollback to savepoint effect_sql_${id}`).pipe(
-                        Effect.andThen(
-                          this.executeTransactionStatement(connection, `release savepoint effect_sql_${id}`),
-                        ),
-                      )
+                  : // The body already failed, so this unwind is best-effort: SQLite may have
+                    // ended the transaction itself (statement-level auto-rollback, a reset
+                    // connection), and the resulting "cannot rollback - no transaction is
+                    // active" must never replace the body's original error below.
+                    (id === 0
+                      ? this.executeTransactionStatement(connection, "rollback")
+                      : this.executeTransactionStatement(connection, `rollback to savepoint effect_sql_${id}`).pipe(
+                          Effect.andThen(
+                            this.executeTransactionStatement(connection, `release savepoint effect_sql_${id}`),
+                          ),
+                        )
+                    ).pipe(
+                      Effect.catchCause((cause) =>
+                        Effect.logDebug("effect-drizzle-sqlite transaction unwind failed", {
+                          transactionID: id,
+                          cause,
+                        }),
+                      ),
+                    )
                 const scoped = scope === undefined ? finalize : Effect.ensuring(finalize, Scope.close(scope, exit))
 
                 return scoped.pipe(Effect.flatMap(() => exit))

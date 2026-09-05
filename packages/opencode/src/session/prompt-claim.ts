@@ -555,7 +555,9 @@ export function make(deps: Deps) {
           )
         )
           continue
-        yield* Effect.logWarning("session transcript has pending message without durable command", {
+        // Legacy transcript-only messages are observable but not recoverable;
+        // repeated sweeps must not manufacture operator warnings for no-op work.
+        yield* Effect.logDebug("session transcript has pending message without durable command", {
           messageID: message.id,
           sessionID: message.sessionID,
           messageAgeMillis: clock() - message.created,

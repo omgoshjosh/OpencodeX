@@ -383,17 +383,54 @@ if [ "$SKIP_GUI" = 0 ]; then
   say "building GUI coordinator sidecar"
   bun run --cwd packages/opencode build --single --gui-coordinator --skip-install
   COORDINATOR="packages/opencode/dist/$TARGET/bin/opencode-gui-coordinator"
+  # copy-sidecar.ts throws its own error for this, but only after the renderer
+  # and main bundles have been rebuilt; failing here keeps the diagnosis next to
+  # the build that was supposed to produce the binary.
+  [ -x "$COORDINATOR" ] || die "coordinator build produced no executable at $COORDINATOR"
 
   say "packaging GUI app"
-  # copy-sidecar.ts prefers this over dist/<target>/package.json; both carry the
-  # same stamp, and setting it explicitly means a stale dist cannot mis-stamp
-  # the bundle the version gate reads.
-  OPENCODEX_GUI_SIDECAR_VERSION="$STAMP" bun run --cwd packages/gui package
+  # OPENCODEX_GUI_SIDECAR_VERSION: copy-sidecar.ts prefers this over
+  # dist/<target>/package.json; both carry the same stamp, and setting it
+  # explicitly means a stale dist cannot mis-stamp the bundle the version gate
+  # reads.
+  #
+  # OPENCODEX_ALLOW_UNSIGNED_GUI: notarize.cjs hard-fails the package step
+  # unless APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD / APPLE_TEAM_ID are all set.
+  # A local dogfood build never has them and its product is an unsigned local
+  # app by definition, so this pipeline opts in on its own behalf instead of
+  # requiring every caller to know the variable.  `:-` keeps it overridable —
+  # an operator who exports 0 still gets the hard failure — and when the real
+  # secrets ARE present notarize.cjs notarizes regardless of this value, so
+  # defaulting it never downgrades a signed build.  Scoped to this command.
+  OPENCODEX_GUI_SIDECAR_VERSION="$STAMP" \
+  OPENCODEX_ALLOW_UNSIGNED_GUI="${OPENCODEX_ALLOW_UNSIGNED_GUI:-1}" \
+    bun run --cwd packages/gui package
+
   BUILT_APP=""
-  for candidate in packages/gui/release/mac-arm64/OpencodeX.app packages/gui/release/mac/OpencodeX.app; do
+  for candidate in packages/gui/release/mac-arm64/OpencodeX.app packages/gui/release/mac/OpencodeX.app \
+                   packages/gui/release/mac-arm64/opencodex-gui.app packages/gui/release/mac/opencodex-gui.app; do
     [ -d "$candidate" ] && { BUILT_APP="$candidate"; break; }
   done
-  [ -n "$BUILT_APP" ] || die "electron-builder produced no OpencodeX.app under packages/gui/release"
+  if [ -z "$BUILT_APP" ]; then
+    # electron-builder names the bundle from productName, which has changed
+    # before (OpencodeX.app -> opencodex-gui.app).  When it produced exactly one
+    # bundle there is nothing to disambiguate, so take it rather than fail a
+    # deploy over a rename; more than one is genuinely ambiguous.
+    found=""
+    count=0
+    for a in packages/gui/release/mac-arm64/*.app packages/gui/release/mac/*.app; do
+      [ -d "$a" ] || continue
+      found="$a"
+      count=$((count + 1))
+    done
+    if [ "$count" -eq 1 ]; then
+      BUILT_APP="$found"
+      say "electron-builder named the bundle ${BUILT_APP##*/}; using it"
+    elif [ "$count" -gt 1 ]; then
+      die "electron-builder produced $count .app bundles under packages/gui/release; cannot tell which to deploy"
+    fi
+  fi
+  [ -n "$BUILT_APP" ] || die "electron-builder produced no .app bundle under packages/gui/release"
   ditto "$BUILT_APP" "$STAGED_APP"
 fi
 
@@ -409,11 +446,25 @@ if [ "$SKIP_GUI" = 0 ]; then
   APP_STAMP="$(jq -r '.version // empty' "$STAGED_APP/Contents/Resources/sidecar/version.json" 2>/dev/null || true)"
   say "GUI  $APP_STAMP"
   [ "$APP_STAMP" = "$STAMP" ] || die "LOCKSTEP FAIL  GUI sidecar stamped '$APP_STAMP', expected '$STAMP'"
-  [ -x "$PACKAGED" ] || die "packaged app has no sidecar coordinator binary"
-  # version.json is a claim; this checks the bundle actually carries the binary
-  # this run built, since that stamp is the sole input to the attach handshake.
-  [ "$(shasum -a 256 "$PACKAGED" | cut -d ' ' -f 1)" = "$(shasum -a 256 "$COORDINATOR" | cut -d ' ' -f 1)" ] ||
-    die "LOCKSTEP FAIL  packaged coordinator is not the binary this run built"
+  # That stamp is the whole client half of the attach handshake:
+  # `sidecarVersion()` in packages/gui/src/main/sidecar-launch.ts reads
+  # resources/sidecar/version.json and nothing else, and the coordinator binary
+  # is never asked its own version — it has no --version flag, it prints usage
+  # for any unrecognised argument.  So version.json == $STAMP is the complete,
+  # correct invariant, and what remains is that the bundle actually carries a
+  # runnable coordinator behind the stamp it advertises.
+  #
+  # This deliberately does NOT sha256-compare against dist/.  That check can
+  # never pass on macOS: electron-builder re-signs every Mach-O it bundles, so
+  # dist/ is `adhoc,linker-signed` (Identifier=a.out) while the packaged copy
+  # carries a hardened-runtime signature (Identifier=opencode-gui-coordinator)
+  # and a different byte length.  It failed 100% of runs with the artifacts in
+  # genuine lockstep, and it was over-specifying an identity the handshake does
+  # not consult.  The freshness it was reaching for is already guaranteed
+  # upstream: OPENCODEX_GUI_SIDECAR{,_TARGET} are unset above, the coordinator
+  # is built immediately before packaging, and copy-sidecar.ts copies that dist
+  # binary and writes version.json from the same build.
+  [ -x "$PACKAGED" ] || die "LOCKSTEP FAIL  packaged app has no executable sidecar coordinator at $PACKAGED"
 fi
 
 CLI_HASH="$(shasum -a 256 "$STAGED_CLI" | cut -d ' ' -f 1)"

@@ -1,0 +1,1 @@
+ALTER TABLE `opencodex_session_state` ADD `marked_unread_at` integer;

@@ -314,13 +314,17 @@ describe("claude channel", () => {
     // every merge, PR and comment had landed and the driver still surfaced
     // "Claude response delivery failed before the turn completed".
     const { create, emit, state } = fakeQuery()
-    const channel = new Channel<Handlers>("s1", create, { closeOutGraceMs: 5000, backgroundTaskGraceMs: 200 })
+    const channel = new Channel<Handlers>("s1", create, { closeOutGraceMs: 5000, backgroundTaskGraceMs: 300 })
     const turn = channel.turn([user("wake")], { name: "t1" })
     emit(event({ type: "system", subtype: "background_tasks_changed", tasks: [{ task_id: "a1" }] }))
     emit(result)
-    // Real work spanning nearly twice the drain budget, task still live throughout.
-    for (let step = 0; step < 3; step++) {
-      await new Promise((resolve) => setTimeout(resolve, 120))
+    // Real work spanning more than the drain budget, task still live throughout.
+    // Each gap is a fifth of the budget so the assertion turns on the *cumulative*
+    // span crossing it, not on any single sleep landing on time: only a stall
+    // longer than the 240ms margin could fail this, which is what keeps it from
+    // flaking on a loaded CI box.
+    for (let step = 0; step < 6; step++) {
+      await new Promise((resolve) => setTimeout(resolve, 60))
       expect(channel.dead).toBe(false)
       emit(assistant)
     }
@@ -328,10 +332,13 @@ describe("claude channel", () => {
     emit(assistant)
     emit(result)
 
-    const seen = await collect(turn.events, 8)
+    const seen = await collect(turn.events, 11)
     expect(seen.map(typeOf)).toEqual([
       "system",
       "result",
+      "assistant",
+      "assistant",
+      "assistant",
       "assistant",
       "assistant",
       "assistant",

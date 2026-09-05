@@ -1119,4 +1119,11 @@ it.instance(
     for (const file of fresh) expect(yield* exists(file)).toBe(false)
   }),
   { git: true },
+  // Pushing 101 real files through track/patch/revert is the most expensive
+  // test in this file on Windows, and it lands within 4ms of the 30s suite
+  // default there, so it intermittently trips the bun timeout mid-`track()`.
+  // Nothing hangs -- the sibling 100-file tests finish on the same runner --
+  // so give this one headroom rather than shrink the batch and lose the
+  // chunk boundary it exists to cover.
+  { timeout: 90_000 },
 )

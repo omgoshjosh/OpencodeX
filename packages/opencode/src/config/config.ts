@@ -292,6 +292,10 @@ export const Info = Schema.Struct({
       mcp_timeout: Schema.optional(PositiveInt).annotate({
         description: "Timeout in milliseconds for model context protocol (MCP) requests",
       }),
+      stream_idle_timeout: Schema.optional(PositiveInt).annotate({
+        description:
+          "Timeout in milliseconds between events on an LLM stream before the turn fails as retryable. Defaults to 300000.",
+      }),
       policies: Schema.optional(Schema.mutable(Schema.Array(ConfigExperimental.Policy))).annotate({
         description: "Policy statements applied to supported resources, such as provider access",
       }),

@@ -948,3 +948,103 @@ it.live("session.processor effect tests mark interruptions aborted without manua
     { config: (url) => providerCfg(url) },
   ),
 )
+
+it.live("session.processor effect tests fail the turn when the llm stream goes idle mid-tool-call", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+
+        // emits the tool-call start, then holds the socket open forever
+        yield* llm.toolHang("bash", { cmd: "pwd" })
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "idle stream")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+
+        const value = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionLegacy.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "idle stream" }],
+          tools: {},
+        })
+
+        const parts = yield* MessageV2.parts(msg.id)
+
+        // the stall is observed after tool-input-start was already handled
+        expect(parts.some((part) => part.type === "tool")).toBe(true)
+        expect(value).toBe("stop")
+        const error = handle.message.error
+        expect(SessionLegacy.APIError.isInstance(error)).toBe(true)
+        if (SessionLegacy.APIError.isInstance(error)) {
+          expect(error.data.message).toContain("no events")
+          // classified retryable so the shared retry path owns the decision
+          expect(error.data.isRetryable).toBe(true)
+        }
+        // a stream that already produced a tool call is not replayed
+        expect(yield* llm.calls).toBe(1)
+      }),
+    { config: (url) => ({ ...providerCfg(url), experimental: { stream_idle_timeout: 1500 } }) },
+  ),
+)
+
+it.live("session.processor effect tests leave a stream that keeps emitting untouched", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+
+        yield* llm.text("within the window")
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "live stream")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+
+        const value = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionLegacy.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "live stream" }],
+          tools: {},
+        })
+
+        const parts = yield* MessageV2.parts(msg.id)
+
+        expect(value).toBe("continue")
+        expect(handle.message.error).toBeUndefined()
+        expect(parts.some((part) => part.type === "text" && part.text === "within the window")).toBe(true)
+      }),
+    { config: (url) => ({ ...providerCfg(url), experimental: { stream_idle_timeout: 5000 } }) },
+  ),
+)

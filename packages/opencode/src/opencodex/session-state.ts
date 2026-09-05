@@ -18,6 +18,10 @@ export const Info = Schema.Struct({
   sessionID: SessionID,
   seenAt: Schema.optional(NonNegativeInt),
   reviewedAt: Schema.optional(NonNegativeInt),
+  // Server time at which a reader explicitly sent the session back to the
+  // unread queue. Absent means "not explicitly marked"; readers still treat
+  // activity newer than seenAt as unread.
+  markedUnreadAt: Schema.optional(NonNegativeInt),
   reviewedFiles: Schema.Array(Schema.String),
   timeUpdated: NonNegativeInt,
 }).annotate({ identifier: "OpencodeXSessionState" })
@@ -26,8 +30,13 @@ export type Info = Schema.Schema.Type<typeof Info>
 export const UpdateInput = Schema.Struct({
   sessionID: SessionID,
   expectedReviewedFiles: Schema.optional(Schema.Array(Schema.String)),
+  // The `timeUpdated` revision the caller last observed. When it is behind the
+  // persisted revision the caller's mark-unread intent is dropped, so a stale
+  // client can neither clear a mark it never saw nor resurrect a cleared one.
+  expectedRevision: Schema.optional(NonNegativeInt),
   seenAt: Schema.optional(NonNegativeInt),
   reviewedAt: Schema.optional(NonNegativeInt),
+  markedUnread: Schema.optional(Schema.Boolean),
   reviewedFiles: Schema.optional(Schema.Array(Schema.String)),
 }).annotate({ identifier: "OpencodeXSessionStateUpdateInput" })
 export type UpdateInput = Schema.Schema.Type<typeof UpdateInput>
@@ -41,6 +50,10 @@ export const UiState = Schema.Struct({
   sessionID: SessionID,
   seenAt: Schema.optional(NonNegativeInt),
   reviewedAt: Schema.optional(NonNegativeInt),
+  markedUnreadAt: Schema.optional(NonNegativeInt),
+  // The persisted revision this state was derived from, echoed back by clients
+  // as `expectedRevision` so the server can reject stale mark-unread writes.
+  revision: NonNegativeInt,
   reviewedFiles: Schema.Array(Schema.String),
   displayStatus: DisplayStatus,
   updated: Schema.Boolean,
@@ -103,6 +116,7 @@ function hydrate(row: typeof OpencodeXSessionStateTable.$inferSelect): Info {
     sessionID: row.session_id,
     ...(row.seen_at === null ? {} : { seenAt: row.seen_at }),
     ...(row.reviewed_at === null ? {} : { reviewedAt: row.reviewed_at }),
+    ...(row.marked_unread_at === null ? {} : { markedUnreadAt: row.marked_unread_at }),
     reviewedFiles: row.reviewed_files,
     timeUpdated: row.time_updated,
   }
@@ -117,6 +131,31 @@ function maxOptional(a: number | undefined, b: number | undefined) {
 function reviewedFiles(input: readonly string[] | undefined, current: Info | undefined) {
   if (input === undefined) return current?.reviewedFiles ?? []
   return [...new Set(input)]
+}
+
+/**
+ * The unread mark is server-authoritative and last-write-wins on the persisted
+ * revision. A caller whose `expectedRevision` is behind has not observed the
+ * newest mark, so its intent is dropped entirely: it can neither clear a mark
+ * it never saw nor resurrect one the server already cleared. That also makes a
+ * retried mark-unread idempotent instead of shifting the mark forward in time.
+ */
+function markedUnreadAt(input: {
+  current: Info | undefined
+  update: UpdateInput
+  revision: number
+  seenAt: number | undefined
+}) {
+  const persisted = input.current?.markedUnreadAt
+  if (input.update.expectedRevision !== undefined && (input.current?.timeUpdated ?? 0) > input.update.expectedRevision) {
+    return persisted
+  }
+  if (input.update.markedUnread !== undefined) return input.update.markedUnread ? input.revision : undefined
+  // Seeing the session clears a mark the reader has caught up with. An older
+  // seen timestamp comes from a client that had not yet observed the mark, so
+  // it must leave the newer mark standing.
+  if (input.update.seenAt !== undefined && persisted !== undefined && (input.seenAt ?? 0) >= persisted) return undefined
+  return persisted
 }
 
 export function deriveUiState(input: {
@@ -150,9 +189,12 @@ export function deriveUiState(input: {
     sessionID: input.session.id,
     ...(input.state?.seenAt === undefined ? {} : { seenAt: input.state.seenAt }),
     ...(input.state?.reviewedAt === undefined ? {} : { reviewedAt: input.state.reviewedAt }),
+    ...(input.state?.markedUnreadAt === undefined ? {} : { markedUnreadAt: input.state.markedUnreadAt }),
+    revision: input.state?.timeUpdated ?? 0,
     reviewedFiles: input.state?.reviewedFiles ?? [],
     displayStatus,
-    updated: input.session.time.updated > (input.state?.seenAt ?? 0),
+    // Unread is either explicit or implied by activity the reader has not seen.
+    updated: input.state?.markedUnreadAt !== undefined || input.session.time.updated > (input.state?.seenAt ?? 0),
   }
 }
 
@@ -171,6 +213,9 @@ export const layer = Layer.effect(
             session_id: state.sessionID,
             seen_at: state.seenAt,
             reviewed_at: state.reviewedAt,
+            // Explicit null, not undefined: drizzle omits undefined columns, and
+            // clearing the mark has to write the absence through.
+            marked_unread_at: state.markedUnreadAt ?? null,
             reviewed_files: [...state.reviewedFiles],
             time_created: state.timeUpdated,
             time_updated: state.timeUpdated,
@@ -181,6 +226,7 @@ export const layer = Layer.effect(
           set: {
             seen_at: state.seenAt,
             reviewed_at: state.reviewedAt,
+            marked_unread_at: state.markedUnreadAt ?? null,
             reviewed_files: [...state.reviewedFiles],
             time_updated: state.timeUpdated,
           },
@@ -222,16 +268,18 @@ export const layer = Layer.effect(
               return yield* new ConflictError({ sessionID: input.sessionID })
             }
           }
+          const revision = Math.max(Date.now(), (current?.timeUpdated ?? 0) + 1)
+          const seenAt = maxOptional(current?.seenAt, input.seenAt)
+          const unreadAt = markedUnreadAt({ current, update: input, revision, seenAt })
           const state = {
             sessionID: input.sessionID,
-            ...(maxOptional(current?.seenAt, input.seenAt) === undefined
-              ? {}
-              : { seenAt: maxOptional(current?.seenAt, input.seenAt) }),
+            ...(seenAt === undefined ? {} : { seenAt }),
             ...(maxOptional(current?.reviewedAt, input.reviewedAt) === undefined
               ? {}
               : { reviewedAt: maxOptional(current?.reviewedAt, input.reviewedAt) }),
+            ...(unreadAt === undefined ? {} : { markedUnreadAt: unreadAt }),
             reviewedFiles: reviewedFiles(input.reviewedFiles, current),
-            timeUpdated: Math.max(Date.now(), (current?.timeUpdated ?? 0) + 1),
+            timeUpdated: revision,
           }
           yield* events.publish(Event.Updated, { sessionID: input.sessionID, state })
           return state

@@ -289,6 +289,9 @@ export function createSessionActionsController(input: {
                 updated: current.sessionUiState[session.id]?.updated ?? false,
                 seenAt: current.sessionUiState[session.id]?.seenAt,
                 reviewedAt: reviewedAt ?? current.sessionUiState[session.id]?.reviewedAt,
+                markedUnreadAt: current.sessionUiState[session.id]?.markedUnreadAt,
+                // An optimistic local edit does not advance the server revision.
+                revision: current.sessionUiState[session.id]?.revision ?? 0,
               },
             },
           }

@@ -67,6 +67,9 @@ export function markSessionViewedInSnapshot(snapshot: GuiSnapshot, sessionID: st
           sessionID,
           seenAt: Math.max(time, state?.seenAt ?? 0),
           reviewedAt: Math.max(time, state?.reviewedAt ?? 0),
+          // Viewing clears an explicit mark, matching the server's seen flow.
+          // markedUnreadAt is deliberately dropped here.
+          revision: state?.revision ?? 0,
           reviewedFiles: state?.reviewedFiles ?? [],
           displayStatus: state?.displayStatus ?? "idle",
           updated: state?.updated ?? false,
@@ -83,6 +86,8 @@ export function deriveSessionUiState(snapshot: GuiSnapshot, session: Session): O
     sessionID: session.id,
     ...(state?.seenAt === undefined ? {} : { seenAt: state.seenAt }),
     ...(state?.reviewedAt === undefined ? {} : { reviewedAt: state.reviewedAt }),
+    ...(state?.markedUnreadAt === undefined ? {} : { markedUnreadAt: state.markedUnreadAt }),
+    revision: state?.revision ?? 0,
     reviewedFiles: state?.reviewedFiles ?? [],
     displayStatus: deriveClientSessionDisplayStatus({
       status: snapshot.sessionStatus[session.id],
@@ -91,7 +96,7 @@ export function deriveSessionUiState(snapshot: GuiSnapshot, session: Session): O
       reviewedAt: state?.reviewedAt,
       parentID: session.parentID,
     }),
-    updated: session.time.updated > (state?.seenAt ?? 0),
+    updated: state?.markedUnreadAt !== undefined || session.time.updated > (state?.seenAt ?? 0),
   }
 }
 

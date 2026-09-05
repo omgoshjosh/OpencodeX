@@ -108,7 +108,7 @@ describe("OpencodeX state HTTP API", () => {
         const row = yield* db
           .select()
           .from(OpencodeXSessionStateTable)
-          .where(eq(OpencodeXSessionStateTable.session_id, sessionID as SessionID))
+          .where(eq(OpencodeXSessionStateTable.session_id, SessionID.make(sessionID)))
           .get()
           .pipe(Effect.orDie)
         return row?.marked_unread_at ?? null

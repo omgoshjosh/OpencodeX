@@ -231,7 +231,16 @@ describe("SessionStatus.Info", () => {
   test("accepts additive background projection on every base variant", () => {
     const background = {
       running: true,
-      jobs: [{ role: "Researcher", title: "Inspect status", owner: "local:1:run:1" }],
+      jobs: [
+        {
+          id: sessionID,
+          sessionID,
+          status: "running" as const,
+          role: "Researcher",
+          title: "Inspect status",
+          owner: "local:1:run:1",
+        },
+      ],
     }
     expect(decode({ type: "idle", background })).toEqual({ type: "idle", background })
     expect(decode({ type: "busy", background })).toEqual({ type: "busy", background })

@@ -634,6 +634,9 @@ export type SessionStatus =
       background?: {
         running: boolean
         jobs: Array<{
+          id: string
+          sessionID: string
+          status: "running"
           role: string
           title: string
           owner: string
@@ -648,6 +651,9 @@ export type SessionStatus =
       background?: {
         running: boolean
         jobs: Array<{
+          id: string
+          sessionID: string
+          status: "running"
           role: string
           title: string
           owner: string
@@ -659,6 +665,9 @@ export type SessionStatus =
       background?: {
         running: boolean
         jobs: Array<{
+          id: string
+          sessionID: string
+          status: "running"
           role: string
           title: string
           owner: string
@@ -670,6 +679,9 @@ export type SessionStatus =
       background?: {
         running: boolean
         jobs: Array<{
+          id: string
+          sessionID: string
+          status: "running"
           role: string
           title: string
           owner: string
@@ -685,6 +697,9 @@ export type SessionStatus =
       background?: {
         running: boolean
         jobs: Array<{
+          id: string
+          sessionID: string
+          status: "running"
           role: string
           title: string
           owner: string

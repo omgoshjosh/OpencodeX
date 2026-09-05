@@ -607,8 +607,19 @@ const scenarios: Scenario[] = [
     }),
   http.protected
     .get("/session/status", "session.status")
-    .seeded((ctx) => ctx.session({ title: "Status session" }))
-    .json(200, object),
+    .seeded((ctx) => ctx.retryChild({ background: true }))
+    .json(200, (body, ctx) => {
+      object(body)
+      const status = body[ctx.state.parent.id]
+      check(isRecord(status) && isRecord(status.background), "parent status should include background work")
+      const jobs = status.background.jobs
+      array(jobs)
+      const job = jobs[0]
+      check(isRecord(job), "background status should include a job")
+      check(job.id === ctx.state.child.id, "background job should expose a stable child key")
+      check(job.sessionID === ctx.state.child.id, "background job should expose its child session")
+      check(job.status === "running", "live background job should report running status")
+    }),
   http.protected
     .post("/session", "session.create")
     .mutating()

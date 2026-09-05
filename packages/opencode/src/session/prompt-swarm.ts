@@ -91,6 +91,11 @@ export interface Deps {
   readonly backgroundCompletionGraceMs?: number
   /** Bounded wait before retrying a fresh delivery claim after restart. */
   readonly deliveryClaimGraceMs?: number
+  /**
+   * How often a blocked foreground delegation re-reads the child's durable
+   * delegation record. Defaults to 15 seconds; tests set a few milliseconds.
+   */
+  readonly foregroundPollIntervalMs?: number
 }
 
 /**
@@ -107,6 +112,13 @@ const DELEGATION_COMPLETE_FOOTER = [
 ].join("\n")
 const DEFAULT_BACKGROUND_COMPLETION_GRACE_MS = 30 * 60_000
 const RECOVERY_QUIET_LIMIT_MS = 2 * 60 * 60_000
+/**
+ * How long a foreground delegation may wait on the in-memory hand-off before
+ * it also starts reading the child's durable record. Short enough that a lost
+ * hand-off costs seconds rather than the rest of the session, long enough that
+ * an ordinary delegation never pays for a database read.
+ */
+const DEFAULT_FOREGROUND_POLL_INTERVAL_MS = 15_000
 
 export function hasCompletionMarker(text: string) {
   return text.includes(DELEGATION_COMPLETE_MARKER)
@@ -388,6 +400,85 @@ export function make(deps: Deps) {
   })
 
   /**
+   * The durable answer to a foreground delegation, polled off the child's own
+   * session rather than the in-memory hand-off.
+   *
+   * A foreground delegate call blocks the orchestrator inside an MCP tool
+   * handler, so depending on the hand-off alone makes every lost one an
+   * unbounded hang instead of a slow call. Live on 2026-09-05 the child's last
+   * word was `claude turn events ended` at 20:11:16 (claude-driver.ts, right
+   * before the post-turn writes) and its parent then logged nothing at all
+   * until an operator aborted at 20:31, by which point the CLI was
+   * unresponsive to interrupt. Those post-turn writes queue behind a
+   * process-wide, un-timed barrier (`packages/core/src/event.ts`
+   * `applicationBarrier`) and the sqlite transaction semaphore, so a stall
+   * there silently swallows the settle stamp AND the return value together.
+   *
+   * Two durable witnesses are therefore read, in order of authority:
+   * the settled delegation record, and - because that stamp is itself behind
+   * the stalling write path - the child's own transcript, which is persisted
+   * as the turn streams. Neither invents a terminal state: the record must
+   * belong to THIS run, and a transcript report must be complete, error-free,
+   * and unchanged across two polls before it counts. It runs forever by
+   * design; a role is allowed to take hours, and only evidence that the child
+   * finished, never elapsed time, ends a delegation.
+   */
+  const foregroundDurableOutcome = (input: {
+    childSessionID: SessionID
+    runID: string
+    /** Claims the terminal settlement, so the losing fiber cannot restamp it. */
+    settle: (outcome: DelegationOutcome, summary?: string) => Effect.Effect<void>
+    claim: Effect.Effect<void>
+  }): Effect.Effect<ClaudeDelegate.Result> =>
+    Effect.gen(function* () {
+      const interval = deps.foregroundPollIntervalMs ?? DEFAULT_FOREGROUND_POLL_INTERVAL_MS
+      let reported: string | undefined
+      while (true) {
+        yield* Effect.sleep(interval)
+        const current = yield* sessions.get(input.childSessionID).pipe(Effect.option)
+        const record = Option.isSome(current) ? delegationRecord(current.value.metadata) : undefined
+        if (record?.runID === input.runID && record.phase === "settled") {
+          log.warn("foreground delegation settled without returning; resolving from the durable record", {
+            sessionID: input.childSessionID,
+            runID: input.runID,
+            outcome: record.outcome,
+          })
+          yield* input.claim
+          if (record.outcome === "cancelled") return ClaudeDelegate.failure("cancelled")
+          if (record.outcome !== "completed") return ClaudeDelegate.failure("errored")
+          // The transcript is the same text `runRole` reads; the record's
+          // summary is truncated, so it is only the last resort.
+          const settled = yield* childReport(input.childSessionID)
+          const text = settled?.state === "completed" ? settled.text : record.summary
+          return text ? { ok: true as const, text } : ClaudeDelegate.failure("empty-output")
+        }
+        // No stamp. The child's reply is persisted as its turn streams, well
+        // before the post-turn writes that stall, so a completed, error-free
+        // report that is STILL unstamped a whole poll later is a lost
+        // hand-off, not a slow one - a healthy run settles in milliseconds.
+        // An errored reply is left alone: the model-fallback chain may still
+        // be working through it.
+        const report = yield* childReport(input.childSessionID)
+        if (report?.state !== "completed") {
+          reported = undefined
+          continue
+        }
+        if (reported !== report.text) {
+          reported = report.text
+          continue
+        }
+        log.warn("foreground delegation stalled after its child reported; resolving from the transcript", {
+          sessionID: input.childSessionID,
+          runID: input.runID,
+        })
+        // Claims the outcome so the interrupted fiber cannot stamp `cancelled`
+        // over it, and bounded because the write path is the suspect here.
+        yield* input.settle("completed", report.text).pipe(Effect.timeout(interval), Effect.ignore)
+        return { ok: true as const, text: report.text }
+      }
+    })
+
+  /**
    * After a restart, background delegations whose report was never delivered
    * are picked back up (OpencodeX-3m9). The child's own turn is replayed by
    * the command recovery that runs first, so this only has to wait for the
@@ -654,17 +745,31 @@ export function make(deps: Deps) {
           ),
         ),
       )
+    // The first terminal settlement wins in this process as well as in the
+    // record: a foreground run is settled by whichever of the role fiber and
+    // the durable poller gets there first, and the loser is then interrupted -
+    // its exit boundary must not restamp `cancelled` over what it lost to.
+    // `stampDelegation` refuses the same thing durably; this also covers the
+    // case where the durable write is exactly what is stuck.
+    let terminal = false
+    const claimTerminal = Effect.sync(() => {
+      terminal = true
+    })
     const settle = (outcome: DelegationOutcome, summary?: string) =>
-      stamp(
-        settleDelegation(started, {
-          outcome,
-          summary,
-          // A background completion still has to be durably delivered to the
-          // parent; the delivery stamp below only lands on a pending record.
-          ...(input.background && outcome === "completed" ? { deliveryOutcome: "pending" as const } : {}),
-        }),
-        runID,
-      ).pipe(Effect.asVoid)
+      Effect.suspend(() => {
+        if (terminal) return Effect.void
+        terminal = true
+        return stamp(
+          settleDelegation(started, {
+            outcome,
+            summary,
+            // A background completion still has to be durably delivered to the
+            // parent; the delivery stamp below only lands on a pending record.
+            ...(input.background && outcome === "completed" ? { deliveryOutcome: "pending" as const } : {}),
+          }),
+          runID,
+        ).pipe(Effect.asVoid)
+      })
     yield* stamp(started)
     const runRole: Effect.Effect<ClaudeDelegate.Result> = Effect.gen(function* () {
       // The role's skill is its base definition; the built-in role skills carry
@@ -853,7 +958,14 @@ export function make(deps: Deps) {
         )
       return { ok: true as const, text: backgroundDelegationStarted(child.id, role.name) }
     }
-    return yield* runRole
+    // Foreground: the fiber's own value is still the fast path, raced against
+    // the durable record so a hand-off that never arrives cannot pin the
+    // orchestrator's tool call open. Whichever settles first wins; the loser's
+    // interrupt cannot restamp, because `stampDelegation` refuses a second
+    // settle for a run it already settled.
+    return yield* runRole.pipe(
+      Effect.raceFirst(foregroundDurableOutcome({ childSessionID: child.id, runID, settle, claim: claimTerminal })),
+    )
   })
 
   /**

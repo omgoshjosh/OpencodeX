@@ -1,4 +1,5 @@
 import { describe, expect } from "bun:test"
+import fs from "fs/promises"
 import path from "path"
 import { Cause, Effect, Exit, Layer } from "effect"
 import { GlobTool } from "../../src/tool/glob"
@@ -139,6 +140,22 @@ describe("tool.glob", () => {
       if (Exit.isFailure(exit)) {
         const err = Cause.squash(exit.cause)
         expect(err instanceof Error ? err.message : String(err)).toContain("glob path must be a directory")
+      }
+    }),
+  )
+
+  it.instance("rejects filesystem roots and their symlink aliases", () =>
+    Effect.gen(function* () {
+      if (process.platform === "win32") return
+      const test = yield* TestInstance
+      const alias = path.join(test.directory, "root")
+      yield* Effect.promise(() => fs.symlink("/", alias, "dir"))
+      const info = yield* GlobTool
+      const glob = yield* info.init()
+      for (const search of ["/", alias]) {
+        const exit = yield* glob.execute({ pattern: "*", path: search }, ctx).pipe(Effect.exit)
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) expect(String(Cause.squash(exit.cause))).toContain("must be narrower")
       }
     }),
   )

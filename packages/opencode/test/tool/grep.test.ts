@@ -146,6 +146,23 @@ describe("tool.grep", () => {
     }),
   )
 
+  it.instance("caps matches globally", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() =>
+        Bun.write(
+          path.join(test.directory, "many.txt"),
+          Array.from({ length: 101 }, (_, index) => `needle ${index}`).join("\n"),
+        ),
+      )
+      const info = yield* GrepTool
+      const grep = yield* info.init()
+      const result = yield* grep.execute({ pattern: "needle", path: test.directory }, ctx)
+      expect(result.metadata.matches).toBe(100)
+      expect(result.metadata.truncated).toBe(true)
+    }),
+  )
+
   it.instance("supports exact file paths", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance

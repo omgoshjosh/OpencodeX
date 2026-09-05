@@ -45,6 +45,10 @@ export const schema = Schema.Struct({
 })
 
 type Item = Schema.Schema.Type<typeof schema>["data"][number]
+type CopilotEndpoint = "chat" | "responses" | "messages"
+type CopilotModel = Omit<Model, "api"> & {
+  api: Model["api"] & { endpoint?: CopilotEndpoint }
+}
 const decodeModels = Schema.decodeUnknownSync(schema)
 
 function build(key: string, remote: Item, url: string, prev?: Model): Model {
@@ -58,14 +62,22 @@ function build(key: string, remote: Item, url: string, prev?: Model): Model {
     (remote.capabilities.limits.vision?.supported_media_types ?? []).some((item) => item.startsWith("image/"))
 
   const isMsgApi = remote.supported_endpoints?.includes("/v1/messages")
+  const endpoint: CopilotEndpoint | undefined = isMsgApi
+    ? "messages"
+    : remote.supported_endpoints?.includes("/responses")
+      ? "responses"
+      : remote.supported_endpoints?.includes("/chat/completions")
+        ? "chat"
+        : undefined
 
-  const model: Model = {
+  const model: CopilotModel = {
     id: key,
     providerID: "github-copilot",
     api: {
       id: remote.id,
       url: isMsgApi ? `${url}/v1` : url,
       npm: isMsgApi ? "@ai-sdk/anthropic" : "@ai-sdk/github-copilot",
+      ...(endpoint ? { endpoint } : {}),
     },
     // API response wins
     status: "active",

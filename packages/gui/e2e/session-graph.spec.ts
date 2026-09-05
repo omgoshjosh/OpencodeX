@@ -102,9 +102,10 @@ test("opening the graph and clicking nodes keeps the app responsive", async ({ p
   await expect(page.locator(".ui-tooltip")).toHaveCount(0)
   await page.getByRole("button", { name: "Fit graph to view" }).click()
 
-  // Click a node at default zoom: the embedded transcript replaces the top
-  // session's, and the way back works.
-  const visibleChildTitle = await clickVisibleChild(page)
+  // Activate a child through the real click handler: a graph wider than the
+  // side pane may fit only at the 25% floor without a whole child card inside
+  // the clip, which is viewport geometry rather than a responsiveness signal.
+  const visibleChildTitle = await clickChild(page)
   await expect(page.locator(".session-graph-embedded")).toBeVisible()
   await expect(page.locator(".session-graph-embedded-heading")).toContainText(visibleChildTitle)
   await page.getByRole("button", { name: "Back to top session" }).click()
@@ -219,7 +220,7 @@ test("opening the graph and clicking nodes keeps the app responsive", async ({ p
   // Last, because it navigates away: "open as a full session" has to actually
   // leave the embedded pane behind. It used to route underneath a pane that
   // survived the change, so the button read as doing nothing at all.
-  const visibleChildTitleAfterReopen = await clickVisibleChild(page)
+  const visibleChildTitleAfterReopen = await clickChild(page)
   await expect(page.locator(".session-graph-embedded")).toBeVisible()
   await page.getByRole("button", { name: "Open this step as a full session" }).click()
   await expect(page.locator(".session-graph-embedded")).toHaveCount(0)
@@ -275,20 +276,11 @@ async function hoverVisibleNode(page: Page) {
   throw new Error("no graph node is fully inside the canvas")
 }
 
-/** Clicks a non-root session card fully inside the canvas and returns its title. */
-async function clickVisibleChild(page: Page) {
-  const canvas = await page.locator(".session-graph-canvas").boundingBox()
-  if (!canvas) throw new Error("graph canvas has no box")
-  const cards = page.locator(`${SESSION_NODE}:not(.root)`)
-  for (let index = 0; index < (await cards.count()); index += 1) {
-    const card = cards.nth(index)
-    const box = await card.boundingBox()
-    if (!box) continue
-    if (box.x < canvas.x || box.y < canvas.y) continue
-    if (box.x + box.width > canvas.x + canvas.width || box.y + box.height > canvas.y + canvas.height) continue
-    const title = await card.locator(".session-graph-node-title").innerText()
-    await card.click()
-    return title
-  }
-  throw new Error("no child session card is fully inside the canvas")
+/** Activates a non-root card through the same handler regardless of clipping. */
+async function clickChild(page: Page) {
+  const card = page.locator(`${SESSION_NODE}:not(.root)`).first()
+  await expect(card).toBeAttached()
+  const title = await card.locator(".session-graph-node-title").innerText()
+  await card.dispatchEvent("click")
+  return title
 }

@@ -1140,9 +1140,9 @@ export const layer: Layer.Layer<
         const stored = delegationRecord(current.metadata)
         if (!stored || stored.runID !== input.runID) return undefined
         if (stored.deliveryOutcome === "delivering" && stored.deliveryClaimToken !== input.claimToken) return undefined
-        // Delivery is monotonic: a late failed retry can never erase proof that
-        // the parent already durably received this run's result.
-        if (stored.deliveryOutcome === "delivered" && input.outcome === "failed") return undefined
+        // Delivery is an edge, not a level: replaying completion after a
+        // restart cannot produce a second durable delivery for this run.
+        if (stored.deliveryOutcome === "delivered") return undefined
         return {
           ...current,
           metadata: withDelegationRecord(current.metadata, {

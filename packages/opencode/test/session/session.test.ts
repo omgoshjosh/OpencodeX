@@ -427,6 +427,10 @@ describe("session delegation stamping", () => {
       expect(
         yield* session.stampDelegationDelivery({ sessionID: info.id, runID: "run_a", outcome: "delivered", at: 555 }),
       ).toBe(true)
+      // Replaying completion after a restart cannot produce a second delivery.
+      expect(
+        yield* session.stampDelegationDelivery({ sessionID: info.id, runID: "run_a", outcome: "delivered", at: 556 }),
+      ).toBe(false)
 
       const current = delegationRecord((yield* session.get(info.id)).metadata)
       expect(current).toMatchObject({ outcome: "completed", deliveryOutcome: "delivered", deliveredAt: 555 })

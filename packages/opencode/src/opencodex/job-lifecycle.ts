@@ -20,6 +20,20 @@ export function createJobLifecycle(
   events: EventV2.Interface,
   store: JobStore,
 ) {
+  const cancelDescendants: (parentJobID: string) => Effect.Effect<void> = Effect.fn(
+    "OpencodeXJob.cancelDescendants",
+  )(function* (parentJobID: string) {
+    const children = yield* db
+      .select({ id: OpencodeXJobTable.id })
+      .from(OpencodeXJobTable)
+      .where(eq(OpencodeXJobTable.parent_job_id, parentJobID))
+      .all()
+      .pipe(Effect.orDie)
+    yield* Effect.forEach(children, (child) => Effect.suspend(() => cancel(child.id)).pipe(Effect.ignore), {
+      concurrency: 1,
+      discard: true,
+    })
+  })
   const claim = Effect.fn("OpencodeXJob.claim")(function* (input: ClaimInput) {
     const current = yield* store.get(input.jobID)
     if (current.attempt >= current.maxAttempts) {
@@ -184,7 +198,7 @@ export function createJobLifecycle(
       return current
     const now = Date.now()
     if (["queued", "failed", "interrupted"].includes(current.status)) {
-      return yield* store.transition({
+      const cancelled = yield* store.transition({
         job: current,
         target: "cancelled",
         settlement,
@@ -196,8 +210,13 @@ export function createJobLifecycle(
           status_reason: "Cancelled by user",
         },
       })
+      yield* cancelDescendants(current.id)
+      return cancelled
     }
-    if (current.cancelRequestedAt) return current
+    if (current.cancelRequestedAt) {
+      yield* cancelDescendants(current.id)
+      return current
+    }
     const committed = yield* events.barrier(
       db.transaction(
         (transaction) =>
@@ -232,6 +251,7 @@ export function createJobLifecycle(
       })
     }
     yield* events.broadcast(committed.event)
+    yield* cancelDescendants(committed.result.id)
     return committed.result
   })
 

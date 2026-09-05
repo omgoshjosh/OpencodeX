@@ -7,15 +7,90 @@ identifies them. Do not infer a branch name from a commit subject.
 ## Immutable Anchors
 
 - Repository: OpenCodeX fork; checkout `/Users/josh/agents/worktrees/dogfood-stack`.
-- Base: PR #31 / `chore/upstream-pin-review-fixes` at
+- Base at manifest creation: PR #31 / `chore/upstream-pin-review-fixes` at
   `b5a5500801dde38a9d411e52c36623ae2216493d`.
-- Target: `fork/dogfood/stack2`; current verified tip
-  `7499962fc8c14819a70e6ff10ece13bd59f9570a`.
+- Target: `fork/dogfood/stack2`. Tip at manifest creation was
+  `7499962fc8c14819a70e6ff10ece13bd59f9570a`, tree
+  `9c76c88630783dd3af9b7a511238fc9c20cdb2dd`. Superseded — see
+  "Rebuild 2026-09-05" below for the current anchors.
 - Expected tip tree is not a mutable constant. Verify it with:
-  `git show -s --format='tip=%H%n tree=%T%n subject=%s' 7499962fc8`.
-  At manifest creation the output tree was `9c76c88630783dd3af9b7a511238fc9c20cdb2dd`.
-- Reconstruct from the base, not from `main`, a moving remote-tracking ref, or
-  an unpinned branch: `git checkout -B dogfood/stack2 b5a5500801dde38a9d411e52c36623ae2216493d`.
+  `git show -s --format='tip=%H%n tree=%T%n subject=%s' <tip>`.
+- Reconstruct from the recorded base, not from `main`, a moving remote-tracking
+  ref, or an unpinned branch.
+
+## Rebuild 2026-09-05
+
+`fork/dogfood/stack2` was rebuilt onto the advanced PR #31 head. Anchors:
+
+- New base: PR #31 head `7d6e2369eeea317631c3cddccf9fe5d2cdfc7ebc`
+  (`test(snapshot): give the 101-file revert test Windows headroom (#31)`),
+  which supersedes `b5a5500801`.
+- Old tip: `ecdbe69d22b1e85275cf40818c7c15b459d27fcf`.
+- New verified tip: `c7c7df4773a095287e221c59b15f5fcf0bf97dff`, tree
+  `6e418daa0f5cc8045f18bec173cc6c00b403a48d`.
+
+The new tip's tree differs from the old tip's tree by exactly the base delta —
+i.e. only the PR #31 commits between `b5a5500801` and `7d6e2369ee`:
+
+```
+git diff --stat ecdbe69d22 HEAD
+ packages/opencode/test/session/tools.test.ts     | 13 +++++++++++--
+ packages/opencode/test/snapshot/snapshot.test.ts |  7 +++++++
+```
+
+The stack's own content is byte-identical across the rebase. Verified with:
+
+```
+diff <(git diff b5a5500801 ecdbe69d22 | grep -v '^index ') \
+     <(git diff 7d6e2369ee HEAD     | grep -v '^index ')
+```
+
+The only difference that command reports is a single *removed* line inside
+`packages/opencode/test/session/durable-execution.test.ts`
+(`expect(row?.status.background).toBeUndefined()` vs. the cast-guarded
+`expect((row?.status as { background?: unknown })?.background).toBeUndefined()`).
+That base hunk is superseded: the stack rewrites the same assertion later in
+its own lineage, so both parents converge on the same final text. No stack
+commit was dropped, added, or edited by the rebuild.
+
+## Groups since Task 8
+
+Ordered first-parent sequence from the new base, taken from
+`git log --reverse --first-parent 7d6e2369ee..HEAD`, listed after the Task 8
+block (which ends at `6c6ca2210aac4a53e489eaa6031ace97fa4b28ba`). Groups are
+interleaved in history; the order below is the true first-parent order.
+
+1. Task 5 late fold — `27853b2fef526b6abaec8ca52ba1473af8ff6bd9`.
+2. Task 6 late fold — `c678090a25cef239e29fdcfe3d60c0e87a3e973d`.
+3. Task 9, descendant process cleanup — `a68f0ae98b2ae005f462ede2b5f83951157d30e9`,
+   `5e1d9b3e6337dbfbcbf50d169e514b97efc4c7a1`,
+   `80832672e1538e853d3af0744af90c1007666fae`.
+4. Task 7 late fold — `23abb8ecfbe205fbe05005654d48885ef0547dce0`.
+5. Task 10, hung Claude query creation — `0bbc257fd34a626e27a35c28c0ebbeca46b10308`.
+6. Task 4 (part 1), no-op transcript recovery — `b1b80867dd51cc7bf8cc7c58a31184b1378621bb`.
+7. Task 11, upstream security salvage — `1cf2d41acb555f3b3baba4b6a5b47d0d1e197254`,
+   then (after the Task 12 commit below) `dd7d5204fcbc0c49f5e0c836fa98ee7896dd9bbb`.
+8. Task 12, idempotent durable cancellation — `d099f8cf3bc02d9733bc5b8f6ac14b4fa18c04c4`.
+9. Task 4 (part 2), restart readiness excludes the caller —
+   `72fe2bb9455ea3ef214eae831a6b7c40edd25511`.
+10. CI-retrigger empty (no files changed) — `a803ed477706980aee34898dc25d6544f757a3ad`
+    (`chore: retrigger CI after unit(linux) flake`).
+11. Local lockstep build/deploy fold — `9d78a460bd12b893c4fb071a735b5fa69fc9cbb1`,
+    `5ed39cf97819bbbaf5c0599a68b60d9d339ef15f`. These close
+    https://github.com/ecgreen/OpencodeX/issues/42; no commit in this range
+    references issue #34.
+12. Task 13 (part 1), durable background task reports —
+    `798de785d95b3888a5f362228b2ef5e9565f5b94`.
+13. dio.6 fold, server-authoritative mark-unread —
+    `70733c165af5465396915fe2dfff8b4587f0537a`,
+    `a11db0f36670914430ae7b61be42f7e2cb5bc6e8`,
+    `0dd1df4c66d436a1aaf155f733cd7161de72f83e`.
+14. Task 13 (part 2), LLM stream idle watchdog —
+    `5275ea9f5b8170eb9eb24a5c1fcbde6b4ce5c417`,
+    `826b5ecdd1523ccbcb5512e609b40c7a915f1f4c`,
+    `4e2a96778f724ce49814a75cc33fb8bf4a2ef62f`.
+15. CI-retrigger empty (no files changed) — `c7c7df4773a095287e221c59b15f5fcf0bf97dff`
+    (`chore: retrigger CI after unit(windows) pwsh flake`), the current tip.
 
 ## Replay Order
 

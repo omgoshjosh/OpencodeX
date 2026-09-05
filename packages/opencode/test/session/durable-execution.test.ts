@@ -27,7 +27,7 @@ import {
   SessionStatusTable,
 } from "@opencode-ai/core/session/sql"
 import { and, eq, sql } from "drizzle-orm"
-import { Context, Duration, Effect, Exit, Fiber, Latch, Layer, Ref, Scope } from "effect"
+import { Context, Duration, Effect, Exit, Fiber, Latch, Layer, Logger, Ref, Scope } from "effect"
 import { pollWithTimeout, testEffect } from "../lib/effect"
 
 const env = Layer.mergeAll(
@@ -127,6 +127,41 @@ const buildPromptClaim = Effect.fn("DurableExecutionTest.buildPromptClaim")(func
   })
 })
 
+// A durable command always belongs to a real session row; recovery now settles
+// orphans instead of running them, so the fixture has to say so.
+const insertSession = Effect.fn("DurableExecutionTest.insertSession")(function* (id: SessionID) {
+  const { db } = yield* Database.Service
+  const ctx = yield* InstanceState.context
+  const now = Date.now()
+  yield* db
+    .insert(ProjectTable)
+    .values({
+      id: "prj_test" as never,
+      worktree: ctx.directory,
+      sandboxes: [],
+      time_created: now,
+      time_updated: now,
+    })
+    .onConflictDoNothing()
+    .run()
+    .pipe(Effect.orDie)
+  yield* db
+    .insert(SessionTable)
+    .values({
+      id,
+      project_id: "prj_test" as never,
+      slug: `slug-${id}`,
+      directory: ctx.directory,
+      title: "Durable execution",
+      version: "test",
+      time_created: now,
+      time_updated: now,
+    })
+    .onConflictDoNothing()
+    .run()
+    .pipe(Effect.orDie)
+})
+
 const insertCommand = Effect.fn("DurableExecutionTest.insertCommand")(function* (input: {
   id: string
   status?: "queued" | "running" | "cancelled"
@@ -139,6 +174,7 @@ const insertCommand = Effect.fn("DurableExecutionTest.insertCommand")(function* 
   const { db } = yield* Database.Service
   const ctx = yield* InstanceState.context
   const now = input.createdAt ?? Date.now()
+  yield* insertSession(input.sessionID ?? sessionID)
   yield* db
     .insert(SessionCommandTable)
     .values({
@@ -920,6 +956,38 @@ it.instance("periodic recovery reclaims an expired running command", () =>
         ),
       "expired running command was not recovered",
     )
+  }),
+)
+
+it.instance("periodic recovery skips a command whose session was deleted", () =>
+  Effect.gen(function* () {
+    const { db } = yield* Database.Service
+    const orphan = SessionID.make("ses_durable_orphan")
+    const runs = yield* Ref.make(0)
+    const claim = yield* buildPromptClaim(Ref.update(runs, (count) => count + 1).pipe(Effect.as(output)))
+    yield* insertCommand({ id: "sec_orphan_session", sessionID: orphan })
+    yield* db.delete(SessionTable).where(eq(SessionTable.id, orphan)).run().pipe(Effect.orDie)
+
+    const logged: string[] = []
+    const capture = Logger.make<unknown, void>(({ message }) => {
+      logged.push(Array.isArray(message) ? message.map(String).join(" ") : String(message))
+    })
+
+    yield* claim.recover().pipe(Effect.provide(Logger.layer([capture])))
+    yield* pollWithTimeout(
+      db
+        .select({ status: SessionCommandTable.status, owner: SessionCommandTable.owner_id })
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.id, "sec_orphan_session"))
+        .get()
+        .pipe(
+          Effect.orDie,
+          Effect.map((row) => (row?.status === "cancelled" && row.owner === null ? true : undefined)),
+        ),
+      "orphaned command was not settled by recovery",
+    )
+    expect(yield* Ref.get(runs)).toBe(0)
+    expect(logged.some((line) => line.includes("session command recovery skipped missing session"))).toBe(true)
   }),
 )
 

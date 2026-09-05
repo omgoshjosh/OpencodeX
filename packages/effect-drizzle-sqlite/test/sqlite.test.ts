@@ -5,7 +5,7 @@ import { expect, test } from "bun:test"
 import { SqliteClient } from "@effect/sql-sqlite-bun"
 import { eq, sql } from "drizzle-orm"
 import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core"
-import { Effect } from "effect"
+import { Effect, Exit } from "effect"
 import type { SqlClient as SqlClientService } from "effect/unstable/sql/SqlClient"
 import { EffectDrizzleSqlite } from "../src"
 
@@ -93,6 +93,23 @@ test("rolls back explicit transaction rollback", async () => {
         .pipe(Effect.ignore)
 
       expect(yield* db.select().from(users)).toEqual([])
+    }),
+  )
+})
+
+test("reports the transaction body's error when the rollback statement fails", async () => {
+  await run(
+    Effect.gen(function* () {
+      const db = yield* makeDb
+
+      // Ending the transaction from inside the body is what SQLite itself does
+      // on some statement failures: the outer `rollback` then fails with
+      // "cannot rollback - no transaction is active".
+      const exit = yield* db
+        .transaction((tx) => tx.run(sql`rollback`).pipe(Effect.andThen(Effect.fail("boom"))))
+        .pipe(Effect.exit)
+
+      expect(exit).toEqual(Exit.fail("boom"))
     }),
   )
 })

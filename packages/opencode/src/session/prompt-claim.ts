@@ -283,6 +283,44 @@ export function make(deps: Deps) {
       yield* diagnostic(commandID, "claim", claimed.state).pipe(Effect.catchCause(() => Effect.void))
       if (claimed.state !== "ready") return
       const command = claimed.command
+      // A session deleted while its command was still queued leaves an orphan
+      // row. Running it anyway reaches Session.patch, which reads the session
+      // inside a transaction and dies with NotFound - once per sweep, forever.
+      // Settle the orphan instead so recovery stays quiet.
+      const session = yield* db
+        .select({ id: SessionTable.id })
+        .from(SessionTable)
+        .where(eq(SessionTable.id, command.session_id))
+        .get()
+        .pipe(Effect.orDie)
+      if (!session) {
+        const skippedAt = clock()
+        yield* Effect.logInfo("session command recovery skipped missing session", {
+          commandID,
+          sessionID: command.session_id,
+          action: "skip",
+        })
+        yield* db
+          .update(SessionCommandTable)
+          .set({
+            status: "cancelled",
+            owner_id: null,
+            lease_expires_at: null,
+            completed_at: skippedAt,
+            time_updated: skippedAt,
+          })
+          .where(
+            and(
+              eq(SessionCommandTable.id, commandID),
+              eq(SessionCommandTable.status, "running"),
+              eq(SessionCommandTable.owner_id, commandOwner),
+              eq(SessionCommandTable.claim_generation, command.claim_generation),
+            ),
+          )
+          .run()
+          .pipe(Effect.orDie)
+        return
+      }
       const requeue = Effect.fnUntraced(function* () {
         const completedAt = clock()
         yield* db

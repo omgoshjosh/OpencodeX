@@ -1,6 +1,6 @@
 import { Image } from "@/image/image"
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
-import { Cause, Deferred, Effect, Exit, Layer, Context, Scope, Schema } from "effect"
+import { Cause, Deferred, Duration, Effect, Exit, Layer, Context, Scope, Schema } from "effect"
 import * as Stream from "effect/Stream"
 import { Agent } from "@/agent/agent"
 import { Config } from "@/config/config"
@@ -17,6 +17,7 @@ import { SessionRetry } from "./retry"
 import { SessionStatus } from "./status"
 import { SessionSummary } from "./summary"
 import type { Provider } from "@/provider/provider"
+import { ProviderError } from "@/provider/error"
 import { Question } from "@/question"
 import { errorMessage } from "@/util/error"
 import * as Log from "@opencode-ai/core/util/log"
@@ -26,6 +27,15 @@ import { Database } from "@opencode-ai/core/database/database"
 import { Usage, type LLMEvent } from "@opencode-ai/llm"
 
 const DOOM_LOOP_THRESHOLD = 3
+/**
+ * A provider stream can stall mid-turn and never close: the socket stays open
+ * with no further events until something else resets it, which strands the turn
+ * in `busy` for as long as that takes. `abortSignal` covers user cancellation
+ * and the provider header timeout only covers the response headers, so nothing
+ * bounds the gap *between* stream events. Override with
+ * `experimental.stream_idle_timeout`.
+ */
+const STREAM_IDLE_TIMEOUT = 300_000
 const log = Log.create({ service: "session.processor" })
 
 export type Result = "compact" | "stop" | "continue"
@@ -642,7 +652,9 @@ export const layer = Layer.effect(
       const process = Effect.fn("SessionProcessor.process")(function* (streamInput: LLM.StreamInput) {
         slog.info("process")
         ctx.needsCompaction = false
-        ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
+        const cfg = yield* config.get()
+        ctx.shouldBreak = cfg.experimental?.continue_loop_on_deny !== true
+        const idleTimeout = cfg.experimental?.stream_idle_timeout ?? STREAM_IDLE_TIMEOUT
 
         return yield* Effect.gen(function* () {
           yield* Effect.gen(function* () {
@@ -652,6 +664,16 @@ export const layer = Layer.effect(
             const stream = llm.stream(streamInput)
 
             yield* stream.pipe(
+              Stream.timeoutOrElse({
+                duration: Duration.millis(idleTimeout),
+                orElse: () =>
+                  Stream.fromEffect(
+                    Effect.gen(function* () {
+                      slog.error("stream idle timeout", { timeoutMs: idleTimeout })
+                      return yield* Effect.fail(new ProviderError.StreamIdleTimeoutError(idleTimeout))
+                    }),
+                  ),
+              }),
               Stream.tap((event) => handleEvent(event)),
               Stream.takeUntil(() => ctx.needsCompaction),
               Stream.runDrain,

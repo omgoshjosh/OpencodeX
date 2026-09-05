@@ -429,7 +429,7 @@ export const make = Effect.gen(function* () {
             }),
             kill: (opts?: ChildProcess.KillOptions) =>
               Effect.gen(function* () {
-                if (yield* Deferred.isDone(signal)) return
+                if (yield* Deferred.isDone(signal)) return yield* Effect.void
                 const sig = opts?.killSignal ?? "SIGTERM"
                 const terminate = process.platform === "win32" || detached ? killGroup : killOne
                 const send = (s: NodeJS.Signals) =>

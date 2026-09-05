@@ -23,11 +23,20 @@ readonly TARGET="opencode-darwin-arm64"
 
 BUILD_DIR="${OXD_BUILD_DIR:-$HOME/agents/worktrees/dogfood-stack}"
 CUTOVER="${OXD_CUTOVER:-$HOME/.opencode/safe-cutover-v2.sh}"
+RECOVER="${OXD_RECOVER:-$HOME/.opencode/cutover-recover-v2.sh}"
 CLI_INSTALL="${OXD_CLI_INSTALL:-$HOME/.opencode/bin/opencodex}"
 GUI_INSTALL="${OXD_GUI_INSTALL:-/Applications/OpencodeX.app}"
 STATE_DIR="${OXD_STATE_DIR:-$HOME/.opencode/oxd}"
 PASS_FILE="${OXD_PASS_FILE:-$HOME/.opencode/serve.pass}"
 PORT="${OXD_PORT:-4096}"
+
+# A deploy costs roughly 3.7GB that nothing else prunes: the cutover root keeps
+# a full database snapshot (~3GB), plus the staged binary, the staged app and
+# the app backup.  Refuse to start unless that fits and still clears the
+# workspace's 10GB hard build stop afterwards.
+readonly DEPLOY_COST_GB=4
+readonly HARD_STOP_GB=10
+readonly KEEP_GENERATIONS=3
 
 REF="${OXD_REF:-fork/dogfood/stack2}"
 CHANNEL=""
@@ -43,7 +52,8 @@ QUIT_GUI=1
 DRAIN=1
 DRAIN_SAMPLES=10
 DRAIN_INTERVAL=6
-DRAIN_TIMEOUT=3600
+DRAIN_TIMEOUT=900
+DRAIN_IGNORE=""
 
 usage() {
   cat <<EOF
@@ -68,6 +78,8 @@ with ONE version stamp, then installs both and restarts the server drain-safe.
   --drain-samples N      consecutive idle readiness samples (default: $DRAIN_SAMPLES)
   --drain-interval S     seconds between samples (default: $DRAIN_INTERVAL)
   --drain-timeout S      give up waiting to drain after S seconds (default: $DRAIN_TIMEOUT)
+  --drain-ignore A,B     treat these readiness blockers as idle, e.g. 'swarms'
+                         for swarms parked in approval_needed/blocked
   --no-drain             restart without waiting for the server to go idle
   --no-quit-gui          do not quit a running OpencodeX.app before replacing it
 
@@ -78,6 +90,9 @@ EOF
 say() { printf '%s\n' "$*"; }
 step() { printf '\n== %s\n' "$*"; }
 die() { printf '%s: %s\n' "$SELF" "$*" >&2; exit 1; }
+positive_int() {
+  case "$2" in "" | *[!0-9]* | 0) die "$1 must be a positive integer, got '$2'" ;; esac
+}
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -94,6 +109,7 @@ while [ "$#" -gt 0 ]; do
     --stamp) STAMP="${2:?--stamp needs a value}"; shift ;;
     --channel) CHANNEL="${2:?--channel needs a value}"; shift ;;
     --build-dir) BUILD_DIR="${2:?--build-dir needs a directory}"; shift ;;
+    --drain-ignore) DRAIN_IGNORE="${2:?--drain-ignore needs blocker names}"; shift ;;
     --drain-samples) DRAIN_SAMPLES="${2:?}"; shift ;;
     --drain-interval) DRAIN_INTERVAL="${2:?}"; shift ;;
     --drain-timeout) DRAIN_TIMEOUT="${2:?}"; shift ;;
@@ -103,32 +119,73 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
+positive_int --drain-samples "$DRAIN_SAMPLES"
+positive_int --drain-interval "$DRAIN_INTERVAL"
+positive_int --drain-timeout "$DRAIN_TIMEOUT"
+# A relative --out would otherwise land inside the checkout once we cd into it,
+# dirtying the tree the next run refuses to build from.
+case "$STAGE" in "" | /*) : ;; *) STAGE="$PWD/$STAGE" ;; esac
+
+# ------------------------------------------------------------ exit handling --
+# safe-cutover-v2.sh exits nonzero whenever it fails, INCLUDING after it has
+# successfully recovered the server to the old binary.  Under errexit that
+# would otherwise terminate this script at the handoff, before the rollback
+# instructions are ever printed — exactly when they are needed most.
+ROLLBACK_ARMED=0
+ORIGINAL_HEAD=""
+CUTOVER_ROOT=""
+GUI_BACKUP=""
+
+print_rollback() {
+  step "rollback"
+  if [ -n "$CUTOVER_ROOT" ] && [ -f "$CUTOVER_ROOT/manifest.json" ]; then
+    say "  CLI + server:  /bin/bash $RECOVER $CUTOVER_ROOT"
+  else
+    say "  CLI + server:  nothing to undo (the binary swap never started)"
+  fi
+  if [ -n "$GUI_BACKUP" ] && [ -d "$GUI_BACKUP" ]; then
+    say "  GUI:           rm -rf $GUI_INSTALL && ditto $GUI_BACKUP $GUI_INSTALL"
+  else
+    say "  GUI:           nothing to undo (no bundle was replaced)"
+  fi
+}
+
+on_exit() {
+  local rc=$?
+  trap - EXIT
+  # Restore the shared build checkout to whatever ref it was on; other sessions
+  # hold a claim on it and did not ask for a detached HEAD.
+  if [ -n "$ORIGINAL_HEAD" ]; then
+    git -C "$BUILD_DIR" checkout --quiet --force "$ORIGINAL_HEAD" 2>/dev/null || true
+  fi
+  [ "$rc" = 0 ] || [ "$ROLLBACK_ARMED" = 0 ] || print_rollback
+  exit "$rc"
+}
+trap on_exit EXIT
+
 # ---------------------------------------------------------------- preflight --
 step "preflight"
-for tool in bun git jq curl launchctl shasum ditto osascript; do
+required=(git jq curl)
+[ "$DRAIN_ONLY" = 1 ] || required+=(bun shasum ditto osascript launchctl)
+for tool in "${required[@]}"; do
   command -v "$tool" >/dev/null || die "missing required tool: $tool"
 done
-[ -d "$BUILD_DIR/.git" ] || [ -f "$BUILD_DIR/.git" ] || die "not a checkout: $BUILD_DIR"
-[ -x "$CUTOVER" ] || [ -r "$CUTOVER" ] || die "missing cutover script: $CUTOVER"
 [ -s "$PASS_FILE" ] || die "missing server password file: $PASS_FILE"
-[ "$STAGE_ONLY" = 1 ] || [ -x "$CLI_INSTALL" ] || die "no installed CLI at $CLI_INSTALL"
 
-FREE_GB="$(df -g / | awk 'NR==2 {print $4}')"
-[ "${FREE_GB:-0}" -ge 10 ] || die "only ${FREE_GB}GB free; hard build stop is 10GB"
-say "free disk       ${FREE_GB}GB"
-
-AUTH=(-u "opencode:$(cat "$PASS_FILE")")
-api() { curl --fail --silent --max-time "${2:-10}" "${AUTH[@]}" "http://127.0.0.1:$PORT$1"; }
+SERVE_PASS="$(cat "$PASS_FILE")"
+# Credentials go through a curl config on stdin rather than argv, so the server
+# password never shows up in `ps`.
+api() {
+  printf 'user = "opencode:%s"\n' "$SERVE_PASS" |
+    curl --fail --silent --max-time "${2:-10}" -K - "http://127.0.0.1:$PORT$1"
+}
 live_version() { api /global/health 5 2>/dev/null | jq -r '.version // empty'; }
 
-SERVER_VERSION="$(live_version || true)"
-say "server          ${SERVER_VERSION:-<not responding>}"
-
 # The server publishes its own restart safety on /global/restart-readiness:
-# `ready` plus the named blockers that are holding work open.  Requiring N
-# consecutive idle samples is the same shape as waitForRestartReadiness in the
-# SDK (defaults there: 10 samples, 6s apart), which is what keeps a restart
-# from landing in the gap between two turns of the same session.
+# `ready` plus the named blockers holding work open.  Requiring N consecutive
+# idle samples is the same shape as waitForRestartReadiness in the SDK
+# (defaults there: 10 samples, 6s apart), which is what keeps a restart from
+# landing in the gap between two turns of the same session.
 wait_for_drain() {
   step "drain"
   if [ "$DRAIN" = 0 ]; then
@@ -136,32 +193,60 @@ wait_for_drain() {
     return 0
   fi
   say "waiting for $DRAIN_SAMPLES consecutive idle samples every ${DRAIN_INTERVAL}s (timeout ${DRAIN_TIMEOUT}s)"
-  local deadline consecutive sample
+  [ -z "$DRAIN_IGNORE" ] || say "ignoring blockers: $DRAIN_IGNORE"
+  local deadline consecutive sample blockers
   deadline=$(( $(date +%s) + DRAIN_TIMEOUT ))
   consecutive=0
   while [ "$consecutive" -lt "$DRAIN_SAMPLES" ]; do
-    [ "$(date +%s)" -lt "$deadline" ] ||
-      die "server never drained within ${DRAIN_TIMEOUT}s — nothing was installed"
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      say "  still blocked by: ${blockers:-unknown}"
+      die "server never drained within ${DRAIN_TIMEOUT}s — nothing was installed.
+    Wait for the blockers to clear, raise --drain-timeout, exempt a blocker with
+    --drain-ignore (e.g. 'swarms' for swarms parked awaiting a human), or accept
+    cutting off in-flight work with --no-drain."
+    fi
     sample="$(api /global/restart-readiness 10 || true)"
     if [ -z "$sample" ]; then
+      blockers="readiness check failed (server not responding)"
       consecutive=0
-      say "  waiting for drain: readiness check failed (server not responding)"
-    elif [ "$(printf '%s' "$sample" | jq -r '.ready')" = "true" ]; then
-      consecutive=$((consecutive + 1))
-      say "  waiting for drain: idle $consecutive/$DRAIN_SAMPLES"
+      say "  waiting for drain: $blockers"
     else
-      consecutive=0
-      say "  waiting for drain: busy — $(printf '%s' "$sample" | jq -r '[.blockers|to_entries[]|select(.value)|.key]|join(", ")')"
+      blockers="$(printf '%s' "$sample" |
+        jq -r --arg ignore "$DRAIN_IGNORE" \
+          '($ignore | split(",") | map(select(length > 0))) as $skip
+           | [.blockers | to_entries[] | select(.value) | .key | select(. as $k | $skip | index($k) | not)]
+           | join(", ")')"
+      if [ -z "$blockers" ]; then
+        consecutive=$((consecutive + 1))
+        say "  waiting for drain: idle $consecutive/$DRAIN_SAMPLES"
+      else
+        consecutive=0
+        say "  waiting for drain: busy — $blockers"
+      fi
     fi
     [ "$consecutive" -ge "$DRAIN_SAMPLES" ] || sleep "$DRAIN_INTERVAL"
   done
   say "server is drained"
 }
 
+SERVER_VERSION="$(live_version || true)"
+say "server          ${SERVER_VERSION:-<not responding>}"
+
 if [ "$DRAIN_ONLY" = 1 ]; then
   wait_for_drain
   exit 0
 fi
+
+[ -d "$BUILD_DIR/.git" ] || [ -f "$BUILD_DIR/.git" ] || die "not a checkout: $BUILD_DIR"
+[ -r "$CUTOVER" ] || die "missing cutover script: $CUTOVER"
+[ -r "$RECOVER" ] || die "missing recovery script: $RECOVER"
+[ "$STAGE_ONLY" = 1 ] || [ -x "$CLI_INSTALL" ] || die "no installed CLI at $CLI_INSTALL"
+
+FREE_GB="$(df -g / | awk 'NR==2 {print $4}')"
+NEEDED_GB=$(( HARD_STOP_GB + DEPLOY_COST_GB ))
+[ "${FREE_GB:-0}" -ge "$NEEDED_GB" ] ||
+  die "only ${FREE_GB}GB free; a deploy consumes about ${DEPLOY_COST_GB}GB and must not cross the ${HARD_STOP_GB}GB hard build stop"
+say "free disk       ${FREE_GB}GB"
 
 # ------------------------------------------------------------------ resolve --
 step "resolve"
@@ -171,7 +256,11 @@ DIRTY="$(git status --porcelain)"
   printf '%s\n' "$DIRTY" >&2
   die "checkout is dirty: $BUILD_DIR — commit, stash or clean it first"
 }
-[ "$DO_FETCH" = 0 ] || git fetch --quiet --prune fork 2>/dev/null || git fetch --quiet --prune --all
+if [ "$DO_FETCH" = 1 ]; then
+  git fetch --quiet --prune fork 2>/dev/null ||
+    git fetch --quiet --prune --all 2>/dev/null ||
+    say "fetch failed; resolving $REF from the local checkout"
+fi
 
 SHA="$(git rev-parse --verify --quiet "${REF}^{commit}")" || die "cannot resolve ref: $REF"
 SUBJECT="$(git log -1 --format=%s "$SHA")"
@@ -186,7 +275,13 @@ fi
 case "$CHANNEL" in
   "" | *[!a-zA-Z0-9/._-]* ) die "cannot derive a channel from '$REF'; pass --channel" ;;
 esac
-[ "$CHANNEL" != "$SHA" ] || die "REF is a raw commit; pass --channel"
+# A bare commit-ish makes a meaningless channel; a branch name is what the
+# deployed stamp is supposed to identify.
+if git rev-parse --verify --quiet "${CHANNEL}^{commit}" >/dev/null &&
+   ! git show-ref --verify --quiet "refs/heads/$CHANNEL" &&
+   ! git show-ref --verify --quiet "refs/remotes/fork/$CHANNEL"; then
+  die "'$CHANNEL' is a commit-ish, not a branch; pass --channel"
+fi
 
 [ -n "$STAMP" ] || STAMP="0.0.0-${CHANNEL}-$(date -u +%Y%m%d%H%M)"
 case "$STAMP" in
@@ -196,9 +291,14 @@ esac
 SAFE_STAMP="${STAMP//\//-}"
 
 [ -n "$STAGE" ] || STAGE="$STATE_DIR/stage/$SAFE_STAMP"
-BACKUP_DIR="$STATE_DIR/backups/$SAFE_STAMP"
+# Backups and the cutover root must never be shared between two runs: a second
+# run in the same minute would otherwise overwrite the first run's backup with
+# its own output, leaving a rollback point that rolls back to nothing.
+RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+BACKUP_DIR="$STATE_DIR/backups/$RUN_ID"
 LAST="$STATE_DIR/last-deploy.json"
-CUTOVER_NONCE="oxd-$SAFE_STAMP"
+CUTOVER_NONCE="oxd-$SAFE_STAMP-$RUN_ID"
+CUTOVER_ROOT="$HOME/.opencode/cutovers/$CUTOVER_NONCE"
 STAGED_CLI="$STAGE/opencodex"
 STAGED_APP="$STAGE/OpencodeX.app"
 
@@ -208,6 +308,13 @@ installed_gui_version() {
   jq -r '.version // empty' "$stamp" 2>/dev/null
 }
 GUI_VERSION="$(installed_gui_version)"
+lockstep_claim() {
+  if [ "$SKIP_GUI" = 1 ]; then
+    printf 'server=TUI (GUI skipped, still at %s)' "${GUI_VERSION:-<unstamped>}"
+  else
+    printf 'server=GUI=TUI'
+  fi
+}
 
 # ---------------------------------------------------------------- the plan --
 step "plan"
@@ -232,7 +339,7 @@ if [ "$FORCE" = 0 ] && [ "$STAGE_ONLY" = 0 ] && [ -r "$LAST" ]; then
      [ "$(jq -r '.stamp // empty' "$LAST")" = "$SERVER_VERSION" ] &&
      { [ "$SKIP_GUI" = 1 ] || [ "$GUI_VERSION" = "$SERVER_VERSION" ]; }; then
     say ""
-    say "LOCKSTEP PASS  $SERVER_VERSION  server=GUI=TUI  (already deployed from $SHA; --force to rebuild)"
+    say "LOCKSTEP PASS  $SERVER_VERSION  $(lockstep_claim)  (already deployed from $SHA; --force to rebuild)"
     exit 0
   fi
 fi
@@ -252,14 +359,18 @@ step "build"
 mkdir -p "$STAGE"
 rm -rf "$STAGED_CLI" "$STAGED_APP"
 
-CURRENT_SHA="$(git rev-parse HEAD)"
-if [ "$CURRENT_SHA" != "$SHA" ]; then
-  say "checking out $SHA"
+ORIGINAL_HEAD="$(git symbolic-ref --quiet --short HEAD || git rev-parse HEAD)"
+if [ "$(git rev-parse HEAD)" != "$SHA" ]; then
+  say "checking out $SHA (restoring $ORIGINAL_HEAD on exit)"
   git checkout --detach --quiet "$SHA"
 fi
 
 export OPENCODE_VERSION="$STAMP"
 export OPENCODE_CHANNEL="$CHANNEL"
+# copy-sidecar.ts checks OPENCODEX_GUI_SIDECAR *before* the binary this build
+# produces. An operator with that exported from a dev workflow would otherwise
+# ship an arbitrary coordinator under a freshly minted stamp.
+unset OPENCODEX_GUI_SIDECAR OPENCODEX_GUI_SIDECAR_TARGET
 
 # The CLI binary is serve + TUI in one artifact.  build.ts starts with
 # `rm -rf dist`, so the CLI has to be copied out of dist before the coordinator
@@ -271,6 +382,7 @@ install -m 755 "packages/opencode/dist/$TARGET/bin/opencode" "$STAGED_CLI"
 if [ "$SKIP_GUI" = 0 ]; then
   say "building GUI coordinator sidecar"
   bun run --cwd packages/opencode build --single --gui-coordinator --skip-install
+  COORDINATOR="packages/opencode/dist/$TARGET/bin/opencode-gui-coordinator"
 
   say "packaging GUI app"
   # copy-sidecar.ts prefers this over dist/<target>/package.json; both carry the
@@ -293,11 +405,15 @@ say "CLI  $CLI_STAMP"
 [ "$CLI_STAMP" = "$STAMP" ] || die "LOCKSTEP FAIL  CLI stamped '$CLI_STAMP', expected '$STAMP'"
 
 if [ "$SKIP_GUI" = 0 ]; then
+  PACKAGED="$STAGED_APP/Contents/Resources/sidecar/opencode-gui-coordinator"
   APP_STAMP="$(jq -r '.version // empty' "$STAGED_APP/Contents/Resources/sidecar/version.json" 2>/dev/null || true)"
   say "GUI  $APP_STAMP"
   [ "$APP_STAMP" = "$STAMP" ] || die "LOCKSTEP FAIL  GUI sidecar stamped '$APP_STAMP', expected '$STAMP'"
-  [ -x "$STAGED_APP/Contents/Resources/sidecar/opencode-gui-coordinator" ] ||
-    die "packaged app has no sidecar coordinator binary"
+  [ -x "$PACKAGED" ] || die "packaged app has no sidecar coordinator binary"
+  # version.json is a claim; this checks the bundle actually carries the binary
+  # this run built, since that stamp is the sole input to the attach handshake.
+  [ "$(shasum -a 256 "$PACKAGED" | cut -d ' ' -f 1)" = "$(shasum -a 256 "$COORDINATOR" | cut -d ' ' -f 1)" ] ||
+    die "LOCKSTEP FAIL  packaged coordinator is not the binary this run built"
 fi
 
 CLI_HASH="$(shasum -a 256 "$STAGED_CLI" | cut -d ' ' -f 1)"
@@ -316,13 +432,18 @@ fi
 wait_for_drain
 
 # ----------------------------------------------------------------- install --
-GUI_BACKUP=""
+restore_gui() {
+  [ -n "$GUI_BACKUP" ] && [ -d "$GUI_BACKUP" ] || return 0
+  say "restoring the previous GUI bundle"
+  rm -rf "$GUI_INSTALL"
+  ditto "$GUI_BACKUP" "$GUI_INSTALL"
+}
+
 if [ "$SKIP_GUI" = 0 ]; then
   step "install GUI"
   mkdir -p "$BACKUP_DIR"
   if [ -d "$GUI_INSTALL" ]; then
     GUI_BACKUP="$BACKUP_DIR/OpencodeX.app"
-    rm -rf "$GUI_BACKUP"
     ditto "$GUI_INSTALL" "$GUI_BACKUP"
     say "backed up  $GUI_INSTALL -> $GUI_BACKUP"
   fi
@@ -336,17 +457,27 @@ if [ "$SKIP_GUI" = 0 ]; then
     pgrep -f "$GUI_INSTALL/Contents/MacOS/" >/dev/null 2>&1 &&
       say "  still running; replacing the bundle anyway — relaunch it when the deploy finishes"
   fi
-  rm -rf "$GUI_INSTALL.oxd-incoming"
+  ROLLBACK_ARMED=1
+  # Move the old bundle aside before moving the new one in, so no failure can
+  # leave /Applications without an OpencodeX.app at all.
+  rm -rf "$GUI_INSTALL.oxd-incoming" "$GUI_INSTALL.oxd-old"
   ditto "$STAGED_APP" "$GUI_INSTALL.oxd-incoming"
-  rm -rf "$GUI_INSTALL"
+  [ ! -d "$GUI_INSTALL" ] || mv "$GUI_INSTALL" "$GUI_INSTALL.oxd-old"
   mv "$GUI_INSTALL.oxd-incoming" "$GUI_INSTALL"
+  rm -rf "$GUI_INSTALL.oxd-old"
   say "installed  $GUI_INSTALL"
 fi
 
 step "install CLI and restart server"
 say "handing off to $(basename "$CUTOVER") (nonce $CUTOVER_NONCE)"
-CUTOVER_NONCE="$CUTOVER_NONCE" /bin/bash "$CUTOVER" "$STAGED_CLI" "$CLI_HASH" "$STAMP"
-CUTOVER_ROOT="$HOME/.opencode/cutovers/$CUTOVER_NONCE"
+ROLLBACK_ARMED=1
+if ! CUTOVER_NONCE="$CUTOVER_NONCE" /bin/bash "$CUTOVER" "$STAGED_CLI" "$CLI_HASH" "$STAMP"; then
+  # The cutover recovers the server to the old binary on its own, so leaving the
+  # new GUI installed would strand it against a version the server no longer
+  # runs — the exact-match attach gate would then refuse every connection.
+  restore_gui
+  die "cutover failed; server and GUI were both returned to their previous versions"
+fi
 
 # ------------------------------------------------------------------ verify --
 step "verify deployment"
@@ -364,25 +495,38 @@ OK=1
 [ "$FINAL_SERVER" = "$STAMP" ] || OK=0
 [ "$SKIP_GUI" = 1 ] || [ "$FINAL_GUI" = "$STAMP" ] || OK=0
 
-# ---------------------------------------------------------------- rollback --
-step "rollback"
-say "  CLI + server:  /bin/bash $HOME/.opencode/cutover-recover-v2.sh $CUTOVER_ROOT"
-if [ -n "$GUI_BACKUP" ]; then
-  say "  GUI:           rm -rf $GUI_INSTALL && ditto $GUI_BACKUP $GUI_INSTALL"
-else
-  say "  GUI:           (no previous app bundle was installed; remove with: rm -rf $GUI_INSTALL)"
+if [ "$OK" != 1 ]; then
+  say ""
+  say "LOCKSTEP FAIL  server='${FINAL_SERVER:-none}' gui='${FINAL_GUI:-none}' expected='$STAMP'"
+  exit 1
 fi
 
+# ------------------------------------------------------------------ record --
+mkdir -p "$STATE_DIR"
+jq -n --arg commit "$SHA" --arg stamp "$STAMP" --arg ref "$REF" --arg channel "$CHANNEL" \
+  --arg cutover "$CUTOVER_ROOT" --arg guiBackup "$GUI_BACKUP" --arg at "$(date -u '+%FT%TZ')" \
+  '{commit:$commit,stamp:$stamp,ref:$ref,channel:$channel,cutover:$cutover,guiBackup:$guiBackup,at:$at}' \
+  > "$LAST.tmp" && mv "$LAST.tmp" "$LAST"
+
+# Keep the newest few rollback points and the one this deploy depends on; drop
+# the rest, because nothing else on this machine ever reclaims them.
+prune() {
+  local dir="$1" pattern="$2" keep count entry
+  [ -d "$dir" ] || return 0
+  count=0
+  for entry in $(ls -td "$dir"/$pattern 2>/dev/null); do
+    count=$((count + 1))
+    [ "$count" -gt "$KEEP_GENERATIONS" ] || continue
+    case "$entry" in "$CUTOVER_ROOT" | "$BACKUP_DIR" | "$STAGE") continue ;; esac
+    rm -rf "$entry"
+  done
+}
+prune "$HOME/.opencode/cutovers" 'oxd-*'
+prune "$STATE_DIR/backups" '*'
+prune "$STATE_DIR/stage" '*'
+
+print_rollback
 say ""
-if [ "$OK" = 1 ]; then
-  mkdir -p "$STATE_DIR"
-  jq -n --arg commit "$SHA" --arg stamp "$STAMP" --arg ref "$REF" --arg channel "$CHANNEL" \
-    --arg cutover "$CUTOVER_ROOT" --arg guiBackup "$GUI_BACKUP" --arg at "$(date -u '+%FT%TZ')" \
-    '{commit:$commit,stamp:$stamp,ref:$ref,channel:$channel,cutover:$cutover,guiBackup:$guiBackup,at:$at}' \
-    > "$LAST.tmp" && mv "$LAST.tmp" "$LAST"
-  say "LOCKSTEP PASS  $STAMP  server=GUI=TUI  from $SHA"
-  [ "$SKIP_GUI" = 1 ] || say "relaunch OpencodeX.app to pick up the new GUI"
-  exit 0
-fi
-say "LOCKSTEP FAIL  server='${FINAL_SERVER:-none}' gui='${FINAL_GUI:-none}' expected='$STAMP' — roll back with the commands above"
-exit 1
+say "LOCKSTEP PASS  $STAMP  $(lockstep_claim)  from $SHA"
+[ "$SKIP_GUI" = 1 ] || say "relaunch OpencodeX.app to pick up the new GUI"
+exit 0

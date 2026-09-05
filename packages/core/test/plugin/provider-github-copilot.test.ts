@@ -111,6 +111,33 @@ describe("GithubCopilotPlugin", () => {
     }),
   )
 
+  it.effect("uses advertised Copilot endpoint metadata before model ID fallbacks", () =>
+    Effect.gen(function* () {
+      const plugin = yield* PluginV2.Service
+      const calls: string[] = []
+      yield* plugin.add(GithubCopilotPlugin)
+      yield* plugin.trigger(
+        "aisdk.language",
+        {
+          model: model("github-copilot", "mai-code-1-flash-picker"),
+          sdk: fakeSelectorSdk(calls),
+          options: { endpoint: "responses" },
+        },
+        {},
+      )
+      yield* plugin.trigger(
+        "aisdk.language",
+        {
+          model: model("github-copilot", "gpt-5"),
+          sdk: fakeSelectorSdk(calls),
+          options: { endpoint: "chat" },
+        },
+        {},
+      )
+      expect(calls).toEqual(["responses:mai-code-1-flash-picker", "chat:gpt-5"])
+    }),
+  )
+
   it.effect("uses the API model ID when selecting responses or chat", () =>
     Effect.gen(function* () {
       const plugin = yield* PluginV2.Service

@@ -227,8 +227,12 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
     "github-copilot": () =>
       Effect.succeed({
         autoload: false,
-        async getModel(sdk: any, modelID: string, _options?: Record<string, any>) {
+        async getModel(sdk: any, modelID: string, _options?: Record<string, any>, model?: Model) {
           if (sdk.responses === undefined && sdk.chat === undefined) return sdk.languageModel(modelID)
+          if (model && "endpoint" in model.api) {
+            if (model.api.endpoint === "responses" && sdk.responses) return sdk.responses(modelID)
+            if (model.api.endpoint === "chat" && sdk.chat) return sdk.chat(modelID)
+          }
           const match = /^gpt-(\d+)/.exec(modelID)
           if (match && Number(match[1]) >= 5 && !modelID.startsWith("gpt-5-mini")) return sdk.responses(modelID)
           return sdk.chat(modelID)
@@ -840,7 +844,7 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
         apiKey: apiToken,
         ...(Object.values(opts).some((v) => v !== undefined) ? { options: opts } : {}),
       })
-      const unified = createUnified()
+      const unified = createUnified({ apiKey: apiToken })
 
       return {
         autoload: true,

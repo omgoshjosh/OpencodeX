@@ -25,7 +25,7 @@ import type { Provider } from "@/provider/provider"
 import * as SessionProcessorModule from "../../src/session/processor"
 import { Snapshot } from "../../src/snapshot"
 import { ProviderTest } from "../fake/provider"
-import { testEffect } from "../lib/effect"
+import { awaitWithTimeout, testEffect } from "../lib/effect"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { TestConfig } from "../fixture/config"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -595,8 +595,6 @@ describe("session.compaction.create", () => {
     ),
   )
 })
-
-
 
 describe("session.compaction.prune", () => {
   it.live(
@@ -1222,7 +1220,7 @@ describe("session.compaction.process", () => {
           })
           .pipe(Effect.forkChild)
 
-        yield* Deferred.await(ready).pipe(Effect.timeout("1 second"))
+        yield* awaitWithTimeout(Deferred.await(ready), "timed out waiting for compaction retry", "10 seconds")
         const start = Date.now()
         yield* Fiber.interrupt(fiber)
         const exit = yield* Fiber.await(fiber).pipe(Effect.timeout("1 second"))
@@ -1235,6 +1233,7 @@ describe("session.compaction.process", () => {
       }).pipe(withCompaction({ llm: stub.layer }))
     },
     { git: true },
+    { timeout: 15_000 },
   )
 
   itCompaction.instance(

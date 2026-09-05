@@ -307,6 +307,60 @@ describe("claude channel", () => {
     expect(seen.map(typeOf)).toEqual(["system", "result", "system", "assistant", "result"])
   })
 
+  test("keeps a productive drain alive past the background deadline", async () => {
+    // A backgrounded subagent re-wakes the model, which keeps streaming tool
+    // calls and text while the task list still reads 1. Capping that turn on
+    // wall clock closed the channel mid-report on healthy Bowser Jr sessions -
+    // every merge, PR and comment had landed and the driver still surfaced
+    // "Claude response delivery failed before the turn completed".
+    const { create, emit, state } = fakeQuery()
+    const channel = new Channel<Handlers>("s1", create, { closeOutGraceMs: 5000, backgroundTaskGraceMs: 200 })
+    const turn = channel.turn([user("wake")], { name: "t1" })
+    emit(event({ type: "system", subtype: "background_tasks_changed", tasks: [{ task_id: "a1" }] }))
+    emit(result)
+    // Real work spanning nearly twice the drain budget, task still live throughout.
+    for (let step = 0; step < 3; step++) {
+      await new Promise((resolve) => setTimeout(resolve, 120))
+      expect(channel.dead).toBe(false)
+      emit(assistant)
+    }
+    emit(event({ type: "system", subtype: "background_tasks_changed", tasks: [] }))
+    emit(assistant)
+    emit(result)
+
+    const seen = await collect(turn.events, 8)
+    expect(seen.map(typeOf)).toEqual([
+      "system",
+      "result",
+      "assistant",
+      "assistant",
+      "assistant",
+      "system",
+      "assistant",
+      "result",
+    ])
+    expect(channel.dead).toBe(false)
+    expect(state.aborts).toBe(0)
+  })
+
+  test("still fails a drain that goes silent past the deadline", async () => {
+    // The extension must not disarm the guard: output moves the deadline,
+    // silence still ends the turn rather than holding the execution lease.
+    const { create, emit } = fakeQuery()
+    const channel = new Channel<Handlers>("s1", create, { closeOutGraceMs: 5000, backgroundTaskGraceMs: 30 })
+    const turn = channel.turn([user("wake")], { name: "t1" })
+    emit(event({ type: "system", subtype: "background_tasks_changed", tasks: [{ task_id: "a1" }] }))
+    emit(result)
+    emit(assistant)
+
+    const outcome = await collect(turn.events, 4).then(
+      () => "completed",
+      (error: unknown) => (error instanceof Error ? error.message : String(error)),
+    )
+    expect(outcome).toContain("background tasks did not settle")
+    await waitFor(() => channel.dead)
+  })
+
   test("completes normally when background tasks already drained", async () => {
     const { create, emit } = fakeQuery()
     const channel = new Channel<Handlers>("s1", create, { closeOutGraceMs: 20, backgroundTaskGraceMs: 100 })

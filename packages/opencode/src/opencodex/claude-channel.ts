@@ -243,6 +243,7 @@ export class Channel<H> {
       this.settling = false
       this.clearCloseOutWatchdog()
       if (this.backgroundWait === "final-output") this.armFinalOutputWatchdog(sink)
+      else if (this.backgroundWait === "drain") this.extendBackgroundTaskWait(sink)
     }
     if (eventType(event) === "result" && !isSuccessCloseOut(event)) this.resetBackgroundWait()
     if (isSuccessCloseOut(event) && this.liveBackgroundTasks === 0) this.resetBackgroundWait()
@@ -293,6 +294,28 @@ export class Channel<H> {
       if (this.sink !== sink || this.backgroundWait !== "drain") return
       this.failBackgroundTaskWait(sink)
     }, Math.max(0, deadline - this.now()))
+  }
+
+  /**
+   * The drain budget bounds *silence*, not the turn. A successful result with
+   * live background tasks is a pause: the CLI re-wakes the model when a
+   * backgrounded subagent reports, and that turn can legitimately run for
+   * hours of real work. Capping it on wall clock killed healthy Bowser Jr
+   * sessions mid-report at exactly 30 minutes past the first pause - the work
+   * was done, the channel was still streaming tool calls, and the driver
+   * reported it as "Claude response delivery failed before the turn
+   * completed" (live capture 2026-09-05 12:06 and 12:46 UTC).
+   *
+   * Assistant output is the one signal that proves the model is still
+   * producing, so only it moves the deadline. The flapping
+   * `background_tasks_changed` level signal deliberately does not: a task list
+   * that oscillates must not buy the turn an unbounded lease on its own.
+   */
+  private extendBackgroundTaskWait(sink: TurnSink) {
+    if (this.backgroundTaskDeadline === undefined) return
+    this.backgroundTaskDeadline = this.now() + this.backgroundTaskGraceMs
+    this.clearBackgroundTaskWatchdog()
+    this.armBackgroundTaskWatchdog(sink)
   }
 
   private failBackgroundTaskWait(sink: TurnSink) {

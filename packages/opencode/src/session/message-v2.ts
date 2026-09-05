@@ -865,6 +865,7 @@ export function fromError(
         { cause: e },
       ).toObject()
     case e instanceof ProviderError.HeaderTimeoutError:
+    case e instanceof ProviderError.StreamIdleTimeoutError:
       return new APIError(
         {
           message: e.message,

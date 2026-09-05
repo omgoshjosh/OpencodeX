@@ -11,6 +11,14 @@ export class HeaderTimeoutError extends Error {
   }
 }
 
+export class StreamIdleTimeoutError extends Error {
+  public override readonly name = "ProviderStreamIdleTimeoutError"
+
+  constructor(public readonly ms: number) {
+    super(`Provider stream produced no events for ${ms}ms`)
+  }
+}
+
 export class ResponseStreamError extends Error {
   public override readonly name = "ProviderResponseStreamError"
 

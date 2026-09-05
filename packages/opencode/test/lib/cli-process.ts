@@ -58,9 +58,8 @@ function cliArgv(args: string[]) {
  * `timeoutMs` can still opt down when a test is specifically asserting
  * promptness.
  *
- * Kept below the 60s bun per-test timeout these suites declare, deliberately:
- * this path kills the child through the scope finalizer, whereas bun expiring
- * first would fail the test and leak the subprocess.
+ * Callers must keep Bun's per-test deadline above this ceiling so this path
+ * kills the child through the scope finalizer instead of Bun expiring first.
  */
 export function cliProcessDefaultTimeout(
   platform = process.platform,

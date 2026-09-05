@@ -17,7 +17,6 @@ import { OpencodeXJob } from "@/opencodex/job"
 import { OpencodeXClaudeDriver } from "@/opencodex/claude-driver"
 import { Effect, Layer } from "effect"
 import { FetchHttpClient } from "effect/unstable/http"
-import fs from "fs/promises"
 import path from "path"
 import { Session } from "@/session/session"
 import { LLM } from "../../src/session/llm"
@@ -239,13 +238,14 @@ it.live("tool execution produces non-empty session diff (snapshot race)", () =>
         permission: [{ permission: "*", pattern: "*", action: "allow" }],
       })
 
-      // Use bash tool (always registered) to create a file
-      const command = `echo 'snapshot race test content' > ${path.join(dir, "race-test.txt")}`
-      yield* llm.toolMatch((hit) => JSON.stringify(hit.body).includes("create the file"), "bash", {
-        command,
-        description: "create test file",
+      // Use the instant built-in mutation path this regression covers. A shell
+      // adds unrelated PowerShell and tree-sitter startup latency on Windows.
+      const filePath = path.join(dir, "race-test.txt")
+      yield* llm.toolMatch((hit) => JSON.stringify(hit.body).includes("create the file"), "write", {
+        filePath,
+        content: "snapshot race test content\n",
       })
-      yield* llm.textMatch((hit) => JSON.stringify(hit.body).includes("bash"), "done")
+      yield* llm.textMatch((hit) => JSON.stringify(hit.body).includes("write"), "done")
 
       // Seed user message
       yield* prompt.prompt({
@@ -260,13 +260,7 @@ it.live("tool execution produces non-empty session diff (snapshot race)", () =>
       expect(result.info.role).toBe("assistant")
 
       // Verify the file was created
-      const filePath = path.join(dir, "race-test.txt")
-      const fileExists = yield* Effect.promise(() =>
-        fs
-          .access(filePath)
-          .then(() => true)
-          .catch(() => false),
-      )
+      const fileExists = yield* Effect.promise(() => Bun.file(filePath).exists())
       expect(fileExists).toBe(true)
 
       // Verify the tool call completed (in the first assistant message)
@@ -276,7 +270,7 @@ it.live("tool execution produces non-empty session diff (snapshot race)", () =>
       )
       const tool = allMsgs
         .flatMap((m) => m.parts)
-        .find((p): p is SessionLegacy.ToolPart => p.type === "tool" && p.tool === "bash")
+        .find((p): p is SessionLegacy.ToolPart => p.type === "tool" && p.tool === "write")
       expect(tool?.state.status).toBe("completed")
       if (!user) throw new Error("Expected user message")
 

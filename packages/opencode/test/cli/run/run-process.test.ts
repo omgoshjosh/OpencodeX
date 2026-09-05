@@ -8,6 +8,10 @@ import { Effect } from "effect"
 import { cliIt } from "../../lib/cli-process"
 import { reply } from "../../lib/llm-server"
 
+// The harness gives hosted Windows children 90s to start and settle under
+// load, so Bun's outer deadline must leave enough room for scoped cleanup.
+const processTestTimeout = process.platform === "win32" ? 120_000 : 60_000
+
 describe("opencode run (non-interactive subprocess)", () => {
   // Happy path: prompt completes, output reaches stdout, process exits 0.
   // If this fails, all the others likely will too — debug here first.
@@ -23,7 +27,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         opencode.expectExit(result, 0)
         expect(result.stdout).toContain("hello from the test llm")
       }),
-    60_000,
+    processTestTimeout,
   )
 
   // Regression for #27371: an unknown model used to hang the process forever
@@ -59,7 +63,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         expect(result.exitCode).not.toBe(0)
         expect(result.stderr.trim()).not.toBe("")
       }),
-    60_000,
+    processTestTimeout,
   )
 
   cliIt.live(
@@ -104,6 +108,6 @@ describe("opencode run (non-interactive subprocess)", () => {
         const text = events.find((e) => e.type === "text")
         expect(text).toBeDefined()
       }),
-    60_000,
+    processTestTimeout,
   )
 })

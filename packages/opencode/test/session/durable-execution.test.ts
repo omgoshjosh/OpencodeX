@@ -15,6 +15,7 @@ import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Database } from "@opencode-ai/core/database/database"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
+import { ProjectV2 } from "@opencode-ai/core/project"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import {
   PermissionTable,
@@ -39,6 +40,7 @@ const env = Layer.mergeAll(
 const it = testEffect(env)
 
 const sessionID = SessionID.make("ses_durable")
+const projectID = ProjectV2.ID.make("prj_test")
 const output: SessionLegacy.WithParts = {
   info: {
     id: MessageID.make("msg_durable_assistant"),
@@ -136,7 +138,7 @@ const insertSession = Effect.fn("DurableExecutionTest.insertSession")(function* 
   yield* db
     .insert(ProjectTable)
     .values({
-      id: "prj_test" as never,
+      id: projectID,
       worktree: ctx.directory,
       sandboxes: [],
       time_created: now,
@@ -149,8 +151,8 @@ const insertSession = Effect.fn("DurableExecutionTest.insertSession")(function* 
     .insert(SessionTable)
     .values({
       id,
-      project_id: "prj_test" as never,
-      slug: `slug-${id}`,
+      project_id: projectID,
+      slug: id.replace("ses_", "slug-"),
       directory: ctx.directory,
       title: "Durable execution",
       version: "test",

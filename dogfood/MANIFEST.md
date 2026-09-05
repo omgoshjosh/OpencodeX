@@ -115,7 +115,7 @@ bun run lint:ci
 bun run surface:audit
 cd packages/core && bun test
 cd ../sdk/js && bun test
-cd ../../ && git diff --exit-code
+cd ../../.. && git diff --exit-code
 ```
 
 Record failures and environment limitations; do not weaken a gate to obtain a

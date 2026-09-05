@@ -210,6 +210,28 @@ export const opencodexProjectStateScenarios: Scenario[] = [
       "status",
     ),
   http.protected
+    .patch("/experimental/opencodex/session-state/{sessionID}", "opencodex.session_state.update")
+    .mutating()
+    .seeded((ctx) => ctx.session({ title: "OpencodeX session mark unread" }))
+    .at((ctx) => ({
+      path: route("/experimental/opencodex/session-state/{sessionID}", { sessionID: ctx.state.id }),
+      headers: ctx.headers(),
+      body: { markedUnread: true, expectedRevision: 0 },
+    }))
+    .json(
+      200,
+      (body, ctx) => {
+        object(body)
+        check(body.sessionID === ctx.state.id, "mark-unread should return the seeded session ID")
+        check(typeof body.markedUnreadAt === "number", "mark-unread should stamp markedUnreadAt with server time")
+        check(
+          body.markedUnreadAt === body.timeUpdated,
+          "mark-unread should stamp the mark with the revision it created",
+        )
+      },
+      "status",
+    ),
+  http.protected
     .post("/experimental/opencodex/session/move", "opencodex.session.move")
     .mutating()
     .seeded((ctx) => ctx.session({ title: "Move from missing project" }))

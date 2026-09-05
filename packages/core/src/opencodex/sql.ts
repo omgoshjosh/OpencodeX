@@ -65,6 +65,7 @@ export const OpencodeXSessionStateTable = sqliteTable(
       .references(() => SessionTable.id, { onDelete: "cascade" }),
     seen_at: integer(),
     reviewed_at: integer(),
+    marked_unread_at: integer(),
     reviewed_files: text({ mode: "json" }).$type<string[]>().notNull(),
     ...Timestamps,
   },

@@ -11,6 +11,7 @@ describe("opencodex session viewed state", () => {
           sessionID: "ses_review",
           seenAt: 20,
           reviewedAt: 30,
+          revision: 0,
           reviewedFiles: ["src/app.ts"],
           displayStatus: "needs_review",
           updated: true,
@@ -21,6 +22,7 @@ describe("opencodex session viewed state", () => {
     ).toEqual({
       sessionID: "ses_review",
       seenAt: 200,
+      revision: 0,
       reviewedAt: 30,
       reviewedFiles: ["src/app.ts"],
       displayStatus: "needs_review",
@@ -33,6 +35,7 @@ describe("opencodex session viewed state", () => {
       sessionID: "ses_review",
       seenAt: 20,
       reviewedAt: 30,
+      revision: 0,
       reviewedFiles: ["src/app.ts"],
       displayStatus: "needs_review" as const,
       updated: true,

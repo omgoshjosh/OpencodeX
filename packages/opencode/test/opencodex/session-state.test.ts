@@ -70,3 +70,34 @@ describe("deriveUiState", () => {
     ).toBe("in_progress")
   })
 })
+
+describe("deriveUiState mark-unread", () => {
+  test("an explicit mark keeps a fully-seen session unread", () => {
+    const state = deriveUiState({
+      session: session({ updated: 100 }),
+      permissions: [],
+      questions: [],
+      state: {
+        sessionID: "ses_root",
+        seenAt: 200,
+        markedUnreadAt: 300,
+        reviewedFiles: [],
+        timeUpdated: 300,
+      } as never,
+    })
+    expect(state.markedUnreadAt).toBe(300)
+    expect(state.updated).toBe(true)
+  })
+
+  test("a seen session with no mark reads as read, and carries the revision clients echo back", () => {
+    const state = deriveUiState({
+      session: session({ updated: 100 }),
+      permissions: [],
+      questions: [],
+      state: { sessionID: "ses_root", seenAt: 200, reviewedFiles: [], timeUpdated: 250 } as never,
+    })
+    expect(state.markedUnreadAt).toBeUndefined()
+    expect(state.updated).toBe(false)
+    expect(state.revision).toBe(250)
+  })
+})

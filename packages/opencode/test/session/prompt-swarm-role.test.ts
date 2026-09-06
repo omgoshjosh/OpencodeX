@@ -661,9 +661,9 @@ describe("foreground delegation never hangs on a lost hand-off", () => {
    * image and was about to describe it.
    */
   test("waits out a streaming image probe and returns its finished dominant-color report", async () => {
-    const image = {
-      type: "image" as const,
-      source: { type: "base64" as const, media_type: "image/png" as const, data: "cGluaw==" },
+    const image: ClaudeImage = {
+      type: "image",
+      source: { type: "base64", media_type: "image/png", data: "cGluaw==" },
     }
     const { runSwarmRole, childReads, promptParts } = harness({
       skills: {},

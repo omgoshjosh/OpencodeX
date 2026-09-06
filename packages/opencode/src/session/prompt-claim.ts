@@ -1,10 +1,11 @@
-import { and, asc, desc, eq, inArray, isNull, lt, min, or } from "drizzle-orm"
-import { Cause, Context, Duration, Effect, Exit, Fiber, Schedule, Scope } from "effect"
+import { and, asc, desc, eq, gt, inArray, isNull, lt, max, min, or } from "drizzle-orm"
+import { Cause, Context, Duration, Effect, Exit, Fiber, Schedule, Schema, Scope } from "effect"
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
 import { Database } from "@opencode-ai/core/database/database"
 import { NamedError } from "@opencode-ai/core/util/error"
 import {
   MessageTable,
+  PartTable,
   SessionCommandTable,
   SessionExecutionTable,
   SessionStatusTable,
@@ -29,7 +30,36 @@ export interface Deps {
   readonly clock?: () => number
   readonly recoveryInterval?: Duration.Input
   readonly beforeExecutionAdmission?: (input: { sessionID: SessionID; commandID: string }) => Effect.Effect<void>
+  /**
+   * How long a finished-but-unsettled execution may keep renewing its lease
+   * before the sweep force-settles it. Read per sweep so a config edit takes
+   * effect without a restart; `experimental.stale_execution_timeout` supplies
+   * it in production and tests inject a short one.
+   */
+  readonly staleExecutionMillis?: Effect.Effect<number>
+  /**
+   * Called after an execution is force-settled, so a delegated child still
+   * reports to its parent through the durable delegation delivery path.
+   */
+  readonly onStaleExecution?: (sessionID: SessionID) => Effect.Effect<void>
 }
+
+/** Matches `experimental.stale_execution_timeout`'s documented default. */
+export const STALE_EXECUTION_MILLIS = 600_000
+
+/** A tool the turn has not finished with; part data is opaque JSON in SQL. */
+const BusyToolPart = Schema.Struct({
+  type: Schema.Literal("tool"),
+  state: Schema.Struct({ status: Schema.Literals(["pending", "running"]) }),
+})
+const decodeBusyToolPart = Schema.decodeUnknownOption(BusyToolPart)
+
+/** An assistant turn that recorded its step-finish. */
+const FinishedAssistant = Schema.Struct({
+  role: Schema.Literal("assistant"),
+  time: Schema.Struct({ completed: Schema.Number }),
+})
+const decodeFinishedAssistant = Schema.decodeUnknownOption(FinishedAssistant)
 
 /**
  * Durable admission for queued prompts. A prompt is a row in
@@ -509,8 +539,173 @@ export function make(deps: Deps) {
       yield* Effect.forEach(commands, (command) => launchCommand(command.id), { discard: true })
     })
 
+    /**
+     * Force-settles an execution whose turn is demonstrably over but whose row
+     * never left `running`.
+     *
+     * The expired-lease reclaim above cannot see these: the owner is this live
+     * process and its heartbeat keeps renewing `lease_expires_at`, so the row
+     * looks busy forever. `/global/restart-readiness` counts exactly that shape
+     * as active work, so one stuck row blocks every cutover indefinitely.
+     *
+     * Settling is safe only with durable proof that nothing is in flight, so
+     * every condition below must hold: the session's newest message is an
+     * assistant turn that already recorded `time.completed` (a step-finish),
+     * none of its tool parts is still pending or running, and no message or
+     * part in the session has been written or updated for `staleExecutionMillis`.
+     * `session_execution.time_updated` is deliberately NOT an activity signal -
+     * it is the renewing heartbeat that hides the stall.
+     */
+    const sweepStaleExecutions = Effect.fn("SessionPrompt.sweepStaleExecutions")(function* () {
+      const ctx = yield* InstanceState.context
+      const staleAfter = yield* deps.staleExecutionMillis ?? Effect.succeed(STALE_EXECUTION_MILLIS)
+      if (staleAfter <= 0) return
+      const now = clock()
+      const candidates = yield* db
+        .select({
+          sessionID: SessionExecutionTable.session_id,
+          owner: SessionExecutionTable.owner_id,
+          generation: SessionExecutionTable.generation,
+          startedAt: SessionExecutionTable.started_at,
+        })
+        .from(SessionExecutionTable)
+        .where(
+          and(
+            eq(SessionExecutionTable.directory, ctx.directory),
+            eq(SessionExecutionTable.state, "running"),
+            // Only a lease that is still being renewed. An expired one is the
+            // existing reclaim's work, and racing it would replay a turn.
+            gt(SessionExecutionTable.lease_expires_at, now),
+          ),
+        )
+        .limit(recoveryBatchSize)
+        .all()
+        .pipe(Effect.orDie)
+      yield* Effect.forEach(
+        candidates,
+        (candidate) =>
+          Effect.gen(function* () {
+            // Another live process's run is its own business; only this
+            // instance can know its heartbeat outlived its work.
+            if (!candidate.owner?.startsWith(`local:${process.pid}:${processRunID}:`)) return
+            const message = yield* db
+              .select({ id: MessageTable.id, data: MessageTable.data, updated: MessageTable.time_updated })
+              .from(MessageTable)
+              .where(eq(MessageTable.session_id, candidate.sessionID))
+              .orderBy(desc(MessageTable.time_created), desc(MessageTable.id))
+              .limit(1)
+              .get()
+              .pipe(Effect.orDie)
+            // A newer user message means the next turn is already starting, and
+            // a missing `time.completed` means this one never step-finished.
+            if (!message || decodeFinishedAssistant(message.data)._tag === "None") return
+            const parts = yield* db
+              .select({ data: PartTable.data })
+              .from(PartTable)
+              .where(eq(PartTable.message_id, message.id))
+              .all()
+              .pipe(Effect.orDie)
+            if (parts.some((part) => decodeBusyToolPart(part.data)._tag === "Some")) return
+            const activity = yield* Effect.all(
+              [
+                db
+                  .select({ latest: max(PartTable.time_updated) })
+                  .from(PartTable)
+                  .where(eq(PartTable.session_id, candidate.sessionID))
+                  .get()
+                  .pipe(Effect.orDie),
+                db
+                  .select({ latest: max(MessageTable.time_updated) })
+                  .from(MessageTable)
+                  .where(eq(MessageTable.session_id, candidate.sessionID))
+                  .get()
+                  .pipe(Effect.orDie),
+              ],
+              { concurrency: "unbounded" },
+            )
+            const idleSince = Math.max(
+              candidate.startedAt ?? 0,
+              ...activity.map((row) => row?.latest ?? 0),
+              message.updated,
+            )
+            if (now - idleSince < staleAfter) return
+            // CAS on the exact row this pass inspected: a concurrent settle,
+            // a new generation, or a second sweep pass all lose here, so the
+            // notification below runs at most once per stuck run.
+            const settled = yield* db
+              .update(SessionExecutionTable)
+              .set({
+                // The transcript shows a clean finish, so this is the state a
+                // normally-released turn ends in (`SessionRunState.release`
+                // with `interrupted: false`). There is no `completed` state in
+                // this vocabulary and `interrupted` would falsely claim the
+                // work was aborted.
+                state: "idle",
+                owner_id: null,
+                lease_expires_at: null,
+                completed_at: now,
+                time_updated: now,
+              })
+              .where(
+                and(
+                  eq(SessionExecutionTable.session_id, candidate.sessionID),
+                  eq(SessionExecutionTable.state, "running"),
+                  eq(SessionExecutionTable.owner_id, candidate.owner),
+                  eq(SessionExecutionTable.generation, candidate.generation),
+                ),
+              )
+              .returning({ sessionID: SessionExecutionTable.session_id })
+              .get()
+              .pipe(Effect.orDie)
+            if (!settled) return
+            // The command that drove the finished turn is stuck the same way.
+            // Queued siblings are untouched: they are real work that becomes
+            // launchable now that the execution is free.
+            yield* db
+              .update(SessionCommandTable)
+              .set({
+                status: "cancelled",
+                owner_id: null,
+                lease_expires_at: null,
+                completed_at: now,
+                time_updated: now,
+              })
+              .where(
+                and(eq(SessionCommandTable.session_id, candidate.sessionID), eq(SessionCommandTable.status, "running")),
+              )
+              .run()
+              .pipe(Effect.orDie)
+            yield* Effect.logWarning("stale execution force-settled", {
+              sessionID: candidate.sessionID,
+              executionOwner: candidate.owner,
+              executionGeneration: candidate.generation,
+              messageID: message.id,
+              idleMillis: now - idleSince,
+              staleAfterMillis: staleAfter,
+              action: "force-settle",
+            })
+            if (deps.onStaleExecution)
+              yield* deps.onStaleExecution(candidate.sessionID).pipe(
+                Effect.catchCause((cause) =>
+                  Effect.logWarning("stale execution delegation settle failed", {
+                    sessionID: candidate.sessionID,
+                    cause,
+                  }),
+                ),
+              )
+          }),
+        { discard: true },
+      )
+    })
+
     const recover = Effect.fn("SessionPrompt.recover")(function* () {
       const ctx = yield* InstanceState.context
+      // First: a force-settled execution frees admission for the queued
+      // commands this same pass is about to launch. Isolated so a watchdog
+      // failure never costs the rest of the sweep.
+      yield* sweepStaleExecutions().pipe(
+        Effect.catchCause((cause) => Effect.logWarning("stale execution sweep failed", { cause })),
+      )
       const sessions = yield* db
         .select({ sessionID: SessionCommandTable.session_id, oldest: min(SessionCommandTable.time_created) })
         .from(SessionCommandTable)
@@ -684,6 +879,7 @@ export function make(deps: Deps) {
       launchCommand,
       wakeSession,
       recover,
+      sweepStaleExecutions,
       start,
     }
   })

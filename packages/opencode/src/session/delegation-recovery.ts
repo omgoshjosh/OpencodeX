@@ -27,6 +27,163 @@ export function make(deps: Deps) {
     const { db } = deps.database
     const processRunID = ensureRunID()
 
+    /**
+     * Settles and delivers one child's delegation run.
+     *
+     * `requireOwnerDead` is the restart witness: a record whose owning process
+     * is still alive normally means the run is genuinely in flight, and only a
+     * dead owner proves otherwise. The stale-execution watchdog is the one
+     * caller that can waive it - it has already force-settled the execution
+     * row on durable evidence the turn finished, so the live owner is a
+     * heartbeat that outlived its work rather than work in progress.
+     */
+    const recoverChild = Effect.fn("SessionDelegationRecovery.recoverChild")(function* (
+      childSessionID: SessionID,
+      options: { requireOwnerDead: boolean },
+    ) {
+      return yield* Effect.gen(function* () {
+        const found = yield* deps.sessions.get(childSessionID).pipe(Effect.option)
+        if (found._tag === "None") return
+        const child = found.value
+        const record = delegationRecord(child.metadata)
+        if (!record) return
+        const parent = yield* deps.sessions.get(SessionID.make(record.parentSessionID)).pipe(Effect.option)
+        const parentPart = parent._tag === "Some" ? yield* taskPart(deps.sessions, record, parent.value.id) : undefined
+        // Version-2 records written before `mode` are recoverable only when
+        // their durable parent task metadata proves they were background.
+        const legacyBackground =
+          parentPart?.metadata?.background === true ||
+          (parentPart !== undefined && "metadata" in parentPart.state && parentPart.state.metadata?.background === true)
+        const foreground = record.mode === "foreground"
+        if (record.mode !== "background" && !foreground && !legacyBackground) return
+        const message = record.childMessageID
+          ? (yield* deps.sessions.messageWithChildren({
+              sessionID: child.id,
+              messageID: MessageID.make(record.childMessageID),
+            })).find((item) => item.info.role === "assistant" && item.info.parentID === record.childMessageID)
+          : undefined
+        const reportText = message?.parts
+          .flatMap((part) => (part.type === "text" && !part.synthetic && part.text.trim() ? [part.text.trim()] : []))
+          .join("\n")
+        const report =
+          message?.info.role === "assistant" && message.info.error
+            ? [JSON.stringify(message.info.error), reportText].filter(Boolean).join("\n")
+            : reportText
+        if (record.phase === "running") {
+          const execution = yield* db
+            .select()
+            .from(SessionExecutionTable)
+            .where(eq(SessionExecutionTable.session_id, child.id))
+            .get()
+            .pipe(Effect.orDie)
+          const ownerAlive = !!record.ownerID && SessionExecutionOwner.alive(record.ownerID, processRunID)
+          const executionAlive =
+            execution?.state === "running" &&
+            !!execution.owner_id &&
+            !!execution.lease_expires_at &&
+            execution.lease_expires_at > Date.now() &&
+            SessionExecutionOwner.alive(execution.owner_id, processRunID)
+          // Either live witness is enough to leave the run untouched. A
+          // restart may settle only once both process identities are dead.
+          if (executionAlive) return
+          if (options.requireOwnerDead && ownerAlive) return
+
+          const outcome =
+            message?.info.role === "assistant" && message.info.time.completed
+              ? message.info.error || !report
+                ? "errored"
+                : message.info.finish === "abort"
+                  ? "cancelled"
+                  : ["stop", "length"].includes(message.info.finish ?? "")
+                    ? "completed"
+                    : "abandoned"
+              : "abandoned"
+          const summary =
+            outcome === "abandoned"
+              ? "Daemon restarted. Runtime execution cannot safely resume; do not assume completion or automatically repeat work/side effects. Inspect the child transcript and decide whether to verify, continue, or start a new attempt."
+              : report
+          yield* deps.sessions.stampDelegation({
+            sessionID: child.id,
+            record: settleDelegation(record, { outcome, summary, deliveryOutcome: "pending" }),
+            expectRunID: record.runID,
+          })
+          yield* deps.refresh(SessionID.make(record.parentSessionID))
+          if (parent._tag === "Some" && parentPart && !foreground)
+            yield* finalizeDanglingPart(deps.sessions, parentPart)
+        }
+
+        const settled = delegationRecord((yield* deps.sessions.get(child.id)).metadata)
+        // A reused child session may have started a newer run while this
+        // recovery pass was inspecting the old one. Never deliver the old
+        // transcript as the newer run's result when the settle CAS loses.
+        if (!settled || settled.runID !== record.runID || settled.phase !== "settled" || parent._tag !== "Some") return
+        // A foreground result is the parent task part itself. Repair it
+        // before honoring delivery evidence: the child can be marked
+        // delivered while its provider stream lost the terminal part frame.
+        if (foreground && parentPart) {
+          const repaired = yield* finalizeRecoveredPart(deps.sessions, parentPart, child.id, settled, report ?? "")
+          if (repaired !== "missing") {
+            yield* deps.sessions.stampDelegationDelivery({
+              sessionID: child.id,
+              runID: settled.runID,
+              outcome: "delivered",
+            })
+            yield* deps.refresh(parent.value.id)
+          }
+        }
+        if (settled.deliveryOutcome === "delivered" || foreground) return
+        const claim = yield* deps.sessions.claimDelegationDelivery({ sessionID: child.id, runID: settled.runID })
+        // `promptAsync` owns one command per deterministic message ID. The
+        // durable claim prevents concurrent recovery passes from entering
+        // it twice before that unique insertion can arbitrate.
+        if (!claim) return
+        const text = [
+          `Background delegation recovery for child ${child.id}, run ${settled.runID}.`,
+          report ?? settled.summary ?? `The child run is recorded as ${settled.outcome}.`,
+          settled.outcome === "abandoned"
+            ? "Daemon restarted, so runtime execution cannot safely resume. Do not assume completion or automatically repeat work/side effects; inspect the child transcript and decide whether to verify, continue, or start a new attempt."
+            : undefined,
+        ]
+          .filter(Boolean)
+          .join("\n\n")
+        const execution = yield* db
+          .select({
+            state: SessionExecutionTable.state,
+            cancelRequestedAt: SessionExecutionTable.cancel_requested_at,
+          })
+          .from(SessionExecutionTable)
+          .where(eq(SessionExecutionTable.session_id, parent.value.id))
+          .get()
+          .pipe(Effect.orDie)
+        const delivered = yield* deps
+          .notify({
+            sessionID: parent.value.id,
+            messageID: MessageID.make(`msg_delegation_recovery_${settled.runID}`),
+            text,
+            noReply: execution?.state === "interrupted" && !!execution.cancelRequestedAt,
+          })
+          .pipe(
+            Effect.as(true),
+            Effect.catchCause((cause) =>
+              Effect.logWarning("delegation recovery delivery failed", {
+                child: child.id,
+                runID: settled.runID,
+                cause,
+              }).pipe(Effect.as(false)),
+            ),
+          )
+        yield* deps.sessions.stampDelegationDelivery({
+          sessionID: child.id,
+          runID: settled.runID,
+          outcome: delivered ? "delivered" : "failed",
+          claimToken: claim,
+        })
+        yield* deps.refresh(parent.value.id)
+      }).pipe(
+        Effect.catchCause((cause) => Effect.logWarning("delegation recovery failed", { child: childSessionID, cause })),
+      )
+    })
+
     const recover = Effect.fn("SessionDelegationRecovery.recover")(function* () {
       const ctx = yield* InstanceState.context
       const children = yield* db
@@ -35,159 +192,22 @@ export function make(deps: Deps) {
         .where(and(eq(SessionTable.project_id, ctx.project.id), eq(SessionTable.directory, ctx.directory)))
         .all()
         .pipe(Effect.orDie)
-      yield* Effect.forEach(
-        children,
-        (row) =>
-          Effect.gen(function* () {
-            const found = yield* deps.sessions.get(row.id).pipe(Effect.option)
-            if (found._tag === "None") return
-            const child = found.value
-            const record = delegationRecord(child.metadata)
-            if (!record) return
-            const parent = yield* deps.sessions.get(SessionID.make(record.parentSessionID)).pipe(Effect.option)
-            const parentPart =
-              parent._tag === "Some" ? yield* taskPart(deps.sessions, record, parent.value.id) : undefined
-            // Version-2 records written before `mode` are recoverable only when
-            // their durable parent task metadata proves they were background.
-            const legacyBackground =
-              parentPart?.metadata?.background === true ||
-              (parentPart !== undefined &&
-                "metadata" in parentPart.state &&
-                parentPart.state.metadata?.background === true)
-            const foreground = record.mode === "foreground"
-            if (record.mode !== "background" && !foreground && !legacyBackground) return
-            const message = record.childMessageID
-              ? (yield* deps.sessions.messageWithChildren({
-                  sessionID: child.id,
-                  messageID: MessageID.make(record.childMessageID),
-                })).find((item) => item.info.role === "assistant" && item.info.parentID === record.childMessageID)
-              : undefined
-            const reportText = message?.parts
-              .flatMap((part) =>
-                part.type === "text" && !part.synthetic && part.text.trim() ? [part.text.trim()] : [],
-              )
-              .join("\n")
-            const report =
-              message?.info.role === "assistant" && message.info.error
-                ? [JSON.stringify(message.info.error), reportText].filter(Boolean).join("\n")
-                : reportText
-            if (record.phase === "running") {
-              const execution = yield* db
-                .select()
-                .from(SessionExecutionTable)
-                .where(eq(SessionExecutionTable.session_id, child.id))
-                .get()
-                .pipe(Effect.orDie)
-              const ownerAlive = !!record.ownerID && SessionExecutionOwner.alive(record.ownerID, processRunID)
-              const executionAlive =
-                execution?.state === "running" &&
-                !!execution.owner_id &&
-                !!execution.lease_expires_at &&
-                execution.lease_expires_at > Date.now() &&
-                SessionExecutionOwner.alive(execution.owner_id, processRunID)
-              // Either live witness is enough to leave the run untouched. A
-              // restart may settle only once both process identities are dead.
-              if (ownerAlive || executionAlive) return
-
-              const outcome =
-                message?.info.role === "assistant" && message.info.time.completed
-                  ? message.info.error || !report
-                    ? "errored"
-                    : message.info.finish === "abort"
-                      ? "cancelled"
-                      : ["stop", "length"].includes(message.info.finish ?? "")
-                        ? "completed"
-                        : "abandoned"
-                  : "abandoned"
-              const summary =
-                outcome === "abandoned"
-                  ? "Daemon restarted. Runtime execution cannot safely resume; do not assume completion or automatically repeat work/side effects. Inspect the child transcript and decide whether to verify, continue, or start a new attempt."
-                  : report
-              yield* deps.sessions.stampDelegation({
-                sessionID: child.id,
-                record: settleDelegation(record, { outcome, summary, deliveryOutcome: "pending" }),
-                expectRunID: record.runID,
-              })
-              yield* deps.refresh(SessionID.make(record.parentSessionID))
-              if (parent._tag === "Some" && parentPart && !foreground)
-                yield* finalizeDanglingPart(deps.sessions, parentPart)
-            }
-
-            const settled = delegationRecord((yield* deps.sessions.get(child.id)).metadata)
-            // A reused child session may have started a newer run while this
-            // recovery pass was inspecting the old one. Never deliver the old
-            // transcript as the newer run's result when the settle CAS loses.
-            if (!settled || settled.runID !== record.runID || settled.phase !== "settled" || parent._tag !== "Some")
-              return
-            // A foreground result is the parent task part itself. Repair it
-            // before honoring delivery evidence: the child can be marked
-            // delivered while its provider stream lost the terminal part frame.
-            if (foreground && parentPart) {
-              const repaired = yield* finalizeRecoveredPart(deps.sessions, parentPart, child.id, settled, report ?? "")
-              if (repaired !== "missing") {
-                yield* deps.sessions.stampDelegationDelivery({
-                  sessionID: child.id,
-                  runID: settled.runID,
-                  outcome: "delivered",
-                })
-                yield* deps.refresh(parent.value.id)
-              }
-            }
-            if (settled.deliveryOutcome === "delivered" || foreground) return
-            const claim = yield* deps.sessions.claimDelegationDelivery({ sessionID: child.id, runID: settled.runID })
-            // `promptAsync` owns one command per deterministic message ID. The
-            // durable claim prevents concurrent recovery passes from entering
-            // it twice before that unique insertion can arbitrate.
-            if (!claim) return
-            const text = [
-              `Background delegation recovery for child ${child.id}, run ${settled.runID}.`,
-              report ?? settled.summary ?? `The child run is recorded as ${settled.outcome}.`,
-              settled.outcome === "abandoned"
-                ? "Daemon restarted, so runtime execution cannot safely resume. Do not assume completion or automatically repeat work/side effects; inspect the child transcript and decide whether to verify, continue, or start a new attempt."
-                : undefined,
-            ]
-              .filter(Boolean)
-              .join("\n\n")
-            const execution = yield* db
-              .select({
-                state: SessionExecutionTable.state,
-                cancelRequestedAt: SessionExecutionTable.cancel_requested_at,
-              })
-              .from(SessionExecutionTable)
-              .where(eq(SessionExecutionTable.session_id, parent.value.id))
-              .get()
-              .pipe(Effect.orDie)
-            const delivered = yield* deps
-              .notify({
-                sessionID: parent.value.id,
-                messageID: MessageID.make(`msg_delegation_recovery_${settled.runID}`),
-                text,
-                noReply: execution?.state === "interrupted" && !!execution.cancelRequestedAt,
-              })
-              .pipe(
-                Effect.as(true),
-                Effect.catchCause((cause) =>
-                  Effect.logWarning("delegation recovery delivery failed", {
-                    child: child.id,
-                    runID: settled.runID,
-                    cause,
-                  }).pipe(Effect.as(false)),
-                ),
-              )
-            yield* deps.sessions.stampDelegationDelivery({
-              sessionID: child.id,
-              runID: settled.runID,
-              outcome: delivered ? "delivered" : "failed",
-              claimToken: claim,
-            })
-            yield* deps.refresh(parent.value.id)
-          }).pipe(
-            Effect.catchCause((cause) => Effect.logWarning("delegation recovery failed", { child: row.id, cause })),
-          ),
-        { concurrency: 4, discard: true },
-      )
+      yield* Effect.forEach(children, (row) => recoverChild(row.id, { requireOwnerDead: true }), {
+        concurrency: 4,
+        discard: true,
+      })
     })
-    return { recover }
+
+    /**
+     * Reports a child whose execution the stale-execution watchdog just
+     * force-settled. Same durable settle-and-deliver path as restart recovery,
+     * including the exactly-once delivery claim.
+     */
+    const settleFinished = Effect.fn("SessionDelegationRecovery.settleFinished")(function* (sessionID: SessionID) {
+      yield* recoverChild(sessionID, { requireOwnerDead: false })
+    })
+
+    return { recover, settleFinished }
   })
 }
 

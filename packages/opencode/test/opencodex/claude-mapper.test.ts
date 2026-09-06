@@ -6,6 +6,7 @@ import {
   initialState,
   mapEvent,
   normalizeToolName,
+  countRewakeableTasks,
   type ClaudeEvent,
   type MapperContext,
   type MapperState,
@@ -556,6 +557,35 @@ describe("background subagents keep the turn open", () => {
   // when they report back. Finishing on that first result is what flipped
   // sessions to idle mid-delegation and orphaned the continuation.
   const agentTask = { task_id: "a1", task_type: "local_agent", description: "probe agent" }
+  // #38 Task 19. A persistent `Monitor` is a `local_bash` task that runs until
+  // TaskStop or session end; nothing ever re-wakes the model for it, so
+  // counting it parked the turn - and the session's execution row - forever.
+  const shellTask = { task_id: "blbm0vycm", task_type: "local_bash", description: "PR checks settling" }
+
+  test("only re-wakeable tasks count as live background work", () => {
+    expect(countRewakeableTasks([shellTask])).toBe(0)
+    expect(countRewakeableTasks([{ task_id: "m1", task_type: "monitor_mcp" }])).toBe(0)
+    expect(countRewakeableTasks([{ task_id: "m2", task_type: "monitor_ws" }])).toBe(0)
+    expect(countRewakeableTasks([shellTask, agentTask])).toBe(1)
+    expect(countRewakeableTasks([{ task_id: "w1", task_type: "local_workflow" }])).toBe(1)
+    // Conservative on anything it cannot positively classify: an unrecognised
+    // or absent type keeps today's pause rather than dropping a real delegate.
+    expect(countRewakeableTasks([{ task_id: "x1", task_type: "future_agent" }])).toBe(1)
+    expect(countRewakeableTasks([{ task_id: "x2" }])).toBe(1)
+    expect(countRewakeableTasks(undefined)).toBe(0)
+  })
+
+  test("a result finishes the turn when only a shell monitor is live", () => {
+    const { writes, state } = run([
+      { type: "system", subtype: "init", session_id: "cc-1" },
+      { type: "assistant", message: { id: "m1", content: [{ type: "text", text: "737 verdict: report and stop." }] } },
+      { type: "system", subtype: "background_tasks_changed", tasks: [shellTask] } as ClaudeEvent,
+      { type: "result", subtype: "success", total_cost_usd: 0.02, usage: { input_tokens: 10, output_tokens: 5 } },
+    ])
+
+    expect(state.finished).toBe(true)
+    expect(messages(writes).at(-1)?.time.completed).toBeGreaterThan(0)
+  })
 
   test("a result while background tasks are live does not finish the turn", () => {
     const { writes, state } = run([

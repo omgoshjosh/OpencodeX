@@ -8,6 +8,7 @@ import { Permission } from "@/permission"
 import { Question } from "@/question"
 import { Session } from "@/session/session"
 import { Todo } from "@/session/todo"
+import { isBackgroundTaskWaitExpired } from "./claude-channel"
 import { ClaudeDriverMetadata } from "./claude-driver-metadata"
 import { ClaudeDelegate } from "./claude-delegate"
 import { ClaudeHandoff } from "./claude-handoff"
@@ -425,13 +426,15 @@ export function makeLayer(options: LayerOptions = {}) {
           void iterator.return?.().catch(() => undefined)
         })
         let deliveryFailed = false
+        let backgroundWaitExpired = false
         let offered: LiveQueueOffer | undefined
         let initialResult: SessionLegacy.WithParts | undefined
         const consume = Effect.gen(function* () {
           while (true) {
             const result = yield* Effect.promise(() => nextClaudeEvent(iterator))
             if ("failure" in result) {
-              deliveryFailed = true
+              if (isBackgroundTaskWaitExpired(result.failure)) backgroundWaitExpired = true
+              else deliveryFailed = true
               break
             }
             const next = result.next
@@ -496,6 +499,7 @@ export function makeLayer(options: LayerOptions = {}) {
             sessionID: input.sessionID,
             finished: live.finished,
             deliveryFailed,
+            backgroundWaitExpired,
           })
         })
         // Stopping the session interrupts this fiber, and interruption must reach
@@ -517,6 +521,20 @@ export function makeLayer(options: LayerOptions = {}) {
             }),
           ),
         )
+
+        // The drain deadline is a self-heal, not a failure. The model's report
+        // is already persisted, so close the turn on it - `finalizeAbandonedTurn`
+        // with no error stamps `time.completed` and flips `finished`, and the
+        // normal completion path below then runs unchanged. Reporting a delivery
+        // failure here hid a finished answer behind an error (#38 Task 19).
+        if (backgroundWaitExpired && !deliveryFailed && !live.finished) {
+          yield* Effect.uninterruptible(
+            Effect.gen(function* () {
+              yield* interruptTurn
+              yield* finalize("background-tasks-timeout")
+            }),
+          )
+        }
 
         if (deliveryFailed || !live.finished) {
           return yield* Effect.uninterruptible(

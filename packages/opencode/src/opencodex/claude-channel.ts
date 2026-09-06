@@ -1,8 +1,26 @@
 import type { SDKUserMessage } from "@anthropic-ai/claude-agent-sdk"
-import type { ClaudeEvent } from "./claude-mapper"
+import { countRewakeableTasks, type ClaudeEvent } from "./claude-mapper"
 import * as Log from "@opencode-ai/core/util/log"
 
 const log = Log.create({ service: "claude-channel" })
+
+/**
+ * The drain budget ran out with re-wakeable background tasks still live. Not a
+ * delivery failure: whatever the model already said is persisted, so the
+ * driver closes the turn on that report instead of stamping an error over a
+ * complete answer (#38 Task 19, same user-visible family as Task 14).
+ */
+export class BackgroundTaskWaitExpired extends Error {
+  readonly _tag = "BackgroundTaskWaitExpired"
+  constructor() {
+    super("Claude background tasks did not settle before timeout.")
+    this.name = "BackgroundTaskWaitExpired"
+  }
+}
+
+export function isBackgroundTaskWaitExpired(value: unknown): value is BackgroundTaskWaitExpired {
+  return value instanceof BackgroundTaskWaitExpired
+}
 
 /**
  * Persistent per-session Claude query channels (OpencodeX-div).
@@ -201,7 +219,10 @@ export class Channel<H> {
       return
     }
     if (eventType(event) === "system" && (event as { subtype?: string }).subtype === "background_tasks_changed") {
-      this.liveBackgroundTasks = Array.isArray(event.tasks) ? event.tasks.length : 0
+      // Shell/monitor tasks are excluded: nothing re-wakes the model for them,
+      // so counting one holds the turn open until the drain deadline at best
+      // and forever at worst (#38 Task 19).
+      this.liveBackgroundTasks = countRewakeableTasks(event.tasks)
       if (this.liveBackgroundTasks === 0 && this.backgroundWait === "drain") {
         this.backgroundWait = "final-output"
         this.clearBackgroundTaskWatchdog()
@@ -318,12 +339,19 @@ export class Channel<H> {
     this.armBackgroundTaskWatchdog(sink)
   }
 
+  /**
+   * The drain budget expired. The channel still goes down - the wait is over
+   * either way - but the turn ends on the report the model already produced,
+   * not on a delivery failure. Reporting "Claude response delivery failed
+   * before the turn completed" over a finished, persisted answer is the same
+   * false alarm Task 14 removed from the healthy-turn path.
+   */
   private failBackgroundTaskWait(sink: TurnSink) {
-    log.warn("background tasks did not settle; closing the channel", {
+    log.warn("background tasks did not settle; closing the channel on the persisted turn", {
       channel: this.key,
       liveBackgroundTasks: this.liveBackgroundTasks,
     })
-    sink.end({ failure: new Error("Claude background tasks did not settle before timeout.") })
+    sink.end({ failure: new BackgroundTaskWaitExpired() })
     void this.close()
   }
 

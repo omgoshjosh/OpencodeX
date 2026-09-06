@@ -2,6 +2,7 @@ import { describe, expect } from "bun:test"
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
 import { Effect, Layer, Option } from "effect"
 import { Agent } from "@/agent/agent"
+import { BackgroundTaskWaitExpired } from "@/opencodex/claude-channel"
 import { OpencodeXClaudeDriver } from "@/opencodex/claude-driver"
 import type { ClaudeMapper } from "@/opencodex/claude-mapper"
 import type { ClaudeImage, ClaudePrompt, ClaudeTransport, TransportOptions } from "@/opencodex/claude-transport"
@@ -489,6 +490,142 @@ describe("Claude driver delivery finalization", () => {
       expect(interrupts).toBe(0)
       expect(assistantInfo(result).error).toBeUndefined()
       expect(result.parts.map((part) => part.type)).toEqual(["step-start", "step-finish"])
+    }),
+  )
+})
+
+/**
+ * #38 Task 19. A persistent `Monitor` (`while true; do ...; sleep 45; done`)
+ * registers as a background task the CLI will never re-wake the model for, but
+ * the driver read the success `result` that followed as a pause. `finished`
+ * stayed false, the consume loop parked, the execution lease was renewed every
+ * 5s forever, and `session_execution` sat `state=running` with the parent never
+ * notified (live capture 2026-09-05 23:57:48 PDT, task `blbm0vycm`).
+ */
+describe("Claude driver background task holds", () => {
+  // The wire shape of a `Monitor`: the CLI models one as a `local_bash` task.
+  const shellTask = { task_id: "blbm0vycm", task_type: "local_bash", description: "Yondi lane-1 PR checks settling" }
+  const agentTask = { task_id: "a1", task_type: "local_agent", description: "probe agent" }
+  const successResult = {
+    type: "result" as const,
+    subtype: "success",
+    total_cost_usd: 0,
+    usage: { input_tokens: 1, output_tokens: 0 },
+  }
+  const say = (id: string, text: string): ClaudeMapper.ClaudeEvent => ({
+    type: "assistant",
+    message: { id, content: [{ type: "text", text }] },
+  })
+  const tasksChanged = (tasks: { task_id: string; task_type: string; description: string }[]) =>
+    ({ type: "system", subtype: "background_tasks_changed", tasks }) satisfies ClaudeMapper.ClaudeEvent
+
+  it.effect("finishes the turn while a persistent shell monitor is still running", () =>
+    Effect.gen(function* () {
+      reset(async function* () {
+        yield tasksChanged([shellTask])
+        yield say("m1", "737 verdict: report and stop.")
+        yield successResult
+      })
+
+      const result = yield* runTurn()
+
+      expect(assistantInfo(result).error).toBeUndefined()
+      expect(assistantInfo(result).time.completed).toEqual(expect.any(Number))
+      expect(result.parts.flatMap((part) => (part.type === "text" ? [part.text] : []))).toEqual([
+        "737 verdict: report and stop.",
+      ])
+    }),
+  )
+
+  it.effect("delivers the delegation report exactly once with a shell monitor live", () =>
+    Effect.gen(function* () {
+      reset(async function* () {
+        yield toolUse()
+        const report = await transportOptions!.delegate!.run(delegated)
+        yield {
+          type: "user" as const,
+          message: {
+            content: [{ type: "tool_result", tool_use_id: "toolu_1", content: report.ok ? report.text : "failed" }],
+          },
+        }
+        yield tasksChanged([shellTask])
+        yield say("m1", "the role reported")
+        yield successResult
+      })
+
+      const result = yield* runTurn({ delegate: { roles: [{ name: "Coder" }], run: () => stampChild } })
+
+      expect(assistantInfo(result).error).toBeUndefined()
+      expect(assistantInfo(result).time.completed).toEqual(expect.any(Number))
+      const tools = result.parts.filter((part) => part.type === "tool")
+      expect(tools).toHaveLength(1)
+      expect(tools[0]).toMatchObject({ callID: "toolu_1", state: { status: "completed", output: "the role's report" } })
+    }),
+  )
+
+  // REGRESSION GUARD: a backgrounded subagent does re-wake the model, so its
+  // result is still a pause. The whole wait stays one assistant message.
+  it.effect("still pauses the turn for a backgrounded subagent", () =>
+    Effect.gen(function* () {
+      reset(async function* () {
+        yield tasksChanged([agentTask])
+        yield say("m1", "Waiting for the agent")
+        yield successResult
+        yield say("m2", "FINISHED")
+        yield tasksChanged([])
+        yield successResult
+      })
+
+      const result = yield* runTurn()
+
+      expect(result.parts.flatMap((part) => (part.type === "text" ? [part.text] : []))).toEqual([
+        "Waiting for the agent",
+        "FINISHED",
+      ])
+      expect(assistantInfo(result).error).toBeUndefined()
+    }),
+  )
+
+  // Conservative classification: one re-wakeable task in the list is enough to
+  // keep the pause, however many shells sit beside it.
+  it.effect("keeps the pause when a subagent shares the list with a shell monitor", () =>
+    Effect.gen(function* () {
+      reset(async function* () {
+        yield tasksChanged([shellTask, agentTask])
+        yield say("m1", "Waiting for the agent")
+        yield successResult
+        yield say("m2", "FINISHED")
+        yield tasksChanged([shellTask])
+        yield successResult
+      })
+
+      const result = yield* runTurn()
+
+      expect(result.parts.flatMap((part) => (part.type === "text" ? [part.text] : []))).toEqual([
+        "Waiting for the agent",
+        "FINISHED",
+      ])
+    }),
+  )
+
+  // The 30-minute drain cap is a self-heal, not a delivery failure: the report
+  // is already on disk, so it must not be buried under an error (Task 14 family).
+  it.effect("closes the turn on the persisted report when the drain deadline expires", () =>
+    Effect.gen(function* () {
+      reset(async function* () {
+        yield tasksChanged([agentTask])
+        yield say("m1", "the report")
+        yield successResult
+        throw new BackgroundTaskWaitExpired()
+      })
+
+      const result = yield* runTurn()
+
+      expect(assistantInfo(result).error).toBeUndefined()
+      expect(assistantInfo(result).time.completed).toEqual(expect.any(Number))
+      expect(result.parts.flatMap((part) => (part.type === "text" ? [part.text] : []))).toEqual(["the report"])
+      // The channel is already down; the child is still interrupted so it stops.
+      expect(interrupts).toBe(1)
     }),
   )
 })

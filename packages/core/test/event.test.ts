@@ -277,10 +277,9 @@ describe("EventV2", () => {
       yield* events.listen((event) => Effect.sync(() => received.push(event)))
 
       const event = yield* db
-        .transaction(
-          () => events.commit(SyncMessage, { id: aggregateID, text: "committed" }),
-          { behavior: "immediate" },
-        )
+        .transaction(() => events.commit(SyncMessage, { id: aggregateID, text: "committed" }), {
+          behavior: "immediate",
+        })
         .pipe(Effect.orDie)
       expect(received).toEqual([])
       expect(
@@ -817,45 +816,62 @@ describe("EventV2", () => {
     }),
   )
 
-  // Task 21 Step 1 (https://github.com/ecgreen/OpencodeX/pull/38). Listeners run
+  // Task 23 Step 1 (https://github.com/ecgreen/OpencodeX/pull/38). Listeners run
   // INLINE inside the application barrier, so anything a listener awaits that
-  // itself needs the barrier has to be reentrant. It is not: `EffectBridge.make`
-  // captures its context once, outside any barrier
-  // (packages/opencode/src/effect/bridge.ts:55,60-70), so an effect run through
-  // `bridge.promise` starts on a fresh root fiber with InApplicationBarrier=false
-  // and blocks on the single permit that the outer publish still holds.
+  // itself needs the barrier has to be reentrant. Before the fix it was not:
+  // `EffectBridge.make` captured its context once, outside any barrier, so an
+  // effect run through `bridge.promise` started on a fresh root fiber with
+  // InApplicationBarrier=false and blocked on the single permit its own caller
+  // still held — unbounded, because that caller cannot release until the
+  // bridged call returns.
   //
-  // Skipped rather than weakened: this deadlocks on current code and is the
-  // acceptance test for the Step 1 reentrancy fix. Unskip it there, do not delete
-  // it, and do not relax the assertion to match today's behaviour. The TestClock
-  // timeout is what turns a regression into a failed assertion instead of a hung
-  // test run.
-  it.effect.skip("listener awaiting a bridged barrier acquisition completes (deadlocks until Task 21 Step 1)", () =>
+  // This is the core-side half of the acceptance test: it pins the invariant
+  // the fix relies on — a fresh root fiber handed the LIVE caller context IS
+  // reentrant, so conferring reentrancy is purely a matter of capturing the
+  // right context at call time. `packages/core` cannot import the bridge, so
+  // the fresh root fiber below mimics the fixed `EffectBridge.promise`
+  // (packages/opencode/src/effect/bridge.ts:63-93). The end-to-end regression
+  // test that runs the real bridge and fails without the fix lives in
+  // packages/opencode/test/effect/bridge-barrier.test.ts.
+  //
+  // Do not relax the assertion. The TestClock timeout is what turns a
+  // regression into a failed assertion instead of a hung test run. Pairs with
+  // "a bridged root fiber does not inherit barrier reentrancy" below, which
+  // pins the other half: no live context, no reentrancy.
+  it.effect("listener awaiting a bridged barrier acquisition completes", () =>
     Effect.gen(function* () {
       const events = yield* EventV2.Service
       const opened = yield* Deferred.make<void>()
-      const controller = new AbortController()
 
-      yield* events.listen(() => Deferred.await(opened))
+      // The inline listener holds the permit for as long as it awaits, exactly
+      // as a production listener that calls out through the bridge does.
+      yield* events.listen(() =>
+        Effect.gen(function* () {
+          const live = yield* Effect.context()
+          yield* Effect.promise(() =>
+            Effect.runPromise(
+              events.barrier(Deferred.succeed(opened, undefined), "test:bridged").pipe(Effect.provide(live)),
+            ),
+          )
+          return yield* Deferred.await(opened)
+        }),
+      )
 
       const publish = yield* events.publish(Message, { text: "inline listener" }).pipe(Effect.forkScoped)
-      yield* Effect.yieldNow
-
-      // Mimics EffectBridge.promise: a fresh root fiber that itself needs the barrier.
-      const bridged = Effect.runPromise(events.barrier(Deferred.succeed(opened, undefined)), {
-        signal: controller.signal,
-      }).catch(() => undefined)
-      // One real event-loop turn so the root fiber reaches its outcome before the
+      // Real event-loop turns so the root fiber reaches its outcome before the
       // TestClock below is allowed to fire the timeout.
       yield* Effect.promise(() => new Promise<void>((resolve) => setImmediate(resolve)))
+      yield* Effect.promise(() => new Promise<void>((resolve) => setImmediate(resolve)))
 
-      const settled = yield* Fiber.join(publish).pipe(Effect.timeout(Duration.seconds(30)), Effect.exit, Effect.forkScoped)
+      const settled = yield* Fiber.join(publish).pipe(
+        Effect.timeout(Duration.seconds(30)),
+        Effect.exit,
+        Effect.forkScoped,
+      )
       yield* Effect.yieldNow
       yield* TestClock.adjust(Duration.seconds(30))
       const exit = yield* Fiber.join(settled)
 
-      controller.abort()
-      yield* Effect.promise(() => bridged)
       expect(Exit.isSuccess(exit)).toBe(true)
     }),
   )

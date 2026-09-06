@@ -6,7 +6,10 @@ import { attachWith } from "./run-service"
 
 export interface Shape {
   readonly promise: <A, E, R>(effect: Effect.Effect<A, E, R>, options?: Effect.RunOptions) => Promise<A>
-  readonly promiseExit: <A, E, R>(effect: Effect.Effect<A, E, R>, options?: Effect.RunOptions) => Promise<Exit.Exit<A, E>>
+  readonly promiseExit: <A, E, R>(
+    effect: Effect.Effect<A, E, R>,
+    options?: Effect.RunOptions,
+  ) => Promise<Exit.Exit<A, E>>
   readonly fork: <A, E, R>(effect: Effect.Effect<A, E, R>) => Fiber.Fiber<A, E>
   readonly run: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E>
   readonly bind: <Args extends readonly unknown[], Result>(fn: (...args: Args) => Result) => (...args: Args) => Result
@@ -60,18 +63,45 @@ export function make(): Effect.Effect<Shape> {
     const workspace = (yield* WorkspaceRef) ?? captured.workspace
     const wrap = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
       attachWith(effect.pipe(Effect.provide(ctx)) as Effect.Effect<A, E>, { instance, workspace })
+    /**
+     * Same as `wrap`, plus the LIVE caller context as a fallback layer under
+     * the `make()`-time context.
+     *
+     * Every bridge entry point starts a fresh root fiber, so it inherits none
+     * of the caller's fiber-scoped state. `ctx` is captured once inside
+     * `make()` — outside any application barrier — so a bridged call made from
+     * inside `EventV2.barrier` loses that region's reentrancy reference and
+     * queues on the single process-wide permit its own caller is still
+     * holding. That wait is unbounded: the caller cannot release until the
+     * bridged call returns. Replaying the caller's live context at CALL time
+     * (not make() time) restores it.
+     *
+     * `ctx` stays innermost, so every service the bridge already resolved
+     * still wins; the live context only supplies what `ctx` never had.
+     *
+     * Deliberately only used by the AWAITED entry points (`promise`,
+     * `promiseExit`, `run`). `fork` must not get it: a concurrent bridged
+     * fiber inheriting barrier reentrancy would write outside the barrier and
+     * break the commit-then-broadcast ordering the permit exists to protect.
+     */
+    const wrapLive = <A, E, R>(effect: Effect.Effect<A, E, R>) => {
+      const fiber = Fiber.getCurrent()
+      if (!fiber) return wrap(effect)
+      return wrap(effect).pipe(Effect.provide(fiber.context))
+    }
 
     return {
       promise: <A, E, R>(effect: Effect.Effect<A, E, R>, options?: Effect.RunOptions) =>
-        restoreWorkspace(workspace, () => Effect.runPromise(wrap(effect), options)),
+        restoreWorkspace(workspace, () => Effect.runPromise(wrapLive(effect), options)),
       promiseExit: <A, E, R>(effect: Effect.Effect<A, E, R>, options?: Effect.RunOptions) =>
-        restoreWorkspace(workspace, () => Effect.runPromiseExit(wrap(effect), options)),
+        restoreWorkspace(workspace, () => Effect.runPromiseExit(wrapLive(effect), options)),
       fork: <A, E, R>(effect: Effect.Effect<A, E, R>) =>
         restoreWorkspace(workspace, () => Effect.runFork(wrap(effect))),
       run: <A, E, R>(effect: Effect.Effect<A, E, R>) =>
         Effect.callback<A, E>((resume) => {
+          const wrapped = wrapLive(effect)
           restoreWorkspace(workspace, () =>
-            Effect.runPromiseExit(wrap(effect)).then((exit) =>
+            Effect.runPromiseExit(wrapped).then((exit) =>
               resume(Exit.isSuccess(exit) ? Effect.succeed(exit.value) : Effect.failCause(exit.cause)),
             ),
           )

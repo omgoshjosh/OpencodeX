@@ -38,6 +38,23 @@ const MAINTENANCE_BATCH_SIZE = 5_000
  * alongside the `event_barrier_slow_hold` line that reports the same window.
  */
 const MAINTENANCE_SLOW_MS = 5_000
+/**
+ * Ceiling on how long one retention pass may pin the process-wide event barrier.
+ * The pass takes the barrier and then queues for the process's single SQLite
+ * connection, so an unrelated multi-second holder of that connection is charged
+ * to the barrier and delays every post-turn write behind it. Its own SQL is a
+ * bounded batch measured in milliseconds, so anything past this budget is
+ * somebody else's connection hold and is not worth blocking the process for.
+ */
+const MAINTENANCE_BUDGET_MS = 2_000
+/**
+ * Consecutive skipped passes before the log escalates. A single skip is healthy
+ * back-pressure — the pass is idempotent and the next one converges. A streak
+ * means retention is never running, so the journal grows unbounded. At the
+ * default 60s interval this fires after ~5 minutes of starvation, long enough to
+ * ride out any single burst of connection contention.
+ */
+const MAINTENANCE_SKIP_STREAK = 5
 const MAX_REPLAY_EVENTS = 512
 const DRAIN_EVENTS = 1_024
 const MAX_CURSOR_LENGTH = 4_096
@@ -57,6 +74,8 @@ export type StateLogOptions = {
   maxReplayEvents?: number
   drainEvents?: number
   maintenanceSlowMs?: number
+  maintenanceBudgetMs?: number
+  maintenanceSkipStreak?: number
 }
 
 export interface StateLog {
@@ -88,6 +107,8 @@ export const makeStateLog = Effect.fn("OpencodeXState.makeLog")(function* (
     maxReplayEvents: Math.max(1, options?.maxReplayEvents ?? MAX_REPLAY_EVENTS),
     drainEvents: Math.max(1, options?.drainEvents ?? DRAIN_EVENTS),
     maintenanceSlowMs: Math.max(0, options?.maintenanceSlowMs ?? MAINTENANCE_SLOW_MS),
+    maintenanceBudgetMs: Math.max(1, options?.maintenanceBudgetMs ?? MAINTENANCE_BUDGET_MS),
+    maintenanceSkipStreak: Math.max(1, options?.maintenanceSkipStreak ?? MAINTENANCE_SKIP_STREAK),
   }
   const listeners = new Array<{
     scope: OpencodeXStateScope
@@ -188,6 +209,11 @@ export const makeStateLog = Effect.fn("OpencodeXState.makeLog")(function* (
     return cursorAt(scope, yield* position(scope))
   })
 
+  // Skipped passes are only meaningful as a streak, so the count has to outlive
+  // a single pass. `maintain` is serialised by the barrier, so a plain counter
+  // is enough.
+  let skippedPasses = 0
+
   const maintain = Effect.fn("OpencodeXState.maintain")(function* () {
     // `event_barrier_slow_hold` reports only the total time this pass pins the
     // process-wide permit shut, and production showed holds up to 39.9s against
@@ -200,13 +226,29 @@ export const makeStateLog = Effect.fn("OpencodeXState.makeLog")(function* (
     //     bun:sqlite is synchronous — is charged to this pass.
     //   sql_ms   — the pass's own scans and delete. Bounded by maintenanceBatchSize.
     //   commit_ms — COMMIT, i.e. the WAL write.
+    //
+    // `maintenanceBudgetMs` caps the whole window. The pass is idempotent, runs
+    // on a forever-loop and deletes a bounded batch, so abandoning one costs
+    // nothing but a later convergence — far less than pinning every writer in
+    // the process behind somebody else's connection hold.
+    //
+    // Interruption boundary: only the connection reservation and the pass's own
+    // SQL are inside the interruptible window. `EffectSQLiteSession.withTransaction`
+    // (packages/effect-drizzle-sqlite/src/effect-sqlite/session.ts:119) runs the
+    // whole transaction under `Effect.uninterruptibleMask` and re-opens
+    // interruption for exactly two regions: the reservation (:146) and
+    // `restore(effect)`, the body (:162). `begin immediate`, `commit` and
+    // `rollback` are outside both, so a budget expiry can only land before
+    // `begin` — where nothing has been written — or inside the body, which then
+    // unwinds through the uninterruptible `rollback`. It can never land during
+    // `commit` and leave the shared connection with an open transaction.
     let began = 0
     let ended = 0
     let removed = 0
     yield* events.barrier(
       Effect.gen(function* () {
         const entered = yield* Clock.currentTimeMillis
-        yield* db
+        const completed = yield* db
           .transaction(
             (transaction) =>
               Effect.gen(function* () {
@@ -264,8 +306,23 @@ export const makeStateLog = Effect.fn("OpencodeXState.makeLog")(function* (
               ),
             { behavior: "immediate" },
           )
-          .pipe(Effect.orDie)
+          .pipe(Effect.orDie, Effect.timeoutOption(Duration.millis(settings.maintenanceBudgetMs)))
         const left = yield* Clock.currentTimeMillis
+        if (Option.isNone(completed)) {
+          skippedPasses += 1
+          // `began` stays 0 when the budget expired before `begin immediate`, so
+          // the whole window was the reservation.
+          const reserve = began === 0 ? left - entered : began - entered
+          const detail = `reserve_ms=${reserve} budget_ms=${settings.maintenanceBudgetMs} consecutive_skips=${skippedPasses} batch=${settings.maintenanceBatchSize}`
+          yield* skippedPasses < settings.maintenanceSkipStreak
+            ? Effect.logWarning(`state_maintain_skipped ${detail}`)
+            : // Retention has not run for `maintenanceSkipStreak` passes: the
+              // journal is growing unbounded, which is a different problem from
+              // one pass yielding to a busy connection.
+              Effect.logError(`state_maintain_starved ${detail}`)
+          return
+        }
+        skippedPasses = 0
         if (left - entered < settings.maintenanceSlowMs) return
         yield* Effect.logWarning(
           `state_maintain_slow_pass total_ms=${left - entered} reserve_ms=${began - entered} sql_ms=${ended - began} commit_ms=${left - ended} removed=${removed} batch=${settings.maintenanceBatchSize}`,

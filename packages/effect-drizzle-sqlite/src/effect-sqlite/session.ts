@@ -128,11 +128,24 @@ export class EffectSQLiteSession<TRelations extends AnyRelations> extends SQLite
             ? Effect.succeed([undefined, connectionOption.value[0]] as const)
             : Scope.make().pipe(
                 Effect.flatMap((scope) =>
-                  Scope.provide(this.client.reserve, scope).pipe(
+                  // `restore` re-opens interruption for the reservation only. A pool with a
+                  // single connection can keep a caller queued for seconds before `begin`
+                  // ever runs, and a caller that has already given up (timeout, client
+                  // disconnect) must be able to leave that queue instead of waiting for a
+                  // connection it will immediately roll back. `SqlClient.reserve`
+                  // implementations are expected to take their permit under their own
+                  // `uninterruptibleMask`, so the permit and its release finalizer are
+                  // registered together.
+                  //
+                  // `onExit` is applied outside `restore`, i.e. it is itself part of the
+                  // enclosing uninterruptible region: an interrupt delivered anywhere inside
+                  // the reservation — including at the instant the permit is handed over —
+                  // still closes the scope and releases it. Once the reservation returns the
+                  // fiber is uninterruptible again, so a reserved connection can never escape
+                  // this pipeline unreleased, and `begin`/`commit` below stay uninterruptible.
+                  Scope.provide(restore(this.client.reserve), scope).pipe(
+                    Effect.onExit((exit) => (Exit.isSuccess(exit) ? Effect.void : Scope.close(scope, exit))),
                     Effect.map((connection) => [scope, connection] as const),
-                    Effect.catch((error) =>
-                      Scope.close(scope, Exit.fail(error)).pipe(Effect.andThen(Effect.fail(error))),
-                    ),
                   ),
                 ),
               )

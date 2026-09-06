@@ -661,10 +661,10 @@ describe("foreground delegation never hangs on a lost hand-off", () => {
    * image and was about to describe it.
    */
   test("waits out a streaming image probe and returns its finished dominant-color report", async () => {
-    const image: ClaudeImage = {
+    const image = {
       type: "image",
       source: { type: "base64", media_type: "image/png", data: "cGluaw==" },
-    }
+    } satisfies ClaudeImage
     const { runSwarmRole, childReads, promptParts } = harness({
       skills: {},
       // The hand-off is lost, so only the durable poller can answer: nothing

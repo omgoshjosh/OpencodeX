@@ -1,6 +1,6 @@
 export * as EventV2 from "./event"
 
-import { Context, Effect, Layer, Option, PubSub, Schema, Semaphore, Stream } from "effect"
+import { Context, Effect, Fiber, Layer, Option, PubSub, Schema, Semaphore, Stream, Tracer } from "effect"
 import { eq } from "drizzle-orm"
 import { Database } from "./database/database"
 import { EventRetention } from "./event/retention"
@@ -61,6 +61,19 @@ export class InvalidSyncEventError extends Schema.TaggedErrorClass<InvalidSyncEv
 export function versionedType(type: string, version: number) {
   return `${type}.${version}`
 }
+
+/**
+ * Waiting or holding the application barrier longer than this is never normal —
+ * every legitimate holder is a short commit plus an inline broadcast.
+ */
+const BARRIER_SLOW_MS = 5_000
+/**
+ * Event listeners run INLINE inside the barrier (see `broadcastEvent`). Today's
+ * listeners are all non-blocking; one that ever awaits a bridged effect needing
+ * the barrier would wedge the process permanently, so make a slow one visible
+ * long before it becomes a deadlock.
+ */
+const LISTENER_SLOW_MS = 1_000
 
 export const registry = new Map<string, Definition>()
 const syncRegistry = new Map<string, Definition & { readonly sync: NonNullable<Definition["sync"]> }>()
@@ -137,7 +150,12 @@ export interface Interface {
   readonly all: () => Stream.Stream<Payload>
   readonly sync: (handler: Sync, filter?: SyncFilter) => Effect.Effect<Unsubscribe>
   readonly listen: (listener: Listener) => Effect.Effect<Unsubscribe>
-  readonly barrier: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>
+  /**
+   * Serializes the effect against every other application barrier acquisition
+   * in this process. `label` is a cheap operation tag used only by the stall
+   * instrumentation; omit it and the current tracing span name is used instead.
+   */
+  readonly barrier: <A, E, R>(effect: Effect.Effect<A, E, R>, label?: string) => Effect.Effect<A, E, R>
   readonly project: <D extends Definition>(definition: D, projector: Projector<D>) => Effect.Effect<void>
   readonly replay: (
     event: SerializedEvent,
@@ -274,10 +292,76 @@ export const layer = Layer.effect(
       })
     }
 
-    function barrier<A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> {
+    // Whoever currently owns the single permit. Four scalars rather than a
+    // snapshot object: `barrier` runs on every write in the process, so nothing
+    // here may allocate on the uncontended path. Reentrant calls return before
+    // touching these, and the permit itself serializes every write below.
+    let holderOp: string | undefined
+    let holderSpan: string | undefined
+    let holderFiber = -1
+    let holderSince = 0
+
+    const currentSpanName = () => {
+      const fiber = Fiber.getCurrent()
+      const span = fiber ? Context.getOrUndefined(fiber.context, Tracer.ParentSpan) : undefined
+      // ExternalSpan (an OTel span adopted from outside) carries no name.
+      return span && span._tag === "Span" ? span.name : undefined
+    }
+
+    function barrier<A, E, R>(effect: Effect.Effect<A, E, R>, label?: string): Effect.Effect<A, E, R> {
       return Effect.gen(function* () {
         if (yield* InApplicationBarrier) return yield* effect
-        return yield* applicationBarrier.withPermit(Effect.provideService(effect, InApplicationBarrier, true))
+        const fiber = Fiber.getCurrent()
+        const op = label ?? "anonymous"
+        const span = currentSpanName()
+        const fiberID = fiber?.id ?? -1
+        const requested = Date.now()
+        // Read the incumbent before queueing so the acquire-side warning can
+        // name the holder we were actually stuck behind.
+        const blockedByOp = holderOp
+        const blockedBySpan = holderSpan
+        const blockedByFiber = holderFiber
+        const blockedHeld = requested - holderSince
+        // A holder already past the threshold may never release, in which case
+        // the acquire-side warning below never runs. Name it from the waiter
+        // side while the stall is still in progress — this is the log line that
+        // identifies a multi-minute holder.
+        if (blockedByOp !== undefined && blockedHeld > BARRIER_SLOW_MS)
+          yield* Effect.logWarning(
+            `event_barrier_blocked waiter=${op} waiter_span=${span ?? "none"} waiter_fiber=${fiberID} holder=${blockedByOp} holder_span=${blockedBySpan ?? "none"} holder_fiber=${blockedByFiber} holder_held_ms=${blockedHeld}`,
+          )
+        let acquired = 0
+        // The bookkeeping lives inside the permit: releasing it first would let
+        // the next holder publish itself before this finalizer wiped the slot.
+        return yield* applicationBarrier.withPermit(
+          Effect.gen(function* () {
+            acquired = Date.now()
+            const waited = acquired - requested
+            holderOp = op
+            holderSpan = span
+            holderFiber = fiberID
+            holderSince = acquired
+            if (waited > BARRIER_SLOW_MS)
+              yield* Effect.logWarning(
+                `event_barrier_slow_acquire waiter=${op} waiter_span=${span ?? "none"} waiter_fiber=${fiberID} waited_ms=${waited} holder=${blockedByOp ?? "none"} holder_span=${blockedBySpan ?? "none"} holder_fiber=${blockedByFiber}`,
+              )
+            return yield* Effect.provideService(effect, InApplicationBarrier, true)
+          }).pipe(
+            Effect.onExit(() =>
+              Effect.suspend(() => {
+                const held = Date.now() - acquired
+                holderOp = undefined
+                holderSpan = undefined
+                holderFiber = -1
+                holderSince = 0
+                if (held <= BARRIER_SLOW_MS) return Effect.void
+                return Effect.logWarning(
+                  `event_barrier_slow_hold holder=${op} holder_span=${span ?? "none"} holder_fiber=${fiberID} held_ms=${held}`,
+                )
+              }),
+            ),
+          ),
+        )
       })
     }
 
@@ -294,7 +378,16 @@ export const layer = Layer.effect(
 
     function broadcastEvent<D extends Definition>(event: Payload<D>) {
       return Effect.gen(function* () {
-        for (const listener of listeners) yield* listener(event as Payload)
+        for (const listener of listeners) {
+          const started = Date.now()
+          yield* listener(event as Payload)
+          const elapsed = Date.now() - started
+          // Cold path only: identifying the listener is allowed to cost a scan.
+          if (elapsed > LISTENER_SLOW_MS)
+            yield* Effect.logWarning(
+              `event_barrier_slow_listener listener=${listener.name || listeners.indexOf(listener)} type=${event.type} elapsed_ms=${elapsed} holder=${holderOp ?? "none"} holder_span=${holderSpan ?? "none"} holder_fiber=${holderFiber}`,
+            )
+        }
         const pubsub = typed.get(event.type)
         if (pubsub) yield* PubSub.publish(pubsub, event as Payload)
         yield* PubSub.publish(all, event as Payload)
@@ -303,7 +396,7 @@ export const layer = Layer.effect(
     }
 
     function publishEvent<D extends Definition>(event: Payload<D>) {
-      return barrier(persistEvent(event).pipe(Effect.andThen(broadcastEvent(event))))
+      return barrier(persistEvent(event).pipe(Effect.andThen(broadcastEvent(event))), `publish:${event.type}`)
     }
 
     const payload = Effect.fn("EventV2.payload")(function* <D extends Definition>(
@@ -330,11 +423,11 @@ export const layer = Layer.effect(
     }
 
     function commit<D extends Definition>(definition: D, data: Data<D>, options?: PublishOptions) {
-      return barrier(payload(definition, data, options).pipe(Effect.tap(persistEvent)))
+      return barrier(payload(definition, data, options).pipe(Effect.tap(persistEvent)), `commit:${definition.type}`)
     }
 
     function broadcast<D extends Definition>(event: Payload<D>) {
-      return barrier(broadcastEvent(event))
+      return barrier(broadcastEvent(event), `broadcast:${event.type}`)
     }
 
     function replay(event: SerializedEvent, options?: { readonly publish?: boolean; readonly ownerID?: string }) {
@@ -367,6 +460,7 @@ export const layer = Layer.effect(
             }
           }
         }),
+        `replay:${event.type}`,
       )
     }
 
@@ -404,6 +498,7 @@ export const layer = Layer.effect(
           }
           return source
         }),
+        `replayAll:${events[0]?.type ?? "empty"}`,
       )
     }
 

@@ -9,7 +9,7 @@ import { ProjectV2 } from "@opencode-ai/core/project"
 import { WorkspaceV2 } from "@opencode-ai/core/workspace"
 import { InstanceRef, WorkspaceRef } from "@/effect/instance-ref"
 import { and, asc, desc, eq, gt, inArray, lt, lte, max, or } from "drizzle-orm"
-import { Duration, Effect, Option, Schedule, Schema, Semaphore } from "effect"
+import { Clock, Duration, Effect, Option, Schedule, Schema, Semaphore } from "effect"
 import {
   aggregateID,
   currentStateScope,
@@ -33,6 +33,11 @@ const RETENTION_MS = 7 * 24 * 60 * 60 * 1_000
 const RETENTION_EVENTS = 100_000
 const MAINTENANCE_INTERVAL_MS = 60_000
 const MAINTENANCE_BATCH_SIZE = 5_000
+/**
+ * Matches `BARRIER_SLOW_MS` in packages/core/src/event.ts so a slow pass emits
+ * alongside the `event_barrier_slow_hold` line that reports the same window.
+ */
+const MAINTENANCE_SLOW_MS = 5_000
 const MAX_REPLAY_EVENTS = 512
 const DRAIN_EVENTS = 1_024
 const MAX_CURSOR_LENGTH = 4_096
@@ -51,6 +56,7 @@ export type StateLogOptions = {
   maintenanceBatchSize?: number
   maxReplayEvents?: number
   drainEvents?: number
+  maintenanceSlowMs?: number
 }
 
 export interface StateLog {
@@ -81,6 +87,7 @@ export const makeStateLog = Effect.fn("OpencodeXState.makeLog")(function* (
     maintenanceBatchSize: Math.max(1, options?.maintenanceBatchSize ?? MAINTENANCE_BATCH_SIZE),
     maxReplayEvents: Math.max(1, options?.maxReplayEvents ?? MAX_REPLAY_EVENTS),
     drainEvents: Math.max(1, options?.drainEvents ?? DRAIN_EVENTS),
+    maintenanceSlowMs: Math.max(0, options?.maintenanceSlowMs ?? MAINTENANCE_SLOW_MS),
   }
   const listeners = new Array<{
     scope: OpencodeXStateScope
@@ -182,54 +189,88 @@ export const makeStateLog = Effect.fn("OpencodeXState.makeLog")(function* (
   })
 
   const maintain = Effect.fn("OpencodeXState.maintain")(function* () {
+    // `event_barrier_slow_hold` reports only the total time this pass pins the
+    // process-wide permit shut, and production showed holds up to 39.9s against
+    // a pass whose SQL measures ~13ms on the live 100k-row journal. The three
+    // phases have completely different causes, so split them:
+    //   reserve_ms — waiting for the process's single SQLite connection permit
+    //     (Semaphore(1) in packages/core/src/database/sqlite.bun.ts) plus BEGIN
+    //     IMMEDIATE. The barrier is already held here, so any unrelated holder
+    //     of that connection — or anything blocking the single JS thread, since
+    //     bun:sqlite is synchronous — is charged to this pass.
+    //   sql_ms   — the pass's own scans and delete. Bounded by maintenanceBatchSize.
+    //   commit_ms — COMMIT, i.e. the WAL write.
+    let began = 0
+    let ended = 0
+    let removed = 0
     yield* events.barrier(
-      db
-        .transaction(
-          (transaction) =>
-            Effect.gen(function* () {
-              const boundary = yield* transaction
-                .select({ position: OpencodeXStateEventTable.position })
-                .from(OpencodeXStateEventTable)
-                .orderBy(desc(OpencodeXStateEventTable.position))
-                .limit(1)
-                .offset(settings.retentionEvents - 1)
-                .get()
-              const expired = lt(OpencodeXStateEventTable.created_at, Date.now() - settings.retentionMs)
-              const removable = boundary
-                ? or(expired, lt(OpencodeXStateEventTable.position, boundary.position))
-                : expired
-              const rows = yield* transaction
-                .select({ position: OpencodeXStateEventTable.position })
-                .from(OpencodeXStateEventTable)
-                .where(removable)
-                .orderBy(asc(OpencodeXStateEventTable.position))
-                .limit(settings.maintenanceBatchSize)
-                .all()
-              if (rows.length === 0) return
-              const floor = Math.max(...rows.map((row) => row.position))
-              yield* transaction
-                .delete(OpencodeXStateEventTable)
-                .where(inArray(OpencodeXStateEventTable.position, rows.map((row) => row.position)))
-                .run()
-              const previous = yield* transaction
-                .select({ value: OpencodeXStateMetadataTable.value })
-                .from(OpencodeXStateMetadataTable)
-                .where(eq(OpencodeXStateMetadataTable.key, JOURNAL_RETENTION_KEY))
-                .get()
-              const previousFloor = Number(previous?.value ?? 0)
-              const nextFloor = Math.max(Number.isFinite(previousFloor) ? previousFloor : 0, floor)
-              yield* transaction
-                .insert(OpencodeXStateMetadataTable)
-                .values({ key: JOURNAL_RETENTION_KEY, value: String(nextFloor) })
-                .onConflictDoUpdate({
-                  target: OpencodeXStateMetadataTable.key,
-                  set: { value: String(nextFloor) },
-                })
-                .run()
-            }),
-          { behavior: "immediate" },
+      Effect.gen(function* () {
+        const entered = yield* Clock.currentTimeMillis
+        yield* db
+          .transaction(
+            (transaction) =>
+              Effect.gen(function* () {
+                began = yield* Clock.currentTimeMillis
+                const boundary = yield* transaction
+                  .select({ position: OpencodeXStateEventTable.position })
+                  .from(OpencodeXStateEventTable)
+                  .orderBy(desc(OpencodeXStateEventTable.position))
+                  .limit(1)
+                  .offset(settings.retentionEvents - 1)
+                  .get()
+                const expired = lt(OpencodeXStateEventTable.created_at, Date.now() - settings.retentionMs)
+                const removable = boundary
+                  ? or(expired, lt(OpencodeXStateEventTable.position, boundary.position))
+                  : expired
+                const rows = yield* transaction
+                  .select({ position: OpencodeXStateEventTable.position })
+                  .from(OpencodeXStateEventTable)
+                  .where(removable)
+                  .orderBy(asc(OpencodeXStateEventTable.position))
+                  .limit(settings.maintenanceBatchSize)
+                  .all()
+                if (rows.length === 0) return
+                removed = rows.length
+                const floor = Math.max(...rows.map((row) => row.position))
+                yield* transaction
+                  .delete(OpencodeXStateEventTable)
+                  .where(inArray(OpencodeXStateEventTable.position, rows.map((row) => row.position)))
+                  .run()
+                const previous = yield* transaction
+                  .select({ value: OpencodeXStateMetadataTable.value })
+                  .from(OpencodeXStateMetadataTable)
+                  .where(eq(OpencodeXStateMetadataTable.key, JOURNAL_RETENTION_KEY))
+                  .get()
+                const previousFloor = Number(previous?.value ?? 0)
+                const nextFloor = Math.max(Number.isFinite(previousFloor) ? previousFloor : 0, floor)
+                yield* transaction
+                  .insert(OpencodeXStateMetadataTable)
+                  .values({ key: JOURNAL_RETENTION_KEY, value: String(nextFloor) })
+                  .onConflictDoUpdate({
+                    target: OpencodeXStateMetadataTable.key,
+                    set: { value: String(nextFloor) },
+                  })
+                  .run()
+              }).pipe(
+                // Runs on both exits and before COMMIT, so an early return still
+                // separates the pass's own SQL from the commit that follows it.
+                Effect.ensuring(
+                  Effect.flatMap(Clock.currentTimeMillis, (now) =>
+                    Effect.sync(() => {
+                      ended = now
+                    }),
+                  ),
+                ),
+              ),
+            { behavior: "immediate" },
+          )
+          .pipe(Effect.orDie)
+        const left = yield* Clock.currentTimeMillis
+        if (left - entered < settings.maintenanceSlowMs) return
+        yield* Effect.logWarning(
+          `state_maintain_slow_pass total_ms=${left - entered} reserve_ms=${began - entered} sql_ms=${ended - began} commit_ms=${left - ended} removed=${removed} batch=${settings.maintenanceBatchSize}`,
         )
-        .pipe(Effect.orDie),
+      }),
     )
   })
 

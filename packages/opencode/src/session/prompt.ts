@@ -993,11 +993,19 @@ export const layer = Layer.effect(
       },
     )
 
+    // The watchdog reports a force-settled child through delegation recovery,
+    // which is built below because it needs `promptAsync`. Held in a ref so
+    // the two can reference each other without a construction cycle.
+    let settleFinishedDelegation: ((sessionID: SessionID) => Effect.Effect<void>) | undefined
     const { wakeSession, recover, cancelCommand, start } = yield* PromptClaim.make({
       database,
       events,
       scope,
       loop: (input) => loop(input),
+      staleExecutionMillis: config
+        .get()
+        .pipe(Effect.map((cfg) => cfg.experimental?.stale_execution_timeout ?? PromptClaim.STALE_EXECUTION_MILLIS)),
+      onStaleExecution: (sessionID) => (settleFinishedDelegation ? settleFinishedDelegation(sessionID) : Effect.void),
     })
 
     // Registered after PromptClaim's handler (registration order is run
@@ -1135,6 +1143,7 @@ export const layer = Layer.effect(
         }).pipe(Effect.orDie),
       refresh: status.refresh,
     })
+    settleFinishedDelegation = delegationRecovery.settleFinished
     const unregisterRecovery = SessionPromptRecovery.register(() =>
       start().pipe(Effect.andThen(delegationRecovery.recover()), Effect.andThen(recover)),
     )

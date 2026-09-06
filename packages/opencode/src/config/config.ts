@@ -300,6 +300,10 @@ export const Info = Schema.Struct({
         description:
           "Timeout in milliseconds between events on an LLM stream before the turn fails as retryable. Defaults to 300000.",
       }),
+      stale_execution_timeout: Schema.optional(PositiveInt).annotate({
+        description:
+          "Timeout in milliseconds a finished-but-unsettled session execution may keep renewing its lease before the recovery sweep force-settles it. Defaults to 600000.",
+      }),
       policies: Schema.optional(Schema.mutable(Schema.Array(ConfigExperimental.Policy))).annotate({
         description: "Policy statements applied to supported resources, such as provider access",
       }),

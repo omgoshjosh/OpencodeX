@@ -8,7 +8,7 @@ import { OpencodeXStateAggregateSequenceTable, OpencodeXStateEventTable } from "
 import { PluginV2 } from "@opencode-ai/core/plugin"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
 import { and, eq } from "drizzle-orm"
-import { Context, Effect, Layer, Schema } from "effect"
+import { Context, Effect, Layer, Logger, Schema } from "effect"
 import { makeStateLog } from "../../src/opencodex/state-log"
 import { OpencodeXPlugin } from "../../src/opencodex/plugin"
 import { OpencodeXSettings } from "../../src/opencodex/settings"
@@ -298,6 +298,84 @@ describe("OpencodeX state log", () => {
           .pipe(Effect.orDie, Effect.map((rows) => (rows.length === 1 ? true : undefined))),
         "state journal was not pruned by periodic maintenance",
       )
+    }),
+  )
+
+  /**
+   * https://github.com/ecgreen/OpencodeX/pull/38 Task 24. Production held the
+   * process-wide application barrier for up to 39.9s under
+   * `holder_span=OpencodeXState.maintain`. These two cover the question that
+   * finding raised: is the hold the pass's own work, and can the pass say so?
+   */
+  it.live("releases the barrier after one bounded batch instead of draining the backlog", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const eventLayer = EventV2.layer.pipe(Layer.provide(Layer.succeed(Database.Service, database)))
+      const events = Context.get(yield* Layer.build(eventLayer), EventV2.Service)
+      const log = yield* makeStateLog(database.db, events, {
+        retentionEvents: 1,
+        maintenanceBatchSize: 2,
+        maintenanceIntervalMs: 60_000,
+      })
+
+      yield* Effect.forEach(["a", "b", "c", "d", "e", "f", "g"], (id) => events.publish(GlobalInvalidation, { id }), {
+        discard: true,
+      })
+      const count = database.db
+        .select({ position: OpencodeXStateEventTable.position })
+        .from(OpencodeXStateEventTable)
+        .all()
+        .pipe(
+          Effect.orDie,
+          Effect.map((rows) => rows.length),
+        )
+      expect(yield* count).toBe(7)
+
+      // One pass takes the permit once and removes at most `maintenanceBatchSize`,
+      // leaving the rest for the next interval. A pass that drained the backlog
+      // would hold the barrier for time proportional to the journal.
+      yield* log.maintain()
+      expect(yield* count).toBe(5)
+
+      // The barrier is free between passes: a writer queued mid-backlog lands
+      // without waiting for retention to catch up.
+      yield* events.publish(GlobalInvalidation, { id: "queued" })
+      expect(yield* count).toBe(6)
+
+      yield* log.maintain()
+      expect(yield* count).toBe(4)
+    }),
+  )
+
+  it.live("attributes a slow maintenance pass to reserve, sql and commit", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const eventLayer = EventV2.layer.pipe(Layer.provide(Layer.succeed(Database.Service, database)))
+      const events = Context.get(yield* Layer.build(eventLayer), EventV2.Service)
+      const log = yield* makeStateLog(database.db, events, {
+        retentionEvents: 1,
+        maintenanceBatchSize: 2,
+        maintenanceIntervalMs: 60_000,
+        // Report every pass so the split is asserted without a wall-clock stall.
+        maintenanceSlowMs: 0,
+      })
+
+      yield* Effect.forEach(["a", "b", "c"], (id) => events.publish(GlobalInvalidation, { id }), { discard: true })
+      const logged: string[] = []
+      const capture = Logger.make<unknown, void>(({ message }) => {
+        logged.push(Array.isArray(message) ? message.map(String).join(" ") : String(message))
+      })
+      yield* log.maintain().pipe(Effect.provide(Logger.layer([capture])))
+
+      const line = logged.find((entry) => entry.includes("state_maintain_slow_pass"))
+      expect(line).toBeDefined()
+      const field = (name: string) => Number(line!.match(new RegExp(`${name}=(-?\\d+)`))?.[1])
+      expect(field("removed")).toBe(2)
+      expect(field("batch")).toBe(2)
+      // The phases partition the hold, so a hold that is not the pass's own SQL
+      // is visible as reserve or commit time rather than being unattributable.
+      expect(field("reserve_ms") + field("sql_ms") + field("commit_ms")).toBe(field("total_ms"))
+      for (const name of ["total_ms", "reserve_ms", "sql_ms", "commit_ms"]) expect(field(name)).toBeGreaterThanOrEqual(0)
     }),
   )
 

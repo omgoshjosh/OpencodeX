@@ -1,5 +1,5 @@
 import { describe, expect } from "bun:test"
-import { Deferred, Duration, Effect, Exit, Fiber, Layer, Schema, Stream } from "effect"
+import { Context, Deferred, Duration, Effect, Exit, Fiber, Layer, Schema, Stream } from "effect"
 import * as TestClock from "effect/testing/TestClock"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Database } from "@opencode-ai/core/database/database"
@@ -826,13 +826,14 @@ describe("EventV2", () => {
   // bridged call returns.
   //
   // This is the core-side half of the acceptance test: it pins the invariant
-  // the fix relies on — a fresh root fiber handed the LIVE caller context IS
-  // reentrant, so conferring reentrancy is purely a matter of capturing the
-  // right context at call time. `packages/core` cannot import the bridge, so
-  // the fresh root fiber below mimics the fixed `EffectBridge.promise`
-  // (packages/opencode/src/effect/bridge.ts:63-93). The end-to-end regression
-  // test that runs the real bridge and fails without the fix lives in
-  // packages/opencode/test/effect/bridge-barrier.test.ts.
+  // the fix relies on — a fresh root fiber handed ONLY the caller's
+  // `InApplicationBarrier` reference IS reentrant, so conferring reentrancy
+  // needs nothing else from the caller (notably not `Scope`, which must stay
+  // behind so a bridged call's resources do not outlive it). `packages/core`
+  // cannot import the bridge, so the fresh root fiber below mimics the fixed
+  // `EffectBridge.promise` (packages/opencode/src/effect/bridge.ts:88-97). The
+  // end-to-end regression test that runs the real bridge and fails without the
+  // fix lives in packages/opencode/test/effect/bridge-barrier.test.ts.
   //
   // Do not relax the assertion. The TestClock timeout is what turns a
   // regression into a failed assertion instead of a hung test run. Pairs with
@@ -847,10 +848,15 @@ describe("EventV2", () => {
       // as a production listener that calls out through the bridge does.
       yield* events.listen(() =>
         Effect.gen(function* () {
+          // Exactly what the fixed bridge confers: the caller's reentrancy
+          // reference read off the live fiber, and nothing else.
           const live = yield* Effect.context()
+          const reentrant = Context.getReferenceUnsafe(live, EventV2.InApplicationBarrier)
           yield* Effect.promise(() =>
             Effect.runPromise(
-              events.barrier(Deferred.succeed(opened, undefined), "test:bridged").pipe(Effect.provide(live)),
+              events
+                .barrier(Deferred.succeed(opened, undefined), "test:bridged")
+                .pipe(Effect.provideService(EventV2.InApplicationBarrier, reentrant)),
             ),
           )
           return yield* Deferred.await(opened)

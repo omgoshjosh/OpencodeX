@@ -384,11 +384,26 @@ export function make(deps: Deps) {
    * The report a finished child produced, read back from its transcript: the
    * last assistant message's visible text, or its error. Undefined while the
    * child has not answered at all.
+   *
+   * `requireFinished` additionally demands that the turn actually ended. Every
+   * other caller reads a transcript that is already over - a background job
+   * after its turn returned, recovery after the daemon came back - and must
+   * NOT ask for it, because a turn the daemon lost mid-stream never gets its
+   * completion stamp and would then be unreadable forever. The foreground
+   * poller is the one caller that reads WHILE the turn streams, and there a
+   * half-written reply is not an answer: the model's opening remark ("no image
+   * was attached", "let me check") is persisted the moment it streams, so
+   * without this the poller can hand the orchestrator a preamble as the
+   * delegate's report and interrupt the turn that was about to answer.
    */
-  const childReport = Effect.fnUntraced(function* (childSessionID: SessionID) {
+  const childReport = Effect.fnUntraced(function* (
+    childSessionID: SessionID,
+    options?: { requireFinished?: boolean },
+  ) {
     const messages = yield* sessions.messages({ sessionID: childSessionID }).pipe(Effect.orElseSucceed(() => []))
     const last = messages.findLast((message) => message.info.role === "assistant")
     if (!last || last.info.role !== "assistant") return undefined
+    if (options?.requireFinished && !last.info.error && last.info.time?.completed === undefined) return undefined
     if (last.info.error)
       return { state: "error" as const, text: ClaudeDelegate.failureMessage(ClaudeDelegate.failure("errored")) }
     const text = last.parts
@@ -453,12 +468,18 @@ export function make(deps: Deps) {
           return text ? { ok: true as const, text } : ClaudeDelegate.failure("empty-output")
         }
         // No stamp. The child's reply is persisted as its turn streams, well
-        // before the post-turn writes that stall, so a completed, error-free
+        // before the post-turn writes that stall, so a FINISHED, error-free
         // report that is STILL unstamped a whole poll later is a lost
         // hand-off, not a slow one - a healthy run settles in milliseconds.
         // An errored reply is left alone: the model-fallback chain may still
         // be working through it.
-        const report = yield* childReport(input.childSessionID)
+        // `requireFinished` is load-bearing: text alone is not an answer here.
+        // A turn's visible text is persisted as it streams, so a role that
+        // opens with a remark and then does the work (reads the attachment,
+        // calls a tool) publishes that remark immediately - and if a tool call
+        // holds the turn past two polls, an unguarded read would return the
+        // preamble as the report AND interrupt the turn that was answering.
+        const report = yield* childReport(input.childSessionID, { requireFinished: true })
         if (report?.state !== "completed") {
           reported = undefined
           continue

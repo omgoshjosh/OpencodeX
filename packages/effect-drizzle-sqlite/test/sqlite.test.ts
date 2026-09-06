@@ -185,21 +185,46 @@ test("a transaction queued for the connection can be interrupted before it begin
   )
 })
 
-// The interrupt window is the reservation only. Whichever side of the handover
-// it lands on, the permit has to come back, or the process deadlocks on the next
-// query.
-test("interrupting a queued transaction never leaks the connection permit", async () => {
+// The interrupt window is the reservation only. Whichever side of the handover it
+// lands on, the queued caller has to leave while the holder still holds — and the
+// permit has to come back, or the process deadlocks on the next query.
+//
+// The holder is parked on a `Deferred` rather than running a quick query, so the
+// queued fiber is genuinely blocked on the semaphore for every attempt; with a
+// fast holder the two rarely overlap and the assertions pass without the fix.
+// `Fiber.interrupt` awaits the interrupted fiber, so the interrupt is forked and
+// the exit awaited under a timeout: before the fix the reservation is
+// uninterruptible and that exit cannot arrive until the holder releases, so this
+// times out instead of hanging the suite.
+test("interrupting a queued transaction leaves the queue without leaking the connection permit", async () => {
   await run(
     Effect.gen(function* () {
       const db = yield* makeDb
-      for (let attempt = 0; attempt < 200; attempt++) {
-        const busy = yield* Effect.forkChild(db.transaction(() => db.select().from(users)))
-        const queued = yield* Effect.forkChild(db.transaction(() => db.select().from(users)))
-        // Vary how far the queued fiber has progressed when the interrupt lands.
+      for (let attempt = 0; attempt < 40; attempt++) {
+        const entered = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        const busy = yield* Effect.forkChild(
+          db.transaction(() => Effect.andThen(Deferred.succeed(entered, undefined), Deferred.await(release))),
+        )
+        yield* Deferred.await(entered)
+
+        const queued = yield* Effect.forkChild(db.transaction(() => db.insert(users).values({ name: "queued" })))
+        // Sweep how far the queued fiber has progressed when the interrupt lands:
+        // short of `semaphore.take`, parked on it, and mid-handover.
         for (let yields = 0; yields < attempt % 5; yields++) yield* Effect.yieldNow
-        yield* Fiber.interrupt(queued)
+
+        yield* Effect.forkChild(Fiber.interrupt(queued))
+        const exit = yield* Fiber.await(queued).pipe(
+          Effect.timeoutOrElse({ duration: "2 seconds", orElse: () => Effect.succeed(undefined) }),
+        )
+
+        // Release the holder before asserting so a failure reports rather than hangs.
+        yield* Deferred.succeed(release, undefined)
         yield* Fiber.join(busy)
+
+        expect(exit !== undefined && Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBe(true)
       }
+      // Every abandoned reservation returned its permit and none reached `begin`.
       yield* db.insert(users).values({ name: "Ada" })
       expect(yield* db.select().from(users)).toEqual([{ id: 1, name: "Ada" }])
     }),

@@ -5,7 +5,7 @@ import { expect, test } from "bun:test"
 import { SqliteClient } from "@effect/sql-sqlite-bun"
 import { eq, sql } from "drizzle-orm"
 import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core"
-import { Effect, Exit } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber } from "effect"
 import type { SqlClient as SqlClientService } from "effect/unstable/sql/SqlClient"
 import { EffectDrizzleSqlite } from "../src"
 
@@ -153,4 +153,55 @@ test("runs migrations once and records migration metadata", async () => {
   } finally {
     await rm(migrationsFolder, { recursive: true, force: true })
   }
+})
+
+// A pool with a single connection can keep a transaction queued for as long as
+// the current one runs. A caller that has already given up must be able to leave
+// that queue rather than wait for a connection it would immediately roll back.
+test("a transaction queued for the connection can be interrupted before it begins", async () => {
+  await run(
+    Effect.gen(function* () {
+      const db = yield* makeDb
+      const entered = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const holder = yield* Effect.forkChild(
+        db.transaction(() => Effect.andThen(Deferred.succeed(entered, undefined), Deferred.await(release))),
+      )
+      yield* Deferred.await(entered)
+
+      const queued = yield* Effect.forkChild(db.transaction(() => db.insert(users).values({ name: "queued" })))
+      yield* Effect.yieldNow
+      yield* Fiber.interrupt(queued)
+      const exit = yield* Fiber.await(queued)
+      expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBe(true)
+
+      yield* Deferred.succeed(release, undefined)
+      yield* Fiber.join(holder)
+
+      // The abandoned reservation released its permit and never reached `begin`.
+      yield* db.insert(users).values({ name: "Ada" })
+      expect(yield* db.select().from(users)).toEqual([{ id: 1, name: "Ada" }])
+    }),
+  )
+})
+
+// The interrupt window is the reservation only. Whichever side of the handover
+// it lands on, the permit has to come back, or the process deadlocks on the next
+// query.
+test("interrupting a queued transaction never leaks the connection permit", async () => {
+  await run(
+    Effect.gen(function* () {
+      const db = yield* makeDb
+      for (let attempt = 0; attempt < 200; attempt++) {
+        const busy = yield* Effect.forkChild(db.transaction(() => db.select().from(users)))
+        const queued = yield* Effect.forkChild(db.transaction(() => db.select().from(users)))
+        // Vary how far the queued fiber has progressed when the interrupt lands.
+        for (let yields = 0; yields < attempt % 5; yields++) yield* Effect.yieldNow
+        yield* Fiber.interrupt(queued)
+        yield* Fiber.join(busy)
+      }
+      yield* db.insert(users).values({ name: "Ada" })
+      expect(yield* db.select().from(users)).toEqual([{ id: 1, name: "Ada" }])
+    }),
+  )
 })

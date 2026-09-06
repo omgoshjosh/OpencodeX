@@ -805,9 +805,14 @@ function harness(input: {
           if (input.childStreamsThenFinishes) {
             const { streaming: opening, finished, finishAfterReads } = input.childStreamsThenFinishes
             if (childReads === 1) record(streaming(opening), "msg_user")
+            // The same message completes, exactly as a streaming turn does:
+            // it keeps its id and grows its text, and only now is stamped.
             if (childReads === finishAfterReads) {
-              const last = turn.at(-1)!
-              turn[turn.length - 1] = { ...success(finished), info: { ...last.info, ...success(finished).info } }
+              const previous = turn.at(-1)!
+              turn[turn.length - 1] = {
+                ...success(finished),
+                info: { ...success(finished).info, id: previous.info.id },
+              } as SessionLegacy.WithParts
             }
           }
           if (

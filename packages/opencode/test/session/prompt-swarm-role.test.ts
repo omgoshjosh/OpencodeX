@@ -645,6 +645,38 @@ describe("foreground delegation never hangs on a lost hand-off", () => {
     })
   })
 
+  /**
+   * The transcript fallback reads a turn that is still streaming, so "has
+   * visible text" is not "has answered". A role that opens with a remark and
+   * then does the work - reads the attachment it was handed, calls a tool -
+   * publishes that remark immediately and can sit on it for longer than two
+   * polls. Resolving there returns the preamble as the delegate's report and,
+   * because the poller wins the race, interrupts the turn that was answering:
+   * the orchestrator is told "no image was attached" by a child that had the
+   * image and was about to describe it.
+   */
+  test("waits out a streaming reply and returns the turn that finished, not its opening remark", async () => {
+    const { runSwarmRole, childReads } = harness({
+      skills: {},
+      // The hand-off is lost, so only the durable poller can answer: nothing
+      // but the transcript decides what this delegation returns.
+      promptResult: Effect.never,
+      foregroundPollIntervalMs: 1,
+      childStreamsThenFinishes: {
+        streaming: "I don't see an image attached",
+        finished: "I don't see an image attached - checking... the image is pink.",
+        // Far past the two identical polls an unguarded read would resolve on.
+        finishAfterReads: 6,
+      },
+    })
+    const call = (await handler(runSwarmRole)).run({ role: "Specialist", prompt: "Do the task." })
+
+    expect(await call).toEqual({ ok: true, text: "I don't see an image attached - checking... the image is pink." })
+    // It really did poll through the streaming window rather than resolve on
+    // the first stable read.
+    expect(childReads()).toBeGreaterThanOrEqual(6)
+  })
+
   test("a durably errored run resolves as a failure rather than hanging", async () => {
     const { runSwarmRole } = harness({
       skills: {},
@@ -730,6 +762,13 @@ function harness(input: {
    * the post-turn writes never land, so the record stays `running` forever.
    */
   childRepliesWithoutSettling?: string
+  /**
+   * A child whose turn streams a remark, holds it across several polls (a tool
+   * call, an attachment being read), and only then finishes with the real
+   * answer - while the in-memory hand-off is lost, so only the poller can
+   * answer. The finished reply keeps the streamed text, as a real turn does.
+   */
+  childStreamsThenFinishes?: { streaming: string; finished: string; finishAfterReads: number }
   foregroundPollIntervalMs?: number
 }) {
   const started: Array<{ id?: string; metadata?: Record<string, unknown>; run: Effect.Effect<string, unknown> }> = []
@@ -763,6 +802,14 @@ function harness(input: {
           childReads++
           if (childReads === 1 && input.childRepliesWithoutSettling !== undefined)
             record(success(input.childRepliesWithoutSettling), "msg_user")
+          if (input.childStreamsThenFinishes) {
+            const { streaming: opening, finished, finishAfterReads } = input.childStreamsThenFinishes
+            if (childReads === 1) record(streaming(opening), "msg_user")
+            if (childReads === finishAfterReads) {
+              const last = turn.at(-1)!
+              turn[turn.length - 1] = { ...success(finished), info: { ...last.info, ...success(finished).info } }
+            }
+          }
           if (
             input.durableSettleAfterReads !== undefined &&
             childReads > input.durableSettleAfterReads &&
@@ -919,7 +966,19 @@ function failure(code: string, parts: Array<Record<string, unknown>> = []): Sess
 
 function success(text: string): SessionLegacy.WithParts {
   return {
-    info: { role: "assistant", error: undefined },
+    info: { role: "assistant", error: undefined, time: { created: 0, completed: 1 } },
+    parts: [{ type: "text", text, synthetic: false }],
+  } as SessionLegacy.WithParts
+}
+
+/**
+ * A turn still in flight: its visible text is already persisted (that is how
+ * the transcript streams) but `time.completed` is not written until the turn
+ * ends. The durable poller has to tell this apart from a finished report.
+ */
+function streaming(text: string): SessionLegacy.WithParts {
+  return {
+    info: { role: "assistant", error: undefined, time: { created: 0 } },
     parts: [{ type: "text", text, synthetic: false }],
   } as SessionLegacy.WithParts
 }

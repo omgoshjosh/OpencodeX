@@ -828,11 +828,13 @@ function harness(input: {
             // The same message completes, exactly as a streaming turn does:
             // it keeps its id and grows its text, and only now is stamped.
             if (childReads === finishAfterReads) {
-              const previous = turn.at(-1)!
+              const previous = turn.at(-1)
+              if (!previous) throw new Error("expected the streaming child turn")
               turn[turn.length - 1] = {
+                ...previous,
                 ...success(finished),
                 info: { ...success(finished).info, id: previous.info.id },
-              } as SessionLegacy.WithParts
+              }
             }
           }
           if (
@@ -1002,10 +1004,11 @@ function success(text: string): SessionLegacy.WithParts {
  * ends. The durable poller has to tell this apart from a finished report.
  */
 function streaming(text: string): SessionLegacy.WithParts {
+  const result = success(text)
   return {
-    info: { role: "assistant", error: undefined, time: { created: 0 } },
-    parts: [{ type: "text", text, synthetic: false }],
-  } as SessionLegacy.WithParts
+    ...result,
+    info: { ...result.info, time: { created: 0 } },
+  }
 }
 
 function imageProbePassed(result: ClaudeDelegate.Result) {

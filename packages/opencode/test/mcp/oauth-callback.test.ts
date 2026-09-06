@@ -112,3 +112,59 @@ describe("McpOAuthCallback.ensureRunning", () => {
     expect(await canConnect("::1", port)).toBe(false)
   })
 })
+
+// Resolves to the rejection reason, or `undefined` if the promise fulfilled.
+async function settle(promise: Promise<unknown>): Promise<unknown> {
+  return promise.then(
+    () => undefined,
+    (error: unknown) => error,
+  )
+}
+
+describe("McpOAuthCallback.waitForCallback", () => {
+  afterEach(async () => {
+    await McpOAuthCallback.stop()
+  })
+
+  // `MCP.startAuth` creates the callback promise, opens a browser, and only then awaits
+  // it, so a `cancelPending` from a concurrent `MCP.removeAuth` can reject it while no
+  // handler is attached. An unhandled rejection is fatal by default under Bun and Node,
+  // so the rejection has to be observed by `waitForCallback` itself.
+  test("a cancellation before the caller awaits is not an unhandled rejection", async () => {
+    const unhandled: unknown[] = []
+    const onUnhandled = (reason: unknown) => unhandled.push(reason)
+    process.on("unhandledRejection", onUnhandled)
+
+    try {
+      const callback = McpOAuthCallback.waitForCallback("state-cancelled-early", "cancel-me")
+      McpOAuthCallback.cancelPending("cancel-me")
+
+      // An unhandled rejection is only reported once the microtask queue has drained.
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      expect(unhandled).toEqual([])
+
+      // The caller that awaits later still sees the cancellation.
+      expect(await settle(callback)).toEqual(new Error("Authorization cancelled"))
+    } finally {
+      process.off("unhandledRejection", onUnhandled)
+    }
+  })
+
+  test("a server stop before the caller awaits is not an unhandled rejection", async () => {
+    const unhandled: unknown[] = []
+    const onUnhandled = (reason: unknown) => unhandled.push(reason)
+    process.on("unhandledRejection", onUnhandled)
+
+    try {
+      const callback = McpOAuthCallback.waitForCallback("state-stopped-early", "stop-me")
+      await McpOAuthCallback.stop()
+
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      expect(unhandled).toEqual([])
+
+      expect(await settle(callback)).toEqual(new Error("OAuth callback server stopped"))
+    } finally {
+      process.off("unhandledRejection", onUnhandled)
+    }
+  })
+})

@@ -190,7 +190,7 @@ export async function ensureRunning(redirectUri?: string): Promise<void> {
 
 export function waitForCallback(oauthState: string, mcpName?: string): Promise<string> {
   if (mcpName) mcpNameToState.set(mcpName, oauthState)
-  return new Promise((resolve, reject) => {
+  const pending = new Promise<string>((resolve, reject) => {
     const timeout = setTimeout(() => {
       if (pendingAuths.has(oauthState)) {
         pendingAuths.delete(oauthState)
@@ -202,6 +202,16 @@ export function waitForCallback(oauthState: string, mcpName?: string): Promise<s
 
     pendingAuths.set(oauthState, { resolve, reject, timeout })
   })
+
+  // Callers hold this promise across other work before they await it: `MCP.startAuth`
+  // creates it, then opens a browser (up to ~500 ms of subprocess handling) and only
+  // then awaits it. `cancelPending` (reachable concurrently via `MCP.removeAuth`) and
+  // `stop` reject it synchronously, so a rejection can land while the promise still has
+  // no handler attached — an unhandled rejection, which is fatal by default under Bun
+  // and Node. Observe it here so the rejection is always handled. The promise returned
+  // is the same one, so a caller awaiting it later still sees the rejection.
+  pending.catch(() => {})
+  return pending
 }
 
 export function cancelPending(mcpName: string): void {

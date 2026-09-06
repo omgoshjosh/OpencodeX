@@ -1,7 +1,13 @@
 import { describe, expect, spyOn, test } from "bun:test"
 import type { SDKUserMessage } from "@anthropic-ai/claude-agent-sdk"
 import { create } from "@opencode-ai/core/util/log"
-import { Channel, createChannelRegistry, createPushable, type CreateQuery } from "../../src/opencodex/claude-channel"
+import {
+  Channel,
+  createChannelRegistry,
+  createPushable,
+  isBackgroundTaskWaitExpired,
+  type CreateQuery,
+} from "../../src/opencodex/claude-channel"
 import type { ClaudeEvent } from "../../src/opencodex/claude-mapper"
 
 type Handlers = { name: string }
@@ -52,6 +58,11 @@ function event(value: Record<string, unknown>): ClaudeEvent {
 function typeOf(value: ClaudeEvent) {
   return (value as unknown as { type?: string }).type
 }
+
+/** The wire shape of a `Monitor`/backgrounded `Bash`: a shell, not a delegate. */
+const shellTask = { task_id: "blbm0vycm", task_type: "local_bash", description: "PR checks settling" }
+/** A backgrounded subagent: the CLI re-wakes the model when it reports back. */
+const agentTask = { task_id: "a1", task_type: "local_agent", description: "probe agent" }
 
 const assistant = event({ type: "assistant", message: { content: [] } })
 const result = event({ type: "result", subtype: "success" })
@@ -171,6 +182,65 @@ describe("claude channel", () => {
 
     const seen = await collect(turn.events, 5)
     expect(seen.map(typeOf)).toEqual(["system", "result", "system", "assistant", "result"])
+  })
+
+  // #38 Task 19: a `Monitor` is a `local_bash` task the CLI never re-wakes the
+  // model for, so it must not open a drain wait the turn can die in.
+  test("does not wait out a shell monitor task after a success result", async () => {
+    const { create, emit } = fakeQuery()
+    const channel = new Channel<Handlers>("s1", create, { closeOutGraceMs: 20, backgroundTaskGraceMs: 50 })
+    const turn = channel.turn([user("wake")], { name: "t1" })
+    const seen: ClaudeEvent[] = []
+    let failure: unknown
+    // Stay attached past the drain deadline: breaking out early would detach
+    // the sink and hide the failure the deadline would otherwise raise.
+    void (async () => {
+      for await (const value of turn.events) seen.push(value)
+    })().catch((error: unknown) => {
+      failure = error
+    })
+    emit(event({ type: "system", subtype: "background_tasks_changed", tasks: [shellTask] }))
+    emit(assistant)
+    emit(result)
+    await new Promise((resolve) => setTimeout(resolve, 90))
+
+    // No drain wait was ever armed, so nothing ends the turn behind the model.
+    expect(failure).toBeUndefined()
+    expect(seen.map(typeOf)).toEqual(["system", "assistant", "result"])
+  })
+
+  // REGRESSION GUARD: a backgrounded subagent still holds the turn open.
+  test("keeps waiting for a live subagent task", async () => {
+    const { create, emit } = fakeQuery()
+    const channel = new Channel<Handlers>("s1", create, { closeOutGraceMs: 20, backgroundTaskGraceMs: 100 })
+    const turn = channel.turn([user("wake")], { name: "t1" })
+    emit(event({ type: "system", subtype: "background_tasks_changed", tasks: [shellTask, agentTask] }))
+    emit(result)
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    expect(channel.dead).toBe(false)
+    emit(event({ type: "system", subtype: "background_tasks_changed", tasks: [shellTask] }))
+    emit(assistant)
+    emit(result)
+
+    const seen = await collect(turn.events, 5)
+    expect(seen.map(typeOf)).toEqual(["system", "result", "system", "assistant", "result"])
+  })
+
+  // The drain cap ends the turn on what the model already said; the driver
+  // reads this sentinel and closes on the persisted report, not a failure.
+  test("ends the drain wait with the background-task sentinel, not a delivery failure", async () => {
+    const { create, emit } = fakeQuery()
+    const channel = new Channel<Handlers>("s1", create, { closeOutGraceMs: 100, backgroundTaskGraceMs: 20 })
+    const turn = channel.turn([user("wake")], { name: "t1" })
+    emit(event({ type: "system", subtype: "background_tasks_changed", tasks: [agentTask] }))
+    emit(result)
+
+    const failure = await collect(turn.events, 3).then(
+      () => undefined,
+      (error: unknown) => error,
+    )
+    expect(isBackgroundTaskWaitExpired(failure)).toBe(true)
+    await waitFor(() => channel.dead)
   })
 
   test("fails when background tasks settle without final output", async () => {

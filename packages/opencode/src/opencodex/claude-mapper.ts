@@ -194,6 +194,47 @@ export function normalizeToolName(name: string) {
 }
 
 /**
+ * Background task types that are a *shell*, not a delegate: a backgrounded
+ * `Bash` command and every flavour of `Monitor` (the CLI reports a monitor as
+ * a `local_bash` task with `kind: "monitor"`, and MCP/websocket monitors as
+ * `monitor_mcp`/`monitor_ws`). Nothing about them ever ends the model's turn -
+ * a `while true` monitor runs until `TaskStop` or session end - so treating
+ * one as a reason to hold the turn open parks it forever.
+ *
+ * Contrast with `local_agent`/`local_workflow`/`remote_agent`: those report
+ * back, the CLI re-wakes the model on the same stream, and the pause is real
+ * work in progress.
+ */
+const SHELL_TASK_TYPES = new Set(["local_bash", "monitor_mcp", "monitor_ws"])
+
+/**
+ * How many live background tasks can still re-wake the model, and so may hold
+ * a successful `result` open as a pause instead of the end of the turn.
+ *
+ * Deliberately conservative: a task is discounted only when its `task_type`
+ * positively identifies it as a shell/monitor. An unknown or missing type
+ * keeps today's pause behaviour, so a new re-wakeable task type cannot be
+ * silently dropped by a stale allow-list.
+ *
+ * Why it exists: on 2026-09-05 a Bowser Jr session started a persistent
+ * `Monitor` (`while true; do ... sleep 45; done`), finished its report at
+ * 23:57:48 PDT, and the success `result` was read as a pause because that
+ * monitor was still in the task list. `finished` never flipped, the driver's
+ * consume loop parked, the execution lease was renewed every 5s forever, and
+ * `session_execution` sat `state=running` with the parent never notified.
+ */
+export function countRewakeableTasks(tasks: unknown) {
+  if (!Array.isArray(tasks)) return 0
+  let count = 0
+  for (const task of tasks) {
+    const type = isRecord(task) ? task.task_type : undefined
+    if (typeof type === "string" && SHELL_TASK_TYPES.has(type)) continue
+    count += 1
+  }
+  return count
+}
+
+/**
  * Claude spells file params `file_path`/`notebook_path`; native tools and the
  * GUI title/detail registries read `filePath`. Mirror of the permission-layer
  * mapping in claude-permission.ts so transcript parts render like native ones.
@@ -231,8 +272,9 @@ export function mapEvent(
   if (event.type === "system" && event.subtype === "background_tasks_changed") {
     // Replace semantics per the SDK contract: the payload is every live
     // background task after the change, so a missed edge cannot wedge a
-    // stale count.
-    next.liveBackgroundTasks = Array.isArray(event.tasks) ? event.tasks.length : 0
+    // stale count. Only re-wakeable tasks count - a shell/monitor task can
+    // outlive the turn by design and must never hold it open.
+    next.liveBackgroundTasks = countRewakeableTasks(event.tasks)
     return { writes, state: next }
   }
 

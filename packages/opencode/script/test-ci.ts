@@ -32,6 +32,22 @@ const parallel = [...new Bun.Glob("**/*.test.{ts,tsx}").scanSync({ cwd: path.joi
   )
   .toSorted()
 
+/*
+ * bun's per-test timeout is a hang detector here, not a work budget. Measured on
+ * windows-latest across the two heaviest shards (2077 and 1867 cases): p50 1ms,
+ * p95 573ms/188ms, p99 1609ms/801ms, slowest *passing* case 19.2s. Nothing
+ * legitimate is within 10s of the 30s default.
+ *
+ * What does blow 30s there is a cold subprocess spawn. `tool.shell > basic
+ * [pwsh]` runs `echo test`; its `[powershell]` and `[cmd]` siblings take 1051ms
+ * and 371ms, yet the pwsh case -- the first pwsh.exe start in that process --
+ * has died at exactly 30000ms on four separate runs, reaped with a dangling
+ * child. Same shape as the ~3.3x CLI-startup stretch documented in
+ * cli-subprocess-suites.ts. A 30s cap on that runner fails healthy tests without
+ * catching anything; the 15-minute per-command watchdog in run() below is the
+ * hang detector that actually works.
+ */
+const testTimeout = Bun.env.OPENCODE_TEST_TIMEOUT_MS ?? (process.platform === "win32" ? "120000" : "30000")
 const shards = shardByArea(parallel)
 const selectedAreas = new Set((Bun.env.OPENCODE_TEST_ONLY_AREAS ?? "").split(",").filter(Boolean))
 const selected = selectedAreas.size === 0 ? shards : shards.filter((shard) => selectedAreas.has(shard.area))
@@ -50,7 +66,7 @@ await pooled(selected, concurrency, async (shard, index) => {
     "test",
     ...shard.files,
     "--timeout",
-    "30000",
+    testTimeout,
     "--max-concurrency",
     Bun.env.OPENCODE_TEST_FILE_CONCURRENCY ?? "1",
     "--reporter",
@@ -92,7 +108,7 @@ function serial(target: string, report: string, options: string[] = []) {
     ...options,
     target,
     "--timeout",
-    "30000",
+    testTimeout,
     "--max-concurrency",
     "1",
     "--reporter",
@@ -103,6 +119,12 @@ function serial(target: string, report: string, options: string[] = []) {
 }
 
 function shardByArea(files: string[]) {
+  // A file count alone does not bound a shard's cost: `tool` is 24 files, which
+  // cut into two 12-file parts measuring 202-214s and 69-71s on windows-latest.
+  // The long half was the pool's critical path at 1.7x the next-biggest shard,
+  // spawning pwsh/git/LSP children for three and a half unbroken minutes. Cut an
+  // area into enough parts to also bound its estimated seconds.
+  const maxShardSeconds = Number(Bun.env.OPENCODE_TEST_SHARD_SECONDS ?? 90)
   const byArea = Map.groupBy(files, (file) => file.slice("test/".length).split("/")[0] ?? "root")
   return [...byArea.entries()]
     .toSorted((left, right) => {
@@ -110,31 +132,52 @@ function shardByArea(files: string[]) {
       return size === 0 ? left[0].localeCompare(right[0]) : size
     })
     .flatMap(([area, areaFiles]) => {
-      const parts = Math.ceil(areaFiles.length / Number(Bun.env.OPENCODE_TEST_SHARD_SIZE ?? 12))
+      const parts = Math.min(
+        areaFiles.length,
+        Math.max(
+          Math.ceil(areaFiles.length / Number(Bun.env.OPENCODE_TEST_SHARD_SIZE ?? 12)),
+          Math.ceil(estimatedSeconds(area) / maxShardSeconds),
+        ),
+      )
       return Array.from({ length: parts }, (_, index) => ({
         area,
         part: index + 1,
         parts,
+        // The pool schedules shards, not areas, so order on what a single shard
+        // is expected to cost. Ordering on the area total put every `tool` shard
+        // at the front of the queue, co-scheduling the spawn-heavy suites.
+        seconds: estimatedSeconds(area) / parts,
         files: areaFiles.filter((_, fileIndex) => fileIndex % parts === index),
       }))
     })
-    .toSorted((left, right) => estimatedSeconds(right.area) - estimatedSeconds(left.area))
+    .toSorted((left, right) => right.seconds - left.seconds)
 }
 
+// Wall-clock seconds for the whole area on the Windows runner, which is the
+// slower of the two platforms and the one that sets the critical path. These
+// were guesses and had drifted far enough to mis-schedule the pool -- `server`
+// was 70 against a measured 405 and `tool` 65 against 285. Re-read them off the
+// `[test:ci] PASS parallel shard` lines of a green `unit (windows)` job when
+// they drift again; the values below come from job 101450360346.
 function estimatedSeconds(area: string) {
   return (
     {
-      snapshot: 240,
-      project: 220,
-      file: 130,
-      provider: 110,
-      config: 90,
-      server: 70,
-      tool: 65,
-      session: 50,
-      "control-plane": 45,
-      permission: 25,
-      plugin: 20,
+      server: 405,
+      tool: 285,
+      session: 130,
+      snapshot: 118,
+      provider: 89,
+      "control-plane": 81,
+      project: 78,
+      opencodex: 74,
+      cli: 72,
+      config: 71,
+      permission: 53,
+      plugin: 50,
+      file: 39,
+      skill: 35,
+      agent: 26,
+      lsp: 22,
     }[area] ?? 10
   )
 }
@@ -176,10 +219,7 @@ async function run(label: string, command: string[]) {
   const timedOut = Symbol("timed-out")
   const deadline = Promise.withResolvers<typeof timedOut>()
   const timeout = setTimeout(() => deadline.resolve(timedOut), timeoutMs)
-  const code = await Promise.race([
-    child.exited,
-    deadline.promise,
-  ]).finally(() => {
+  const code = await Promise.race([child.exited, deadline.promise]).finally(() => {
     clearInterval(heartbeat)
     clearTimeout(timeout)
   })
@@ -201,7 +241,10 @@ async function run(label: string, command: string[]) {
 }
 
 async function printFailureLogs(log: string) {
-  const [stdout, stderr] = await Promise.all([Bun.file(`${log}.stdout.log`).text(), Bun.file(`${log}.stderr.log`).text()])
+  const [stdout, stderr] = await Promise.all([
+    Bun.file(`${log}.stdout.log`).text(),
+    Bun.file(`${log}.stderr.log`).text(),
+  ])
   if (stdout) console.error(stdout)
   if (stderr) console.error(stderr)
 }

@@ -118,6 +118,20 @@ export function definitions() {
   return registry.values().toArray()
 }
 
+/**
+ * Set on the fiber that holds the application barrier permit (see `barrier`
+ * below), so nested writes on that fiber and its children pass straight
+ * through instead of deadlocking on the permit their own caller holds.
+ *
+ * Exported only so `EffectBridge` can confer it across the fresh root fiber it
+ * starts for an AWAITED bridged call; it is keyed by name, so reading it off a
+ * live fiber's context is equivalent to reading the layer's own reference.
+ * Nothing outside the barrier machinery should provide it.
+ */
+export const InApplicationBarrier = Context.Reference<boolean>("@opencode/Event/InApplicationBarrier", {
+  defaultValue: () => false,
+})
+
 export interface PublishOptions {
   readonly id?: ID
   readonly metadata?: Record<string, unknown>
@@ -180,9 +194,6 @@ export const layer = Layer.effect(
     const listeners = new Array<Listener>()
     const syncHandlers = new Array<{ handler: Sync; filter?: SyncFilter }>()
     const applicationBarrier = Semaphore.makeUnsafe(1)
-    const InApplicationBarrier = Context.Reference<boolean>("@opencode/Event/InApplicationBarrier", {
-      defaultValue: () => false,
-    })
     const { db } = yield* Database.Service
 
     const getOrCreate = (definition: Definition) =>

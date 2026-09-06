@@ -3,6 +3,7 @@ import { Deferred, Effect, Exit, Option } from "effect"
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
 import { EffectBridge } from "../../src/effect/bridge"
 import { ClaudeDelegate } from "../../src/opencodex/claude-delegate"
+import type { ClaudeImage } from "../../src/opencodex/claude-transport"
 import * as PromptSwarm from "../../src/session/prompt-swarm"
 import type { DelegationOutcome, DelegationRecord } from "../../src/session/delegation-outcome"
 import { SessionID } from "../../src/session/schema"
@@ -564,7 +565,10 @@ function toolPart(input: { id: string; callID: string }) {
 describe("foreground delegation never hangs on a lost hand-off", () => {
   const specialist = [role({ name: "Specialist", skill: null, instructions: "" })]
 
-  const handler = async (runSwarmRole: ReturnType<typeof PromptSwarm.make>["runSwarmRole"]) =>
+  const handler = async (
+    runSwarmRole: ReturnType<typeof PromptSwarm.make>["runSwarmRole"],
+    images?: readonly ClaudeImage[],
+  ) =>
     ClaudeDelegate.capability(await Effect.runPromise(EffectBridge.make()), {
       roles: [{ name: "Specialist" }],
       run: (callInput) =>
@@ -574,6 +578,7 @@ describe("foreground delegation never hangs on a lost hand-off", () => {
           roles: specialist,
           role: callInput.role,
           prompt: callInput.prompt,
+          ...(images ? { images } : {}),
         }),
     })
 
@@ -655,23 +660,38 @@ describe("foreground delegation never hangs on a lost hand-off", () => {
    * the orchestrator is told "no image was attached" by a child that had the
    * image and was about to describe it.
    */
-  test("waits out a streaming reply and returns the turn that finished, not its opening remark", async () => {
-    const { runSwarmRole, childReads } = harness({
+  test("waits out a streaming image probe and returns its finished dominant-color report", async () => {
+    const image = {
+      type: "image" as const,
+      source: { type: "base64" as const, media_type: "image/png" as const, data: "cGluaw==" },
+    }
+    const { runSwarmRole, childReads, promptParts } = harness({
       skills: {},
       // The hand-off is lost, so only the durable poller can answer: nothing
       // but the transcript decides what this delegation returns.
       promptResult: Effect.never,
       foregroundPollIntervalMs: 1,
       childStreamsThenFinishes: {
-        streaming: "I don't see an image attached",
-        finished: "I don't see an image attached - checking... the image is pink.",
+        streaming: "Let me inspect the image.",
+        finished: "The dominant color is pink.",
         // Far past the two identical polls an unguarded read would resolve on.
         finishAfterReads: 6,
       },
     })
-    const call = (await handler(runSwarmRole)).run({ role: "Specialist", prompt: "Do the task." })
+    const call = (await handler(runSwarmRole, [image])).run({
+      role: "Specialist",
+      prompt: "What is the dominant color?",
+    })
 
-    expect(await call).toEqual({ ok: true, text: "I don't see an image attached - checking... the image is pink." })
+    // This is the production shape: the orchestrator's native image reaches
+    // the child as a persisted file part before its foreground reply streams.
+    expect(promptParts[0]).toContainEqual({ type: "file", mime: "image/png", url: "data:image/png;base64,cGluaw==" })
+    const report = await call
+    expect(report).toEqual({ ok: true, text: "The dominant color is pink." })
+    // A no-image preamble used to be returned as the report and falsely made
+    // this probe green. The completed answer must actually interpret the image.
+    expect(imageProbePassed(report)).toBe(true)
+    expect(imageProbePassed({ ok: true, text: "No image attached." })).toBe(false)
     // It really did poll through the streaming window rather than resolve on
     // the first stable read.
     expect(childReads()).toBeGreaterThanOrEqual(6)
@@ -986,4 +1006,8 @@ function streaming(text: string): SessionLegacy.WithParts {
     info: { role: "assistant", error: undefined, time: { created: 0 } },
     parts: [{ type: "text", text, synthetic: false }],
   } as SessionLegacy.WithParts
+}
+
+function imageProbePassed(result: ClaudeDelegate.Result) {
+  return result.ok && /\bdominant color is pink\b/i.test(result.text) && !/\bno image\b|\bno .*attached\b/i.test(result.text)
 }

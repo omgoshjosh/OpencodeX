@@ -4,11 +4,16 @@ import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
 import { AppFileSystem } from "@opencode-ai/core/filesystem"
 import { AbsolutePath } from "@opencode-ai/core/schema"
-import { OpencodeXStateAggregateSequenceTable, OpencodeXStateEventTable } from "@opencode-ai/core/opencodex/sql"
+import {
+  OpencodeXStateAggregateSequenceTable,
+  OpencodeXStateEventTable,
+  OpencodeXStateMetadataTable,
+} from "@opencode-ai/core/opencodex/sql"
 import { PluginV2 } from "@opencode-ai/core/plugin"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
 import { and, eq } from "drizzle-orm"
-import { Context, Effect, Layer, Logger, Schema } from "effect"
+import { Context, Deferred, Duration, Effect, Fiber, Layer, Logger, Schema } from "effect"
+import * as TestClock from "effect/testing/TestClock"
 import { makeStateLog } from "../../src/opencodex/state-log"
 import { OpencodeXPlugin } from "../../src/opencodex/plugin"
 import { OpencodeXSettings } from "../../src/opencodex/settings"
@@ -31,6 +36,26 @@ const it = testEffect(
     Database.defaultLayer,
   ),
 )
+
+const JOURNAL_RETENTION_KEY = "retention:journal"
+
+function captureLogs(logged: string[]) {
+  return Logger.layer([
+    Logger.make<unknown, void>(({ message }) => {
+      logged.push(Array.isArray(message) ? message.map(String).join(" ") : String(message))
+    }),
+  ])
+}
+
+// Moves virtual time past the maintenance budget. The yield before each step
+// lets the pass under test reach its timeout, so the budget expires on the test
+// clock rather than on a wall-clock sleep.
+const advancePast = (budgetMs: number) =>
+  Effect.forEach(
+    [0, 1, 2, 3],
+    () => Effect.andThen(Effect.yieldNow, TestClock.adjust(Duration.millis(budgetMs))),
+    { discard: true },
+  )
 
 function record(value: unknown) {
   return value && typeof value === "object" && !Array.isArray(value) ? Object.fromEntries(Object.entries(value)) : {}
@@ -376,6 +401,161 @@ describe("OpencodeX state log", () => {
       // is visible as reserve or commit time rather than being unattributable.
       expect(field("reserve_ms") + field("sql_ms") + field("commit_ms")).toBe(field("total_ms"))
       for (const name of ["total_ms", "reserve_ms", "sql_ms", "commit_ms"]) expect(field(name)).toBeGreaterThanOrEqual(0)
+    }),
+  )
+
+  // The pass takes the process-wide barrier and only then queues for the single
+  // SQLite connection, so an unrelated multi-second transaction used to be
+  // charged to the barrier and delayed every writer behind it.
+  it.effect("skips the pass instead of pinning the barrier behind a busy connection", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const eventLayer = EventV2.layer.pipe(Layer.provide(Layer.succeed(Database.Service, database)))
+      const events = Context.get(yield* Layer.build(eventLayer), EventV2.Service)
+      const log = yield* makeStateLog(database.db, events, {
+        retentionMs: 1,
+        retentionEvents: 1,
+        maintenanceBatchSize: 1,
+        maintenanceIntervalMs: 60_000,
+        maintenanceBudgetMs: 2_000,
+      })
+      const count = database.db
+        .select({ position: OpencodeXStateEventTable.position })
+        .from(OpencodeXStateEventTable)
+        .all()
+        .pipe(
+          Effect.orDie,
+          Effect.map((rows) => rows.length),
+        )
+      yield* Effect.forEach(["a", "b", "c"], (id) => events.publish(GlobalInvalidation, { id }), { discard: true })
+      const before = yield* count
+
+      const entered = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const holder = yield* Effect.forkChild(
+        database.db
+          .transaction(() => Effect.andThen(Deferred.succeed(entered, undefined), Deferred.await(release)))
+          .pipe(Effect.orDie),
+      )
+      yield* Deferred.await(entered)
+
+      const logged: string[] = []
+      const pass = yield* Effect.forkChild(log.maintain().pipe(Effect.provide(captureLogs(logged))))
+      yield* advancePast(2_000)
+      yield* Fiber.join(pass)
+
+      // The barrier is free again while the other transaction is still open, so
+      // the hold is bounded by the budget rather than by the other holder.
+      yield* events.barrier(Effect.void)
+
+      const line = logged.find((entry) => entry.includes("state_maintain_skipped"))
+      expect(line).toBeDefined()
+      expect(line).toContain("budget_ms=2000")
+      expect(line).toContain("consecutive_skips=1")
+      expect(line).toMatch(/reserve_ms=\d+/)
+
+      yield* Deferred.succeed(release, undefined)
+      yield* Fiber.join(holder)
+      // A skipped pass trims nothing; the next pass covers the same rows.
+      expect(yield* count).toBe(before)
+    }),
+  )
+
+  it.effect("counts consecutive skipped passes, escalates a streak and resets after a pass lands", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const eventLayer = EventV2.layer.pipe(Layer.provide(Layer.succeed(Database.Service, database)))
+      const events = Context.get(yield* Layer.build(eventLayer), EventV2.Service)
+      const log = yield* makeStateLog(database.db, events, {
+        retentionMs: 1,
+        retentionEvents: 1,
+        maintenanceBatchSize: 1,
+        maintenanceIntervalMs: 60_000,
+        maintenanceBudgetMs: 2_000,
+        maintenanceSkipStreak: 2,
+      })
+      yield* Effect.forEach(["a", "b", "c", "d"], (id) => events.publish(GlobalInvalidation, { id }), { discard: true })
+
+      const logged: string[] = []
+      const skip = Effect.gen(function* () {
+        const entered = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        const holder = yield* Effect.forkChild(
+          database.db
+            .transaction(() => Effect.andThen(Deferred.succeed(entered, undefined), Deferred.await(release)))
+            .pipe(Effect.orDie),
+        )
+        yield* Deferred.await(entered)
+        const pass = yield* Effect.forkChild(log.maintain().pipe(Effect.provide(captureLogs(logged))))
+        yield* advancePast(2_000)
+        yield* Fiber.join(pass)
+        yield* Deferred.succeed(release, undefined)
+        yield* Fiber.join(holder)
+      })
+
+      yield* skip
+      yield* skip
+      expect(logged.some((entry) => entry.includes("state_maintain_skipped") && entry.includes("consecutive_skips=1")))
+        .toBe(true)
+      // Past the streak threshold the message changes: one skip is back-pressure,
+      // a streak means retention never runs and the journal grows unbounded.
+      expect(logged.some((entry) => entry.includes("state_maintain_starved") && entry.includes("consecutive_skips=2")))
+        .toBe(true)
+
+      // A pass that lands clears the streak.
+      yield* log.maintain().pipe(Effect.provide(captureLogs(logged)))
+      logged.length = 0
+      yield* skip
+      expect(logged.some((entry) => entry.includes("state_maintain_skipped") && entry.includes("consecutive_skips=1")))
+        .toBe(true)
+      expect(logged.some((entry) => entry.includes("state_maintain_starved"))).toBe(false)
+    }),
+  )
+
+  it.effect("leaves the retention floor untouched when a pass is skipped", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const eventLayer = EventV2.layer.pipe(Layer.provide(Layer.succeed(Database.Service, database)))
+      const events = Context.get(yield* Layer.build(eventLayer), EventV2.Service)
+      const log = yield* makeStateLog(database.db, events, {
+        retentionMs: 1,
+        retentionEvents: 1,
+        maintenanceBatchSize: 1,
+        maintenanceIntervalMs: 60_000,
+        maintenanceBudgetMs: 2_000,
+      })
+      const floor = database.db
+        .select({ value: OpencodeXStateMetadataTable.value })
+        .from(OpencodeXStateMetadataTable)
+        .where(eq(OpencodeXStateMetadataTable.key, JOURNAL_RETENTION_KEY))
+        .get()
+        .pipe(
+          Effect.orDie,
+          Effect.map((row) => Number(row?.value ?? 0)),
+        )
+      yield* Effect.forEach(["a", "b", "c"], (id) => events.publish(GlobalInvalidation, { id }), { discard: true })
+
+      yield* log.maintain()
+      const trimmed = yield* floor
+      expect(trimmed).toBeGreaterThan(0)
+
+      const entered = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const holder = yield* Effect.forkChild(
+        database.db
+          .transaction(() => Effect.andThen(Deferred.succeed(entered, undefined), Deferred.await(release)))
+          .pipe(Effect.orDie),
+      )
+      yield* Deferred.await(entered)
+      const pass = yield* Effect.forkChild(log.maintain())
+      yield* advancePast(2_000)
+      yield* Fiber.join(pass)
+
+      yield* Deferred.succeed(release, undefined)
+      yield* Fiber.join(holder)
+      // The floor is what tells readers a cursor is no longer satisfiable, so an
+      // abandoned pass must never move it — least of all backwards.
+      expect(yield* floor).toBe(trimmed)
     }),
   )
 

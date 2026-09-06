@@ -12,6 +12,7 @@ import {
   SessionTable,
 } from "@opencode-ai/core/session/sql"
 import { EventV2Bridge } from "@/event-v2-bridge"
+import { delegationRecord, isLiveDelegation } from "./delegation-outcome"
 import { InstanceState } from "@/effect/instance-state"
 import { MessageID, SessionID } from "./schema"
 import type { LoopInput } from "./prompt-schema"
@@ -54,12 +55,25 @@ const BusyToolPart = Schema.Struct({
 })
 const decodeBusyToolPart = Schema.decodeUnknownOption(BusyToolPart)
 
-/** An assistant turn that recorded its step-finish. */
+/** The newest message is the model's turn, not the next prompt already queued. */
+const AssistantMessage = Schema.Struct({ role: Schema.Literal("assistant") })
+const decodeAssistantMessage = Schema.decodeUnknownOption(AssistantMessage)
+
+/** An assistant turn the mapper closed out with a completion timestamp. */
 const FinishedAssistant = Schema.Struct({
   role: Schema.Literal("assistant"),
   time: Schema.Struct({ completed: Schema.Number }),
 })
 const decodeFinishedAssistant = Schema.decodeUnknownOption(FinishedAssistant)
+
+/**
+ * The turn's step-finish. `claude-mapper` writes this part the moment the model
+ * stops, then only stamps `time.completed` on the message if nothing is left to
+ * wake it - so on the stall this watchdog exists for, the step-finish part is
+ * the ONLY durable record that the turn ended.
+ */
+const StepFinishPart = Schema.Struct({ type: Schema.Literal("step-finish") })
+const decodeStepFinishPart = Schema.decodeUnknownOption(StepFinishPart)
 
 /**
  * Durable admission for queued prompts. A prompt is a row in
@@ -540,6 +554,34 @@ export function make(deps: Deps) {
     })
 
     /**
+     * Whether the session is legitimately paused waiting on a delegation that
+     * will wake it back up.
+     *
+     * A backgrounded subagent leaves the parent with the same signature as the
+     * stall: no busy tool part, no new writes, no `time.completed` - the CLI is
+     * holding the stream open until the child reports. Requiring
+     * `time.completed` used to exclude these by accident; now it is explicit.
+     *
+     * "Re-wakeable" is the child that reports back into the model's turn, which
+     * durably is a delegation record still in `running` whose owner process is
+     * alive - the same pair `/session/status` treats as a live background job.
+     * `monitoring` is deliberately excluded: that phase begins after the tool
+     * call already returned to the model, so nothing is waiting on it.
+     */
+    const hasLiveRewakeableDelegation = Effect.fnUntraced(function* (sessionID: SessionID) {
+      const children = yield* db
+        .select({ metadata: SessionTable.metadata })
+        .from(SessionTable)
+        .where(eq(SessionTable.parent_id, sessionID))
+        .all()
+        .pipe(Effect.orDie)
+      return children.some((child) => {
+        const record = delegationRecord(child.metadata)
+        return record?.phase === "running" && isLiveDelegation(record, processRunID)
+      })
+    })
+
+    /**
      * Force-settles an execution whose turn is demonstrably over but whose row
      * never left `running`.
      *
@@ -550,11 +592,16 @@ export function make(deps: Deps) {
      *
      * Settling is safe only with durable proof that nothing is in flight, so
      * every condition below must hold: the session's newest message is an
-     * assistant turn that already recorded `time.completed` (a step-finish),
-     * none of its tool parts is still pending or running, and no message or
-     * part in the session has been written or updated for `staleExecutionMillis`.
-     * `session_execution.time_updated` is deliberately NOT an activity signal -
-     * it is the renewing heartbeat that hides the stall.
+     * assistant turn that ended (its newest part is a step-finish, or it
+     * recorded `time.completed`), none of its tool parts is still pending or
+     * running, the session has no live re-wakeable delegation, and no message
+     * or part in the session has been written or updated for
+     * `staleExecutionMillis`. `session_execution.time_updated` is deliberately
+     * NOT an activity signal - it is the renewing heartbeat that hides the stall.
+     *
+     * `time.completed` alone is too narrow to catch this bug: the mapper stamps
+     * it only when the turn is truly over, and the stall's whole shape is a
+     * step-finished turn that never got that stamp.
      */
     const sweepStaleExecutions = Effect.fn("SessionPrompt.sweepStaleExecutions")(function* () {
       const ctx = yield* InstanceState.context
@@ -596,16 +643,24 @@ export function make(deps: Deps) {
               .limit(1)
               .get()
               .pipe(Effect.orDie)
-            // A newer user message means the next turn is already starting, and
-            // a missing `time.completed` means this one never step-finished.
-            if (!message || decodeFinishedAssistant(message.data)._tag === "None") return
+            // A newer user message means the next turn is already starting.
+            if (!message || decodeAssistantMessage(message.data)._tag === "None") return
             const parts = yield* db
               .select({ data: PartTable.data })
               .from(PartTable)
               .where(eq(PartTable.message_id, message.id))
+              .orderBy(asc(PartTable.id))
               .all()
               .pipe(Effect.orDie)
             if (parts.some((part) => decodeBusyToolPart(part.data)._tag === "Some")) return
+            // Either proof that the model stopped talking. Nothing is appended
+            // after a step-finish until the turn is woken again, so it being
+            // the newest part is what separates "ended" from "mid-stream".
+            const newest = parts.at(-1)
+            const finished =
+              (newest !== undefined && decodeStepFinishPart(newest.data)._tag === "Some") ||
+              decodeFinishedAssistant(message.data)._tag === "Some"
+            if (!finished) return
             const activity = yield* Effect.all(
               [
                 db
@@ -629,6 +684,7 @@ export function make(deps: Deps) {
               message.updated,
             )
             if (now - idleSince < staleAfter) return
+            if (yield* hasLiveRewakeableDelegation(candidate.sessionID)) return
             // CAS on the exact row this pass inspected: a concurrent settle,
             // a new generation, or a second sweep pass all lose here, so the
             // notification below runs at most once per stuck run.

@@ -3,7 +3,12 @@ import { BackgroundJob } from "@/background/job"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { SessionDelegationRecovery } from "@/session/delegation-recovery"
-import { DELEGATION_RECORD_VERSION, delegationRecord, type DelegationRecord } from "@/session/delegation-outcome"
+import {
+  DELEGATION_RECORD_VERSION,
+  delegationRecord,
+  settleDelegation,
+  type DelegationRecord,
+} from "@/session/delegation-outcome"
 import * as PromptClaim from "@/session/prompt-claim"
 import { MessageID, PartID, SessionID } from "@/session/schema"
 import { Session } from "@/session/session"
@@ -103,12 +108,19 @@ const insertExecution = Effect.fn("StaleExecutionTest.insertExecution")(function
     .pipe(Effect.orDie)
 })
 
-/** A turn whose last assistant message recorded a clean step-finish. */
+/**
+ * A turn the model has stopped talking in. `completed: false` is the shape of
+ * the incident this watchdog exists for: `claude-mapper` wrote the step-finish
+ * part and then returned early because background tasks were live, so the
+ * message never got its `time.completed`. `stepFinish: false` is the genuinely
+ * mid-stream turn, where neither proof exists.
+ */
 const finishedTurn = Effect.fn("StaleExecutionTest.finishedTurn")(function* (input: {
   sessionID: SessionID
   parentID?: MessageID
   messageID?: MessageID
   completed?: boolean
+  stepFinish?: boolean
   text?: string
 }) {
   const sessions = yield* Session.Service
@@ -135,6 +147,17 @@ const finishedTurn = Effect.fn("StaleExecutionTest.finishedTurn")(function* (inp
     type: "text",
     text: input.text ?? "the report",
   })
+  // Written last, exactly as the mapper writes it when the model stops.
+  if (input.stepFinish !== false)
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      sessionID: input.sessionID,
+      messageID,
+      type: "step-finish",
+      reason: "stop",
+      cost: 0,
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    })
   return messageID
 })
 
@@ -275,7 +298,11 @@ it.instance("leaves an execution whose session wrote parts more recently than th
   }),
 )
 
-it.instance("leaves an execution whose last assistant message has not finished", () =>
+// The reported incident: `claude-mapper` wrote the step-finish part at 23:57:48
+// and returned early on a success result with live background tasks, so
+// `time.completed` was never stamped and the row renewed its lease until the
+// 00:26:22 abort. Gating on `time.completed` skipped this row forever.
+it.instance("settles a step-finished turn that never recorded time.completed", () =>
   Effect.gen(function* () {
     const sessions = yield* Session.Service
     const session = yield* sessions.create({})
@@ -284,7 +311,46 @@ it.instance("leaves an execution whose last assistant message has not finished",
 
     const claim = yield* buildClaim()
     yield* claim.sweepStaleExecutions()
+    expect((yield* executionRow(session.id))?.state).toBe("idle")
+  }),
+)
+
+it.instance("leaves an execution whose last assistant message is still mid-stream", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({})
+    // Neither proof: no step-finish part and no `time.completed`.
+    yield* finishedTurn({ sessionID: session.id, completed: false, stepFinish: false })
+    yield* insertExecution({ sessionID: session.id })
+
+    const claim = yield* buildClaim()
+    yield* claim.sweepStaleExecutions()
     expect((yield* executionRow(session.id))?.state).toBe("running")
+  }),
+)
+
+it.instance("leaves a step-finished turn that is waiting on a live background delegation", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({})
+    yield* finishedTurn({ sessionID: session.id, completed: false })
+    yield* insertExecution({ sessionID: session.id })
+    // A backgrounded subagent that will report back and re-wake the turn.
+    const delegate = yield* sessions.create({ parentID: session.id })
+    const record = delegation(session.id, MessageID.make("msg_delegate_boundary"))
+    yield* sessions.stampDelegation({ sessionID: delegate.id, record })
+
+    const claim = yield* buildClaim()
+    yield* claim.sweepStaleExecutions()
+    expect((yield* executionRow(session.id))?.state).toBe("running")
+
+    // Once the delegation settles, nothing is left to wake the turn.
+    yield* sessions.stampDelegation({
+      sessionID: delegate.id,
+      record: settleDelegation(record, { outcome: "completed", completedAt: Date.now() }),
+    })
+    yield* claim.sweepStaleExecutions()
+    expect((yield* executionRow(session.id))?.state).toBe("idle")
   }),
 )
 

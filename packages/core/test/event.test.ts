@@ -1,5 +1,6 @@
 import { describe, expect } from "bun:test"
-import { Deferred, Effect, Fiber, Layer, Schema, Stream } from "effect"
+import { Deferred, Duration, Effect, Exit, Fiber, Layer, Schema, Stream } from "effect"
+import * as TestClock from "effect/testing/TestClock"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
@@ -813,6 +814,84 @@ describe("EventV2", () => {
       })
 
       expect(received[0]?.data).toEqual({ id: aggregateID, text: "replayed" })
+    }),
+  )
+
+  // Task 21 Step 1 (https://github.com/ecgreen/OpencodeX/pull/38). Listeners run
+  // INLINE inside the application barrier, so anything a listener awaits that
+  // itself needs the barrier has to be reentrant. It is not: `EffectBridge.make`
+  // captures its context once, outside any barrier
+  // (packages/opencode/src/effect/bridge.ts:55,60-70), so an effect run through
+  // `bridge.promise` starts on a fresh root fiber with InApplicationBarrier=false
+  // and blocks on the single permit that the outer publish still holds.
+  //
+  // Skipped rather than weakened: this deadlocks on current code and is the
+  // acceptance test for the Step 1 reentrancy fix. Unskip it there, do not delete
+  // it, and do not relax the assertion to match today's behaviour. The TestClock
+  // timeout is what turns a regression into a failed assertion instead of a hung
+  // test run.
+  it.effect.skip("listener awaiting a bridged barrier acquisition completes (deadlocks until Task 21 Step 1)", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const opened = yield* Deferred.make<void>()
+      const controller = new AbortController()
+
+      yield* events.listen(() => Deferred.await(opened))
+
+      const publish = yield* events.publish(Message, { text: "inline listener" }).pipe(Effect.forkScoped)
+      yield* Effect.yieldNow
+
+      // Mimics EffectBridge.promise: a fresh root fiber that itself needs the barrier.
+      const bridged = Effect.runPromise(events.barrier(Deferred.succeed(opened, undefined)), {
+        signal: controller.signal,
+      }).catch(() => undefined)
+      // One real event-loop turn so the root fiber reaches its outcome before the
+      // TestClock below is allowed to fire the timeout.
+      yield* Effect.promise(() => new Promise<void>((resolve) => setImmediate(resolve)))
+
+      const settled = yield* Fiber.join(publish).pipe(Effect.timeout(Duration.seconds(30)), Effect.exit, Effect.forkScoped)
+      yield* Effect.yieldNow
+      yield* TestClock.adjust(Duration.seconds(30))
+      const exit = yield* Fiber.join(settled)
+
+      controller.abort()
+      yield* Effect.promise(() => bridged)
+      expect(Exit.isSuccess(exit)).toBe(true)
+    }),
+  )
+
+  it.effect("a bridged root fiber does not inherit barrier reentrancy", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      // `EffectBridge.make` captures the ambient context once and replays it onto a
+      // brand new root fiber for every `bridge.fork`. Capturing here — outside any
+      // barrier — is exactly what production does.
+      const captured = yield* Effect.context<EventV2.Service>()
+      const entered = new Array<string>()
+      const bridged = events
+        .barrier(
+          Effect.sync(() => {
+            entered.push("inner")
+          }),
+          "test:inner",
+        )
+        .pipe(Effect.provide(captured))
+
+      let forked: Fiber.Fiber<void> | undefined
+      yield* events.barrier(
+        Effect.gen(function* () {
+          forked = Effect.runFork(bridged)
+          // A real event-loop turn. A fiber that had inherited the reentrancy flag
+          // would have pushed "inner" by now instead of queueing on the permit.
+          yield* Effect.promise(() => new Promise<void>((resolve) => setImmediate(resolve)))
+          expect(entered).toEqual([])
+          entered.push("outer")
+        }),
+        "test:outer",
+      )
+
+      yield* Fiber.join(forked!)
+      expect(entered).toEqual(["outer", "inner"])
     }),
   )
 })

@@ -92,7 +92,7 @@ export interface Retention {
   compact: () => Effect.Effect<number>
 }
 
-type Barrier = <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>
+type Barrier = <A, E, R>(effect: Effect.Effect<A, E, R>, label?: string) => Effect.Effect<A, E, R>
 
 type Pass = {
   instance: string
@@ -288,6 +288,7 @@ export const make = Effect.fn("EventRetention.make")(function* (
           { behavior: "immediate" },
         )
         .pipe(Effect.orDie),
+      "retention:compact",
     )
     if (deletion.activeLease === "present") {
       return finish({

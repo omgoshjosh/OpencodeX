@@ -18,7 +18,7 @@ import { and, eq } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { FetchHttpClient } from "effect/unstable/http"
 import { expect } from "bun:test"
-import { Context, Effect, Fiber, Layer } from "effect"
+import { Effect, Fiber, Layer, Schema } from "effect"
 import path from "path"
 import { Agent as AgentSvc } from "../../src/agent/agent"
 import { BackgroundJob } from "@/background/job"
@@ -34,6 +34,8 @@ import { Git } from "../../src/git"
 import { Image } from "../../src/image/image"
 import { Question } from "../../src/question"
 import { QuestionID } from "../../src/question/schema"
+
+const encodeQuestionID = Schema.encodeSync(QuestionID)
 import { Todo } from "../../src/session/todo"
 import { Session } from "@/session/session"
 import { SessionCommandTable, SessionExecutionTable, SessionInteractionTable } from "@opencode-ai/core/session/sql"
@@ -271,12 +273,12 @@ const httpReply = Effect.fn("test.httpReply")(function* (
   const { directory } = yield* TestInstance
   const response = yield* Effect.promise(() =>
     HttpApiApp.webHandler().handler(
-      new Request(`http://localhost/question/${requestID}/reply`, {
+      new Request(`http://localhost/question/${encodeQuestionID(requestID)}/reply`, {
         method: "POST",
         body: JSON.stringify({ answers }),
         headers: { "x-opencode-directory": directory, "content-type": "application/json" },
       }),
-      Context.empty() as Context.Context<unknown>,
+      HttpApiApp.context,
     ),
   )
   expect(response.status).toBe(200)
@@ -308,7 +310,7 @@ const pendingRequest = pollWithTimeout(
 )
 
 /** Every durable command row the bridge wrote for `requestID`. */
-const notificationID = (requestID: QuestionID) => MessageID.make(`msg_question_${requestID}`)
+const notificationID = (requestID: QuestionID) => MessageID.make(`msg_question_${encodeQuestionID(requestID)}`)
 
 const commandRows = Effect.fn("test.commandRows")(function* (requestID: QuestionID) {
   const { db } = yield* Database.Service
@@ -323,7 +325,7 @@ const commandRows = Effect.fn("test.commandRows")(function* (requestID: Question
 const waitForCommand = (requestID: QuestionID) =>
   pollWithTimeout(
     commandRows(requestID).pipe(Effect.map((rows) => (rows.length > 0 ? rows : undefined))),
-    `no session_command row for question ${requestID}`,
+    `no session_command row for question ${encodeQuestionID(requestID)}`,
     "10 seconds",
   )
 
@@ -340,7 +342,6 @@ const seedIdleParent = Effect.fn("test.seedIdleParent")(function* (sessionID: Se
 it.instance("notifies an idle parent and gives it a turn", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig()
-    const prompt = yield* SessionPrompt.Service
     const sessions = yield* Session.Service
 
     const parent = yield* sessions.create({ title: "orchestrator" })
@@ -369,30 +370,44 @@ it.instance("notifies an idle parent and gives it a turn", () =>
     )
     expect(notification.parts).toMatchObject([{ type: "text", synthetic: true, metadata: { question_request: true } }])
     const text = notification.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("")
-    expect(text).toContain(String(request.id))
+    expect(text).toContain(encodeQuestionID(request.id))
     expect(text).toContain(child.id)
     expect(text).toContain("implementer")
     expect(text).toContain("Which database should the worker use?")
     expect(text).toContain("Postgres")
     expect(text).toContain("question_reply")
 
-    // The point of the whole change: the parent has to actually run. A
-    // durable row nobody consumes is the failure class this fixes, so assert
-    // the loop anchored on the notification and produced an assistant reply.
+    // The point of the whole change: the parent has to actually run. A durable
+    // row nobody consumes is the failure class this fixes, so the evidence is
+    // a model call carrying the notification -- polled, because the assistant
+    // row is written before the request reaches the model.
+    const prompted = yield* pollWithTimeout(
+      llm.inputs.pipe(
+        Effect.map((bodies) =>
+          bodies.find((body) => JSON.stringify(body).includes(encodeQuestionID(request.id))),
+        ),
+      ),
+      "the parent never took a turn on the question notification",
+      "15 seconds",
+    )
+    expect(JSON.stringify(prompted)).toContain("question_request")
+    expect(yield* llm.calls).toBeGreaterThan(seeded)
+
+    // ...and the turn it earned finished as a normal assistant reply.
     const answered = yield* pollWithTimeout(
       Effect.gen(function* () {
         const messages = yield* sessions.messages({ sessionID: parent.id })
         return messages.find(
-          (message) => message.info.role === "assistant" && message.info.parentID === notificationID(request.id),
+          (message) =>
+            message.info.role === "assistant" &&
+            message.info.parentID === notificationID(request.id) &&
+            !!message.info.finish,
         )
       }),
-      "the parent never took a turn on the question notification",
+      "the parent's question turn never finished",
       "15 seconds",
     )
     expect(answered.info.role).toBe("assistant")
-    expect(yield* llm.calls).toBeGreaterThan(seeded)
-    // ...and the model saw the notification, not just any prompt.
-    expect((yield* llm.inputs).some((body) => JSON.stringify(body).includes(String(request.id)))).toBe(true)
 
     yield* Question.Service.use((svc) => svc.reject(request.id))
     yield* Fiber.await(fiber)
@@ -544,7 +559,7 @@ production.instance("a notified question a parent leaves alone is still answerab
       yield* db
         .select({ state: SessionInteractionTable.state })
         .from(SessionInteractionTable)
-        .where(eq(SessionInteractionTable.id, String(request.id)))
+        .where(eq(SessionInteractionTable.id, encodeQuestionID(request.id)))
         .get()
         .pipe(Effect.orDie),
     ).toEqual({ state: "replied" })

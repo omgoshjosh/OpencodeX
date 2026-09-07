@@ -5,10 +5,13 @@
  * structurally owns (`session.parentID`), never for a sibling or a stranger.
  */
 import { describe, expect } from "bun:test"
-import { Cause, Effect, Exit, Fiber, Layer, Queue } from "effect"
+import { Cause, Effect, Exit, Fiber, Layer, Queue, Schema } from "effect"
 import { eq } from "drizzle-orm"
 import { QuestionReplyTool } from "../../src/tool/question-reply"
 import { Question } from "../../src/question"
+import { QuestionID } from "../../src/question/schema"
+
+const encodeQuestionID = Schema.encodeSync(QuestionID)
 import { Session } from "@/session/session"
 import { SessionID, MessageID } from "../../src/session/schema"
 import { SessionInteractionTable } from "@opencode-ai/core/session/sql"
@@ -97,13 +100,13 @@ describe("tool.question_reply", () => {
       const { tool, fiber, request, parent } = yield* scenario()
 
       const result = yield* tool.execute(
-        { requestID: String(request.id), action: "answer", answers: [["Postgres"]] },
+        { requestID: encodeQuestionID(request.id), action: "answer", answers: [["Postgres"]] },
         context(parent.id),
       )
       expect(result.metadata).toMatchObject({ outcome: "answered" })
 
       expect(yield* Fiber.join(fiber)).toEqual([["Postgres"]])
-      expect(yield* state(String(request.id))).toEqual({ state: "replied" })
+      expect(yield* state(encodeQuestionID(request.id))).toEqual({ state: "replied" })
     }),
   )
 
@@ -111,13 +114,13 @@ describe("tool.question_reply", () => {
     Effect.gen(function* () {
       const { tool, fiber, request, parent } = yield* scenario()
 
-      const result = yield* tool.execute({ requestID: String(request.id), action: "reject" }, context(parent.id))
+      const result = yield* tool.execute({ requestID: encodeQuestionID(request.id), action: "reject" }, context(parent.id))
       expect(result.metadata).toMatchObject({ outcome: "rejected" })
 
       const exit = yield* Fiber.await(fiber)
       expect(Exit.isFailure(exit)).toBe(true)
       if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(Question.RejectedError)
-      expect(yield* state(String(request.id))).toEqual({ state: "rejected" })
+      expect(yield* state(encodeQuestionID(request.id))).toEqual({ state: "rejected" })
     }),
   )
 
@@ -127,13 +130,13 @@ describe("tool.question_reply", () => {
       const stranger = yield* sessions.create({ title: "unrelated" })
 
       const exit = yield* tool
-        .execute({ requestID: String(request.id), action: "answer", answers: [["Postgres"]] }, context(stranger.id))
+        .execute({ requestID: encodeQuestionID(request.id), action: "answer", answers: [["Postgres"]] }, context(stranger.id))
         .pipe(Effect.exit)
       expect(Exit.isFailure(exit)).toBe(true)
       if (Exit.isFailure(exit)) expect(String(Cause.squash(exit.cause))).toContain("not a child of this session")
 
       // Refused, not resolved: the question is still the parent's (or a human's) to answer.
-      expect(yield* state(String(request.id))).toEqual({ state: "pending" })
+      expect(yield* state(encodeQuestionID(request.id))).toEqual({ state: "pending" })
       yield* Question.Service.use((svc) => svc.reject(request.id))
       yield* Fiber.await(fiber)
     }),
@@ -147,13 +150,13 @@ describe("tool.question_reply", () => {
       yield* Fiber.join(fiber)
 
       const result = yield* tool.execute(
-        { requestID: String(request.id), action: "answer", answers: [["Postgres"]] },
+        { requestID: encodeQuestionID(request.id), action: "answer", answers: [["Postgres"]] },
         context(parent.id),
       )
       expect(result.metadata).toMatchObject({ outcome: "already_resolved" })
       expect(result.output).toContain("already")
       // The human's answer stands.
-      expect(yield* state(String(request.id))).toEqual({ state: "replied" })
+      expect(yield* state(encodeQuestionID(request.id))).toEqual({ state: "replied" })
     }),
   )
 
@@ -161,7 +164,7 @@ describe("tool.question_reply", () => {
     Effect.gen(function* () {
       const { tool, fiber, request, parent } = yield* scenario()
 
-      const exit = yield* tool.execute({ requestID: String(request.id), action: "answer" }, context(parent.id)).pipe(Effect.exit)
+      const exit = yield* tool.execute({ requestID: encodeQuestionID(request.id), action: "answer" }, context(parent.id)).pipe(Effect.exit)
       expect(Exit.isFailure(exit)).toBe(true)
       if (Exit.isFailure(exit)) expect(String(Cause.squash(exit.cause))).toContain("`answers` is required")
 

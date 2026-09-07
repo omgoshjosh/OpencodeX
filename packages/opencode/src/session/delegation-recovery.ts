@@ -56,11 +56,20 @@ export function make(deps: Deps) {
           (parentPart !== undefined && "metadata" in parentPart.state && parentPart.state.metadata?.background === true)
         const foreground = record.mode === "foreground"
         if (record.mode !== "background" && !foreground && !legacyBackground) return
+        // The child's report is its LAST assistant reply to the delegation
+        // boundary, not its first: one turn commonly persists several assistant
+        // messages against that same parent (steps, auto-continue), so `.find`
+        // reported an opening progress line as the result. `childReport`
+        // (prompt-swarm.ts) already reads the transcript this way; the two
+        // paths must agree. Deliberately no `requireFinished` filter here - a
+        // turn the daemon lost mid-stream never gets its completion stamp, and
+        // skipping it would make the run unreadable forever; the outcome logic
+        // below already downgrades an uncompleted message to "abandoned".
         const message = record.childMessageID
           ? (yield* deps.sessions.messageWithChildren({
               sessionID: child.id,
               messageID: MessageID.make(record.childMessageID),
-            })).find((item) => item.info.role === "assistant" && item.info.parentID === record.childMessageID)
+            })).findLast((item) => item.info.role === "assistant" && item.info.parentID === record.childMessageID)
           : undefined
         const reportText = message?.parts
           .flatMap((part) => (part.type === "text" && !part.synthetic && part.text.trim() ? [part.text.trim()] : []))

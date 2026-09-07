@@ -1,0 +1,18 @@
+Answer or dismiss a question raised by one of your subagent sessions.
+
+You receive a `<question_request>` block when a session you started blocks on a
+question. That child is stopped until somebody responds. Use this tool to
+respond in its place when the decision is yours to make.
+
+- `requestID`: the id from the `<question_request id="...">` block.
+- `action`: `"answer"` to supply answers, `"reject"` to dismiss the question so
+  the child continues without one.
+- `answers`: required when `action` is `"answer"`. One array per question, in
+  the order the questions were listed, each holding the labels you choose.
+  Questions marked `multiple="true"` accept more than one label; questions that
+  allow a custom answer accept free text instead of a listed label.
+
+You may only respond to a question raised by a direct child of your own
+session. If the decision genuinely belongs to a human, do not call this tool:
+leave the request pending, say so in your reply, and a human can still answer
+it directly.

@@ -56,6 +56,7 @@ import { STRUCTURED_OUTPUT_SYSTEM_PROMPT, createStructuredOutputTool } from "./p
 import * as PromptClaim from "./prompt-claim"
 import { SessionDelegationRecovery } from "./delegation-recovery"
 import { SessionPromptRecovery } from "./prompt-recovery"
+import { SessionQuestionNotify } from "./question-notify"
 import * as PromptShell from "./prompt-shell"
 import * as PromptSubtask from "./prompt-subtask"
 import * as PromptSwarm from "./prompt-swarm"
@@ -109,6 +110,45 @@ const AUTO_CONTINUE_LIMIT = 3
 function isSyntheticOnly(msg: SessionLegacy.WithParts) {
   return msg.parts.length > 0 && msg.parts.every((part) => part.type === "text" && part.synthetic === true)
 }
+/** Descriptive only — never used to decide who owns a child's question. */
+function swarmRoleOf(session: Session.Info) {
+  const opencodex = session.metadata?.opencodex
+  if (typeof opencodex !== "object" || opencodex === null) return undefined
+  const { swarmRole } = opencodex as { swarmRole?: unknown }
+  return typeof swarmRole === "string" && swarmRole ? swarmRole : undefined
+}
+
+/**
+ * The text a parent reads when one of its children blocks on a question.
+ *
+ * It carries everything the parent needs to answer without opening the child:
+ * the request id it must quote back, which child is waiting, the full question
+ * set with its options, and the tool call the child is parked on.
+ */
+function questionRequestMessage(input: { child: Session.Info; request: Question.Request }) {
+  const role = swarmRoleOf(input.child)
+  const questions = input.request.questions.flatMap((question, index) => [
+    `<question index="${index}" header="${question.header}"${question.multiple === true ? ' multiple="true"' : ""}${question.custom === false ? ' custom="false"' : ""}>`,
+    question.question,
+    ...question.options.map((option) => `- ${option.label}: ${option.description}`),
+    "</question>",
+  ])
+  return [
+    `<question_request id="${input.request.id}" session="${input.child.id}"${role ? ` role="${role}"` : ""}>`,
+    `<summary>Your subagent session ${input.child.id} ("${input.child.title}") is blocked waiting for an answer.</summary>`,
+    ...(input.request.tool
+      ? [`<tool messageID="${input.request.tool.messageID}" callID="${input.request.tool.callID}" />`]
+      : []),
+    ...questions,
+    "<instructions>",
+    `Answer with the question_reply tool: question_reply({ requestID: "${input.request.id}", action: "answer", answers: [["<label>"]] }).`,
+    "Give one array of chosen labels per question, in order. Use action \"reject\" to dismiss the question and let the child continue without an answer.",
+    "If this is genuinely a human's call, do not answer it — leave the request pending and say so, and a human can still answer it directly.",
+    "</instructions>",
+    "</question_request>",
+  ].join("\n")
+}
+
 const UNFINISHED_TODO_STATUS = new Set(["pending", "in_progress"])
 const STEERING_REMINDER = [
   "<system-reminder>",
@@ -640,14 +680,19 @@ export const layer = Layer.effect(
           // A background task or swarm-role report (tagged task_report by the
           // task tool and deliverReport) is the third: it is delivered exactly
           // once per child run and the orchestrator must answer it, or a
-          // background delegation never comes back. Anything else
-          // synthetic-only arrived from outside the turn.
+          // background delegation never comes back. A child's blocked question
+          // (tagged question_request by the question bridge) is the fourth, for
+          // the same reason: the child stays blocked until the parent answers,
+          // and without this clause the notification is written and silently
+          // ignored. Anything else synthetic-only arrived from outside the turn.
           const isInternalContinuation = (m: SessionLegacy.WithParts) =>
             m.info.id === autoContinueID ||
             m.parts.some(
               (part) =>
                 part.type === "text" &&
-                (part.metadata?.compaction_continue === true || part.metadata?.task_report === true),
+                (part.metadata?.compaction_continue === true ||
+                  part.metadata?.task_report === true ||
+                  part.metadata?.question_request === true),
             )
 
           const lastHumanUser =
@@ -1148,6 +1193,71 @@ export const layer = Layer.effect(
       start().pipe(Effect.andThen(delegationRecovery.recover()), Effect.andThen(recover)),
     )
     yield* Effect.addFinalizer(() => Effect.sync(unregisterRecovery))
+
+    /**
+     * Turns a child session's blocked question into a durable turn for its parent.
+     *
+     * Ownership is structural and nothing else: only `session.parentID` decides
+     * who is asked. `metadata.opencodex.{swarmID,swarmRole}` is descriptive — it
+     * rides along in the text so an orchestrator can tell which of its roles is
+     * stuck — and is never consulted to pick a recipient. A parentless session's
+     * question is a human's to answer, so this no-ops and leaves it pending.
+     *
+     * `promptAsync` with a deterministic `msg_question_<requestID>` gives
+     * idempotency for free: a second hook fire, or a recovery pass over the same
+     * still-pending row, short-circuits on the existing command row instead of
+     * writing a second message.
+     */
+    const notifyQuestionParent = Effect.fn("SessionPrompt.notifyQuestionParent")(function* (
+      request: Question.Request,
+    ) {
+      const child = yield* sessions.get(request.sessionID).pipe(Effect.option)
+      if (child._tag === "None") return
+      const parentID = child.value.parentID
+      if (!parentID) return
+      const parent = yield* sessions.get(SessionID.make(parentID)).pipe(Effect.option)
+      if (parent._tag === "None") return
+      yield* elog.info("question notify", {
+        sessionID: parent.value.id,
+        childSessionID: child.value.id,
+        requestID: request.id,
+      })
+      yield* promptAsync({
+        sessionID: parent.value.id,
+        messageID: MessageID.make(`msg_question_${request.id}`),
+        delivery: "deferred",
+        ...(parent.value.agent ? { agent: parent.value.agent } : {}),
+        parts: [
+          {
+            type: "text",
+            synthetic: true,
+            // The prompt loop only answers a synthetic-only message it
+            // recognises; this tag is how the notification earns its turn.
+            metadata: { question_request: true },
+            text: questionRequestMessage({ child: child.value, request }),
+          },
+        ],
+      })
+    })
+
+    const questionParentNotification = (request: Question.Request) =>
+      notifyQuestionParent(request).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("question parent notification failed", { requestID: request.id, cause }),
+        ),
+      )
+    const unregisterQuestionNotify = SessionQuestionNotify.register(questionParentNotification)
+    yield* Effect.addFinalizer(() => Effect.sync(unregisterQuestionNotify))
+    // A crash between the pending row's insert and the hook leaves a blocked
+    // child with no notification at all, so recovery re-runs the notification
+    // for every request that is still pending.
+    const unregisterQuestionRecovery = SessionPromptRecovery.register(() =>
+      question.list().pipe(
+        Effect.flatMap((pending) => Effect.forEach(pending, questionParentNotification, { discard: true })),
+        Effect.catchCause((cause) => Effect.logWarning("question notification recovery failed", { cause })),
+      ),
+    )
+    yield* Effect.addFinalizer(() => Effect.sync(unregisterQuestionRecovery))
 
     const command = Effect.fn("SessionPrompt.command")(function* (input: CommandInput) {
       yield* elog.info("command", { sessionID: input.sessionID, command: input.command, agent: input.agent })

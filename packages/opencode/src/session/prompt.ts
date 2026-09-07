@@ -31,7 +31,7 @@ import { AppFileSystem } from "@opencode-ai/core/filesystem"
 import { Truncate } from "@/tool/truncate"
 import { Image } from "@/image/image"
 import { Process } from "@/util/process"
-import { Cause, Effect, Exit, Layer, Option, Scope, Context } from "effect"
+import { Cause, Effect, Exit, Layer, Option, Schema, Scope, Context } from "effect"
 import * as EffectLogger from "@opencode-ai/core/effect/logger"
 import { InstanceState } from "@/effect/instance-state"
 import { type TaskPromptOps } from "@/tool/task"
@@ -50,6 +50,7 @@ import { Todo } from "./todo"
 import { BackgroundJob } from "@/background/job"
 import { Identifier } from "@opencode-ai/core/util/identifier"
 import { Question } from "@/question"
+import { QuestionID } from "@/question/schema"
 import { OpencodeXClaudeDriver } from "@/opencodex/claude-driver"
 import { PromptInput, LoopInput, ShellInput, CommandInput } from "./prompt-schema"
 import { STRUCTURED_OUTPUT_SYSTEM_PROMPT, createStructuredOutputTool } from "./prompt-structured-output"
@@ -73,6 +74,7 @@ export { PromptInput, LoopInput, ShellInput, CommandInput }
 export { createStructuredOutputTool }
 
 const elog = EffectLogger.create({ service: "session.prompt" })
+const encodeQuestionID = Schema.encodeSync(QuestionID)
 
 function isOrphanedInterruptedTool(part: SessionLegacy.ToolPart) {
   // cleanup() marks abandoned tool_use blocks this way after retries/aborts.
@@ -134,14 +136,14 @@ function questionRequestMessage(input: { child: Session.Info; request: Question.
     "</question>",
   ])
   return [
-    `<question_request id="${input.request.id}" session="${input.child.id}"${role ? ` role="${role}"` : ""}>`,
+    `<question_request id="${encodeQuestionID(input.request.id)}" session="${input.child.id}"${role ? ` role="${role}"` : ""}>`,
     `<summary>Your subagent session ${input.child.id} ("${input.child.title}") is blocked waiting for an answer.</summary>`,
     ...(input.request.tool
       ? [`<tool messageID="${input.request.tool.messageID}" callID="${input.request.tool.callID}" />`]
       : []),
     ...questions,
     "<instructions>",
-    `Answer with the question_reply tool: question_reply({ requestID: "${input.request.id}", action: "answer", answers: [["<label>"]] }).`,
+    `Answer with the question_reply tool: question_reply({ requestID: "${encodeQuestionID(input.request.id)}", action: "answer", answers: [["<label>"]] }).`,
     "Give one array of chosen labels per question, in order. Use action \"reject\" to dismiss the question and let the child continue without an answer.",
     "If this is genuinely a human's call, do not answer it — leave the request pending and say so, and a human can still answer it directly.",
     "</instructions>",
@@ -1224,7 +1226,7 @@ export const layer = Layer.effect(
       })
       yield* promptAsync({
         sessionID: parent.value.id,
-        messageID: MessageID.make(`msg_question_${request.id}`),
+        messageID: MessageID.make(`msg_question_${encodeQuestionID(request.id)}`),
         delivery: "deferred",
         ...(parent.value.agent ? { agent: parent.value.agent } : {}),
         parts: [

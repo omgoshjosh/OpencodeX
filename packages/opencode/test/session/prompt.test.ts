@@ -751,6 +751,176 @@ it.instance("promptAsync retains one deterministic deferred report command throu
   }),
 )
 
+it.instance(
+  "promptAsync pins each deferred provider turn to its durable message",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const { db } = yield* Database.Service
+      const gate = yield* Deferred.make<void>()
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+
+      yield* llm.hold("first complete", deferredAsPromise(gate))
+      yield* llm.tool("glob", { pattern: "**/*.txt" })
+      yield* llm.text("second complete")
+      yield* llm.text("third complete")
+
+      const firstID = MessageID.ascending()
+      yield* prompt.promptAsync({
+        sessionID: chat.id,
+        messageID: firstID,
+        model: ref,
+        parts: [{ type: "text", text: "first report" }],
+      })
+      yield* llm.wait(1)
+
+      const secondID = MessageID.ascending()
+      const thirdID = MessageID.ascending()
+      const second = {
+        sessionID: chat.id,
+        messageID: secondID,
+        model: ref,
+        delivery: "deferred" as const,
+        parts: [{ type: "text" as const, synthetic: true, metadata: { task_report: true }, text: "second report" }],
+      }
+      const third = {
+        sessionID: chat.id,
+        messageID: thirdID,
+        model: ref,
+        delivery: "deferred" as const,
+        parts: [{ type: "text" as const, synthetic: true, metadata: { task_report: true }, text: "third report" }],
+      }
+      yield* prompt.promptAsync(second)
+      yield* prompt.promptAsync(third)
+      yield* Deferred.succeed(gate, void 0)
+
+      const settled = (messageID: MessageID) =>
+        pollWithTimeout(
+          db
+            .select({ status: SessionCommandTable.status })
+            .from(SessionCommandTable)
+            .where(eq(SessionCommandTable.message_id, messageID))
+            .get()
+            .pipe(
+              Effect.orDie,
+              Effect.map((command) => (command?.status === "succeeded" ? true : undefined)),
+            ),
+          `command ${messageID} did not settle`,
+        )
+      yield* settled(firstID)
+      yield* settled(secondID)
+      yield* settled(thirdID)
+
+      yield* pollWithTimeout(
+        llm.calls.pipe(Effect.map((calls) => (calls === 4 ? true : undefined))),
+        "provider did not receive every pinned turn",
+      )
+
+      yield* pollWithTimeout(
+        db
+          .select({ status: SessionCommandTable.status })
+          .from(SessionCommandTable)
+          .where(eq(SessionCommandTable.session_id, chat.id))
+          .all()
+          .pipe(
+            Effect.orDie,
+            Effect.map((commands) =>
+              commands.length === 3 && commands.every((command) => command.status === "succeeded") ? true : undefined,
+            ),
+          ),
+        "deferred provider turns did not settle",
+      )
+
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const parents = messages.flatMap((message) => (message.info.role === "assistant" ? [message.info.parentID] : []))
+      expect(parents).toEqual([firstID, secondID, secondID, thirdID])
+
+      const inputs = (yield* llm.inputs).map((input) => JSON.stringify(input.messages))
+      expect(inputs).toHaveLength(4)
+      expect(inputs[1]).toContain("second report")
+      expect(inputs[1]).not.toContain("third report")
+      expect(inputs[2]).toContain("second report")
+      expect(inputs[2]).not.toContain("third report")
+      expect(inputs[3]).toContain("third report")
+    }),
+  15_000,
+)
+
+it.instance("claimed provider turn fails closed when its user message is absent", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+
+    const exit = yield* prompt
+      .loop({ sessionID: chat.id, messageID: MessageID.make("msg_missing_claimed_root") })
+      .pipe(Effect.exit)
+
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (Exit.isFailure(exit)) {
+      expect(Cause.pretty(exit.cause)).toContain("Claimed user message msg_missing_claimed_root is missing")
+    }
+    expect(yield* llm.calls).toBe(0)
+  }),
+)
+
+it.instance("claimed provider turn excludes a foreign compaction continuation", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const claimed = yield* user(chat.id, "claimed report")
+    const foreign = yield* sessions.updateMessage({
+      id: MessageID.ascending(),
+      role: "user",
+      sessionID: chat.id,
+      agent: "build",
+      model: ref,
+      time: { created: Date.now() + 1 },
+    })
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: foreign.id,
+      sessionID: chat.id,
+      type: "text",
+      text: "foreign continuation",
+      synthetic: true,
+      metadata: { compaction_continue: true },
+    })
+    yield* sessions.updateMessage({
+      id: MessageID.ascending(),
+      parentID: foreign.id,
+      role: "assistant",
+      mode: "build",
+      agent: "build",
+      path: { cwd: "/tmp", root: "/tmp" },
+      cost: 0,
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: ref.modelID,
+      providerID: ref.providerID,
+      time: { created: Date.now() + 2, completed: Date.now() + 2 },
+      finish: "stop",
+      sessionID: chat.id,
+    })
+    yield* llm.text("claimed result")
+
+    const result = yield* prompt.loop({ sessionID: chat.id, messageID: claimed.id })
+
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role === "assistant") expect(result.info.parentID).toBe(claimed.id)
+    expect(result.parts.some((part) => part.type === "text" && part.text === "claimed result")).toBe(true)
+    expect(yield* llm.calls).toBe(1)
+    expect(JSON.stringify((yield* llm.inputs)[0]?.messages)).not.toContain("foreign continuation")
+  }),
+)
+
 it.instance("recovery stamps delivery when real promptAsync finds a succeeded report command", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)
@@ -1705,6 +1875,7 @@ it.instance("loop compacts and resumes after provider context overflow", () =>
     const prompt = yield* SessionPrompt.Service
     const sessions = yield* Session.Service
     const events = yield* EventV2Bridge.Service
+    const { db } = yield* Database.Service
     const chat = yield* sessions.create({
       title: "Pinned",
       permission: [{ permission: "*", pattern: "*", action: "allow" }],
@@ -1718,21 +1889,37 @@ it.instance("loop compacts and resumes after provider context overflow", () =>
     })
     yield* Effect.addFinalizer(() => off)
 
-    yield* prompt.prompt({
-      sessionID: chat.id,
-      agent: "build",
-      noReply: true,
-      parts: [{ type: "text", text: "continue after compaction" }],
-    })
     yield* llm.error(400, { type: "error", error: { code: "context_length_exceeded" } })
     yield* llm.text("summary")
     yield* llm.text("resumed")
+    const messageID = MessageID.ascending()
+    yield* prompt.promptAsync({
+      sessionID: chat.id,
+      messageID,
+      agent: "build",
+      parts: [{ type: "text", text: "continue after compaction" }],
+    })
+    yield* pollWithTimeout(
+      db
+        .select({ status: SessionCommandTable.status })
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.message_id, messageID))
+        .get()
+        .pipe(
+          Effect.orDie,
+          Effect.map((command) => (command?.status === "succeeded" ? true : undefined)),
+        ),
+      "anchored compaction command did not settle",
+    )
 
-    const result = yield* prompt.loop({ sessionID: chat.id })
     const messages = yield* sessions.messages({ sessionID: chat.id })
+    const result = messages.findLast(
+      (message) =>
+        message.info.role === "assistant" &&
+        message.parts.some((part) => part.type === "text" && part.text === "resumed"),
+    )
 
-    expect(result.info.role).toBe("assistant")
-    expect(result.parts.some((part) => part.type === "text" && part.text === "resumed")).toBe(true)
+    expect(result?.info.role).toBe("assistant")
     expect(messages.some((message) => message.info.role === "assistant" && message.info.summary)).toBe(true)
     expect(yield* llm.hits).toHaveLength(3)
     expect(errors).toEqual([])
@@ -1772,28 +1959,45 @@ it.instance("loop auto-continues an empty stop finish when todos are unfinished"
     const prompt = yield* SessionPrompt.Service
     const sessions = yield* Session.Service
     const todo = yield* Todo.Service
+    const { db } = yield* Database.Service
     const session = yield* sessions.create({
       title: "Prompt provider unfinished",
       permission: [{ permission: "*", pattern: "*", action: "allow" }],
     })
 
-    yield* prompt.prompt({
-      sessionID: session.id,
-      agent: "build",
-      noReply: true,
-      parts: [{ type: "text", text: "do the task" }],
-    })
     yield* todo.update({
       sessionID: session.id,
       todos: [{ content: "finish the task", status: "pending", priority: "high" }],
     })
     yield* llm.push(reply().stop())
     yield* llm.text("resumed")
+    const messageID = MessageID.ascending()
+    yield* prompt.promptAsync({
+      sessionID: session.id,
+      messageID,
+      agent: "build",
+      parts: [{ type: "text", text: "do the task" }],
+    })
+    yield* pollWithTimeout(
+      db
+        .select({ status: SessionCommandTable.status })
+        .from(SessionCommandTable)
+        .where(eq(SessionCommandTable.message_id, messageID))
+        .get()
+        .pipe(
+          Effect.orDie,
+          Effect.map((command) => (command?.status === "succeeded" ? true : undefined)),
+        ),
+      "anchored auto-continuation command did not settle",
+    )
 
-    const result = yield* prompt.loop({ sessionID: session.id })
+    const result = (yield* sessions.messages({ sessionID: session.id })).findLast(
+      (message) =>
+        message.info.role === "assistant" &&
+        message.parts.some((part) => part.type === "text" && part.text === "resumed"),
+    )
     expect(yield* llm.calls).toBe(2)
-    expect(result.info.role).toBe("assistant")
-    expect(result.parts.some((part) => part.type === "text" && part.text === "resumed")).toBe(true)
+    expect(result?.info.role).toBe("assistant")
   }),
 )
 

@@ -363,7 +363,7 @@ export function make(deps: Deps) {
           )
           .run()
           .pipe(Effect.orDie)
-        return
+        return command.session_id
       }
       const requeue = Effect.fnUntraced(function* () {
         const completedAt = clock()
@@ -477,7 +477,7 @@ export function make(deps: Deps) {
           )
           .run()
           .pipe(Effect.orDie)
-        return
+        return command.session_id
       }
 
       if (Cause.hasInterruptsOnly(exit.cause)) {
@@ -513,12 +513,15 @@ export function make(deps: Deps) {
         sessionID: command.session_id,
         error: new NamedError.Unknown({ message: error }).toObject(),
       })
+      return command.session_id
     })
 
+    let wakeQueued = (_sessionID: SessionID): Effect.Effect<void> => Effect.void
     const launchCommand = Effect.fn("SessionPrompt.launchCommand")(function* (commandID: string) {
       if (launching.has(commandID)) return
       launching.add(commandID)
       yield* executeCommand(commandID).pipe(
+        Effect.tap((sessionID) => (sessionID ? wakeQueued(sessionID) : Effect.void)),
         Effect.catchCause((cause) => Effect.logError("prompt_async recovery failed", { commandID, cause })),
         Effect.ensuring(Effect.sync(() => launching.delete(commandID))),
         Effect.forkIn(scope, { startImmediately: true }),
@@ -552,6 +555,7 @@ export function make(deps: Deps) {
         .pipe(Effect.orDie)
       yield* Effect.forEach(commands, (command) => launchCommand(command.id), { discard: true })
     })
+    wakeQueued = wakeSession
 
     /**
      * Whether the session is legitimately paused waiting on a delegation that

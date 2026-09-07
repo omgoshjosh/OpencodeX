@@ -195,6 +195,7 @@ export interface Interface {
     sessionID: SessionID
     auto: boolean
     overflow?: boolean
+    onContinuation?: (messageID: MessageID) => void
   }) => Effect.Effect<"continue" | "stop">
   readonly create: (input: {
     sessionID: SessionID
@@ -202,7 +203,7 @@ export interface Interface {
     model: { providerID: ProviderV2.ID; modelID: ProviderV2.ModelID }
     auto: boolean
     overflow?: boolean
-  }) => Effect.Effect<void>
+  }) => Effect.Effect<MessageID>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionCompaction") {}
@@ -346,6 +347,7 @@ export const layer = Layer.effect(
       sessionID: SessionID
       auto: boolean
       overflow?: boolean
+      onContinuation?: (messageID: MessageID) => void
     }) {
       const parent = input.messages.findLast((m) => m.info.id === input.parentID)
       if (!parent || parent.info.role !== "user") {
@@ -489,6 +491,7 @@ export const layer = Layer.effect(
             tools: original.tools,
             system: original.system,
           })
+          input.onContinuation?.(replayMsg.id)
           for (const part of replay.parts) {
             if (part.type === "compaction") continue
             const replayPart =
@@ -534,6 +537,7 @@ export const layer = Layer.effect(
               agent: userMessage.agent,
               model: userMessage.model,
             })
+            input.onContinuation?.(continueMsg.id)
             const text =
               (input.overflow
                 ? "The previous request exceeded the provider's size limit due to large media attachments. The conversation was compacted and media files were removed from context. If the user was asking about attached images or files, explain that the attachments were too large to process and suggest they try again with smaller or fewer files.\n\n"
@@ -597,6 +601,7 @@ export const layer = Layer.effect(
         auto: input.auto,
         overflow: input.overflow,
       })
+      return msg.id
     })
 
     return Service.of({

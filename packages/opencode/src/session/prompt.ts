@@ -636,8 +636,9 @@ export const layer = Layer.effect(
       throw new Error("Impossible")
     })
 
-    const runLoop: (sessionID: SessionID) => Effect.Effect<SessionLegacy.WithParts> = Effect.fn("SessionPrompt.run")(
-      function* (sessionID: SessionID) {
+    const runLoop: (input: { sessionID: SessionID; messageID?: MessageID }) => Effect.Effect<SessionLegacy.WithParts> =
+      Effect.fn("SessionPrompt.run")(function* (input: { sessionID: SessionID; messageID?: MessageID }) {
+        const sessionID = input.sessionID
         const ctx = yield* InstanceState.context
         const slog = elog.with({ sessionID })
         let structured: unknown
@@ -648,6 +649,8 @@ export const layer = Layer.effect(
         // another model turn. That is legitimate and already bounded by
         // AUTO_CONTINUE_LIMIT -- only EXTERNAL synthetic injections must be ignored.
         let autoContinueID: string | undefined
+        const ownedContinuationIDs = new Set<MessageID>()
+        let claimedAnchor: SessionLegacy.User | undefined
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
 
         while (true) {
@@ -657,6 +660,28 @@ export const layer = Layer.effect(
           let msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
             Effect.provideService(Database.Service, database),
           )
+
+          if (input.messageID) {
+            const anchor = claimedAnchor ?? msgs.find((message) => message.info.id === input.messageID)?.info
+            if (!anchor || anchor.role !== "user") {
+              throw new Error(`Claimed user message ${input.messageID} is missing from session ${sessionID}`)
+            }
+            claimedAnchor = anchor
+            const allowedUsers = new Set(
+              msgs
+                .filter(
+                  (message) =>
+                    message.info.role === "user" &&
+                    (!MessageV2.isAfter(message.info, anchor) || ownedContinuationIDs.has(message.info.id)),
+                )
+                .map((message) => message.info.id),
+            )
+            msgs = msgs.filter((message) =>
+              message.info.role === "user"
+                ? allowedUsers.has(message.info.id)
+                : allowedUsers.has(message.info.parentID),
+            )
+          }
 
           const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = MessageV2.latest(msgs)
 
@@ -764,6 +789,7 @@ export const layer = Layer.effect(
                   model: lastUser.model,
                 }
                 autoContinueID = continueMsg.id
+                ownedContinuationIDs.add(continueMsg.id)
                 yield* sessions.updateMessage(continueMsg)
                 yield* sessions.updatePart({
                   id: PartID.ascending(),
@@ -805,6 +831,7 @@ export const layer = Layer.effect(
               sessionID,
               auto: task.auto,
               overflow: task.overflow,
+              onContinuation: (messageID) => ownedContinuationIDs.add(messageID),
             })
             if (result === "stop") break
             continue
@@ -815,7 +842,9 @@ export const layer = Layer.effect(
             lastFinished.summary !== true &&
             (yield* compaction.isOverflow({ tokens: lastFinished.tokens, model }))
           ) {
-            yield* compaction.create({ sessionID, agent: lastUser.agent, model: lastUser.model, auto: true })
+            ownedContinuationIDs.add(
+              yield* compaction.create({ sessionID, agent: lastUser.agent, model: lastUser.model, auto: true }),
+            )
             continue
           }
 
@@ -985,13 +1014,15 @@ export const layer = Layer.effect(
 
             if (result === "stop") return "break" as const
             if (result === "compact") {
-              yield* compaction.create({
-                sessionID,
-                agent: lastUser.agent,
-                model: lastUser.model,
-                auto: true,
-                overflow: !handle.message.finish,
-              })
+              ownedContinuationIDs.add(
+                yield* compaction.create({
+                  sessionID,
+                  agent: lastUser.agent,
+                  model: lastUser.model,
+                  auto: true,
+                  overflow: !handle.message.finish,
+                }),
+              )
             }
             return "continue" as const
           }).pipe(
@@ -1009,8 +1040,7 @@ export const layer = Layer.effect(
 
         yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
         return yield* lastAssistant(sessionID)
-      },
-    )
+      })
 
     const { ensureSwarmBriefing, claudeCodeTurn, recoverBackgroundDelegations } = PromptSwarm.make({
       claudeDriver,
@@ -1036,7 +1066,7 @@ export const layer = Layer.effect(
           input.commandID,
           input.claimGeneration,
           input.claimOwner,
-        ).pipe(Effect.flatMap((turn) => turn ?? runLoop(input.sessionID)))
+        ).pipe(Effect.flatMap((turn) => turn ?? runLoop({ sessionID: input.sessionID, messageID: input.messageID })))
         return yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), work)
       },
     )

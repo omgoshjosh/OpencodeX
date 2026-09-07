@@ -31,6 +31,7 @@ import { AppFileSystem } from "@opencode-ai/core/filesystem"
 import { Truncate } from "@/tool/truncate"
 import { Image } from "@/image/image"
 import { Process } from "@/util/process"
+import { isRecord } from "@/util/record"
 import { Cause, Effect, Exit, Layer, Option, Schema, Scope, Context } from "effect"
 import * as EffectLogger from "@opencode-ai/core/effect/logger"
 import { InstanceState } from "@/effect/instance-state"
@@ -115,8 +116,8 @@ function isSyntheticOnly(msg: SessionLegacy.WithParts) {
 /** Descriptive only — never used to decide who owns a child's question. */
 function swarmRoleOf(session: Session.Info) {
   const opencodex = session.metadata?.opencodex
-  if (typeof opencodex !== "object" || opencodex === null) return undefined
-  const { swarmRole } = opencodex as { swarmRole?: unknown }
+  if (!isRecord(opencodex)) return undefined
+  const swarmRole = opencodex.swarmRole
   return typeof swarmRole === "string" && swarmRole ? swarmRole : undefined
 }
 

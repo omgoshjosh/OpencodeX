@@ -163,6 +163,70 @@ it.instance("settles only the exact completed child reply and redelivers idempot
   }),
 )
 
+it.instance("reports the child's final assistant reply, not its first progress message", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const database = yield* Database.Service
+    const parent = yield* sessions.create({})
+    const child = yield* sessions.create({ parentID: parent.id })
+    const notices = yield* Ref.make<Array<{ messageID: string; text: string; noReply: boolean }>>([])
+    const boundary = "msg_child_boundary"
+    yield* sessions.stampDelegation({ sessionID: child.id, record: record(parent.id, boundary) })
+    yield* sessions.updateMessage({
+      id: MessageID.make(boundary),
+      sessionID: child.id,
+      role: "user",
+      time: { created: 1 },
+      agent: "build",
+      model: { providerID: ProviderV2.ID.make("test"), modelID: ProviderV2.ModelID.make("test") },
+    })
+    // One turn, several assistant messages against the same boundary: an early
+    // progress line, then the real answer.
+    for (const step of [
+      { id: "msg_step_1", created: 2, text: "Feature-axis enumeration, not path-axis. Let me inventory..." },
+      { id: "msg_step_2", created: 3, text: "Still working through the middle of the inventory." },
+      { id: "msg_step_3", created: 4, text: "107 capabilities inventoried; decisions recorded." },
+    ]) {
+      yield* sessions.updateMessage({
+        id: MessageID.make(step.id),
+        sessionID: child.id,
+        role: "assistant",
+        parentID: MessageID.make(boundary),
+        providerID: ProviderV2.ID.make("test"),
+        modelID: ProviderV2.ModelID.make("test"),
+        mode: "build",
+        agent: "build",
+        path: { cwd: ".", root: "." },
+        cost: 0,
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        time: { created: step.created, completed: step.created + 1 },
+        finish: "stop",
+      })
+      yield* sessions.updatePart({
+        id: PartID.make(`prt_${step.id}`),
+        sessionID: child.id,
+        messageID: MessageID.make(step.id),
+        type: "text",
+        text: step.text,
+      })
+    }
+    const recovery = yield* SessionDelegationRecovery.make({
+      database,
+      sessions,
+      notify: (input) => Ref.update(notices, (items) => [...items, input]),
+      refresh: () => Effect.void,
+    })
+    yield* recovery.recover()
+    expect(delegationRecord((yield* sessions.get(child.id)).metadata)).toMatchObject({
+      outcome: "completed",
+      summary: "107 capabilities inventoried; decisions recorded.",
+    })
+    const delivered = (yield* Ref.get(notices))[0]
+    expect(delivered?.text).toContain("107 capabilities inventoried; decisions recorded.")
+    expect(delivered?.text).not.toContain("Feature-axis enumeration")
+  }),
+)
+
 it.instance("does not reload transcripts for delivered runs", () =>
   Effect.gen(function* () {
     const sessions = yield* Session.Service

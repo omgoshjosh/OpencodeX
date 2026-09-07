@@ -72,6 +72,8 @@ export type ScenarioContext = {
     blocked?: boolean
     partialOutput?: boolean
     background?: boolean
+    /** Settle the delegation as completed, with this delivery outcome recorded. */
+    settled?: "pending" | "delivered"
   }) => Effect.Effect<{ parent: SessionInfo; child: SessionInfo }>
 }
 

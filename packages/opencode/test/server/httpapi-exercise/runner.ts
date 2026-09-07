@@ -224,8 +224,15 @@ function withContext<A, E>(
                             }
                           : {}),
                         attempt: 1,
-                        phase: "running",
                         startedAt: Date.now(),
+                        ...(input?.settled
+                          ? {
+                              phase: "settled" as const,
+                              outcome: "completed" as const,
+                              completedAt: Date.now(),
+                              deliveryOutcome: input.settled,
+                            }
+                          : { phase: "running" as const }),
                       },
                     })
                   }),

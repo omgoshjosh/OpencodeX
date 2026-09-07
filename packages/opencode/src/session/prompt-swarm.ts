@@ -89,6 +89,11 @@ export interface Deps {
    * delivered anyway. Defaults to 30 minutes; tests set 0.
    */
   readonly backgroundCompletionGraceMs?: number
+  /**
+   * How often that grace period re-reads the child's transcript. Defaults to
+   * 10 seconds; tests set a few milliseconds.
+   */
+  readonly backgroundCompletionPollIntervalMs?: number
   /** Bounded wait before retrying a fresh delivery claim after restart. */
   readonly deliveryClaimGraceMs?: number
   /**
@@ -111,6 +116,7 @@ const DELEGATION_COMPLETE_FOOTER = [
   "If you end a turn while still waiting on something (CI, a poller, a monitor), do not include it: the delegation stays open until a later turn ends with it.",
 ].join("\n")
 const DEFAULT_BACKGROUND_COMPLETION_GRACE_MS = 30 * 60_000
+const DEFAULT_BACKGROUND_COMPLETION_POLL_INTERVAL_MS = 10_000
 const RECOVERY_QUIET_LIMIT_MS = 2 * 60 * 60_000
 /**
  * How long a foreground delegation may wait on the in-memory hand-off before
@@ -359,25 +365,55 @@ export function make(deps: Deps) {
       graceMs: grace,
     })
     const deadline = Date.now() + grace
+    const interval = deps.backgroundCompletionPollIntervalMs ?? DEFAULT_BACKGROUND_COMPLETION_POLL_INTERVAL_MS
     let latestID = lastAssistantID
     let latest = report
+    // The newest message seen mid-stream, kept only for the deadline fallback
+    // below. A tick that lands inside a streaming turn sees whatever text has
+    // been persisted so far - see `childReport`'s `requireFinished` note - and
+    // latching that here was permanent, because the `id > latestID` filter can
+    // never re-read the same message. Live on 2026-09-07 a tick landed 1s into
+    // a 21.8s stream and delivered a 4397-character report as the single
+    // character "C" (#38 Task 30). So: never advance `latestID` past an
+    // unfinished message, and re-read it once its turn stamps completed.
+    let streaming: { id: string; text: string } | undefined
     while (Date.now() < deadline) {
-      yield* Effect.sleep("10 seconds")
+      yield* Effect.sleep(interval)
       const messages = yield* sessions.messages({ sessionID: childSessionID }).pipe(Effect.orElseSucceed(() => []))
       const last = messages.findLast((message) => message.info.role === "assistant" && message.info.id > latestID)
-      if (!last || last.info.role !== "assistant" || last.info.error) continue
+      if (!last || last.info.role !== "assistant") continue
+      if (last.info.error) continue
       const text = last.parts
         .flatMap((part) => (part.type === "text" && !part.synthetic && part.text.trim() ? [part.text.trim()] : []))
         .join("\n")
       if (!text) continue
+      if (last.info.time?.completed === undefined) {
+        streaming = { id: last.info.id, text }
+        continue
+      }
+      streaming = undefined
       latestID = last.info.id
       latest = text
       if (hasCompletionMarker(text)) return text
     }
-    log.warn("background delegation never sent the completion marker; delivering the last report", {
+    // Deadline safety valve, and the one place an unfinished message is still
+    // read: a turn the daemon lost mid-stream never gets its completion stamp,
+    // so demanding one here would report nothing at all instead of something
+    // partial. Falls back to today's lenient read - the newest visible text,
+    // finished or not.
+    const fallback = streaming?.text ?? latest
+    log.warn("background delegation grace period expired; delivering the last report seen", {
       sessionID: childSessionID,
+      messageID: streaming?.id ?? latestID,
+      reportLength: fallback.length,
+      // Tells the two ways to get here apart. `false`: the child's turns all
+      // ended and none carried the marker - it forgot, or is still being
+      // re-invoked between turns. `true`: the newest turn never stamped
+      // completed, so the marker may simply be withheld and this text is a
+      // partial stream, not a report.
+      streaming: streaming !== undefined,
     })
-    return latest
+    return fallback
   })
 
   /**

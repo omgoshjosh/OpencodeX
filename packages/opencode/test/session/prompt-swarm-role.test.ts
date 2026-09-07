@@ -212,6 +212,62 @@ describe("background swarm delegation", () => {
     expect(asyncPrompts[0]?.text).not.toContain(PromptSwarm.DELEGATION_COMPLETE_MARKER)
   })
 
+  /**
+   * Live on 2026-09-07 a grace-poll tick landed 1s into a 21.8s stream, read
+   * the one character persisted so far, latched it, and - because the poll
+   * only ever looks at ids ABOVE the latched one - could never re-read that
+   * message. A 4397-character report was delivered as `"C"`, 30 minutes late
+   * (#38 Task 30).
+   */
+  test("re-reads a grace-poll message that was still streaming, instead of latching one character", async () => {
+    const finished = `CI is fully green.\n${PromptSwarm.DELEGATION_COMPLETE_MARKER}`
+    const graceMs = 4000
+    const { runSwarmRole, asyncPrompts, stamps, runJob } = harness({
+      skills: {},
+      background: true,
+      // Recorded so the first turn has a real id for the poll to compare against.
+      promptResults: [success("first turn, no marker")],
+      backgroundCompletionGraceMs: graceMs,
+      backgroundCompletionPollIntervalMs: 5,
+      graceStreamsThenFinishes: { streaming: "C", finished, completeAfterReads: 3 },
+    })
+
+    await Effect.runPromise(run(runSwarmRole, { background: true }))
+    const startedAt = Date.now()
+    await Effect.runPromise(runJob())
+    const elapsed = Date.now() - startedAt
+
+    // The full report, not the first character of it.
+    expect(stamps.at(-1)?.record.summary).toBe("CI is fully green.")
+    expect(asyncPrompts[0]?.text).toContain("CI is fully green.")
+    expect(asyncPrompts[0]?.text).not.toContain(PromptSwarm.DELEGATION_COMPLETE_MARKER)
+    // And it arrived when the marker landed, not when the grace period gave up.
+    expect(elapsed).toBeLessThan(graceMs)
+  })
+
+  /**
+   * The other half of the same rule: a turn the daemon lost mid-stream never
+   * gets a completion stamp, so requiring one would report nothing at all.
+   * The deadline is the safety valve, and the only lenient read left.
+   */
+  test("still delivers a never-completed turn's partial text once the grace period expires", async () => {
+    const { runSwarmRole, asyncPrompts, stamps, runJob } = harness({
+      skills: {},
+      background: true,
+      // Recorded so the first turn has a real id for the poll to compare against.
+      promptResults: [success("first turn, no marker")],
+      backgroundCompletionGraceMs: 60,
+      backgroundCompletionPollIntervalMs: 5,
+      graceStreamsThenFinishes: { streaming: "C", finished: "never reached", completeAfterReads: 0 },
+    })
+
+    await Effect.runPromise(run(runSwarmRole, { background: true }))
+    await Effect.runPromise(runJob())
+
+    expect(stamps.at(-1)?.record.summary).toBe("C")
+    expect(asyncPrompts[0]?.text).toContain("C")
+  })
+
   test("a foreground delegation is not told about the marker", async () => {
     const { runSwarmRole, prompts } = harness({ skills: {} })
     await Effect.runPromise(run(runSwarmRole))
@@ -790,6 +846,15 @@ function harness(input: {
    */
   childStreamsThenFinishes?: { streaming: string; finished: string; finishAfterReads: number }
   foregroundPollIntervalMs?: number
+  backgroundCompletionPollIntervalMs?: number
+  /**
+   * A background child that opens a SECOND turn during the completion-marker
+   * grace period: the first transcript read lands mid-stream and sees only
+   * `streaming`, and the read numbered `completeAfterReads` finds the same
+   * message completed, carrying `finished`. `completeAfterReads: 0` means the
+   * turn never completes, which is how a turn lost mid-stream looks forever.
+   */
+  graceStreamsThenFinishes?: { streaming: string; finished: string; completeAfterReads: number }
 }) {
   const started: Array<{ id?: string; metadata?: Record<string, unknown>; run: Effect.Effect<string, unknown> }> = []
   const prompts: string[] = []
@@ -801,6 +866,7 @@ function harness(input: {
   const stamps: Array<{ record: DelegationRecord; expectRunID?: string }> = []
   const parts: Array<Record<string, unknown>> = []
   let childReads = 0
+  let messageReads = 0
   const parentMessage = { info: { id: "msg_1", role: "assistant" }, parts: input.parentParts ?? [] }
   const turn: SessionLegacy.WithParts[] = []
   let loopCount = 0
@@ -858,7 +924,21 @@ function harness(input: {
         })
       },
       create: () => Effect.succeed({ id: "ses_child" }),
-      messages: () => Effect.succeed([...turn]),
+      messages: () =>
+        Effect.sync(() => {
+          const plan = input.graceStreamsThenFinishes
+          if (plan) {
+            messageReads++
+            if (messageReads === 1) record(streaming(plan.streaming), "msg_user")
+            else if (messageReads === plan.completeAfterReads) {
+              const previous = turn.at(-1)
+              if (!previous) throw new Error("expected the streaming child turn")
+              const done = success(plan.finished)
+              turn[turn.length - 1] = { ...previous, ...done, info: { ...done.info, id: previous.info.id } }
+            }
+          }
+          return [...turn]
+        }),
       messageWithChildren: () => Effect.succeed([...turn]),
       updateMessage: (message: SessionLegacy.Info) => {
         const index = turn.findIndex((item) => item.info.id === message.id)
@@ -955,6 +1035,9 @@ function harness(input: {
     // Background children here answer without the completion marker; do not
     // wait the production grace period for one.
     backgroundCompletionGraceMs: input.backgroundCompletionGraceMs ?? 0,
+    ...(input.backgroundCompletionPollIntervalMs !== undefined
+      ? { backgroundCompletionPollIntervalMs: input.backgroundCompletionPollIntervalMs }
+      : {}),
     ...(input.deliveryClaimGraceMs !== undefined ? { deliveryClaimGraceMs: input.deliveryClaimGraceMs } : {}),
     ...(input.foregroundPollIntervalMs !== undefined
       ? { foregroundPollIntervalMs: input.foregroundPollIntervalMs }

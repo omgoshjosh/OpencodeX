@@ -363,7 +363,7 @@ export function make(deps: Deps) {
           )
           .run()
           .pipe(Effect.orDie)
-        return command.session_id
+        return
       }
       const requeue = Effect.fnUntraced(function* () {
         const completedAt = clock()
@@ -477,7 +477,7 @@ export function make(deps: Deps) {
           )
           .run()
           .pipe(Effect.orDie)
-        return command.session_id
+        return
       }
 
       if (Cause.hasInterruptsOnly(exit.cause)) {
@@ -513,7 +513,6 @@ export function make(deps: Deps) {
         sessionID: command.session_id,
         error: new NamedError.Unknown({ message: error }).toObject(),
       })
-      return command.session_id
     })
 
     let wakeQueued = (_sessionID: SessionID): Effect.Effect<void> => Effect.void
@@ -521,7 +520,21 @@ export function make(deps: Deps) {
       if (launching.has(commandID)) return
       launching.add(commandID)
       yield* executeCommand(commandID).pipe(
-        Effect.tap((sessionID) => (sessionID ? wakeQueued(sessionID) : Effect.void)),
+        Effect.andThen(
+          db
+            .select({ sessionID: SessionCommandTable.session_id, status: SessionCommandTable.status })
+            .from(SessionCommandTable)
+            .where(eq(SessionCommandTable.id, commandID))
+            .get()
+            .pipe(
+              Effect.orDie,
+              Effect.flatMap((command) =>
+                command && ["succeeded", "failed", "cancelled"].includes(command.status)
+                  ? wakeQueued(command.sessionID)
+                  : Effect.void,
+              ),
+            ),
+        ),
         Effect.catchCause((cause) => Effect.logError("prompt_async recovery failed", { commandID, cause })),
         Effect.ensuring(Effect.sync(() => launching.delete(commandID))),
         Effect.forkIn(scope, { startImmediately: true }),

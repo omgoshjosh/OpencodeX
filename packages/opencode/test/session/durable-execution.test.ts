@@ -863,7 +863,7 @@ it.instance("does not starve a later session behind a backlog larger than one ba
         .where(eq(SessionCommandTable.id, "sec_fifo_01"))
         .get()
         .pipe(Effect.orDie),
-    ).toEqual({ status: "queued" })
+    ).toEqual({ status: "succeeded" })
   }),
 )
 

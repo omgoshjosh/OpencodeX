@@ -2,6 +2,7 @@ import { PlanExitTool } from "./plan"
 import { Session } from "@/session/session"
 import { SessionStatus } from "@/session/status"
 import { QuestionTool } from "./question"
+import { QuestionReplyTool } from "./question-reply"
 import { ShellTool } from "./shell"
 import { EditTool } from "./edit"
 import { GlobTool } from "./glob"
@@ -144,6 +145,7 @@ export const layer: Layer.Layer<
     const task = yield* TaskTool
     const read = yield* ReadTool
     const question = yield* QuestionTool
+    const questionReply = yield* QuestionReplyTool
     const todo = yield* TodoWriteTool
     const lsptool = yield* LspTool
     const plan = yield* PlanExitTool
@@ -274,6 +276,7 @@ export const layer: Layer.Layer<
           skill: Tool.init(skilltool),
           patch: Tool.init(patchtool),
           question: Tool.init(question),
+          question_reply: Tool.init(questionReply),
           lsp: Tool.init(lsptool),
           plan: Tool.init(plan),
           opencodex_swarm_create: Tool.init(opencodexSwarmCreate),
@@ -291,6 +294,10 @@ export const layer: Layer.Layer<
           builtin: [
             tool.invalid,
             ...(questionEnabled ? [tool.question] : []),
+            // Not gated on `questionEnabled`: that flag is about whether a
+            // client can render a question prompt. Answering a child's question
+            // needs no client at all.
+            tool.question_reply,
             tool.shell,
             tool.read,
             tool.glob,

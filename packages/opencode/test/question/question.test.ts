@@ -10,7 +10,7 @@ import { testEffect } from "../lib/effect"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { EventV2Bridge } from "../../src/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
-import { SessionExecutionTable, SessionInteractionTable } from "@opencode-ai/core/session/sql"
+import { SessionCommandTable, SessionExecutionTable, SessionInteractionTable } from "@opencode-ai/core/session/sql"
 import { eq } from "drizzle-orm"
 
 const database = Database.defaultLayer
@@ -79,6 +79,33 @@ const waitForPending = Effect.fn("QuestionTest.waitForPending")(function* (count
     yield* Queue.take(asked).pipe(Effect.timeout("2 seconds"))
   }
 })
+
+// A session with no parent has nobody to notify: its question is a human's,
+// and the parent bridge must leave it exactly as it was before the bridge
+// existed. Every other case in this file also runs with no SessionPrompt layer
+// built, so no notification hook is registered at all -- which is the second
+// half of the same guarantee.
+it.instance("ask - writes no parent notification for a session with no parent", () =>
+  Effect.gen(function* () {
+    const fiber = yield* askEffect({
+      sessionID: SessionID.make("ses_parentless"),
+      questions: [
+        {
+          question: "Who decides this?",
+          header: "Owner",
+          options: [{ label: "A human", description: "Nobody else can" }],
+        },
+      ],
+    }).pipe(Effect.forkScoped)
+
+    const pending = yield* waitForPending(1)
+    const { db } = yield* Database.Service
+    expect(yield* db.select().from(SessionCommandTable).all().pipe(Effect.orDie)).toHaveLength(0)
+
+    yield* rejectEffect(pending[0].id)
+    expect((yield* Fiber.await(fiber))._tag).toBe("Failure")
+  }),
+)
 
 it.instance(
   "ask - remains pending until answered",

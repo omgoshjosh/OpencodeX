@@ -10,6 +10,7 @@ import { SessionExecutionTable, SessionInteractionTable } from "@opencode-ai/cor
 import { and, eq } from "drizzle-orm"
 import { SessionStatus } from "@/session/status"
 import { SessionInteractionEvent } from "@/session/interaction-event"
+import { SessionQuestionNotify } from "@/session/question-notify"
 
 const log = Log.create({ service: "question" })
 const encodeQuestionID = Schema.encodeSync(QuestionID)
@@ -277,6 +278,14 @@ export const layer = Layer.effect(
         )
         if (!asked) return yield* new RejectedError()
         yield* events.broadcast(asked)
+        // Tell whoever owns this session that it is now blocked. Forked into
+        // the layer scope rather than awaited: a listener that hangs or fails
+        // must never delay the child's question or turn `ask` into a failure.
+        // `notify` also isolates each handler, so this is belt and braces.
+        yield* SessionQuestionNotify.notify(info).pipe(
+          Effect.catchCause((cause) => Effect.logWarning("question notification failed", { id, cause })),
+          Effect.forkIn(scope),
+        )
         yield* observe(id, deferred).pipe(Effect.forkIn(scope))
         return yield* Deferred.await(deferred)
       }).pipe(

@@ -3,25 +3,43 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
 import { NonNegativeInt } from "@opencode-ai/core/schema"
-import { SessionExecutionTable, SessionStatusTable, SessionTable } from "@opencode-ai/core/session/sql"
+import {
+  SessionExecutionTable,
+  SessionInteractionTable,
+  SessionStatusTable,
+  SessionTable,
+} from "@opencode-ai/core/session/sql"
 import { ensureRunID } from "@opencode-ai/core/util/opencode-process"
-import { and, eq } from "drizzle-orm"
+import { and, eq, inArray } from "drizzle-orm"
 import { Context, Duration, Effect, Layer, Option, Schedule, Schema } from "effect"
 import { SessionID } from "./schema"
 import { SessionExecutionOwner } from "./execution-owner"
-import { delegationRecord, isLiveDelegation } from "./delegation-outcome"
+import { delegationRecord, type DelegationRecord } from "./delegation-outcome"
 import { SessionInteractionRecovery } from "./interaction-recovery"
 
+/**
+ * What a parent's delegated background children are doing right now.
+ *
+ * `running` answers the only question a client actually asks - "is anything
+ * still working for me?" - so it counts working jobs alone. A child parked on
+ * a question is not working (nobody is spending tokens; a human is), and a
+ * finished child whose report has not been handed over yet is not working
+ * either. Both still belong in `jobs`, because they are outstanding.
+ */
 const Background = Schema.Struct({
   running: Schema.Boolean,
   jobs: Schema.Array(
     Schema.Struct({
       id: SessionID,
       sessionID: SessionID,
-      status: Schema.Literal("running"),
+      status: Schema.Literals(["running", "blocked", "completed"]),
       role: Schema.String,
       title: Schema.String,
       owner: Schema.String,
+      /** Set once the run settled; the delegation record's own completion time. */
+      completedAt: Schema.optional(NonNegativeInt),
+      /** Whether the parent has durably received the report. Never `delivered` here. */
+      delivery: Schema.optional(Schema.Literals(["pending", "delivering", "delivered", "failed"])),
     }),
   ),
 })
@@ -109,6 +127,36 @@ export const ExecutionGeneration = Context.Reference<{ sessionID: SessionID; gen
 const decode = Schema.decodeUnknownOption(Info)
 const OWNERLESS_STALE_MILLIS = 15_000
 
+/**
+ * Durable terminal evidence on the record itself. The settle boundary stamps
+ * all three together, but any one of them is a run that has ended: a reader
+ * must never advertise work as live while the record it is reading says the
+ * work is over.
+ */
+function settledDelegation(record: DelegationRecord) {
+  return record.phase === "settled" || record.outcome !== undefined || record.completedAt !== undefined
+}
+
+/**
+ * The child's own execution row proving this run's turn already returned, for
+ * a record whose settle stamp never landed (a swallowed stamp, or a job that
+ * died between the turn and its exit boundary). Owner liveness cannot see
+ * this: the owner is the daemon, which outlives its children by days.
+ *
+ * Scoped to `running`, so a `monitoring` record - whose local execution is
+ * *expected* to be idle while a durable external job runs - keeps its job.
+ * `completedAt` must post-date the run's start, or a reused child session's
+ * previous turn would retire the new one.
+ */
+function returnedLocally(
+  record: DelegationRecord,
+  execution: { state: string; completedAt: number | null } | undefined,
+) {
+  if (record.phase !== "running" || !execution) return false
+  if (execution.state === "running" || execution.state === "queued") return false
+  return execution.completedAt !== null && execution.completedAt >= record.startedAt
+}
+
 export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -122,22 +170,78 @@ export const layer = Layer.effect(
         .from(SessionTable)
         .all()
         .pipe(Effect.orDie)
-      return rows.reduce((result, row) => {
+      // A dead owner still retires a job outright - it is just no longer the
+      // only way out. Everything past this point is a live owner's delegation,
+      // which is exactly the case that used to project `running` forever.
+      const candidates = rows.flatMap((row) => {
         const record = delegationRecord(row.metadata)
-        if (!record?.background || !isLiveDelegation(record, processRunID)) return result
-        const parentID = SessionID.make(record.parentSessionID)
-        const jobs = result.get(parentID) ?? []
-        jobs.push({
+        if (!record?.background || !record.ownerID) return []
+        if (!SessionExecutionOwner.alive(record.ownerID, processRunID)) return []
+        return [{ row, record }]
+      })
+      const result = new Map<SessionID, BackgroundJob[]>()
+      if (candidates.length === 0) return result
+      const ids = candidates.map((candidate) => candidate.row.id)
+      // Only the handful of children a live owner is still carrying, so these
+      // stay indexed lookups rather than the two extra table scans a blanket
+      // read would cost every time a client paints a sidebar.
+      const [executions, questions] = yield* Effect.all([
+        db
+          .select({
+            sessionID: SessionExecutionTable.session_id,
+            state: SessionExecutionTable.state,
+            completedAt: SessionExecutionTable.completed_at,
+          })
+          .from(SessionExecutionTable)
+          .where(inArray(SessionExecutionTable.session_id, ids))
+          .all()
+          .pipe(Effect.orDie),
+        db
+          .select({ sessionID: SessionInteractionTable.session_id })
+          .from(SessionInteractionTable)
+          .where(
+            and(
+              inArray(SessionInteractionTable.session_id, ids),
+              eq(SessionInteractionTable.kind, "question"),
+              eq(SessionInteractionTable.state, "pending"),
+            ),
+          )
+          .all()
+          .pipe(Effect.orDie),
+      ])
+      const executionByChild = new Map(executions.map((row) => [row.sessionID, row]))
+      const asking = new Set(questions.map((row) => row.sessionID))
+      for (const { row, record } of candidates) {
+        const identity = {
           id: row.id,
           sessionID: row.id,
-          status: "running",
           role: record.role ?? "Background task",
           title: record.title ?? row.title,
           owner: record.ownerID!,
-        })
-        result.set(parentID, jobs)
-        return result
-      }, new Map<SessionID, BackgroundJob[]>())
+        }
+        const job = settledDelegation(record)
+          ? // A settled run is the parent's business only until its report has
+            // actually been handed over; anything else is finished business.
+            record.deliveryOutcome && record.deliveryOutcome !== "delivered"
+            ? ({
+                ...identity,
+                status: "completed",
+                ...(record.completedAt !== undefined ? { completedAt: record.completedAt } : {}),
+                delivery: record.deliveryOutcome,
+              } as const)
+            : undefined
+          : // Task 27's durable question request is the authority on a parked
+            // child; nothing here has to be inferred from a quiet transcript.
+            asking.has(row.id)
+            ? ({ ...identity, status: "blocked" } as const)
+            : returnedLocally(record, executionByChild.get(row.id))
+              ? undefined
+              : ({ ...identity, status: "running" } as const)
+        if (!job) continue
+        const parentID = SessionID.make(record.parentSessionID)
+        result.set(parentID, [...(result.get(parentID) ?? []), job])
+      }
+      return result
     })
 
     const withBackground = (status: Info, jobs: BackgroundJob[] | undefined): Info =>
@@ -145,7 +249,7 @@ export const layer = Layer.effect(
         ? {
             ...status,
             background: {
-              running: true,
+              running: jobs.some((job) => job.status === "running"),
               jobs: jobs.toSorted((a, b) => a.id.localeCompare(b.id)),
             },
           }

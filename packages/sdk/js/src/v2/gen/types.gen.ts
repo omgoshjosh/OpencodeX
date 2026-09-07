@@ -636,10 +636,12 @@ export type SessionStatus =
         jobs: Array<{
           id: string
           sessionID: string
-          status: "running"
+          status: "running" | "blocked" | "completed"
           role: string
           title: string
           owner: string
+          completedAt?: number
+          delivery?: "pending" | "delivering" | "delivered" | "failed"
         }>
       }
     }
@@ -653,10 +655,12 @@ export type SessionStatus =
         jobs: Array<{
           id: string
           sessionID: string
-          status: "running"
+          status: "running" | "blocked" | "completed"
           role: string
           title: string
           owner: string
+          completedAt?: number
+          delivery?: "pending" | "delivering" | "delivered" | "failed"
         }>
       }
     }
@@ -667,10 +671,12 @@ export type SessionStatus =
         jobs: Array<{
           id: string
           sessionID: string
-          status: "running"
+          status: "running" | "blocked" | "completed"
           role: string
           title: string
           owner: string
+          completedAt?: number
+          delivery?: "pending" | "delivering" | "delivered" | "failed"
         }>
       }
     }
@@ -681,10 +687,12 @@ export type SessionStatus =
         jobs: Array<{
           id: string
           sessionID: string
-          status: "running"
+          status: "running" | "blocked" | "completed"
           role: string
           title: string
           owner: string
+          completedAt?: number
+          delivery?: "pending" | "delivering" | "delivered" | "failed"
         }>
       }
       childSessionID: string
@@ -699,10 +707,12 @@ export type SessionStatus =
         jobs: Array<{
           id: string
           sessionID: string
-          status: "running"
+          status: "running" | "blocked" | "completed"
           role: string
           title: string
           owner: string
+          completedAt?: number
+          delivery?: "pending" | "delivering" | "delivered" | "failed"
         }>
       }
       childSessionID?: string

@@ -620,6 +620,37 @@ const scenarios: Scenario[] = [
       check(job.id === ctx.state.child.id, "background job should expose a stable child key")
       check(job.sessionID === ctx.state.child.id, "background job should expose its child session")
       check(job.status === "running", "live background job should report running status")
+      check(status.background.running === true, "a working child should read as running work")
+    }),
+  http.protected
+    .get("/session/status", "session.status.settled")
+    .seeded((ctx) => ctx.retryChild({ background: true, settled: "pending" }))
+    .json(200, (body, ctx) => {
+      object(body)
+      const status = body[ctx.state.parent.id]
+      check(isRecord(status) && isRecord(status.background), "an undelivered report should still be reported")
+      const jobs = status.background.jobs
+      array(jobs)
+      const job = jobs[0]
+      check(isRecord(job), "background status should include a job")
+      check(job.sessionID === ctx.state.child.id, "background status should include the child")
+      check(job.status === "completed", "a settled child must not be advertised as running")
+      check(job.delivery === "pending", "the status contract should expose the durable delivery outcome")
+      check(typeof job.completedAt === "number", "the status contract should expose the completion time")
+      check(status.background.running === false, "a settled child is outstanding work, not running work")
+    }),
+  http.protected
+    .get("/session/status", "session.status.delivered")
+    .seeded((ctx) => ctx.retryChild({ background: true, settled: "delivered" }))
+    .json(200, (body, ctx) => {
+      object(body)
+      const status = body[ctx.state.parent.id]
+      // The phantom worker: a live owner and a finished child. Nothing is
+      // owed to the parent anymore, so the job is retired outright.
+      check(
+        status === undefined || (isRecord(status) && status.background === undefined),
+        "a delivered background child should leave no background work behind",
+      )
     }),
   http.protected
     .post("/session", "session.create")

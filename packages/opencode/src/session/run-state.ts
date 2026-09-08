@@ -5,8 +5,9 @@ import { Database } from "@opencode-ai/core/database/database"
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
 import { SessionCommandTable, SessionExecutionTable } from "@opencode-ai/core/session/sql"
 import { ensureRunID } from "@opencode-ai/core/util/opencode-process"
-import { and, eq, inArray } from "drizzle-orm"
-import { Context, Effect, Latch, Layer, Scope } from "effect"
+import { and, eq, gt, inArray, isNull, sql } from "drizzle-orm"
+import { Cause, Context, Effect, Latch, Layer, Scope } from "effect"
+import { isSqlError, isSqlErrorReason } from "effect/unstable/sql/SqlError"
 import * as Session from "./session"
 import { SessionID } from "./schema"
 import { SessionStatus } from "./status"
@@ -14,16 +15,21 @@ import { SessionExecutionOwner } from "./execution-owner"
 
 const LEASE_MILLIS = 15_000
 const POLL_MILLIS = 200
+const SQLITE_BUSY_MILLIS = 5_000
+const RETRY_MARGIN_MILLIS = 500
+const DATABASE_NOW_MILLIS = sql<number>`cast(unixepoch('subsec') * 1000 as integer)`
 
 interface Lease {
   owner: string
   generation: number
+  expiresAt: number
 }
 
 interface ActiveRunner {
   runner: Runner.Runner<SessionLegacy.WithParts>
   lease: Lease
   interrupted: boolean
+  heartbeatFailed: boolean
 }
 
 export interface Interface {
@@ -45,9 +51,16 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionRunState") {}
 
-export const layer = Layer.effect(
+export interface LayerOptions {
+  readonly onHeartbeatLockTimeout?: Effect.Effect<void>
+}
+
+class Options extends Context.Service<Options, LayerOptions>()("@opencode/SessionRunStateOptions") {}
+
+const configuredLayer = Layer.effect(
   Service,
   Effect.gen(function* () {
+    const options = yield* Options
     const background = yield* BackgroundJob.Service
     const status = yield* SessionStatus.Service
     const { db } = yield* Database.Service
@@ -56,44 +69,45 @@ export const layer = Layer.effect(
 
     const claim = Effect.fn("SessionRunState.claim")(function* (sessionID: SessionID) {
       const ctx = yield* InstanceState.context
-      const now = Date.now()
       return yield* db
         .transaction(
           (transaction) =>
             Effect.gen(function* () {
-              const current = yield* transaction
+              const now = yield* transaction.get<{ now: number }>(sql`select ${DATABASE_NOW_MILLIS} as now`)
+              const execution = yield* transaction
                 .select()
                 .from(SessionExecutionTable)
                 .where(eq(SessionExecutionTable.session_id, sessionID))
                 .get()
               if (
-                current?.state === "running" &&
-                current.owner_id &&
-                current.lease_expires_at &&
-                current.lease_expires_at > now &&
-                SessionExecutionOwner.alive(current.owner_id, processRunID)
+                execution?.state === "running" &&
+                execution.owner_id &&
+                execution.lease_expires_at &&
+                now &&
+                execution.lease_expires_at > now.now &&
+                SessionExecutionOwner.alive(execution.owner_id, processRunID)
               )
                 return undefined
 
-              const lease = {
+              const identity = {
                 owner: `${ownerPrefix}:${sessionID}`,
-                generation: (current?.generation ?? 0) + 1,
+                generation: (execution?.generation ?? 0) + 1,
               }
-              yield* transaction
+              const claimed = yield* transaction
                 .insert(SessionExecutionTable)
                 .values({
                   session_id: sessionID,
                   project_id: ctx.project.id,
                   directory: ctx.directory,
                   state: "running",
-                  owner_id: lease.owner,
-                  generation: lease.generation,
-                  lease_expires_at: now + LEASE_MILLIS,
+                  owner_id: identity.owner,
+                  generation: identity.generation,
+                  lease_expires_at: sql`${DATABASE_NOW_MILLIS} + ${LEASE_MILLIS}`,
                   cancel_requested_at: null,
-                  started_at: now,
+                  started_at: DATABASE_NOW_MILLIS,
                   completed_at: null,
-                  time_created: current?.time_created ?? now,
-                  time_updated: now,
+                  time_created: execution?.time_created ?? DATABASE_NOW_MILLIS,
+                  time_updated: DATABASE_NOW_MILLIS,
                 })
                 .onConflictDoUpdate({
                   target: SessionExecutionTable.session_id,
@@ -101,17 +115,19 @@ export const layer = Layer.effect(
                     project_id: ctx.project.id,
                     directory: ctx.directory,
                     state: "running",
-                    owner_id: lease.owner,
-                    generation: lease.generation,
-                    lease_expires_at: now + LEASE_MILLIS,
+                    owner_id: identity.owner,
+                    generation: identity.generation,
+                    lease_expires_at: sql`${DATABASE_NOW_MILLIS} + ${LEASE_MILLIS}`,
                     cancel_requested_at: null,
-                    started_at: now,
+                    started_at: DATABASE_NOW_MILLIS,
                     completed_at: null,
-                    time_updated: now,
+                    time_updated: DATABASE_NOW_MILLIS,
                   },
                 })
-                .run()
-              return lease
+                .returning({ expiresAt: SessionExecutionTable.lease_expires_at })
+                .get()
+              if (!claimed?.expiresAt) return yield* Effect.die("session execution claim returned no lease")
+              return { ...identity, expiresAt: claimed.expiresAt }
             }),
           { behavior: "immediate" },
         )
@@ -167,53 +183,123 @@ export const layer = Layer.effect(
 
     const supervise = Effect.fn("SessionRunState.supervise")(function* (
       sessionID: SessionID,
-      lease: Lease,
+      active: ActiveRunner,
       onInterrupt: Effect.Effect<SessionLegacy.WithParts>,
       work: Effect.Effect<SessionLegacy.WithParts>,
     ) {
+      const lease = active.lease
+      const terminal = (error: unknown) => {
+        active.heartbeatFailed = true
+        return Effect.die(error)
+      }
+      const renew = Effect.fn("SessionRunState.renew")(function* () {
+        const pass = () =>
+          Effect.gen(function* () {
+            const current = yield* db
+              .select({
+                state: SessionExecutionTable.state,
+                owner: SessionExecutionTable.owner_id,
+                generation: SessionExecutionTable.generation,
+                cancelRequestedAt: SessionExecutionTable.cancel_requested_at,
+                leaseExpiresAt: SessionExecutionTable.lease_expires_at,
+                now: DATABASE_NOW_MILLIS,
+              })
+              .from(SessionExecutionTable)
+              .where(eq(SessionExecutionTable.session_id, sessionID))
+              .get()
+            if (
+              !current ||
+              current.state !== "running" ||
+              current.owner !== lease.owner ||
+              current.generation !== lease.generation ||
+              current.cancelRequestedAt ||
+              !current.leaseExpiresAt ||
+              current.leaseExpiresAt <= current.now
+            )
+              return { _tag: "Interrupted" } as const
+
+            const renewed = yield* db
+              .update(SessionExecutionTable)
+              .set({
+                lease_expires_at: sql`${DATABASE_NOW_MILLIS} + ${LEASE_MILLIS}`,
+                time_updated: DATABASE_NOW_MILLIS,
+              })
+              .where(
+                and(
+                  eq(SessionExecutionTable.session_id, sessionID),
+                  eq(SessionExecutionTable.state, "running"),
+                  eq(SessionExecutionTable.owner_id, lease.owner),
+                  eq(SessionExecutionTable.generation, lease.generation),
+                  isNull(SessionExecutionTable.cancel_requested_at),
+                  gt(SessionExecutionTable.lease_expires_at, DATABASE_NOW_MILLIS),
+                ),
+              )
+              .returning({ expiresAt: SessionExecutionTable.lease_expires_at })
+              .get()
+            if (!renewed?.expiresAt) return { _tag: "Interrupted" } as const
+            return { _tag: "Renewed", expiresAt: renewed.expiresAt } as const
+          })
+
+        return yield* pass().pipe(
+          Effect.catchTag("EffectDrizzleQueryError", (error) =>
+            Effect.gen(function* () {
+              if (!isLockTimeout(error)) return yield* terminal(error)
+              const current = yield* db
+                .get<{ now: number }>(sql`select ${DATABASE_NOW_MILLIS} as now`)
+                .pipe(Effect.catch((admissionError) => terminal(admissionError)))
+              if (!current || lease.expiresAt <= current.now + SQLITE_BUSY_MILLIS + RETRY_MARGIN_MILLIS)
+                return yield* terminal(error)
+              yield* options.onHeartbeatLockTimeout ?? Effect.void
+              return yield* pass().pipe(Effect.catch((retryError) => terminal(retryError)))
+            }),
+          ),
+        )
+      })
+
       const monitor = Effect.gen(function* () {
-        let renewedAt = Date.now()
+        let expiresAt = lease.expiresAt
         while (true) {
           yield* Effect.sleep(POLL_MILLIS)
           const current = yield* db
             .select({
+              state: SessionExecutionTable.state,
               owner: SessionExecutionTable.owner_id,
               generation: SessionExecutionTable.generation,
               cancelRequestedAt: SessionExecutionTable.cancel_requested_at,
+              leaseExpiresAt: SessionExecutionTable.lease_expires_at,
+              now: DATABASE_NOW_MILLIS,
             })
             .from(SessionExecutionTable)
             .where(eq(SessionExecutionTable.session_id, sessionID))
             .get()
-            .pipe(Effect.orDie)
-          if (!current || current.owner !== lease.owner || current.generation !== lease.generation)
-            return yield* onInterrupt
-          if (current.cancelRequestedAt) return yield* onInterrupt
-          const now = Date.now()
-          if (now - renewedAt < Math.floor(LEASE_MILLIS / 3)) continue
-          const renewed = yield* db
-            .update(SessionExecutionTable)
-            .set({ lease_expires_at: now + LEASE_MILLIS, time_updated: now })
-            .where(
-              and(
-                eq(SessionExecutionTable.session_id, sessionID),
-                eq(SessionExecutionTable.owner_id, lease.owner),
-                eq(SessionExecutionTable.generation, lease.generation),
-              ),
-            )
-            .returning({ sessionID: SessionExecutionTable.session_id })
-            .get()
-            .pipe(Effect.orDie)
-          if (!renewed) return yield* onInterrupt
-          renewedAt = now
+            .pipe(Effect.catch((error) => terminal(error)))
+          if (
+            !current ||
+            current.state !== "running" ||
+            current.owner !== lease.owner ||
+            current.generation !== lease.generation ||
+            !current.leaseExpiresAt ||
+            current.leaseExpiresAt <= current.now
+          )
+            return { _tag: "Interrupted" } as const
+          if (current.cancelRequestedAt) return { _tag: "Interrupted" } as const
+          if (current.now < expiresAt - Math.floor((LEASE_MILLIS * 3) / 4)) continue
+          const result = yield* renew()
+          if (result._tag === "Interrupted") return result
+          expiresAt = result.expiresAt
+          lease.expiresAt = result.expiresAt
         }
       })
-      return yield* work.pipe(
+      const result = yield* work.pipe(
         Effect.provideService(SessionStatus.ExecutionGeneration, {
           sessionID,
           generation: lease.generation,
         }),
+        Effect.map((value) => ({ _tag: "Completed", value }) as const),
         Effect.raceFirst(monitor),
       )
+      if (result._tag === "Interrupted") return yield* onInterrupt
+      return result.value
     })
 
     const waitForForeign = Effect.fn("SessionRunState.waitForForeign")(function* (
@@ -271,12 +357,14 @@ export const layer = Layer.effect(
         onIdle: Effect.gen(function* () {
           if (data.runners.get(sessionID) !== active) return
           data.runners.delete(sessionID)
-          yield* release(sessionID, lease, active.interrupted)
+          yield* release(sessionID, lease, active.interrupted).pipe(
+            Effect.catchCause((cause) => (active.heartbeatFailed ? Effect.logError(cause) : Effect.failCause(cause))),
+          )
         }),
         onBusy: status.setForGeneration(sessionID, lease.generation, { type: "busy" }).pipe(Effect.asVoid),
         onInterrupt,
       })
-      const active: ActiveRunner = { runner: next, lease, interrupted: false }
+      const active: ActiveRunner = { runner: next, lease, interrupted: false, heartbeatFailed: false }
       data.runners.set(sessionID, active)
       return active
     })
@@ -465,7 +553,7 @@ export const layer = Layer.effect(
       if (!lease) return yield* waitForForeign(sessionID, onInterrupt)
       yield* status.setForGeneration(sessionID, lease.generation, { type: "busy" })
       const active = yield* ownedRunner(sessionID, lease, onInterrupt)
-      return yield* active.runner.ensureRunning(supervise(sessionID, lease, onInterrupt, work))
+      return yield* active.runner.ensureRunning(supervise(sessionID, active, onInterrupt, work))
     })
 
     const startShell = Effect.fn("SessionRunState.startShell")(function* (
@@ -479,15 +567,24 @@ export const layer = Layer.effect(
       const lease = yield* claim(sessionID)
       if (!lease) return yield* busyError(sessionID)
       const active = yield* ownedRunner(sessionID, lease, onInterrupt)
-      return yield* active.runner.startShell(supervise(sessionID, lease, onInterrupt, work), ready).pipe(
+      return yield* active.runner.startShell(supervise(sessionID, active, onInterrupt, work), ready).pipe(
         Effect.catchTag("RunnerBusy", () => Effect.fail(busyError(sessionID))),
-        Effect.onError(() => release(sessionID, lease, true)),
+        Effect.onError(() =>
+          release(sessionID, lease, true).pipe(
+            Effect.catchCause((cause) => (active.heartbeatFailed ? Effect.logError(cause) : Effect.failCause(cause))),
+          ),
+        ),
       )
     })
 
     return Service.of({ assertNotBusy, cancel, interrupt, ensureRunning, startShell })
   }),
 )
+
+export const layerWithOptions = (options: LayerOptions = {}) =>
+  configuredLayer.pipe(Layer.provide(Layer.succeed(Options, options)))
+
+export const layer = layerWithOptions()
 
 export const defaultLayer = layer.pipe(
   Layer.provide(BackgroundJob.defaultLayer),
@@ -531,6 +628,25 @@ const cancelBackgroundJobs = Effect.fn("SessionRunState.cancelBackgroundJobs")(f
 
 function busyError(sessionID: SessionID) {
   return new Session.BusyError({ sessionID })
+}
+
+function isLockTimeout(error: unknown) {
+  if (
+    typeof error !== "object" ||
+    error === null ||
+    !("_tag" in error) ||
+    error._tag !== "EffectDrizzleQueryError" ||
+    !("cause" in error) ||
+    !Cause.isCause(error.cause)
+  )
+    return false
+  return error.cause.reasons.some(
+    (reason) =>
+      Cause.isFailReason(reason) &&
+      isSqlError(reason.error) &&
+      isSqlErrorReason(reason.error.reason) &&
+      reason.error.reason._tag === "LockTimeoutError",
+  )
 }
 
 export * as SessionRunState from "./run-state"

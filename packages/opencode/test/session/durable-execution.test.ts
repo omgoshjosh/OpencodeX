@@ -1,4 +1,5 @@
 import { expect } from "bun:test"
+import path from "path"
 import { BackgroundJob } from "@/background/job"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { InstanceState } from "@/effect/instance-state"
@@ -28,8 +29,9 @@ import {
   SessionStatusTable,
 } from "@opencode-ai/core/session/sql"
 import { and, eq, sql } from "drizzle-orm"
-import { Context, Duration, Effect, Exit, Fiber, Latch, Layer, Logger, Ref, Scope } from "effect"
-import { pollWithTimeout, testEffect } from "../lib/effect"
+import { Cause, Context, Duration, Effect, Exit, Fiber, Latch, Layer, Logger, Ref, Scope } from "effect"
+import { TestInstance } from "../fixture/fixture"
+import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 
 const env = Layer.mergeAll(
   Database.defaultLayer,
@@ -64,14 +66,16 @@ function eventRequestID(data: unknown) {
   return typeof data === "object" && data !== null && "requestID" in data ? String(data.requestID) : undefined
 }
 
-const buildRunGraph = Effect.fn("DurableExecutionTest.buildRunGraph")(function* () {
+const buildRunGraph = Effect.fn("DurableExecutionTest.buildRunGraph")(function* (
+  options: SessionRunState.LayerOptions = {},
+) {
   const database = yield* Database.Service
   const events = yield* EventV2Bridge.Service
   const background = yield* BackgroundJob.Service
   const databaseLayer = Layer.succeed(Database.Service, database)
   const eventsLayer = Layer.succeed(EventV2Bridge.Service, events)
   const statusLayer = SessionStatus.layer.pipe(Layer.provide(databaseLayer), Layer.provide(eventsLayer))
-  const runLayer = SessionRunState.layer.pipe(
+  const runLayer = SessionRunState.layerWithOptions(options).pipe(
     Layer.provide(Layer.succeed(BackgroundJob.Service, background)),
     Layer.provide(databaseLayer),
     Layer.provide(statusLayer),
@@ -80,6 +84,48 @@ const buildRunGraph = Effect.fn("DurableExecutionTest.buildRunGraph")(function* 
   return {
     run: Context.get(context, SessionRunState.Service),
     status: Context.get(context, SessionStatus.Service),
+  }
+})
+
+const holdWriteLock = Effect.fn("DurableExecutionTest.holdWriteLock")(function* (filename: string) {
+  const process = Bun.spawn(
+    [
+      "bun",
+      "-e",
+      `import { Database } from "bun:sqlite"
+const database = new Database(process.argv[1])
+database.run("pragma busy_timeout = 5000")
+database.run("begin immediate")
+console.log("locked")
+for await (const chunk of Bun.stdin.stream()) break
+database.run("rollback")
+database.close()`,
+      filename,
+    ],
+    { stdin: "pipe", stdout: "pipe", stderr: "pipe" },
+  )
+  const reader = process.stdout.getReader()
+  const ready = yield* Effect.promise(() => reader.read())
+  reader.releaseLock()
+  if (ready.done || new TextDecoder().decode(ready.value).trim() !== "locked") {
+    const stderr = yield* Effect.promise(() => new Response(process.stderr).text())
+    return yield* Effect.die(new Error(`lock holder failed to start: ${stderr}`))
+  }
+  yield* Effect.addFinalizer(() =>
+    Effect.promise(async () => {
+      if (process.exitCode === null) {
+        await process.stdin.write("release\n")
+        await process.stdin.end()
+      }
+      await process.exited
+    }).pipe(Effect.ignore),
+  )
+  return {
+    release: Effect.promise(async () => {
+      await process.stdin.write("release\n")
+      await process.stdin.end()
+      await process.exited
+    }),
   }
 })
 
@@ -495,6 +541,181 @@ it.instance("allows one lease winner and makes a foreign caller join", () =>
 
     expect(yield* Effect.all([Fiber.join(a), Fiber.join(b)])).toHaveLength(2)
     expect(yield* Ref.get(started)).toBe(1)
+  }),
+)
+
+it.instance(
+  "retries one transient heartbeat lock timeout and renews the same generation",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const filename = path.join(test.directory, "heartbeat-transient.db")
+      yield* Effect.gen(function* () {
+        const timeoutObserved = yield* Latch.make()
+        const allowRetry = yield* Latch.make()
+        const releaseWork = yield* Latch.make()
+        const lockTimeouts = yield* Ref.make(0)
+        const graph = yield* buildRunGraph({
+          onHeartbeatLockTimeout: Ref.update(lockTimeouts, (value) => value + 1).pipe(
+            Effect.andThen(timeoutObserved.open),
+            Effect.andThen(allowRetry.await),
+          ),
+        })
+        const { db } = yield* Database.Service
+        const fiber = yield* graph.run
+          .ensureRunning(sessionID, Effect.succeed(output), releaseWork.await.pipe(Effect.as(output)))
+          .pipe(Effect.forkScoped)
+        yield* pollWithTimeout(
+          graph.status.get(sessionID).pipe(Effect.map((status) => (status.type === "busy" ? true : undefined))),
+          "session never became busy",
+        )
+        const initial = yield* db
+          .select({
+            generation: SessionExecutionTable.generation,
+            expiresAt: SessionExecutionTable.lease_expires_at,
+          })
+          .from(SessionExecutionTable)
+          .where(eq(SessionExecutionTable.session_id, sessionID))
+          .get()
+          .pipe(Effect.orDie)
+        const initialExpiresAt = initial?.expiresAt ?? (yield* Effect.die("initial execution lease missing"))
+        const initialGeneration = initial?.generation ?? (yield* Effect.die("initial execution generation missing"))
+
+        const lock = yield* holdWriteLock(filename)
+        yield* awaitWithTimeout(timeoutObserved.await, "heartbeat did not report a lock timeout", "12 seconds")
+        yield* lock.release
+        yield* allowRetry.open
+
+        const renewed = yield* pollWithTimeout(
+          db
+            .select({
+              generation: SessionExecutionTable.generation,
+              expiresAt: SessionExecutionTable.lease_expires_at,
+            })
+            .from(SessionExecutionTable)
+            .where(eq(SessionExecutionTable.session_id, sessionID))
+            .get()
+            .pipe(
+              Effect.orDie,
+              Effect.map((row) => (row?.expiresAt && row.expiresAt > initialExpiresAt ? row : undefined)),
+            ),
+          "heartbeat retry did not renew the lease",
+        )
+        expect(renewed.generation).toBe(initialGeneration)
+        expect(yield* Ref.get(lockTimeouts)).toBe(1)
+
+        yield* releaseWork.open
+        expect(yield* Fiber.join(fiber)).toEqual(output)
+      }).pipe(Effect.provide(Layer.fresh(Database.layerFromPath(filename))))
+    }),
+  20_000,
+)
+
+it.instance(
+  "stops after one heartbeat lock retry and preserves the heartbeat defect",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const filename = path.join(test.directory, "heartbeat-persistent-lock.db")
+      yield* Effect.gen(function* () {
+        const timeoutObserved = yield* Latch.make()
+        const lockTimeouts = yield* Ref.make(0)
+        const graph = yield* buildRunGraph({
+          onHeartbeatLockTimeout: Ref.update(lockTimeouts, (value) => value + 1).pipe(
+            Effect.andThen(timeoutObserved.open),
+          ),
+        })
+        const fiber = yield* graph.run
+          .ensureRunning(sessionID, Effect.succeed(output), Effect.never)
+          .pipe(Effect.forkScoped)
+        yield* pollWithTimeout(
+          graph.status.get(sessionID).pipe(Effect.map((status) => (status.type === "busy" ? true : undefined))),
+          "session never became busy",
+        )
+
+        const lock = yield* holdWriteLock(filename)
+        yield* awaitWithTimeout(timeoutObserved.await, "heartbeat did not report a lock timeout", "12 seconds")
+        const exit = yield* awaitWithTimeout(Fiber.await(fiber), "persistent heartbeat lock did not fail", "12 seconds")
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toMatchObject({ _tag: "EffectDrizzleQueryError" })
+        expect(yield* Ref.get(lockTimeouts)).toBe(1)
+        yield* lock.release
+      }).pipe(Effect.provide(Layer.fresh(Database.layerFromPath(filename))))
+    }),
+  25_000,
+)
+
+it.instance("keeps a non-lock heartbeat database failure terminal", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    const filename = path.join(test.directory, "heartbeat-non-lock.db")
+    yield* Effect.gen(function* () {
+      const graph = yield* buildRunGraph()
+      const { db } = yield* Database.Service
+      const fiber = yield* graph.run
+        .ensureRunning(sessionID, Effect.succeed(output), Effect.never)
+        .pipe(Effect.forkScoped)
+      yield* pollWithTimeout(
+        graph.status.get(sessionID).pipe(Effect.map((status) => (status.type === "busy" ? true : undefined))),
+        "session never became busy",
+      )
+
+      yield* db.run(sql`pragma query_only = true`).pipe(Effect.orDie)
+      const exit = yield* awaitWithTimeout(
+        Fiber.await(fiber),
+        "non-lock heartbeat failure did not terminate",
+        "6 seconds",
+      )
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("readonly database")
+    }).pipe(Effect.provide(Layer.fresh(Database.layerFromPath(filename))))
+  }),
+)
+
+it.instance("interrupts stale work before running slow ownership-loss recovery", () =>
+  Effect.gen(function* () {
+    const graph = yield* buildRunGraph()
+    const workInterrupted = yield* Latch.make()
+    const recoveryStarted = yield* Latch.make()
+    const allowRecovery = yield* Latch.make()
+    const fiber = yield* graph.run
+      .ensureRunning(
+        sessionID,
+        recoveryStarted.open.pipe(Effect.andThen(allowRecovery.await), Effect.as(output)),
+        Effect.never.pipe(Effect.onInterrupt(() => workInterrupted.open.pipe(Effect.asVoid))),
+      )
+      .pipe(Effect.forkScoped)
+    yield* pollWithTimeout(
+      graph.status.get(sessionID).pipe(Effect.map((status) => (status.type === "busy" ? true : undefined))),
+      "session never became busy",
+    )
+
+    const { db } = yield* Database.Service
+    const now = Date.now()
+    yield* db
+      .update(SessionExecutionTable)
+      .set({
+        owner_id: "local:foreign:run:owner",
+        generation: 2,
+        lease_expires_at: now + 60_000,
+        time_updated: now,
+      })
+      .where(eq(SessionExecutionTable.session_id, sessionID))
+      .run()
+      .pipe(Effect.orDie)
+
+    yield* awaitWithTimeout(workInterrupted.await, "stale work continued while recovery was blocked")
+    yield* awaitWithTimeout(recoveryStarted.await, "ownership-loss recovery did not start")
+    yield* allowRecovery.open
+    expect(yield* Fiber.join(fiber)).toEqual(output)
+
+    const execution = yield* db
+      .select({ owner: SessionExecutionTable.owner_id, generation: SessionExecutionTable.generation })
+      .from(SessionExecutionTable)
+      .where(eq(SessionExecutionTable.session_id, sessionID))
+      .get()
+      .pipe(Effect.orDie)
+    expect(execution).toEqual({ owner: "local:foreign:run:owner", generation: 2 })
   }),
 )
 

@@ -716,14 +716,30 @@ it.instance(
         })
         yield* insertSession(sessionID)
         const reportID = MessageID.make("msg_status_exact_once")
+        const reportPartID = PartID.make("prt_status_exact_once")
         const commandID = "sec_status_exact_once"
         const now = Date.now()
+        const report = {
+          role: "user",
+          time: { created: now },
+          agent: "test",
+          model: {
+            providerID: ProviderV2.ID.make("test"),
+            modelID: ProviderV2.ModelID.make("test-model"),
+          },
+        } satisfies Omit<SessionLegacy.User, "id" | "sessionID">
+        const reportPart = {
+          type: "text",
+          text: "report",
+          synthetic: true,
+          metadata: { task_report: true },
+        } satisfies Omit<SessionLegacy.TextPart, "id" | "sessionID" | "messageID">
         yield* db
           .insert(MessageTable)
           .values({
             id: reportID,
             session_id: sessionID,
-            data: { role: "user" } as never,
+            data: report,
             time_created: now,
             time_updated: now,
           })
@@ -732,10 +748,10 @@ it.instance(
         yield* db
           .insert(PartTable)
           .values({
-            id: "prt_status_exact_once" as never,
+            id: reportPartID,
             message_id: reportID,
             session_id: sessionID,
-            data: { type: "text", text: "report", synthetic: true, metadata: { task_report: true } } as never,
+            data: reportPart,
             time_created: now,
             time_updated: now,
           })
@@ -799,7 +815,7 @@ it.instance(
             .where(eq(PartTable.message_id, reportID))
             .all()
             .pipe(Effect.orDie),
-        ).toEqual([{ id: PartID.make("prt_status_exact_once"), messageID: reportID }])
+        ).toEqual([{ id: reportPartID, messageID: reportID }])
         expect(
           yield* db
             .select({

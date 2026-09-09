@@ -11,7 +11,8 @@ import {
 } from "@opencode-ai/core/session/sql"
 import { ensureRunID } from "@opencode-ai/core/util/opencode-process"
 import { and, eq, inArray } from "drizzle-orm"
-import { Context, Duration, Effect, Layer, Option, Schedule, Schema } from "effect"
+import { Cause, Context, Duration, Effect, Layer, Option, Schedule, Schema } from "effect"
+import { isSqlError, isSqlErrorReason } from "effect/unstable/sql/SqlError"
 import { SessionID } from "./schema"
 import { SessionExecutionOwner } from "./execution-owner"
 import { delegationRecord, type DelegationRecord } from "./delegation-outcome"
@@ -107,7 +108,12 @@ export interface Interface {
   readonly list: () => Effect.Effect<Map<SessionID, Info>>
   readonly snapshot: () => Effect.Effect<Map<SessionID, Info>>
   readonly set: (sessionID: SessionID, status: Info) => Effect.Effect<void>
-  readonly setForGeneration: (sessionID: SessionID, generation: number, status: Info) => Effect.Effect<boolean>
+  readonly setForGeneration: (
+    sessionID: SessionID,
+    generation: number,
+    status: Info,
+    owner?: string,
+  ) => Effect.Effect<boolean>
   readonly refresh: (sessionID: SessionID) => Effect.Effect<void>
   readonly claimBlockedRetry: (input: { sessionID: SessionID; childSessionID: SessionID }) => Effect.Effect<boolean>
   readonly settleMonitoring: (input: {
@@ -119,13 +125,46 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionStatus") {}
 
-export const ExecutionGeneration = Context.Reference<{ sessionID: SessionID; generation: number } | undefined>(
+export interface LayerOptions {
+  readonly beforeGenerationStatusWrite?: Effect.Effect<void>
+  readonly onGenerationStatusLockTimeout?: Effect.Effect<void>
+}
+
+class Options extends Context.Service<Options, LayerOptions>()("@opencode/SessionStatusOptions") {}
+
+export const ExecutionGeneration = Context.Reference<
+  { sessionID: SessionID; generation: number; owner: string } | undefined
+>(
   "@opencode/SessionStatus/ExecutionGeneration",
   { defaultValue: () => undefined },
 )
 
 const decode = Schema.decodeUnknownOption(Info)
 const OWNERLESS_STALE_MILLIS = 15_000
+
+function isLockTimeout(error: unknown) {
+  if (isSqlError(error) && isSqlErrorReason(error.reason) && error.reason._tag === "LockTimeoutError") return true
+  if (
+    typeof error !== "object" ||
+    error === null ||
+    !("_tag" in error) ||
+    error._tag !== "EffectDrizzleQueryError" ||
+    !("cause" in error) ||
+    !Cause.isCause(error.cause)
+  )
+    return false
+  return (
+    error.cause.reasons.length === 1 &&
+    Cause.isFailReason(error.cause.reasons[0]) &&
+    isSqlError(error.cause.reasons[0].error) &&
+    isSqlErrorReason(error.cause.reasons[0].error.reason) &&
+    error.cause.reasons[0].error.reason._tag === "LockTimeoutError"
+  )
+}
+
+function isLockTimeoutCause(cause: Cause.Cause<unknown>) {
+  return cause.reasons.length === 1 && Cause.isFailReason(cause.reasons[0]) && isLockTimeout(cause.reasons[0].error)
+}
 
 /**
  * Durable terminal evidence on the record itself. The settle boundary stamps
@@ -157,9 +196,10 @@ function returnedLocally(
   return execution.completedAt !== null && execution.completedAt >= record.startedAt
 }
 
-export const layer = Layer.effect(
+const configuredLayer = Layer.effect(
   Service,
   Effect.gen(function* () {
+    const options = yield* Options
     const events = yield* EventV2Bridge.Service
     const { db } = yield* Database.Service
     const processRunID = ensureRunID()
@@ -365,23 +405,38 @@ export const layer = Layer.effect(
       return yield* snapshot()
     })
 
-    const write = Effect.fnUntraced(function* (sessionID: SessionID, status: Info, generation?: number) {
+    const write = Effect.fnUntraced(function* (
+      sessionID: SessionID,
+      status: Info,
+      generation?: number,
+      retryLockTimeout = false,
+      owner?: string,
+    ) {
       const ctx = yield* InstanceState.context
       const now = Date.now()
       const { background: _background, ...persisted } = status
-      const committed = yield* events.barrier(
-        db
-          .transaction(
+      const attempt = () =>
+        events.barrier(
+          db.transaction(
             (transaction) =>
               Effect.gen(function* () {
                 if (generation !== undefined) {
                   const execution = yield* transaction
-                    .select({ generation: SessionExecutionTable.generation, state: SessionExecutionTable.state })
+                    .select({
+                      generation: SessionExecutionTable.generation,
+                      state: SessionExecutionTable.state,
+                      owner: SessionExecutionTable.owner_id,
+                      cancelRequestedAt: SessionExecutionTable.cancel_requested_at,
+                    })
                     .from(SessionExecutionTable)
                     .where(eq(SessionExecutionTable.session_id, sessionID))
                     .get()
                   if (execution?.generation !== generation) return undefined
-                  if (status.type !== "idle" && execution.state !== "running") return undefined
+                  if (
+                    status.type !== "idle" &&
+                    (execution.state !== "running" || execution.owner !== owner || execution.cancelRequestedAt)
+                  )
+                    return undefined
                 }
                 // A blocked child and external monitoring are independently
                 // owned states. Releasing the local execution must not erase
@@ -421,8 +476,15 @@ export const layer = Layer.effect(
                 }
               }),
             { behavior: "immediate" },
-          )
-          .pipe(Effect.orDie),
+          ),
+        )
+      if (retryLockTimeout) yield* options.beforeGenerationStatusWrite ?? Effect.void
+      const committed = yield* attempt().pipe(
+        Effect.catchCause((cause) => {
+          if (!retryLockTimeout || !isLockTimeoutCause(cause)) return Effect.failCause(cause)
+          return (options.onGenerationStatusLockTimeout ?? Effect.void).pipe(Effect.andThen(attempt()))
+        }),
+        Effect.orDie,
       )
       if (!committed) return false
       yield* events.broadcast(committed.status)
@@ -434,14 +496,15 @@ export const layer = Layer.effect(
       sessionID: SessionID,
       generation: number,
       status: Info,
+      owner?: string,
     ) {
-      return yield* write(sessionID, status, generation)
+      return yield* write(sessionID, status, generation, true, owner)
     })
 
     const set = Effect.fn("SessionStatus.set")(function* (sessionID: SessionID, status: Info) {
       const generation = yield* ExecutionGeneration
       if (generation?.sessionID === sessionID) {
-        yield* setForGeneration(sessionID, generation.generation, status)
+        yield* setForGeneration(sessionID, generation.generation, status, generation.owner)
         return
       }
       yield* write(sessionID, status)
@@ -555,6 +618,11 @@ export const layer = Layer.effect(
     })
   }),
 )
+
+export const layerWithOptions = (options: LayerOptions = {}) =>
+  configuredLayer.pipe(Layer.provide(Layer.succeed(Options, options)))
+
+export const layer = layerWithOptions()
 
 export const defaultLayer = layer.pipe(Layer.provide(Database.defaultLayer), Layer.provide(EventV2Bridge.defaultLayer))
 

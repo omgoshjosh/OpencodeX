@@ -8,7 +8,7 @@ import { PermissionID } from "@/permission/schema"
 import { Question } from "@/question"
 import { QuestionID } from "@/question/schema"
 import { SessionRunState } from "@/session/run-state"
-import { MessageID, SessionID } from "@/session/schema"
+import { MessageID, PartID, SessionID } from "@/session/schema"
 import { SessionStatus } from "@/session/status"
 import { SessionInteractionRecovery } from "@/session/interaction-recovery"
 import * as PromptClaim from "@/session/prompt-claim"
@@ -18,6 +18,7 @@ import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { ProviderV2 } from "@opencode-ai/core/provider"
+import { ensureRunID } from "@opencode-ai/core/util/opencode-process"
 import {
   PermissionTable,
   PartTable,
@@ -68,13 +69,17 @@ function eventRequestID(data: unknown) {
 
 const buildRunGraph = Effect.fn("DurableExecutionTest.buildRunGraph")(function* (
   options: SessionRunState.LayerOptions = {},
+  statusOptions: SessionStatus.LayerOptions = {},
 ) {
   const database = yield* Database.Service
   const events = yield* EventV2Bridge.Service
   const background = yield* BackgroundJob.Service
   const databaseLayer = Layer.succeed(Database.Service, database)
   const eventsLayer = Layer.succeed(EventV2Bridge.Service, events)
-  const statusLayer = SessionStatus.layer.pipe(Layer.provide(databaseLayer), Layer.provide(eventsLayer))
+  const statusLayer = SessionStatus.layerWithOptions(statusOptions).pipe(
+    Layer.provide(databaseLayer),
+    Layer.provide(eventsLayer),
+  )
   const runLayer = SessionRunState.layerWithOptions(options).pipe(
     Layer.provide(Layer.succeed(BackgroundJob.Service, background)),
     Layer.provide(databaseLayer),
@@ -127,6 +132,30 @@ database.close()`,
       await process.exited
     }),
   }
+})
+
+const seedRunningExecution = Effect.fn("DurableExecutionTest.seedRunningExecution")(function* (sessionID: SessionID) {
+  const { db } = yield* Database.Service
+  const ctx = yield* InstanceState.context
+  const now = Date.now()
+  const owner = `local:${process.pid}:${ensureRunID()}:status-test`
+  yield* db
+    .insert(SessionExecutionTable)
+    .values({
+      session_id: sessionID,
+      project_id: ctx.project.id,
+      directory: ctx.directory,
+      state: "running",
+      owner_id: owner,
+      generation: 1,
+      lease_expires_at: now + 60_000,
+      started_at: now,
+      time_created: now,
+      time_updated: now,
+    })
+    .run()
+    .pipe(Effect.orDie)
+  return owner
 })
 
 const buildPermissionGraph = Effect.fn("DurableExecutionTest.buildPermissionGraph")(function* () {
@@ -643,6 +672,297 @@ it.instance(
       }).pipe(Effect.provide(Layer.fresh(Database.layerFromPath(filename))))
     }),
   25_000,
+)
+
+it.instance(
+  "retries one contended generation status write without replaying work",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const filename = path.join(test.directory, "status-transient-lock.db")
+      yield* Effect.gen(function* () {
+        const scope = yield* Scope.Scope
+        const timeoutObserved = yield* Latch.make()
+        const allowRetry = yield* Latch.make()
+        const lockReady = yield* Latch.make()
+        const releaseLock = yield* Latch.make()
+        const lockReleased = yield* Latch.make()
+        const timeouts = yield* Ref.make(0)
+        const workRuns = yield* Ref.make(0)
+        const providerInvocations = yield* Ref.make(0)
+        const reportDeliveries = yield* Ref.make(0)
+        const toolExecutions = yield* Ref.make(0)
+        const events = yield* EventV2Bridge.Service
+        const { db } = yield* Database.Service
+        const graph = yield* buildRunGraph({}, {
+          beforeGenerationStatusWrite: Effect.gen(function* () {
+            yield* Effect.gen(function* () {
+              const lock = yield* holdWriteLock(filename)
+              yield* lockReady.open
+              yield* releaseLock.await
+              yield* lock.release
+              yield* lockReleased.open
+            })
+              .pipe(Effect.forkScoped)
+              .pipe(Effect.provideService(Scope.Scope, scope))
+            yield* lockReady.await
+          }),
+          onGenerationStatusLockTimeout: events.barrier(
+            Ref.update(timeouts, (value) => value + 1).pipe(
+              Effect.andThen(timeoutObserved.open),
+              Effect.andThen(allowRetry.await),
+            ),
+          ),
+        })
+        yield* insertSession(sessionID)
+        const reportID = MessageID.make("msg_status_exact_once")
+        const commandID = "sec_status_exact_once"
+        const now = Date.now()
+        yield* db
+          .insert(MessageTable)
+          .values({
+            id: reportID,
+            session_id: sessionID,
+            data: { role: "user" } as never,
+            time_created: now,
+            time_updated: now,
+          })
+          .run()
+          .pipe(Effect.orDie)
+        yield* db
+          .insert(PartTable)
+          .values({
+            id: "prt_status_exact_once" as never,
+            message_id: reportID,
+            session_id: sessionID,
+            data: { type: "text", text: "report", synthetic: true, metadata: { task_report: true } } as never,
+            time_created: now,
+            time_updated: now,
+          })
+          .run()
+          .pipe(Effect.orDie)
+        yield* db
+          .insert(SessionCommandTable)
+          .values({
+            id: commandID,
+            session_id: sessionID,
+            message_id: reportID,
+            project_id: projectID,
+            directory: ".",
+            status: "queued",
+            time_created: now,
+            time_updated: now,
+          })
+          .run()
+          .pipe(Effect.orDie)
+        const claimScope = yield* Scope.make()
+        const claim = yield* buildPromptClaim(
+          graph.run.ensureRunning(
+            sessionID,
+            Effect.succeed(output),
+            Effect.gen(function* () {
+              yield* Ref.update(workRuns, (value) => value + 1)
+              yield* Ref.update(providerInvocations, (value) => value + 1)
+              yield* Ref.update(reportDeliveries, (value) => value + 1)
+              yield* Ref.update(toolExecutions, (value) => value + 1)
+              return output
+            }),
+          ),
+          "1 hour",
+        ).pipe(Effect.provideService(Scope.Scope, claimScope))
+        const status = yield* claim
+          .executeCommand(commandID)
+          .pipe(Effect.forkScoped)
+        yield* awaitWithTimeout(timeoutObserved.await, "status write did not report a lock timeout", "12 seconds")
+        yield* releaseLock.open
+        yield* awaitWithTimeout(lockReleased.await, "status write lock did not release")
+        yield* allowRetry.open
+        yield* Fiber.join(status)
+        yield* Scope.close(claimScope, Exit.void)
+        expect(yield* Ref.get(timeouts)).toBe(1)
+        expect(yield* Ref.get(workRuns)).toBe(1)
+        expect(yield* Ref.get(providerInvocations)).toBe(1)
+        expect(yield* Ref.get(reportDeliveries)).toBe(1)
+        expect(yield* Ref.get(toolExecutions)).toBe(1)
+        expect(
+          yield* db
+            .select({ id: MessageTable.id, sessionID: MessageTable.session_id })
+            .from(MessageTable)
+            .where(eq(MessageTable.session_id, sessionID))
+            .all()
+            .pipe(Effect.orDie),
+        ).toEqual([{ id: reportID, sessionID }])
+        expect(
+          yield* db
+            .select({ id: PartTable.id, messageID: PartTable.message_id })
+            .from(PartTable)
+            .where(eq(PartTable.message_id, reportID))
+            .all()
+            .pipe(Effect.orDie),
+        ).toEqual([{ id: PartID.make("prt_status_exact_once"), messageID: reportID }])
+        expect(
+          yield* db
+            .select({
+              id: SessionCommandTable.id,
+              messageID: SessionCommandTable.message_id,
+              status: SessionCommandTable.status,
+            })
+            .from(SessionCommandTable)
+            .where(eq(SessionCommandTable.session_id, sessionID))
+            .all()
+            .pipe(Effect.orDie),
+        ).toEqual([{ id: commandID, messageID: reportID, status: "succeeded" }])
+      }).pipe(Effect.provide(Layer.fresh(Database.layerFromPath(filename))))
+    }),
+  20_000,
+)
+
+it.instance(
+  "keeps the second contended generation status write terminal",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const filename = path.join(test.directory, "status-persistent-lock.db")
+      yield* Effect.gen(function* () {
+        const timeouts = yield* Ref.make(0)
+        const graph = yield* buildRunGraph({}, {
+          onGenerationStatusLockTimeout: Ref.update(timeouts, (value) => value + 1),
+        })
+        const owner = yield* seedRunningExecution(sessionID)
+        const lock = yield* holdWriteLock(filename)
+        const status = yield* graph.status
+          .setForGeneration(sessionID, 1, { type: "busy" }, owner)
+          .pipe(Effect.forkScoped)
+        const exit = yield* awaitWithTimeout(Fiber.await(status), "persistent status lock did not fail", "15 seconds")
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit))
+          expect(Cause.squash(exit.cause)).toMatchObject({ _tag: "SqlError", reason: { _tag: "LockTimeoutError" } })
+        expect(yield* Ref.get(timeouts)).toBe(1)
+        yield* lock.release
+      }).pipe(Effect.provide(Layer.fresh(Database.layerFromPath(filename))))
+    }),
+  20_000,
+)
+
+it.instance("keeps a non-lock generation status write terminal", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    const filename = path.join(test.directory, "status-non-lock.db")
+    yield* Effect.gen(function* () {
+      const retries = yield* Ref.make(0)
+      const graph = yield* buildRunGraph({}, {
+        onGenerationStatusLockTimeout: Ref.update(retries, (value) => value + 1),
+      })
+      const { db } = yield* Database.Service
+      const owner = yield* seedRunningExecution(sessionID)
+      yield* db.run(sql`pragma query_only = true`).pipe(Effect.orDie)
+      const exit = yield* Fiber.await(
+        yield* graph.status.setForGeneration(sessionID, 1, { type: "busy" }, owner).pipe(Effect.forkScoped),
+      )
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("readonly database")
+      expect(yield* Ref.get(retries)).toBe(0)
+    }).pipe(Effect.provide(Layer.fresh(Database.layerFromPath(filename))))
+  }),
+)
+
+it.instance(
+  "does not start work when a generation status retry loses ownership",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const filename = path.join(test.directory, "status-stale-retry.db")
+      yield* Effect.gen(function* () {
+        const scope = yield* Scope.Scope
+        const timeoutObserved = yield* Latch.make()
+        const allowRetry = yield* Latch.make()
+        const lockReady = yield* Latch.make()
+        const releaseLock = yield* Latch.make()
+        const lockReleased = yield* Latch.make()
+        const workRuns = yield* Ref.make(0)
+        const graph = yield* buildRunGraph({}, {
+          beforeGenerationStatusWrite: Effect.gen(function* () {
+            yield* Effect.gen(function* () {
+              const lock = yield* holdWriteLock(filename)
+              yield* lockReady.open
+              yield* releaseLock.await
+              yield* lock.release
+              yield* lockReleased.open
+            })
+              .pipe(Effect.forkScoped)
+              .pipe(Effect.provideService(Scope.Scope, scope))
+            yield* lockReady.await
+          }),
+          onGenerationStatusLockTimeout: timeoutObserved.open.pipe(Effect.andThen(allowRetry.await)),
+        })
+        const { db } = yield* Database.Service
+        yield* insertSession(sessionID)
+        const status = yield* graph.run
+          .ensureRunning(
+            sessionID,
+            Effect.succeed(output),
+            Ref.update(workRuns, (value) => value + 1).pipe(Effect.as(output)),
+          )
+          .pipe(Effect.forkScoped)
+        yield* awaitWithTimeout(timeoutObserved.await, "status write did not report a lock timeout", "12 seconds")
+        yield* releaseLock.open
+        yield* awaitWithTimeout(lockReleased.await, "status write lock did not release")
+        yield* db
+          .update(SessionExecutionTable)
+          .set({ owner_id: "local:foreign:owner" })
+          .where(eq(SessionExecutionTable.session_id, sessionID))
+          .run()
+          .pipe(Effect.orDie)
+        yield* allowRetry.open
+        expect(yield* Fiber.join(status)).toEqual(output)
+        expect(yield* Ref.get(workRuns)).toBe(0)
+      }).pipe(Effect.provide(Layer.fresh(Database.layerFromPath(filename))))
+    }),
+  20_000,
+)
+
+it.instance("does not cache a shell runner whose status admission is rejected", () =>
+  Effect.gen(function* () {
+    const writes = yield* Ref.make(0)
+    const secondAdmission = yield* Latch.make()
+    const { db } = yield* Database.Service
+    const graph = yield* buildRunGraph({}, {
+      beforeGenerationStatusWrite: Effect.gen(function* () {
+        const call = yield* Ref.updateAndGet(writes, (value) => value + 1)
+        if (call === 2) yield* secondAdmission.open
+        if (call !== 1) return
+        yield* db
+          .update(SessionExecutionTable)
+          .set({ owner_id: `local:${process.pid}:${ensureRunID()}:replacement` })
+          .where(eq(SessionExecutionTable.session_id, sessionID))
+          .run()
+          .pipe(Effect.orDie)
+      }),
+    })
+    yield* insertSession(sessionID)
+    expect(yield* graph.run.startShell(sessionID, Effect.succeed(output), Effect.succeed(output))).toEqual(output)
+
+    const now = Date.now()
+    yield* db
+      .update(SessionExecutionTable)
+      .set({
+        state: "idle",
+        owner_id: null,
+        lease_expires_at: null,
+        cancel_requested_at: null,
+        completed_at: now,
+        time_updated: now,
+      })
+      .where(eq(SessionExecutionTable.session_id, sessionID))
+      .run()
+      .pipe(Effect.orDie)
+
+    const resumed = yield* graph.run
+      .ensureRunning(sessionID, Effect.succeed(output), Effect.succeed(output))
+      .pipe(Effect.forkScoped)
+    yield* awaitWithTimeout(secondAdmission.await, "next run bypassed status admission")
+    expect(yield* Fiber.join(resumed)).toEqual(output)
+  }),
 )
 
 it.instance("keeps a non-lock heartbeat database failure terminal", () =>

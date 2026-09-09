@@ -294,6 +294,7 @@ const configuredLayer = Layer.effect(
         Effect.provideService(SessionStatus.ExecutionGeneration, {
           sessionID,
           generation: lease.generation,
+          owner: lease.owner,
         }),
         Effect.map((value) => ({ _tag: "Completed", value }) as const),
         Effect.raceFirst(monitor),
@@ -361,7 +362,6 @@ const configuredLayer = Layer.effect(
             Effect.catchCause((cause) => (active.heartbeatFailed ? Effect.logError(cause) : Effect.failCause(cause))),
           )
         }),
-        onBusy: status.setForGeneration(sessionID, lease.generation, { type: "busy" }).pipe(Effect.asVoid),
         onInterrupt,
       })
       const active: ActiveRunner = { runner: next, lease, interrupted: false, heartbeatFailed: false }
@@ -551,7 +551,11 @@ const configuredLayer = Layer.effect(
       if (existing) return yield* existing.runner.ensureRunning(work)
       const lease = yield* claim(sessionID)
       if (!lease) return yield* waitForForeign(sessionID, onInterrupt)
-      yield* status.setForGeneration(sessionID, lease.generation, { type: "busy" })
+      const admitted = yield* status.setForGeneration(sessionID, lease.generation, { type: "busy" }, lease.owner)
+      if (!admitted) {
+        yield* release(sessionID, lease, true)
+        return yield* onInterrupt
+      }
       const active = yield* ownedRunner(sessionID, lease, onInterrupt)
       return yield* active.runner.ensureRunning(supervise(sessionID, active, onInterrupt, work))
     })
@@ -566,13 +570,22 @@ const configuredLayer = Layer.effect(
       if (data.runners.get(sessionID)?.runner.busy) return yield* busyError(sessionID)
       const lease = yield* claim(sessionID)
       if (!lease) return yield* busyError(sessionID)
+      const admitted = yield* status.setForGeneration(sessionID, lease.generation, { type: "busy" }, lease.owner)
+      if (!admitted) {
+        yield* release(sessionID, lease, true)
+        return yield* onInterrupt
+      }
       const active = yield* ownedRunner(sessionID, lease, onInterrupt)
       return yield* active.runner.startShell(supervise(sessionID, active, onInterrupt, work), ready).pipe(
         Effect.catchTag("RunnerBusy", () => Effect.fail(busyError(sessionID))),
         Effect.onError(() =>
-          release(sessionID, lease, true).pipe(
-            Effect.catchCause((cause) => (active.heartbeatFailed ? Effect.logError(cause) : Effect.failCause(cause))),
-          ),
+          Effect.gen(function* () {
+            const current = yield* InstanceState.get(state)
+            if (current.runners.get(sessionID) === active) current.runners.delete(sessionID)
+            yield* release(sessionID, lease, true).pipe(
+              Effect.catchCause((cause) => (active.heartbeatFailed ? Effect.logError(cause) : Effect.failCause(cause))),
+            )
+          }),
         ),
       )
     })

@@ -46,6 +46,14 @@ import { and, asc, eq, exists, gt, isNotNull, isNull } from "drizzle-orm"
 import { SessionCommandTable, SessionExecutionTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
+import {
+  classifyProviderFailure,
+  hasStatedOutcome,
+  isModelFallbackError,
+  shouldAdvanceModelFallback,
+  type ProviderFailure,
+} from "./model-fallback"
+import { SessionProviderExhaustion } from "./provider-exhaustion"
 import { LLMEvent } from "@opencode-ai/llm"
 import { Todo } from "./todo"
 import { BackgroundJob } from "@/background/job"
@@ -636,6 +644,129 @@ export const layer = Layer.effect(
       throw new Error("Impossible")
     })
 
+    /**
+     * Move a turn stranded by provider usage exhaustion onto the role's next
+     * configured route. Returns whether the caller should keep looping.
+     *
+     * Retargeting the anchor user message is what actually moves the turn: the
+     * loop re-derives its model from that message on every pass, so the next
+     * iteration opens on the new route. The same mechanism the swarm delegation
+     * path already uses, applied to the ordinary provider path.
+     */
+    const advanceExhaustedRoute = Effect.fn("SessionPrompt.advanceExhaustedRoute")(function* (input: {
+      sessionID: SessionID
+      session: Session.Info
+      lastUser: SessionLegacy.User
+      assistant: SessionLegacy.Assistant
+      turn: readonly SessionLegacy.WithParts[]
+      classification: ProviderFailure
+      slog: typeof elog
+    }) {
+      const identity = SessionProviderExhaustion.swarmIdentity(input.session.metadata)
+      const failed = { providerID: input.assistant.providerID, modelID: input.assistant.modelID }
+      // A turn that already produced visible text or ran a tool cannot be
+      // replayed on another model without duplicating what the user saw and
+      // whatever the tool did, so it stops here regardless of the chain.
+      const replayable = shouldAdvanceModelFallback(input.turn, input.lastUser.id)
+      const attempted = SessionProviderExhaustion.attemptedRoutes(input.turn, input.lastUser.id)
+      const routes = identity
+        ? yield* SessionProviderExhaustion.roleRoutes(identity).pipe(Effect.provideService(Database.Service, database))
+        : []
+      const next = replayable ? SessionProviderExhaustion.selectUntriedRoute(routes, attempted) : undefined
+
+      if (!next) {
+        // Says nothing here: the caller's stated-reason guard is the single
+        // writer, so every break path states itself the same way.
+        yield* input.slog.warn("provider exhaustion has no untried route", {
+          providerID: failed.providerID,
+          modelID: failed.modelID,
+          classification: input.classification,
+          attempted,
+          replayable,
+          role: identity?.swarmRole,
+        })
+        return false
+      }
+
+      yield* input.slog.info("provider exhaustion advancing to fallback route", {
+        providerID: failed.providerID,
+        modelID: failed.modelID,
+        classification: input.classification,
+        fallbackProviderID: next.providerID,
+        fallbackModelID: next.modelID,
+        attempted,
+        role: identity?.swarmRole,
+      })
+      yield* sessions.updateMessage({
+        ...input.lastUser,
+        model: {
+          providerID: ProviderV2.ID.make(next.providerID),
+          modelID: ProviderV2.ModelID.make(next.modelID),
+          ...(next.variant && next.variant !== "default" ? { variant: next.variant } : {}),
+        },
+      })
+      yield* status.set(input.sessionID, {
+        type: "retry",
+        attempt: attempted.length,
+        message: `${failed.providerID} usage limit reached — retrying on ${next.providerID}/${next.modelID}`,
+        next: Date.now(),
+      })
+      return true
+    })
+
+    /**
+     * THE INVARIANT: no loop break may leave a durable assistant row with zero
+     * parts.
+     *
+     * Such a row is indistinguishable from a dropped write to every caller
+     * downstream, and it is exactly what the 2026-09-10 stall looked like from
+     * the outside. The first version of this guard only fired when the failure
+     * had been classified as exhaustion, which made "does the user get told
+     * anything" depend on matching provider prose - an unbounded chase we will
+     * always be one message behind. So the guard now runs on EVERY break path
+     * and states whatever is known, including "unclassified". Classification
+     * decides only whether to advance a route, never whether the turn speaks.
+     *
+     * A row that already carries a part says enough on its own and is left
+     * alone, as is a turn that produced structured output instead of parts.
+     */
+    const stateUnfinishedTurn = Effect.fn("SessionPrompt.stateUnfinishedTurn")(function* (input: {
+      sessionID: SessionID
+      lastUser: SessionLegacy.User
+      assistant: SessionLegacy.Assistant
+      turn: readonly SessionLegacy.WithParts[]
+      classification: ProviderFailure | undefined
+      fallbackAttempted: boolean
+      slog: typeof elog
+    }) {
+      if (input.assistant.structured !== undefined) return
+      const row = input.turn.find((message) => message.info.id === input.assistant.id)
+      if (row && hasStatedOutcome(row.parts)) return
+      const failed = { providerID: input.assistant.providerID, modelID: input.assistant.modelID }
+      const message = SessionProviderExhaustion.failureMessage(input.assistant.error)
+      yield* input.slog.warn("stating an otherwise empty assistant row", {
+        providerID: failed.providerID,
+        modelID: failed.modelID,
+        classification: input.classification ?? "unclassified",
+        fallbackAttempted: input.fallbackAttempted,
+      })
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: input.assistant.id,
+        sessionID: input.sessionID,
+        type: "text",
+        text: SessionProviderExhaustion.unfinishedTurnNotice({
+          ...failed,
+          message,
+          classification: input.classification,
+          attempted: SessionProviderExhaustion.attemptedRoutes(input.turn, input.lastUser.id),
+          fallbackAttempted: input.fallbackAttempted,
+        }),
+        synthetic: true,
+        metadata: { provider_exhaustion: true },
+      } satisfies SessionLegacy.TextPart)
+    })
+
     const runLoop: (input: { sessionID: SessionID; messageID?: MessageID }) => Effect.Effect<SessionLegacy.WithParts> =
       Effect.fn("SessionPrompt.run")(function* (input: { sessionID: SessionID; messageID?: MessageID }) {
         const sessionID = input.sessionID
@@ -1030,6 +1161,36 @@ export const layer = Layer.effect(
             Effect.onInterrupt(() => finalizeInterruptedAssistant),
           )
           if (outcome === "break") {
+            // A turn stopped by provider usage exhaustion is not finished, it is
+            // stranded: the model will keep refusing until a human tops the
+            // account up. Move it to the role's next configured route instead of
+            // ending the turn.
+            const classification = classifyProviderFailure(handle.message.error)
+            const turn = yield* sessions.messageWithChildren({ sessionID, messageID: lastUser.id })
+            const advancing = isModelFallbackError(handle.message.error)
+            if (advancing && classification) {
+              const advanced = yield* advanceExhaustedRoute({
+                sessionID,
+                session,
+                lastUser,
+                assistant: handle.message,
+                turn,
+                classification,
+                slog,
+              })
+              if (advanced) continue
+            }
+            // Whether or not the failure was classified, the turn must not end
+            // silently - see stateUnfinishedTurn for why this is unconditional.
+            yield* stateUnfinishedTurn({
+              sessionID,
+              lastUser,
+              assistant: handle.message,
+              turn,
+              classification,
+              fallbackAttempted: advancing,
+              slog,
+            })
             // The natural-finish branch above logs its own exit; this is the
             // error/stop path, which used to leave no trace in the log.
             yield* slog.info("exiting loop", { reason: "break" })

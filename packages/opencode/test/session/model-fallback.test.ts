@@ -1,6 +1,18 @@
 import { describe, expect, test } from "bun:test"
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
+import { NamedError } from "@opencode-ai/core/util/error"
 import { isModelFallbackError, shouldAdvanceModelFallback } from "../../src/session/model-fallback"
+import {
+  assistantMessage,
+  completedToolState,
+  filePart,
+  reasoningPart,
+  stepFinishPart,
+  stepStartPart,
+  textPart,
+  toolPart,
+  userMessage,
+} from "./message-fixture"
 
 describe("model fallback error classification", () => {
   test.each([
@@ -35,24 +47,64 @@ describe("model fallback error classification", () => {
     new SessionLegacy.AuthError({ providerID: "test", message: "quota_exceeded" }),
     new SessionLegacy.ContextOverflowError({ message: "usage_limit_reached" }),
     new SessionLegacy.AbortedError({ message: "cancelled" }),
-    {
-      name: "UnknownError",
-      data: { message: "unknown", responseBody: '{"code":"quota_exceeded"}' },
-    } as unknown as SessionLegacy.Assistant["error"],
+    // An error the provider path did not classify as an API failure: only an
+    // APIError may advance a route, whatever the surrounding error carries.
+    new NamedError.Unknown({ message: "unknown" }),
+    // ...including a structured exhaustion code sitting in a non-APIError's own
+    // response body, which is the reading path a bare code would otherwise hit.
+    new SessionLegacy.ContextOverflowError({ message: "unknown", responseBody: '{"code":"quota_exceeded"}' }),
   ])("rejects non-structured or non-usage errors", (error) => {
     expect(isModelFallbackError(error)).toBe(false)
   })
 })
 
+describe("provider usage exhaustion in plain provider prose", () => {
+  /**
+   * The wire shape of the 2026-09-10 15:44 UTC stall, from the daemon log:
+   * `{"name":"AI_APICallError","isRetryable":true,"statusCode":429}` with the
+   * message "The usage limit has been reached" and no structured code. Status
+   * and retryability are identical to an ordinary rate limit, so prose is the
+   * only signal that separates them.
+   */
+  const incident = apiError({ message: "The usage limit has been reached", isRetryable: true, statusCode: 429 })
+  const rateLimit = apiError({
+    message: "Rate limit reached for gpt-5.6-sol in organization org-abc on requests per min (RPM): Limit 500, Used 500",
+    isRetryable: true,
+    statusCode: 429,
+  })
+
+  test("advances the role's route on an unstructured usage limit", () => {
+    expect(isModelFallbackError(incident)).toBe(true)
+    expect(shouldAdvanceModelFallback([userMessage(), assistantMessage({ error: incident })], "msg_user")).toBe(true)
+  })
+
+  test("a rate limit on the same status and retryability does not advance", () => {
+    // Conflating the two either burns a fallback on a limit that would have
+    // cleared, or parks a turn on a model that will never answer.
+    expect(isModelFallbackError(rateLimit)).toBe(false)
+    expect(shouldAdvanceModelFallback([userMessage(), assistantMessage({ error: rateLimit })], "msg_user")).toBe(false)
+  })
+
+  test.each([
+    "You exceeded your current quota, please check your plan and billing details.",
+    "Your credit balance is too low to access the Anthropic API.",
+    "Monthly usage limit reached.",
+  ])("accepts other provider exhaustion prose: %s", (message) => {
+    expect(isModelFallbackError(apiError({ message, isRetryable: true, statusCode: 429 }))).toBe(true)
+  })
+})
+
 describe("model fallback turn safety", () => {
   test("advances only for the latest eligible empty assistant result", () => {
-    expect(shouldAdvanceModelFallback([user(), assistant([], exhaustion())], "msg_user")).toBe(true)
+    expect(shouldAdvanceModelFallback([userMessage(), assistantMessage({ error: exhaustion() })], "msg_user")).toBe(
+      true,
+    )
     expect(
       shouldAdvanceModelFallback(
         [
-          user(),
-          assistant([], exhaustion()),
-          assistant([], apiError({ responseBody: '{"code":"rate_limit_exceeded"}' })),
+          userMessage(),
+          assistantMessage({ error: exhaustion() }),
+          assistantMessage({ error: apiError({ responseBody: '{"code":"rate_limit_exceeded"}' }) }),
         ],
         "msg_user",
       ),
@@ -60,32 +112,21 @@ describe("model fallback turn safety", () => {
   })
 
   test("prior visible or side-effecting assistant parts permanently block advancement", () => {
-    const latest = assistant([], exhaustion(), "msg_latest")
+    const latest = assistantMessage({ error: exhaustion(), id: "msg_latest" })
+    const prior = (parts: SessionLegacy.Part[]) =>
+      assistantMessage({ parts, error: exhaustion(), id: "msg_prior" })
     expect(
-      shouldAdvanceModelFallback(
-        [user(), assistant([{ type: "text", text: "partial", synthetic: false }], exhaustion(), "msg_prior"), latest],
-        "msg_user",
-      ),
+      shouldAdvanceModelFallback([userMessage(), prior([textPart("partial", { synthetic: false })]), latest], "msg_user"),
+    ).toBe(false)
+    expect(
+      shouldAdvanceModelFallback([userMessage(), prior([toolPart(completedToolState())]), latest], "msg_user"),
+    ).toBe(false)
+    expect(
+      shouldAdvanceModelFallback([userMessage(), prior([reasoningPart("partial reasoning")]), latest], "msg_user"),
     ).toBe(false)
     expect(
       shouldAdvanceModelFallback(
-        [user(), assistant([{ type: "tool", state: { status: "completed" } }], exhaustion(), "msg_prior"), latest],
-        "msg_user",
-      ),
-    ).toBe(false)
-    expect(
-      shouldAdvanceModelFallback(
-        [user(), assistant([{ type: "reasoning", text: "partial reasoning" }], exhaustion(), "msg_prior"), latest],
-        "msg_user",
-      ),
-    ).toBe(false)
-    expect(
-      shouldAdvanceModelFallback(
-        [
-          user(),
-          assistant([{ type: "file", mime: "text/plain", url: "data:text/plain,output" }], exhaustion(), "msg_prior"),
-          latest,
-        ],
+        [userMessage(), prior([filePart({ mime: "text/plain", url: "data:text/plain,output" })]), latest],
         "msg_user",
       ),
     ).toBe(false)
@@ -94,7 +135,7 @@ describe("model fallback turn safety", () => {
   test("allows internal step bookkeeping before an exhaustion failure", () => {
     expect(
       shouldAdvanceModelFallback(
-        [user(), assistant([{ type: "step-start" }, { type: "step-finish" }], exhaustion())],
+        [userMessage(), assistantMessage({ parts: [stepStartPart(), stepFinishPart()], error: exhaustion() })],
         "msg_user",
       ),
     ).toBe(true)
@@ -103,7 +144,11 @@ describe("model fallback turn safety", () => {
   test("ignores unrelated assistant messages from another user turn", () => {
     expect(
       shouldAdvanceModelFallback(
-        [user(), assistant([{ type: "tool" }], exhaustion(), "msg_other", "other_user"), assistant([], exhaustion())],
+        [
+          userMessage(),
+          assistantMessage({ parts: [toolPart()], error: exhaustion(), id: "msg_other", parentID: "msg_other_user" }),
+          assistantMessage({ error: exhaustion() }),
+        ],
         "msg_user",
       ),
     ).toBe(true)
@@ -116,17 +161,4 @@ function exhaustion() {
 
 function apiError(input: Partial<SessionLegacy.APIError["data"]>) {
   return new SessionLegacy.APIError({ message: "request failed", isRetryable: false, ...input })
-}
-
-function user(): SessionLegacy.WithParts {
-  return { info: { id: "msg_user", role: "user" }, parts: [] } as unknown as SessionLegacy.WithParts
-}
-
-function assistant(
-  parts: Array<Record<string, unknown>>,
-  error: SessionLegacy.Assistant["error"],
-  id = "msg_assistant",
-  parentID = "msg_user",
-): SessionLegacy.WithParts {
-  return { info: { id, role: "assistant", parentID, error }, parts } as unknown as SessionLegacy.WithParts
 }

@@ -3910,6 +3910,47 @@ noLLMServer.instance(
   30_000,
 )
 
+/**
+ * THE INVARIANT, end to end. The 2026-09-10 stall was user-visible not because
+ * the classifier missed a phrase but because the loop broke leaving a durable
+ * assistant row with zero parts - indistinguishable from a dropped write.
+ *
+ * This failure is deliberately one NO classifier recognises: not exhaustion,
+ * not a rate limit, not RESOURCE_EXHAUSTED. Chasing every provider's wording is
+ * unbounded, so the guard must not depend on winning that chase.
+ */
+it.instance("an unclassified provider failure still leaves the turn with something to read", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({})
+    yield* llm.error(400, {
+      error: { message: "Developer instruction is not enabled for models/test-model", code: 400 },
+    })
+
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      model: ref,
+      noReply: true,
+      parts: [{ type: "text", text: "say something" }],
+    })
+    const result = yield* prompt.loop({ sessionID: chat.id })
+
+    expect(result.info.role).toBe("assistant")
+    // The error is still recorded verbatim: the notice adds to the row, it does
+    // not stand in for the structured error a client may already handle.
+    if (result.info.role === "assistant") expect(result.info.error?.name).toBe("APIError")
+    const stated = result.parts.filter((part) => part.type === "text" && part.text.trim().length > 0)
+    expect(stated).not.toHaveLength(0)
+    const text = stated.map((part) => (part.type === "text" ? part.text : "")).join("\n")
+    // Provider, model, the provider's own words, and how they were classified.
+    expect(text).toContain("test/test-model")
+    expect(text).toContain("Developer instruction is not enabled")
+    expect(text).toContain("unclassified")
+  }),
+)
+
 it.instance("swarm models run in-session on the orchestrator's model with a team briefing", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)

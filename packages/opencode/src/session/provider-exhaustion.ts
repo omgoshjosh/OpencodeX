@@ -93,17 +93,61 @@ export function attemptedRoutes(turn: readonly SessionLegacy.WithParts[], userMe
 }
 
 /**
- * The reason line the session states when the chain runs out. The incident this
- * guards against left a durable assistant row with zero parts, which a caller
- * cannot tell apart from a dropped write - so the terminal case has to say the
- * provider, the classification, and what was tried.
+ * The reason line for a turn that ends without the model saying anything.
+ *
+ * This is the invariant the whole feature rests on, and it deliberately does
+ * NOT depend on having classified the provider's prose correctly. Chasing every
+ * provider's wording is unbounded and we will always be one message behind; a
+ * durable assistant row with zero parts, however, is indistinguishable from a
+ * dropped write to every caller downstream, which is the actual user-visible
+ * defect. So the notice states what is known either way: the provider, the
+ * model, the provider's own words, how those words were classified (including
+ * "unclassified"), and whether a fallback route was attempted.
  */
-export function exhaustionNotice(input: { providerID: string; modelID: string; attempted: readonly string[] }) {
+export function unfinishedTurnNotice(input: {
+  providerID: string
+  modelID: string
+  message?: string
+  classification?: string
+  attempted?: readonly string[]
+  fallbackAttempted: boolean
+}) {
+  const reported = input.message?.trim()
   return [
-    `Provider usage limit reached on ${input.providerID}/${input.modelID}, and no untried fallback model remains for this role.`,
-    `Routes attempted: ${input.attempted.join(", ") || routeKey(input)}.`,
-    "Update the role's model or add a fallback model, then retry this turn.",
+    input.fallbackAttempted
+      ? `Provider usage limit reached on ${routeKey(input)}, and no untried fallback model remains for this role.`
+      : `This turn stopped on ${routeKey(input)} before the model produced a response.`,
+    `Provider reported: ${reported || "no message"} (classified as ${input.classification ?? "unclassified"}).`,
+    `Routes attempted: ${input.attempted?.length ? input.attempted.join(", ") : routeKey(input)}.`,
+    input.fallbackAttempted
+      ? "Update the role's model or add a fallback model, then retry this turn."
+      : "Retry this turn, or configure a fallback model for this role.",
   ].join(" ")
+}
+
+/** The chain-spent case: the same notice, with the fallback attempt stated. */
+export function exhaustionNotice(input: {
+  providerID: string
+  modelID: string
+  attempted: readonly string[]
+  message?: string
+  classification?: string
+}) {
+  return unfinishedTurnNotice({ ...input, fallbackAttempted: true })
+}
+
+/**
+ * The provider's own words, whatever error shape carried them. Read
+ * structurally rather than from a known error class because the point of the
+ * notice is to survive error shapes this module has never seen.
+ */
+export function failureMessage(error: unknown) {
+  if (!isRecord(error)) return undefined
+  const data = isRecord(error.data) ? error.data : undefined
+  const message = data?.message
+  const name = typeof error.name === "string" ? error.name : undefined
+  if (typeof message !== "string" || !message.trim()) return name
+  return name ? `${name}: ${message}` : message
 }
 
 export * as SessionProviderExhaustion from "./provider-exhaustion"

@@ -3,6 +3,7 @@ import { SessionLegacy } from "@opencode-ai/core/session/legacy"
 import { classifyProviderFailure, isModelFallbackError } from "../../src/session/model-fallback"
 import { SessionRetry } from "../../src/session/retry"
 import { SessionProviderExhaustion } from "../../src/session/provider-exhaustion"
+import { assistantMessage, userMessage } from "./message-fixture"
 
 /**
  * The exact wire shape of the 2026-09-10 15:44 UTC stall, taken from the daemon
@@ -120,10 +121,20 @@ describe("provider exhaustion route advancement", () => {
     // Durable rather than in-memory so a turn resumed after a daemon restart
     // cannot retry a route it already burned.
     const turn = [
-      user(),
-      assistant([], incidentError().toObject(), "msg_a", "msg_user", "openai", "gpt-5.6-sol"),
-      assistant([], incidentError().toObject(), "msg_b", "msg_user", "anthropic", "claude-sonnet-4-5"),
-      assistant([], undefined, "msg_c", "msg_other", "anthropic", "claude-opus-4-1"),
+      userMessage(),
+      assistantMessage({ error: incidentError().toObject(), id: "msg_a", providerID: "openai", modelID: "gpt-5.6-sol" }),
+      assistantMessage({
+        error: incidentError().toObject(),
+        id: "msg_b",
+        providerID: "anthropic",
+        modelID: "claude-sonnet-4-5",
+      }),
+      assistantMessage({
+        id: "msg_c",
+        parentID: "msg_other",
+        providerID: "anthropic",
+        modelID: "claude-opus-4-1",
+      }),
     ]
     expect(SessionProviderExhaustion.attemptedRoutes(turn, "msg_user")).toEqual([
       "openai/gpt-5.6-sol",
@@ -162,21 +173,3 @@ describe("provider exhaustion role identity", () => {
     expect(SessionProviderExhaustion.swarmIdentity({ opencodex: { swarmID: "swm_1" } })).toBeUndefined()
   })
 })
-
-function user(): SessionLegacy.WithParts {
-  return { info: { id: "msg_user", role: "user" }, parts: [] } as unknown as SessionLegacy.WithParts
-}
-
-function assistant(
-  parts: Array<Record<string, unknown>>,
-  error: SessionLegacy.Assistant["error"],
-  id = "msg_assistant",
-  parentID = "msg_user",
-  providerID = "openai",
-  modelID = "gpt-5.6-sol",
-): SessionLegacy.WithParts {
-  return {
-    info: { id, role: "assistant", parentID, error, providerID, modelID },
-    parts,
-  } as unknown as SessionLegacy.WithParts
-}

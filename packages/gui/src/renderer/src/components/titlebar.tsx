@@ -38,8 +38,10 @@ export function Titlebar(props: {
   onMount(() => document.addEventListener("focusin", rememberEditTarget))
   onCleanup(() => document.removeEventListener("focusin", rememberEditTarget))
 
+  const mac = isApplePlatform()
+
   return (
-    <header class="titlebar">
+    <header class="titlebar" data-platform={mac ? "darwin" : undefined}>
       <div class="titlebar-menu" aria-label="Application menu">
         <div class="titlebar-history" aria-label="Navigation history">
           <Button appearance="ghost" class="titlebar-history-button" title="Back" aria-label="Back" disabled={!props.canGoBack} onClick={props.goBack}><Icon name="chevronLeft" /></Button>
@@ -101,13 +103,22 @@ export function Titlebar(props: {
           </Show>
         </nav>
       </div>
-      <div class="window-controls">
-        <Button appearance="ghost" aria-label="Minimize" onClick={() => void window.opencodex?.window("minimize")}><Icon name="minus" /></Button>
-        <Button appearance="ghost" aria-label="Maximize" onClick={() => void window.opencodex?.window("maximize")}><Icon name="stop" /></Button>
-        <Button appearance="ghost" aria-label="Close" class="close" onClick={() => void window.opencodex?.window("close")}><Icon name="x" /></Button>
-      </div>
+      <Show when={!mac}>
+        <div class="window-controls">
+          <Button appearance="ghost" aria-label="Minimize" onClick={() => void window.opencodex?.window("minimize")}><Icon name="minus" /></Button>
+          <Button appearance="ghost" aria-label="Maximize" onClick={() => void window.opencodex?.window("maximize")}><Icon name="stop" /></Button>
+          <Button appearance="ghost" aria-label="Close" class="close" onClick={() => void window.opencodex?.window("close")}><Icon name="x" /></Button>
+        </div>
+      </Show>
     </header>
   )
+}
+
+export function isApplePlatform(
+  platform = typeof navigator === "undefined" ? "" : navigator.platform,
+  userAgent = typeof navigator === "undefined" ? "" : navigator.userAgent,
+) {
+  return /mac|iphone|ipad/i.test(platform || userAgent)
 }
 
 function runEditAction(action: "cut" | "copy" | "paste", target?: HTMLElement) {

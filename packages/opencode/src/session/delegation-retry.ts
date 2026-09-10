@@ -12,6 +12,7 @@ import { SessionStatus } from "./status"
 import { SessionID } from "./schema"
 import { DELEGATION_RECORD_VERSION, delegationAttempts, delegationRecord } from "./delegation-outcome"
 import { hydrateFallbackModels } from "@/opencodex/swarm-model"
+import { selectUntriedRoute } from "./provider-exhaustion"
 
 export type Result = {
   childSessionID: SessionID
@@ -127,12 +128,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
-export function selectUntriedRoute<T extends { providerID: string; modelID: string }>(
-  routes: readonly T[],
-  attemptedModels: readonly string[],
-) {
-  return routes.find((route) => !attemptedModels.includes(`${route.providerID}/${route.modelID}`))
-}
+export { selectUntriedRoute } from "./provider-exhaustion"
 
 export function hasUnsafeRetryOutput(messages: SessionLegacy.WithParts[]) {
   return messages.some(

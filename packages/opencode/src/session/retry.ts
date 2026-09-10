@@ -2,6 +2,7 @@ import type { NamedError } from "@opencode-ai/core/util/error"
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
 import { Cause, Clock, Duration, Effect, Schedule } from "effect"
 import { MessageV2 } from "./message-v2"
+import { classifyProviderFailure } from "./model-fallback"
 import { iife } from "@/util/iife"
 import { isRecord } from "@/util/record"
 
@@ -57,6 +58,13 @@ export function delay(attempt: number, error?: SessionLegacy.APIError) {
 export function retryable(error: Err) {
   // context overflow errors should not be retried
   if (SessionLegacy.ContextOverflowError.isInstance(error)) return undefined
+  // Usage exhaustion is an account condition, not congestion: the same model
+  // returns it again on every attempt, so backing off here only spends the
+  // budget that the route fallback needs. It is deliberately checked ahead of
+  // `isRetryable` - the provider marks exhaustion retryable (statusCode 429,
+  // isRetryable true, indistinguishable from a rate limit except in prose) and
+  // trusting that flag is what stalled four sessions on 2026-09-10.
+  if (classifyProviderFailure(error) === "exhausted") return undefined
   if (SessionLegacy.APIError.isInstance(error)) {
     const status = error.data.statusCode
     const code = error.data.metadata?.code

@@ -44,6 +44,42 @@ describe("model fallback error classification", () => {
   })
 })
 
+describe("provider usage exhaustion in plain provider prose", () => {
+  /**
+   * The wire shape of the 2026-09-10 15:44 UTC stall, from the daemon log:
+   * `{"name":"AI_APICallError","isRetryable":true,"statusCode":429}` with the
+   * message "The usage limit has been reached" and no structured code. Status
+   * and retryability are identical to an ordinary rate limit, so prose is the
+   * only signal that separates them.
+   */
+  const incident = apiError({ message: "The usage limit has been reached", isRetryable: true, statusCode: 429 })
+  const rateLimit = apiError({
+    message: "Rate limit reached for gpt-5.6-sol in organization org-abc on requests per min (RPM): Limit 500, Used 500",
+    isRetryable: true,
+    statusCode: 429,
+  })
+
+  test("advances the role's route on an unstructured usage limit", () => {
+    expect(isModelFallbackError(incident)).toBe(true)
+    expect(shouldAdvanceModelFallback([user(), assistant([], incident)], "msg_user")).toBe(true)
+  })
+
+  test("a rate limit on the same status and retryability does not advance", () => {
+    // Conflating the two either burns a fallback on a limit that would have
+    // cleared, or parks a turn on a model that will never answer.
+    expect(isModelFallbackError(rateLimit)).toBe(false)
+    expect(shouldAdvanceModelFallback([user(), assistant([], rateLimit)], "msg_user")).toBe(false)
+  })
+
+  test.each([
+    "You exceeded your current quota, please check your plan and billing details.",
+    "Your credit balance is too low to access the Anthropic API.",
+    "Monthly usage limit reached.",
+  ])("accepts other provider exhaustion prose: %s", (message) => {
+    expect(isModelFallbackError(apiError({ message, isRetryable: true, statusCode: 429 }))).toBe(true)
+  })
+})
+
 describe("model fallback turn safety", () => {
   test("advances only for the latest eligible empty assistant result", () => {
     expect(shouldAdvanceModelFallback([user(), assistant([], exhaustion())], "msg_user")).toBe(true)

@@ -154,11 +154,11 @@ async function createWindow() {
     title: "OpencodeX",
     icon: appIconPath(),
     backgroundColor: "#090a0f",
-    frame: false,
+    frame: process.platform === "darwin",
     show: !background,
     skipTaskbar: background,
     titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "hidden",
-    trafficLightPosition: { x: 18, y: 18 },
+    trafficLightPosition: { x: 12, y: 11 },
     webPreferences: {
       preload: path.join(app.getAppPath(), "dist", "preload", "index.cjs"),
       contextIsolation: true,

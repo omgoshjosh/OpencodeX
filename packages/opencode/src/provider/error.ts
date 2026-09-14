@@ -12,10 +12,31 @@ export class HeaderTimeoutError extends Error {
 }
 
 export class StreamIdleTimeoutError extends Error {
-  public override readonly name = "ProviderStreamIdleTimeoutError"
+  public override readonly name: string = "ProviderStreamIdleTimeoutError"
 
-  constructor(public readonly ms: number) {
-    super(`Provider stream produced no events for ${ms}ms`)
+  constructor(
+    public readonly ms: number,
+    message = `Provider stream produced no events for ${ms}ms`,
+  ) {
+    super(message)
+  }
+}
+
+/**
+ * The idle watchdog's ceiling for a locally executed tool: the stream was
+ * silent because a tool was in flight, and that tool never settled within
+ * the in-flight bound. Same family (and failure path) as the idle timeout,
+ * but the stated reason names the tool so the operator knows what hung.
+ */
+export class ToolInflightTimeoutError extends StreamIdleTimeoutError {
+  public override readonly name: string = "ProviderToolInflightTimeoutError"
+
+  constructor(
+    public readonly tool: string,
+    public readonly callID: string,
+    ms: number,
+  ) {
+    super(ms, `Tool ${tool} (${callID}) produced no result for ${ms}ms`)
   }
 }
 

@@ -36,6 +36,9 @@ const DOOM_LOOP_THRESHOLD = 3
  * `experimental.stream_idle_timeout`.
  */
 const STREAM_IDLE_TIMEOUT = 300_000
+// A local tool pauses the idle watchdog, but not without bound: the default
+// in-flight ceiling is this multiple of the idle timeout (30 min at 300s).
+const TOOL_INFLIGHT_MULTIPLIER = 6
 const log = Log.create({ service: "session.processor" })
 
 export type Result = "compact" | "stop" | "continue"
@@ -81,12 +84,14 @@ type ToolCall = {
   done: Deferred.Deferred<void>
   inputEnded: boolean
   /**
-   * True from the `tool-call` event until the matching `tool-result` or
+   * Set from the `tool-call` event until the matching `tool-result` or
    * `tool-error` settles it. With the AI SDK a local tool executes inside
    * the stream loop, so the provider is legitimately silent for the whole
-   * execution; the idle watchdog must not count that silence.
+   * execution; the idle watchdog must not count that silence against the
+   * provider. `since` is the wall-clock start the in-flight ceiling is
+   * measured from; part metadata updates never reset it.
    */
-  executing: boolean
+  executing?: { tool: string; since: number }
 }
 
 interface ProcessorContext extends Input {
@@ -294,17 +299,25 @@ export const layer = Layer.effect(
           messageID: part.messageID,
           sessionID: part.sessionID,
           inputEnded: false,
-          executing: false,
         }
         return { call: ctx.toolcalls[input.id], part }
       })
 
-      const setExecuting = (toolCallID: string, executing: boolean) => {
+      const setExecuting = (toolCallID: string, executing: ToolCall["executing"]) => {
         const call = ctx.toolcalls[toolCallID]
         if (call) ctx.toolcalls[toolCallID] = { ...call, executing }
       }
 
-      const toolInFlight = () => Object.values(ctx.toolcalls).some((call) => call.executing)
+      // The in-flight tool that has run longest: it is the one whose ceiling
+      // fires first, and the one the stated reason must name.
+      const toolInFlight = () => {
+        let match: { callID: string; tool: string; since: number } | undefined
+        for (const [callID, call] of Object.entries(ctx.toolcalls)) {
+          if (!call.executing) continue
+          if (!match || call.executing.since < match.since) match = { callID, ...call.executing }
+        }
+        return match
+      }
 
       const isFilePart = (value: unknown): value is SessionLegacy.FilePart => Schema.is(SessionLegacy.FilePart)(value)
 
@@ -396,7 +409,12 @@ export const layer = Layer.effect(
             }
             // A provider-executed tool, or one with no local handler, runs
             // nowhere in this loop: any silence after it is the provider's.
-            setExecuting(value.id, !value.providerExecuted && typeof tools[value.name]?.execute === "function")
+            setExecuting(
+              value.id,
+              !value.providerExecuted && typeof tools[value.name]?.execute === "function"
+                ? { tool: value.name, since: Date.now() }
+                : undefined,
+            )
             yield* updateToolCall(value.id, (match) => ({
               ...match,
               tool: value.name,
@@ -445,7 +463,7 @@ export const layer = Layer.effect(
 
           case "tool-result": {
             yield* readToolCall(value.id)
-            setExecuting(value.id, false)
+            setExecuting(value.id, undefined)
             const rawOutput = toolResultOutput(value)
             const normalized = yield* Effect.forEach(rawOutput.attachments ?? [], (attachment) =>
               attachment.mime.startsWith("image/")
@@ -474,7 +492,7 @@ export const layer = Layer.effect(
 
           case "tool-error": {
             yield* readToolCall(value.id)
-            setExecuting(value.id, false)
+            setExecuting(value.id, undefined)
             yield* failToolCall(value.id, value.error ?? new Error(value.message))
             return
           }
@@ -678,6 +696,7 @@ export const layer = Layer.effect(
         const cfg = yield* config.get()
         ctx.shouldBreak = cfg.experimental?.continue_loop_on_deny !== true
         const idleTimeout = cfg.experimental?.stream_idle_timeout ?? STREAM_IDLE_TIMEOUT
+        const inflightTimeout = cfg.experimental?.tool_inflight_timeout ?? idleTimeout * TOOL_INFLIGHT_MULTIPLIER
         tools = streamInput.tools
 
         return yield* Effect.gen(function* () {
@@ -707,23 +726,52 @@ export const layer = Layer.effect(
               // is silent until it returns, which is not a hung stream - a
               // foreground `task` delegation routinely runs past the bound.
               // Pulls with no local tool in flight keep the full bound.
+              //
+              // The pause is itself bounded: a tool that never settles must
+              // not hang the turn forever. While a tool is in flight the pull
+              // is timed against the in-flight ceiling, wall-clock from that
+              // tool's `tool-call`, and firing it fails the turn naming the
+              // tool. The idle clock resumes on `tool-result`/`tool-error`.
               (self) =>
                 Stream.transformPull(self, (pull) =>
                   Effect.succeed(
-                    Effect.suspend(() =>
-                      toolInFlight()
-                        ? pull
-                        : pull.pipe(
-                            Effect.timeoutOrElse({
-                              duration: Duration.millis(idleTimeout),
-                              orElse: () =>
-                                Effect.gen(function* () {
-                                  slog.error("stream idle timeout", { timeoutMs: idleTimeout })
-                                  return yield* Effect.fail(new ProviderError.StreamIdleTimeoutError(idleTimeout))
-                                }),
+                    Effect.suspend(() => {
+                      const inflight = toolInFlight()
+                      if (!inflight) {
+                        return pull.pipe(
+                          Effect.timeoutOrElse({
+                            duration: Duration.millis(idleTimeout),
+                            orElse: () =>
+                              Effect.gen(function* () {
+                                slog.error("stream idle timeout", { timeoutMs: idleTimeout })
+                                return yield* Effect.fail(new ProviderError.StreamIdleTimeoutError(idleTimeout))
+                              }),
+                          }),
+                        )
+                      }
+                      const remaining = Math.max(0, inflight.since + inflightTimeout - Date.now())
+                      return pull.pipe(
+                        Effect.timeoutOrElse({
+                          duration: Duration.millis(remaining),
+                          orElse: () =>
+                            Effect.gen(function* () {
+                              slog.error("tool inflight timeout", {
+                                tool: inflight.tool,
+                                callID: inflight.callID,
+                                timeoutMs: inflightTimeout,
+                                elapsedMs: Date.now() - inflight.since,
+                              })
+                              return yield* Effect.fail(
+                                new ProviderError.ToolInflightTimeoutError(
+                                  inflight.tool,
+                                  inflight.callID,
+                                  inflightTimeout,
+                                ),
+                              )
                             }),
-                          ),
-                    ),
+                        }),
+                      )
+                    }),
                   ),
                 ),
               Stream.tap((event) => handleEvent(event)),

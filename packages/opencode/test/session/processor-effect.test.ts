@@ -1119,6 +1119,178 @@ it.live("session.processor effect tests keep the idle clock paused while a local
   ),
 )
 
+it.live("session.processor effect tests fail the turn naming the tool when a local tool never settles", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const idleTimeout = 300
+        const inflightTimeout = 60
+
+        yield* llm.tool("stuck", { query: "forever" })
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "stuck tool")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+
+        const started = Date.now()
+        const value = yield* handle
+          .process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionLegacy.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "stuck tool" }],
+            tools: {
+              stuck: tool({
+                description: "Never answers",
+                inputSchema: z.object({ query: z.string() }),
+                // no tool-result can ever arrive: only the in-flight ceiling
+                // can end this attempt
+                execute: () => new Promise(() => {}),
+              }),
+            },
+          })
+          .pipe(
+            // a hang is the defect under test; bound it so the test fails
+            // instead of stalling the suite
+            Effect.timeoutOrElse({
+              duration: "2 seconds",
+              orElse: () => Effect.succeed("hung" as const),
+            }),
+          )
+
+        const parts = yield* MessageV2.parts(msg.id)
+        const call = parts.find((part): part is SessionLegacy.ToolPart => part.type === "tool")
+
+        expect(value).toBe("stop")
+        expect(Date.now() - started).toBeGreaterThanOrEqual(inflightTimeout)
+        // the ceiling ended it (plus cleanup's 250ms grace for the unsettled
+        // call), not the idle bound and not the guard above
+        expect(Date.now() - started).toBeLessThan(idleTimeout + 250)
+        expect(yield* llm.calls).toBe(1)
+        const error = handle.message.error
+        expect(SessionLegacy.APIError.isInstance(error)).toBe(true)
+        if (SessionLegacy.APIError.isInstance(error)) {
+          // the stated reason names what hung, not "the provider went quiet"
+          expect(error.data.message).toBe(`Tool stuck (call_1) produced no result for ${inflightTimeout}ms`)
+          expect(error.data.metadata?.code).toBe("ProviderToolInflightTimeoutError")
+        }
+        expect(call?.state.status).toBe("error")
+      }),
+    {
+      config: (url) => ({
+        ...providerCfg(url),
+        experimental: { stream_idle_timeout: 300, tool_inflight_timeout: 60 },
+      }),
+    },
+  ),
+)
+
+it.live("session.processor effect tests resume the idle clock after a tool settles under the in-flight ceiling", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const idleTimeout = 300
+        const inflightTimeout = 600
+
+        // turn 1: a tool that outlives the idle bound but settles under the ceiling
+        yield* llm.tool("slow", { query: "weather" })
+        // turn 2: pure provider silence with no tool in flight, then the retry
+        yield* llm.hang
+        yield* llm.text("after")
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "slow then silent")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+        const input = {
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionLegacy.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "slow then silent" }],
+          tools: {
+            slow: tool({
+              description: "Outlives the idle bound, settles under the in-flight ceiling",
+              inputSchema: z.object({ query: z.string() }),
+              execute: async (input) => {
+                await new Promise((resolve) => setTimeout(resolve, idleTimeout + 150))
+                return { title: "Slow lookup", output: `result:${input.query}`, metadata: {} }
+              },
+            }),
+          },
+        } satisfies LLM.StreamInput
+
+        const first = yield* handle.process(input)
+        const parts = yield* MessageV2.parts(msg.id)
+        const call = parts.find((part): part is SessionLegacy.ToolPart => part.type === "tool")
+
+        expect(first).toBe("continue")
+        expect(handle.message.error).toBeUndefined()
+        expect(yield* llm.calls).toBe(1)
+        expect(call?.state.status).toBe("completed")
+        if (call?.state.status !== "completed") return
+        expect(call.state.output).toBe("result:weather")
+        expect(call.state.time.end - call.state.time.start).toBeGreaterThanOrEqual(idleTimeout + 100)
+        expect(call.state.time.end - call.state.time.start).toBeLessThan(inflightTimeout)
+
+        // the settled tool no longer holds the clock: the 300ms bound trips
+        // on the silent attempt and, with nothing replayed, it retries
+        // (the retry backoff dominates the elapsed time; the guard only
+        // turns a genuine hang into a failure)
+        const started = Date.now()
+        const second = yield* handle.process(input).pipe(
+          Effect.timeoutOrElse({
+            duration: "20 seconds",
+            orElse: () => Effect.succeed("hung" as const),
+          }),
+        )
+
+        expect(second).toBe("continue")
+        expect(Date.now() - started).toBeGreaterThanOrEqual(idleTimeout)
+        expect(yield* llm.calls).toBe(3)
+        expect(handle.message.error).toBeUndefined()
+        const after = yield* MessageV2.parts(msg.id)
+        expect(after.some((part) => part.type === "text" && part.text === "after")).toBe(true)
+      }),
+    {
+      config: (url) => ({
+        ...providerCfg(url),
+        experimental: { stream_idle_timeout: 300, tool_inflight_timeout: 600 },
+      }),
+    },
+  ),
+)
+
 it.live("session.processor effect tests leave a stream that keeps emitting untouched", () =>
   provideTmpdirServer(
     ({ dir, llm }) =>

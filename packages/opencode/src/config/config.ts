@@ -300,6 +300,10 @@ export const Info = Schema.Struct({
         description:
           "Timeout in milliseconds between events on an LLM stream before the turn fails as retryable. Defaults to 300000.",
       }),
+      tool_inflight_timeout: Schema.optional(PositiveInt).annotate({
+        description:
+          "Ceiling in milliseconds a locally executed tool may hold the stream idle watchdog paused, measured wall-clock from its tool-call to its tool-result. On expiry the turn fails naming the tool. Defaults to 6x stream_idle_timeout (1800000).",
+      }),
       stale_execution_timeout: Schema.optional(PositiveInt).annotate({
         description:
           "Timeout in milliseconds a finished-but-unsettled session execution may keep renewing its lease before the recovery sweep force-settles it. Defaults to 600000.",

@@ -2352,7 +2352,10 @@ unix(
       const idleTimeout = 250
       const { dir, llm } = yield* useServerConfig((url) => ({
         ...providerCfg(url),
-        experimental: { stream_idle_timeout: idleTimeout },
+        // the delegation as a whole (several child turns) runs well past
+        // 6x a 250ms idle bound; the in-flight ceiling under test elsewhere
+        // must not be what ends it here
+        experimental: { stream_idle_timeout: idleTimeout, tool_inflight_timeout: 30_000 },
       }))
       const prompt = yield* SessionPrompt.Service
       const sessions = yield* Session.Service

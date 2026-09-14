@@ -20,6 +20,13 @@ const levelPriority: Record<Level, number> = {
   ERROR: 3,
 }
 const keep = 10
+// A log written within this window is treated as belonging to a live process
+// and is never pruned. Filenames sort by start time, so the longest-lived
+// process (the production daemon) is otherwise always the first file doomed
+// once scratch servers or CLI runs push more than `keep` newer files into the
+// dir (live 2026-09-14, OpencodeX-ucp: pid 71661 kept writing to an unlinked
+// inode and every diagnostic reading its log went blind until restart).
+export const liveWindowMs = 15 * 60 * 1000
 const initializedRunID = "OPENCODE_LOG_INITIALIZED_RUN_ID"
 
 let level: Level = "INFO"
@@ -52,6 +59,12 @@ export interface Options {
   print: boolean
   dev?: boolean
   level?: Level
+  /**
+   * Prune old timestamped logs from the log dir. Only the long-running server
+   * entrypoint should pass this; short-lived CLI/TUI processes must not delete
+   * files that a concurrent daemon still has open.
+   */
+  prune?: boolean
 }
 
 let logpath = ""
@@ -65,7 +78,7 @@ let write = (msg: any) => {
 
 export async function init(options: Options) {
   if (options.level) level = options.level
-  void cleanup(Global.Path.log)
+  if (options.prune) void cleanup(Global.Path.log)
   if (options.print) return
   logpath = path.join(
     Global.Path.log,
@@ -113,7 +126,7 @@ export async function init(options: Options) {
   }
 }
 
-async function cleanup(dir: string) {
+export async function cleanup(dir: string, now = Date.now()) {
   const files = (
     await Glob.scan("????-??-??T??????.log", {
       cwd: dir,
@@ -126,7 +139,14 @@ async function cleanup(dir: string) {
   if (files.length <= keep) return
 
   const doomed = files.slice(0, -keep)
-  await Promise.all(doomed.map((file) => fs.unlink(path.join(dir, file)).catch(() => {})))
+  await Promise.all(
+    doomed.map(async (file) => {
+      const full = path.join(dir, file)
+      const stat = await fs.stat(full).catch(() => undefined)
+      if (!stat || now - stat.mtimeMs < liveWindowMs) return
+      await fs.unlink(full).catch(() => {})
+    }),
+  )
 }
 
 function formatError(error: Error, depth = 0): string {

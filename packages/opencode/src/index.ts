@@ -100,6 +100,9 @@ const cli = yargs(args)
     await Log.init({
       print: process.argv.includes("--print-logs"),
       dev: Installation.isLocal(),
+      // Only the long-running server prunes old logs; a CLI/TUI start must not
+      // unlink the file a concurrent daemon is still writing (OpencodeX-ucp).
+      prune: opts._[0] === "serve",
       level: (() => {
         if (opts.logLevel) return opts.logLevel as Log.Level
         if (Installation.isLocal()) return "DEBUG"

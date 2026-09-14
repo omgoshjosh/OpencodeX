@@ -1004,6 +1004,121 @@ it.live("session.processor effect tests fail the turn when the llm stream goes i
   ),
 )
 
+it.live("session.processor effect tests fail the turn when the llm stream goes idle with no tool in flight", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const idleTimeout = 300
+
+        // role chunk, then the socket is held open with nothing on it; the
+        // watchdog fails that attempt and, with nothing replayed, retries
+        yield* llm.hang
+        yield* llm.text("after")
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "silent stream")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+
+        const started = Date.now()
+        const value = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionLegacy.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "silent stream" }],
+          tools: {},
+        })
+
+        const parts = yield* MessageV2.parts(msg.id)
+
+        // the only way the first attempt can end is the watchdog, after the bound
+        expect(Date.now() - started).toBeGreaterThanOrEqual(idleTimeout)
+        expect(yield* llm.calls).toBe(2)
+        expect(value).toBe("continue")
+        expect(handle.message.error).toBeUndefined()
+        expect(parts.some((part) => part.type === "text" && part.text === "after")).toBe(true)
+      }),
+    { config: (url) => ({ ...providerCfg(url), experimental: { stream_idle_timeout: 300 } }) },
+  ),
+)
+
+it.live("session.processor effect tests keep the idle clock paused while a local tool executes", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const idleTimeout = 300
+
+        yield* llm.tool("slow", { query: "weather" })
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "slow tool")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+
+        const value = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionLegacy.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "slow tool" }],
+          tools: {
+            slow: tool({
+              description: "Takes twice the idle timeout to answer",
+              inputSchema: z.object({ query: z.string() }),
+              execute: async (input) => {
+                // the provider is silent for all of this: the tool-call has
+                // been emitted and the tool-result cannot exist yet
+                await new Promise((resolve) => setTimeout(resolve, idleTimeout * 2))
+                return { title: "Slow lookup", output: `result:${input.query}`, metadata: {} }
+              },
+            }),
+          },
+        })
+
+        const parts = yield* MessageV2.parts(msg.id)
+        const call = parts.find((part): part is SessionLegacy.ToolPart => part.type === "tool")
+
+        expect(handle.message.error).toBeUndefined()
+        expect(value).toBe("continue")
+        expect(yield* llm.calls).toBe(1)
+        expect(call?.state.status).toBe("completed")
+        if (call?.state.status !== "completed") return
+        expect(call.state.output).toBe("result:weather")
+        expect(call.state.time.end - call.state.time.start).toBeGreaterThanOrEqual(idleTimeout * 2 - 50)
+      }),
+    { config: (url) => ({ ...providerCfg(url), experimental: { stream_idle_timeout: 300 } }) },
+  ),
+)
+
 it.live("session.processor effect tests leave a stream that keeps emitting untouched", () =>
   provideTmpdirServer(
     ({ dir, llm }) =>

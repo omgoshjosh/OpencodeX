@@ -1816,6 +1816,7 @@ export type Config = {
     mcp_timeout?: number
     search_timeout?: number
     stream_idle_timeout?: number
+    tool_inflight_timeout?: number
     stale_execution_timeout?: number
     policies?: Array<ConfigV2ExperimentalPolicy>
   }

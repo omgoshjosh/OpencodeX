@@ -2345,6 +2345,73 @@ it.instance(
   10_000,
 )
 
+unix(
+  "a foreground delegation that outlives the stream idle timeout returns its real report",
+  () =>
+    Effect.gen(function* () {
+      const idleTimeout = 250
+      const { dir, llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        experimental: { stream_idle_timeout: idleTimeout },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Long delegation",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+
+      // Parent: one foreground task call. While the child works, the parent's
+      // provider is silent - the task tool executes inside the stream loop.
+      yield* llm.tool("task", { description: "long child", prompt: "take your time", subagent_type: "general" })
+      // Child: three shell waits, each well inside the idle bound so the child
+      // itself is never idle, whose sum outlives the parent's bound.
+      for (let i = 0; i < 3; i++) {
+        yield* llm.tool("bash", { command: "sleep 0.15", description: "wait", workdir: path.resolve(dir) })
+      }
+      yield* llm.text("child report after the bound")
+      yield* llm.text("parent done")
+      yield* user(chat.id, "delegate")
+
+      const result = yield* prompt.loop({ sessionID: chat.id })
+
+      const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
+      const delegating = msgs.find(
+        (item) =>
+          item.info.role === "assistant" && item.parts.some((part) => part.type === "tool" && part.tool === "task"),
+      )
+      expect(delegating?.info.role).toBe("assistant")
+      if (!delegating || delegating.info.role !== "assistant") return
+      const task = completedTool(delegating.parts)
+      if (!task) return
+      expect(task.state.output).not.toContain("The subagent was cancelled")
+      expect(task.state.output).toContain("child report after the bound")
+      expect(task.state.time.end - task.state.time.start).toBeGreaterThan(idleTimeout)
+      expect(delegating.info.error).toBeUndefined()
+
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role !== "assistant") return
+      expect(result.info.error).toBeUndefined()
+      expect(result.parts.some((part) => part.type === "text" && part.text === "parent done")).toBe(true)
+
+      const childID = task.state.metadata?.sessionId
+      expect(typeof childID).toBe("string")
+      if (typeof childID !== "string") return
+      const child = yield* sessions.get(SessionID.make(childID))
+      expect(delegationRecord(child.metadata)).toMatchObject({ phase: "settled", outcome: "completed" })
+      const childTurns = (yield* sessions.messages({ sessionID: child.id })).filter(
+        (message) => message.info.role === "assistant",
+      )
+      expect(childTurns.length).toBeGreaterThan(0)
+      for (const turn of childTurns) {
+        if (turn.info.role === "assistant") expect(turn.info.error).toBeUndefined()
+      }
+      expect(yield* llm.calls).toBe(6)
+    }),
+  { git: true },
+  30_000,
+)
+
 it.instance(
   "loop sets status to busy then idle",
   () =>

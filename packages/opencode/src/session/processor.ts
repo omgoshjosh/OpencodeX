@@ -80,6 +80,13 @@ type ToolCall = {
   sessionID: SessionLegacy.ToolPart["sessionID"]
   done: Deferred.Deferred<void>
   inputEnded: boolean
+  /**
+   * True from the `tool-call` event until the matching `tool-result` or
+   * `tool-error` settles it. With the AI SDK a local tool executes inside
+   * the stream loop, so the provider is legitimately silent for the whole
+   * execution; the idle watchdog must not count that silence.
+   */
+  executing: boolean
 }
 
 interface ProcessorContext extends Input {
@@ -131,6 +138,9 @@ export const layer = Layer.effect(
         reasoningMap: {},
       }
       let aborted = false
+      // The tools handed to the current stream; only one the runtime will
+      // execute locally (has `execute`) can hold the idle clock.
+      let tools: LLM.StreamInput["tools"] = {}
       const slog = log.clone().tag("session.id", input.sessionID).tag("messageID", input.assistantMessage.id)
 
       const parse = (e: unknown) =>
@@ -284,9 +294,17 @@ export const layer = Layer.effect(
           messageID: part.messageID,
           sessionID: part.sessionID,
           inputEnded: false,
+          executing: false,
         }
         return { call: ctx.toolcalls[input.id], part }
       })
+
+      const setExecuting = (toolCallID: string, executing: boolean) => {
+        const call = ctx.toolcalls[toolCallID]
+        if (call) ctx.toolcalls[toolCallID] = { ...call, executing }
+      }
+
+      const toolInFlight = () => Object.values(ctx.toolcalls).some((call) => call.executing)
 
       const isFilePart = (value: unknown): value is SessionLegacy.FilePart => Schema.is(SessionLegacy.FilePart)(value)
 
@@ -376,6 +394,9 @@ export const layer = Layer.effect(
             const input = toolInput(value.input)
             if (!toolCall.call.inputEnded) {
             }
+            // A provider-executed tool, or one with no local handler, runs
+            // nowhere in this loop: any silence after it is the provider's.
+            setExecuting(value.id, !value.providerExecuted && typeof tools[value.name]?.execute === "function")
             yield* updateToolCall(value.id, (match) => ({
               ...match,
               tool: value.name,
@@ -424,6 +445,7 @@ export const layer = Layer.effect(
 
           case "tool-result": {
             yield* readToolCall(value.id)
+            setExecuting(value.id, false)
             const rawOutput = toolResultOutput(value)
             const normalized = yield* Effect.forEach(rawOutput.attachments ?? [], (attachment) =>
               attachment.mime.startsWith("image/")
@@ -452,6 +474,7 @@ export const layer = Layer.effect(
 
           case "tool-error": {
             yield* readToolCall(value.id)
+            setExecuting(value.id, false)
             yield* failToolCall(value.id, value.error ?? new Error(value.message))
             return
           }
@@ -655,6 +678,7 @@ export const layer = Layer.effect(
         const cfg = yield* config.get()
         ctx.shouldBreak = cfg.experimental?.continue_loop_on_deny !== true
         const idleTimeout = cfg.experimental?.stream_idle_timeout ?? STREAM_IDLE_TIMEOUT
+        tools = streamInput.tools
 
         return yield* Effect.gen(function* () {
           yield* Effect.gen(function* () {
@@ -674,18 +698,31 @@ export const layer = Layer.effect(
               // has not registered yet. Timing the pull keeps pull-then-handle
               // sequential in one fiber, and only measures time actually spent
               // waiting on the provider (not time spent handling an event).
+              //
+              // That same sequencing is what lets the clock pause for a tool:
+              // a `tool-call` has been fully handled (and flagged executing)
+              // before the pull that waits on its `tool-result` starts, so the
+              // decision to time a pull is made against up-to-date state. A
+              // local tool executes inside the stream loop and the provider
+              // is silent until it returns, which is not a hung stream - a
+              // foreground `task` delegation routinely runs past the bound.
+              // Pulls with no local tool in flight keep the full bound.
               (self) =>
                 Stream.transformPull(self, (pull) =>
                   Effect.succeed(
-                    pull.pipe(
-                      Effect.timeoutOrElse({
-                        duration: Duration.millis(idleTimeout),
-                        orElse: () =>
-                          Effect.gen(function* () {
-                            slog.error("stream idle timeout", { timeoutMs: idleTimeout })
-                            return yield* Effect.fail(new ProviderError.StreamIdleTimeoutError(idleTimeout))
-                          }),
-                      }),
+                    Effect.suspend(() =>
+                      toolInFlight()
+                        ? pull
+                        : pull.pipe(
+                            Effect.timeoutOrElse({
+                              duration: Duration.millis(idleTimeout),
+                              orElse: () =>
+                                Effect.gen(function* () {
+                                  slog.error("stream idle timeout", { timeoutMs: idleTimeout })
+                                  return yield* Effect.fail(new ProviderError.StreamIdleTimeoutError(idleTimeout))
+                                }),
+                            }),
+                          ),
                     ),
                   ),
                 ),

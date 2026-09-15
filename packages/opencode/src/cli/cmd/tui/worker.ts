@@ -28,6 +28,7 @@ import {
 } from "./coordinator-registry"
 import { randomBytes } from "crypto"
 import { createWorkerGate, WorkerShuttingDownError } from "./worker-gate"
+import { CANONICAL_PORT, readCanonicalAuthorityGuard, type CanonicalAuthorityGuard } from "./canonical-authority"
 
 ensureProcessMetadata("worker")
 
@@ -184,6 +185,18 @@ async function startServer(input: {
   try {
     const existing = await readActiveCoordinator(key, database)
     if (existing) throw collidingAuthorityError(existing)
+    // OpencodeX-1d2 layer 2: while a canonical daemon is registered, port 0
+    // must not resolve to :4096 (the daemon's socket, briefly free during a
+    // cutover). Ephemeral is fine: clients find this worker via the manifest.
+    const guard = await readCanonicalAuthorityGuard()
+    if (guard.engaged) {
+      if (input.port === CANONICAL_PORT) throw canonicalPortReservedError(guard)
+      Log.Default.info("canonical authority registered; embedded worker will not prefer :4096", {
+        marker: guard.path,
+        pid: guard.pid,
+        corrupt: guard.corrupt,
+      })
+    }
     const needsCompanion = !LOOPBACK_HOSTS.has(input.hostname) && !WILDCARD_HOSTS.has(input.hostname)
     const primary = {
       hostname: input.hostname,
@@ -191,6 +204,7 @@ async function startServer(input: {
       mdns: input.mdns,
       mdnsDomain: input.mdnsDomain,
       cors: input.cors ?? [],
+      ...(guard.engaged ? { prefer4096: false } : {}),
     }
     listeners = needsCompanion
       ? await Server.listenShared([
@@ -249,6 +263,13 @@ function causeChain(error: unknown): string {
 function collidingAuthorityError(manifest: TuiCoordinatorManifest) {
   return new Error(
     `A backend authority is already serving this database (pid ${manifest.pid}, url ${manifest.url}); refusing to start a second one`,
+  )
+}
+
+function canonicalPortReservedError(guard: Extract<CanonicalAuthorityGuard, { engaged: true }>) {
+  const who = guard.corrupt ? "unreadable marker" : `pid ${guard.pid}`
+  return new Error(
+    `Port ${CANONICAL_PORT} is reserved for the canonical backend authority registered at ${guard.path} (${who}); the embedded GUI worker refuses to take it. Remove the marker only if no launchd daemon serves this database`,
   )
 }
 

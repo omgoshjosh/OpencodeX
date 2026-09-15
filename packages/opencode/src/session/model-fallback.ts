@@ -59,11 +59,24 @@ const RATE_LIMIT_MESSAGE = /rate limits? reached|rate limit|too many requests|ra
  * It matches `quota exceeded` word for word, yet it clears on its own in about
  * a minute - reading it as exhaustion burns a fallback route on a blip.
  *
- * The discriminator is the windowing wording (`quota metric`, `per minute`): a
- * genuine account-level "You exceeded your current quota" never names a window.
- * Tested BEFORE the exhaustion set precisely because the two overlap.
+ * The discriminator is the named window: a genuine account-level "You exceeded
+ * your current quota" never names one. Only a MINUTE window is a rate limit;
+ * day/hour windows and window-less quota metrics are `QUOTA_WINDOW_MESSAGE`.
+ * Tested BEFORE the exhaustion set precisely because the two overlap, and
+ * before the window set because a message naming both windows clears with the
+ * shorter one.
  */
-const QUOTA_RATE_LIMIT_MESSAGE = /quota metric|per[- ]minute|per min\b|per day\b|per[- ]hour\b/i
+const QUOTA_RATE_LIMIT_MESSAGE = /per[- ]minute|per min\b/i
+
+/**
+ * The same "Quota exceeded for quota metric ..." shape with a per-DAY or
+ * per-HOUR window, or with no window named at all. A daily allowance does not
+ * clear in a minute: reading it as `rate-limited` retries the same model
+ * forever and stalls the role, while reading it as definite `exhausted` burns a
+ * route on the ambiguous window-less form. So it joins the ambiguous class:
+ * bounded same-model retry first, then advance the route.
+ */
+const QUOTA_WINDOW_MESSAGE = /quota metric|per[- ]day\b|per[- ]hour\b/i
 
 /**
  * Google's canonical RESOURCE_EXHAUSTED prose - "Resource has been exhausted
@@ -87,8 +100,11 @@ export type ProviderFailure = "exhausted" | "rate-limited" | "resource-exhausted
  *   which. Retry the same model first, then advance rather than stall.
  *
  * Definite exhaustion wins over the ambiguous class, and a message that names a
- * time window wins over both - that ordering is what keeps Google's per-minute
+ * MINUTE window wins over both - that ordering is what keeps Google's per-minute
  * 429 (which literally reads "Quota exceeded") from burning a fallback route.
+ * A per-day/per-hour window, or a quota metric with no window, is the
+ * ambiguous class instead: it also reads "Quota exceeded", but it will not
+ * clear during any same-model backoff, so it must be allowed to advance.
  * Neither HTTP status nor `isRetryable` participates: both are 429/true for
  * every condition here, which is precisely why this function reads prose.
  */
@@ -100,6 +116,7 @@ export function classifyProviderFailure(error: unknown): ProviderFailure | undef
   const message = error.data.message
   if (typeof message !== "string" || !message) return structured
   if (QUOTA_RATE_LIMIT_MESSAGE.test(message)) return "rate-limited"
+  if (QUOTA_WINDOW_MESSAGE.test(message)) return "resource-exhausted"
   if (EXHAUSTION_MESSAGE.test(message)) return "exhausted"
   if (RESOURCE_EXHAUSTED_MESSAGE.test(message)) return "resource-exhausted"
   if (RATE_LIMIT_MESSAGE.test(message)) return "rate-limited"

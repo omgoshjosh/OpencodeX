@@ -138,6 +138,51 @@ describe("Google RESOURCE_EXHAUSTED is not one condition", () => {
     expect(isModelFallbackError(error)).toBe(false)
   })
 
+  /** Google's per-DAY 429. A spent daily allowance does not clear in a minute. */
+  const PER_DAY =
+    "Quota exceeded for quota metric 'Generate Content API requests per day' and limit 'GenerateRequestsPerDayPerProjectPerModel' of service 'generativelanguage.googleapis.com' for consumer 'project_number:123456789'."
+  /** Vertex-style per-HOUR window: same shape, same problem as per-day. */
+  const PER_HOUR =
+    "Quota exceeded for quota metric 'Generate Content API requests per hour' and limit 'GenerateRequestsPerHourPerProjectPerModel' of service 'aiplatform.googleapis.com'."
+  /** A quota metric with NO window named at all. */
+  const NO_WINDOW =
+    "Quota exceeded for quota metric 'Generate Content API requests' of service 'generativelanguage.googleapis.com'."
+
+  test("per-day and per-hour quota windows are resource-exhausted, not rate-limited", () => {
+    // Same "Quota exceeded for quota metric" prefix as the per-minute 429, but
+    // the window will not roll over during any same-model backoff budget:
+    // reading it as a rate limit retries the same model forever and stalls the
+    // role. Bounded same-model retry first, then advance the route.
+    for (const message of [PER_DAY, PER_HOUR]) {
+      const error = googleError(message)
+      expect(classifyProviderFailure(error)).toBe("resource-exhausted")
+      expect(SessionRetry.retryable(error.toObject())).toEqual({ message })
+      expect(isModelFallbackError(error)).toBe(true)
+    }
+    // Inside Google's envelope too: the RESOURCE_EXHAUSTED status must not
+    // change the answer either way.
+    const enveloped = googleError(PER_DAY, { error: { code: 429, message: PER_DAY, status: "RESOURCE_EXHAUSTED" } })
+    expect(classifyProviderFailure(enveloped)).toBe("resource-exhausted")
+  })
+
+  test("a quota metric that names no window is ambiguous, not a rate limit", () => {
+    // Nothing in the message says whether the window is 60 seconds or 24
+    // hours, so it gets the same treatment as bare RESOURCE_EXHAUSTED.
+    const error = googleError(NO_WINDOW)
+    expect(classifyProviderFailure(error)).toBe("resource-exhausted")
+    expect(isModelFallbackError(error)).toBe(true)
+  })
+
+  test("a message naming both a minute window and a day window is a rate limit", () => {
+    // The shorter window is the one blocking right now; a message that names
+    // both (metric per day, limit per minute, or the reverse) clears with it.
+    const both = googleError(
+      "Quota exceeded for quota metric 'Generate Content API requests per day' and limit 'GenerateContent request limit per minute for a region' of service 'generativelanguage.googleapis.com'.",
+    )
+    expect(classifyProviderFailure(both)).toBe("rate-limited")
+    expect(isModelFallbackError(both)).toBe(false)
+  })
+
   test("bare RESOURCE_EXHAUSTED prose is classified, and retries the same model first", () => {
     // Unclassified is what broke the loop on 2026-09-10: three attempts on one
     // model and then a durable assistant row with zero parts.

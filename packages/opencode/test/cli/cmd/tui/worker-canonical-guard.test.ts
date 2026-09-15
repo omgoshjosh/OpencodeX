@@ -2,7 +2,7 @@
 // while a canonical launchd daemon is registered via the persistent marker.
 // `Server.listenShared` is stubbed (delegating to the real one when no stub is
 // set) so no test binds a socket, let alone 4096.
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test"
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test"
 import fs from "fs/promises"
 import path from "path"
 import * as RealServer from "@/server/server"
@@ -36,9 +36,14 @@ describe("embedded worker canonical authority guard", () => {
   // fails on behavior) against a source tree without the guard.
   const marker = path.join(Global.Path.data, "canonical-authority.json")
   const seed = () =>
-    fs
-      .mkdir(path.dirname(marker), { recursive: true })
-      .then(() => fs.writeFile(marker, JSON.stringify({ pid: 4242, hostname: "127.0.0.1", port: 4096, since: "" })))
+    fs.mkdir(path.dirname(marker), { recursive: true }).then(() =>
+      fs.writeFile(
+        marker,
+        // Fresh `since`: the marker is inside the grace window, so the stale
+        // reclaim (canonical-authority-stale.test.ts) leaves it engaged.
+        JSON.stringify({ pid: 4242, hostname: "127.0.0.1", port: 4096, since: new Date().toISOString() }),
+      ),
+    )
   let worker: typeof import("@/cli/cmd/tui/worker")
 
   beforeEach(async () => {
@@ -79,6 +84,23 @@ describe("embedded worker canonical authority guard", () => {
     expect(message).toContain(marker)
     expect(message).toContain("pid 4242")
     expect(requested).toHaveLength(0)
+  })
+
+  test("refusing :4096 is never silent: stderr names the marker, pid/port and remedy", async () => {
+    await seed()
+    const stderr = spyOn(console, "error").mockImplementation(() => {})
+    try {
+      await failure(worker.rpc.server({ port: 4096, hostname: "127.0.0.1" }))
+
+      expect(stderr).toHaveBeenCalledTimes(1)
+      const line = stderr.mock.calls[0].map(String).join(" ")
+      expect(line).toContain(marker)
+      expect(line).toContain("pid 4242")
+      expect(line).toContain("port 4096")
+      expect(line).toContain("Remove the marker")
+    } finally {
+      stderr.mockRestore()
+    }
   })
 
   test("marker absent: listener options are unchanged", async () => {

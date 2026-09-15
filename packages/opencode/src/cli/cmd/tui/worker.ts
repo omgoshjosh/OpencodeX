@@ -194,6 +194,9 @@ async function startServer(input: {
       Log.Default.info("canonical authority registered; embedded worker will not prefer :4096", {
         marker: guard.path,
         pid: guard.pid,
+        port: guard.port,
+        ageMs: guard.ageMs,
+        reason: guard.reason,
         corrupt: guard.corrupt,
       })
     }
@@ -266,11 +269,25 @@ function collidingAuthorityError(manifest: TuiCoordinatorManifest) {
   )
 }
 
+/**
+ * The refusal is logged twice on purpose — structured logger AND stderr — so
+ * it is never silent, even when logging has not been initialised yet.
+ */
 function canonicalPortReservedError(guard: Extract<CanonicalAuthorityGuard, { engaged: true }>) {
-  const who = guard.corrupt ? "unreadable marker" : `pid ${guard.pid}`
-  return new Error(
-    `Port ${CANONICAL_PORT} is reserved for the canonical backend authority registered at ${guard.path} (${who}); the embedded GUI worker refuses to take it. Remove the marker only if no launchd daemon serves this database`,
-  )
+  const who = guard.corrupt ? "unreadable marker" : `pid ${guard.pid}, port ${guard.port ?? CANONICAL_PORT}`
+  const remedy = "Remove the marker only if no launchd daemon serves this database"
+  const message = `Port ${CANONICAL_PORT} is reserved for the canonical backend authority registered at ${guard.path} (${who}); the embedded GUI worker refuses to take it. ${remedy}`
+  Log.Default.error("embedded worker refused :4096; canonical authority marker engaged", {
+    marker: guard.path,
+    pid: guard.pid,
+    port: guard.port,
+    since: guard.since,
+    ageMs: guard.ageMs,
+    reason: guard.reason,
+    corrupt: guard.corrupt,
+  })
+  console.error(`[opencodex] ${message}`)
+  return new Error(message)
 }
 
 async function stopListeners(listeners: Listener[]) {

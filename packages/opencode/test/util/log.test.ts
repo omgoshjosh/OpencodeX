@@ -61,9 +61,9 @@ it.live("serve init cleanup keeps the newest timestamped logs", () =>
 
     const next = yield* files(dir, 11)
 
-    expect(next).not.toContain(list[0]!)
-    expect(next).not.toContain(list[1]!)
-    expect(next).toContain(list[2]!)
+    expect(next).not.toContain(list[0])
+    expect(next).not.toContain(list[1])
+    expect(next).toContain(list[2])
     expect(next).toContain(list.at(-1)!)
   }),
 )
@@ -74,16 +74,16 @@ it.live("cleanup never removes a recently written log even when it sorts oldest"
     const list = yield* seed(dir)
 
     // The oldest-named file is the long-lived daemon: still being written.
-    const live = path.join(dir, list[0]!)
+    const live = path.join(dir, list[0])
     const now = new Date()
     yield* Effect.promise(() => fs.utimes(live, now, now))
 
     yield* Effect.promise(() => Log.cleanup(dir))
 
     const next = yield* Effect.promise(() => fs.readdir(dir).then((files) => files.sort()))
-    expect(next).toContain(list[0]!)
-    expect(next).not.toContain(list[1]!)
-    expect(next).toContain(list[2]!)
+    expect(next).toContain(list[0])
+    expect(next).not.toContain(list[1])
+    expect(next).toContain(list[2])
     expect(next).toHaveLength(11)
   }),
 )

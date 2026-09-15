@@ -18,6 +18,7 @@ import {
   writeCoordinatorManifest,
   type TuiCoordinatorManifest,
 } from "./tui/coordinator-registry"
+import { isCanonicalAuthority, writeCanonicalAuthorityMarker } from "./tui/canonical-authority"
 
 /**
  * Shared backend authority for `opencodex serve`.
@@ -177,6 +178,20 @@ function startServeAuthority(
         catch: (error) => new Error(`Failed to bind the requested listener: ${errorMessage(error)}`),
       })
       const companion = needsCompanion ? listeners[1] : undefined
+      // OpencodeX-1d2 layer 2: the launchd daemon records itself so the GUI's
+      // embedded worker stops preferring :4096. Persistent by design (never
+      // removed on stop) so the guard also covers the daemon's restart window.
+      if (isCanonicalAuthority()) {
+        yield* Effect.tryPromise(() =>
+          writeCanonicalAuthorityMarker({ pid: process.pid, hostname: input.hostname, port: listeners[0].port }),
+        ).pipe(
+          Effect.catch((error) =>
+            Effect.sync(() =>
+              Log.Default.warn("canonical authority marker write failed", { error: errorMessage(error) }),
+            ),
+          ),
+        )
+      }
       const manifest = {
         version: 2 as const,
         key: input.key,

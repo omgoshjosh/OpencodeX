@@ -1,4 +1,5 @@
 import { Database } from "@opencode-ai/core/database/database"
+import { Agent } from "@/agent/agent"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { InstanceBootstrap } from "@/project/bootstrap"
 import { InstanceStore } from "@/project/instance-store"
@@ -181,6 +182,7 @@ export const layer = Layer.effect(
 const executionLayer = goalExecutionLayer.pipe(
   Layer.provide(
     Layer.mergeAll(
+      Agent.defaultLayer,
       Database.defaultLayer,
       InstanceStore.defaultLayer.pipe(Layer.provide(InstanceBootstrap.defaultLayer)),
       OpencodeXJob.defaultLayer,

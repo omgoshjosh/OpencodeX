@@ -40,7 +40,9 @@ function sessionRow(info: SessionLegacy.SessionInfo): typeof SessionTable.$infer
     directory: info.directory,
     path: info.path,
     title: info.title,
-    agent: info.agent,
+    // Explicit NULL: drizzle skips undefined, which made clearing the agent a
+    // silent no-op (PATCH /session {"agent": null} kept the old value).
+    agent: info.agent ?? null,
     model: info.model,
     version: info.version,
     summary_additions: info.summary?.additions,

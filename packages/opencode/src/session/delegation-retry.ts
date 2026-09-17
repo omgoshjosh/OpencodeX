@@ -6,6 +6,8 @@ import { SessionLegacy } from "@opencode-ai/core/session/legacy"
 import { Effect, Schema } from "effect"
 import { eq, and } from "drizzle-orm"
 import { BackgroundJob } from "@/background/job"
+import { Agent } from "@/agent/agent"
+import { resolveSessionAgent } from "./session-agent"
 import { Session } from "./session"
 import { SessionPrompt } from "./prompt"
 import { SessionStatus } from "./status"
@@ -84,6 +86,7 @@ export const retryBlockedChild = Effect.fn("DelegationRetry.retryBlockedChild")(
   }
   const attempt = delegationAttempts(child.metadata) + 1
   const runID = Identifier.ascending()
+  const agent = yield* resolveSessionAgent(yield* Agent.Service, { sessionID: child.id, agent: role.agent })
   yield* sessions.stampDelegation({
     sessionID: child.id,
     record: {
@@ -99,7 +102,7 @@ export const retryBlockedChild = Effect.fn("DelegationRetry.retryBlockedChild")(
     .promptAsync({
       sessionID: child.id,
       model: { providerID: ProviderV2.ID.make(selected.providerID), modelID: ProviderV2.ModelID.make(selected.modelID) },
-      ...(role.agent ? { agent: role.agent } : {}),
+      ...(agent ? { agent } : {}),
       ...(selected.variant && selected.variant !== "default" ? { variant: selected.variant } : {}),
       parts,
     })

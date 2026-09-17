@@ -62,6 +62,7 @@ import { SessionQuestionNotify } from "./question-notify"
 import * as PromptShell from "./prompt-shell"
 import * as PromptSubtask from "./prompt-subtask"
 import * as PromptSwarm from "./prompt-swarm"
+import { resolveSessionAgent } from "./session-agent"
 import * as PromptUserMessage from "./prompt-user-message"
 import { Skill } from "@/skill"
 import { argsRegex, bashRegex, placeholderRegex, quoteTrimRegex } from "./prompt-user-message"
@@ -1047,6 +1048,7 @@ export const layer = Layer.effect(
       database,
       sessions,
       skills,
+      agents,
       background,
       status,
       prompt: (input) => prompt(input),
@@ -1255,11 +1257,14 @@ export const layer = Layer.effect(
         childSessionID: child.value.id,
         requestID: request.id,
       })
+      // An unregistered stored agent would make the prompt throw "Agent not
+      // found" and leave the child blocked with no notification (OpencodeX-557).
+      const agent = yield* resolveSessionAgent(agents, { sessionID: parent.value.id, agent: parent.value.agent })
       yield* promptAsync({
         sessionID: parent.value.id,
         messageID: MessageID.make(`msg_question_${encodeQuestionID(request.id)}`),
         delivery: "deferred",
-        ...(parent.value.agent ? { agent: parent.value.agent } : {}),
+        ...(agent ? { agent } : {}),
         parts: [
           {
             type: "text",

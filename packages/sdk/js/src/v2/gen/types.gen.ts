@@ -9969,9 +9969,9 @@ export type SessionCreateData = {
 
 export type SessionCreateErrors = {
   /**
-   * BadRequest | InvalidRequestError
+   * BadRequest | ValidationError | InvalidRequestError
    */
-  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  400: EffectHttpApiErrorBadRequest | ValidationError | InvalidRequestError
 }
 
 export type SessionCreateError = SessionCreateErrors[keyof SessionCreateErrors]
@@ -10245,9 +10245,9 @@ export type SessionUpdateData = {
 
 export type SessionUpdateErrors = {
   /**
-   * BadRequest | InvalidRequestError
+   * BadRequest | ValidationError | InvalidRequestError
    */
-  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  400: EffectHttpApiErrorBadRequest | ValidationError | InvalidRequestError
   /**
    * NotFoundError
    */

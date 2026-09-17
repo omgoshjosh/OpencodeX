@@ -414,6 +414,42 @@ it.instance("notifies an idle parent and gives it a turn", () =>
   }),
 )
 
+/**
+ * OpencodeX-557: a parent whose stored agent is not registered ("claude-code",
+ * written through PATCH /session) made the notification prompt throw "Agent
+ * not found", so the child's question never reached anyone.
+ */
+it.instance("notifies a parent whose stored agent is not registered", () =>
+  Effect.gen(function* () {
+    yield* useServerConfig()
+    const sessions = yield* Session.Service
+
+    const parent = yield* sessions.create({ title: "orchestrator", agent: "claude-code" })
+    const child = yield* sessions.create({ parentID: parent.id, title: "worker" })
+    yield* seedIdleParent(parent.id)
+
+    const fiber = yield* askChild(child.id).pipe(Effect.forkScoped)
+    const request = yield* pendingRequest
+    const rows = yield* waitForCommand(request.id)
+    expect(rows).toHaveLength(1)
+    expect(rows[0]?.session_id).toBe(parent.id)
+
+    const notification = yield* pollWithTimeout(
+      Effect.gen(function* () {
+        const messages = yield* sessions.messages({ sessionID: parent.id })
+        return messages.find((message) => message.info.id === notificationID(request.id))
+      }),
+      "notification message never landed",
+      "10 seconds",
+    )
+    // Delivered under the default agent, not the unregistered stored one.
+    expect(notification.info.role === "user" && notification.info.agent).not.toBe("claude-code")
+
+    yield* Question.Service.use((svc) => svc.reject(request.id))
+    yield* Fiber.await(fiber)
+  }),
+)
+
 it.instance("queues behind a running parent turn without interrupting it", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig()

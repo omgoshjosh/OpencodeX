@@ -468,6 +468,88 @@ describe("session HttpApi", () => {
     { git: true, config: { formatter: false, lsp: false } },
   )
 
+  /**
+   * OpencodeX-557: seven root sessions carried agent="claude-code", written
+   * through these routes, which then made every background report prompt for
+   * them throw "Agent not found". PATCH {"agent": null} was also a silent
+   * no-op, so the stored name could not even be cleared.
+   */
+  it.instance(
+    "rejects an unregistered agent on create and update, and null clears the field",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const headers = { "x-opencode-directory": test.directory, "content-type": "application/json" }
+        const { db } = yield* Database.Service
+        const storedAgent = (sessionID: SessionIDType) =>
+          db
+            .select({ agent: SessionTable.agent })
+            .from(SessionTable)
+            .where(eq(SessionTable.id, sessionID))
+            .get()
+            .pipe(
+              Effect.orDie,
+              Effect.map((row) => row?.agent),
+            )
+
+        const rejectedCreate = yield* request(SessionPaths.create, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ title: "bad agent", agent: "claude-code" }),
+        })
+        expect(rejectedCreate.status).toBe(400)
+        expect(yield* rejectedCreate.text).toContain("build")
+
+        const created = yield* requestJson<Session.Info>(SessionPaths.create, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ title: "agent lifecycle", agent: "build" }),
+        })
+        expect(yield* storedAgent(created.id)).toBe("build")
+
+        const rejectedUpdate = yield* request(pathFor(SessionPaths.update, { sessionID: created.id }), {
+          method: "PATCH",
+          headers,
+          body: JSON.stringify({ agent: "claude-code" }),
+        })
+        expect(rejectedUpdate.status).toBe(400)
+        const body = yield* rejectedUpdate.text
+        expect(body).toContain("claude-code")
+        expect(body).toContain("build")
+        expect(yield* storedAgent(created.id)).toBe("build")
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+  )
+
+  it.instance(
+    "PATCH {agent: null} clears the stored agent",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const headers = { "x-opencode-directory": test.directory, "content-type": "application/json" }
+        const { db } = yield* Database.Service
+        const created = yield* requestJson<Session.Info>(SessionPaths.create, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ title: "clear agent", agent: "build" }),
+        })
+        const cleared = yield* requestJson<Session.Info>(pathFor(SessionPaths.update, { sessionID: created.id }), {
+          method: "PATCH",
+          headers,
+          body: JSON.stringify({ agent: null }),
+        })
+        expect(cleared.agent).toBeUndefined()
+        const row = yield* db
+          .select({ agent: SessionTable.agent })
+          .from(SessionTable)
+          .where(eq(SessionTable.id, created.id))
+          .get()
+          .pipe(Effect.orDie)
+        expect(row?.agent).toBeNull()
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+  )
+
   it.instance(
     "persists selected workspace id when creating a session",
     () =>

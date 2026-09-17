@@ -40,7 +40,7 @@ import {
   TreeQuery,
   UpdatePayload,
 } from "../groups/session"
-import { PermissionNotFoundError } from "../errors"
+import { ApiValidationError, PermissionNotFoundError } from "../errors"
 import * as SessionError from "./session-errors"
 
 const tryParseJson = (text: string) =>
@@ -215,7 +215,21 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       )
     })
 
+    /**
+     * A stored agent name is forwarded onto every background report, question
+     * notification and retry prompt for the session; an unregistered one made
+     * all of those throw "Agent not found" (OpencodeX-557), so it is rejected here.
+     */
+    const requireRegisteredAgent = Effect.fn("SessionHttpApi.requireRegisteredAgent")(function* (agent: string) {
+      if (yield* agentSvc.get(agent)) return
+      const registered = (yield* agentSvc.list()).map((info) => info.name)
+      yield* new ApiValidationError({
+        message: `Agent not found: "${agent}". Registered agents: ${registered.join(", ")}`,
+      })
+    })
+
     const create = Effect.fn("SessionHttpApi.create")(function* (ctx: { payload?: Session.CreateInput }) {
+      if (ctx.payload?.agent) yield* requireRegisteredAgent(ctx.payload.agent)
       const created = yield* session.create(ctx.payload)
       yield* warpToHub(created)
       return created
@@ -272,6 +286,8 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
         yield* session.setModel({ sessionID: ctx.params.sessionID, model: ctx.payload.model ?? undefined })
       }
       if (ctx.payload.agent !== undefined) {
+        if (ctx.payload.agent !== null) yield* requireRegisteredAgent(ctx.payload.agent)
+        // null clears the field; setAgent writes NULL for undefined.
         yield* session.setAgent({ sessionID: ctx.params.sessionID, agent: ctx.payload.agent ?? undefined })
       }
       if (ctx.payload.time?.archived !== undefined) {

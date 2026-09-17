@@ -32,6 +32,7 @@ import * as Log from "@opencode-ai/core/util/log"
 import * as Session from "./session"
 import { prepareImages } from "./swarm-attachments"
 import { SessionStatus } from "./status"
+import { resolveSessionAgent, type AgentRegistry } from "./session-agent"
 import { hydrateFallbackModels } from "@/opencodex/swarm-model"
 import { shouldAdvanceModelFallback } from "./model-fallback"
 
@@ -55,6 +56,8 @@ export interface Deps {
   readonly database: Context.Service.Shape<typeof Database.Service>
   readonly sessions: Context.Service.Shape<typeof Session.Service>
   readonly skills: Context.Service.Shape<typeof Skill.Service>
+  /** Vets a stored session/role agent name before it is forwarded onto a prompt. */
+  readonly agents: AgentRegistry
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionLegacy.WithParts, Image.Error>
   /** Queues a prompt without waiting for its turn, with durable message and command intent. */
   readonly promptAsync: (input: PromptInput) => Effect.Effect<void, Image.Error>
@@ -96,6 +99,8 @@ export interface Deps {
   readonly backgroundCompletionPollIntervalMs?: number
   /** Bounded wait before retrying a fresh delivery claim after restart. */
   readonly deliveryClaimGraceMs?: number
+  /** Wait before the single retry of a report delivery whose prompt failed. Defaults to 30s. */
+  readonly deliveryRetryDelayMs?: number
   /**
    * How often a blocked foreground delegation re-reads the child's durable
    * delegation record. Defaults to 15 seconds; tests set a few milliseconds.
@@ -118,6 +123,7 @@ const DELEGATION_COMPLETE_FOOTER = [
 const DEFAULT_BACKGROUND_COMPLETION_GRACE_MS = 30 * 60_000
 const DEFAULT_BACKGROUND_COMPLETION_POLL_INTERVAL_MS = 10_000
 const RECOVERY_QUIET_LIMIT_MS = 2 * 60 * 60_000
+const DEFAULT_DELIVERY_RETRY_DELAY_MS = 30_000
 /**
  * How long a foreground delegation may wait on the in-memory hand-off before
  * it also starts reading the child's durable record. Short enough that a lost
@@ -302,42 +308,63 @@ export function make(deps: Deps) {
         yield* Effect.sleep(deps.deliveryClaimGraceMs ?? DELEGATION_DELIVERY_CLAIM_GRACE)
       }
       const messageID = MessageID.make(`msg_delegation_recovery_${input.runID}`)
-      yield* deps
-        .promptAsync({
-          sessionID: input.parentSessionID,
-          messageID,
-          // Deferred: the default "immediate" delivery interrupts an in-flight
-          // turn to steer it, which would abort whatever the orchestrator is
-          // doing right now. A report queues behind the current turn.
-          delivery: "deferred",
-          ...(parent.agent ? { agent: parent.agent } : {}),
-          parts: [
-            {
-              type: "text",
-              synthetic: true,
-              // See the task tool: the loop answers tagged reports exactly once.
-              metadata: { task_report: true },
-              text: backgroundDelegationMessage({
-                childSessionID: input.childSessionID,
-                role: input.role,
-                state: input.state,
-                text: input.text,
-              }),
-            },
-          ],
-        })
-        .pipe(
-          Effect.catchCause((cause) =>
-            sessions
-              .stampDelegationDelivery({
-                sessionID: input.childSessionID,
-                runID: input.runID,
-                outcome: "failed",
-                claimToken: claim,
-              })
-              .pipe(Effect.ignore, Effect.andThen(Effect.failCause(cause))),
+      // A parent whose stored agent is not registered would make the prompt
+      // throw "Agent not found" and strand every report (OpencodeX-557).
+      const agent = yield* resolveSessionAgent(deps.agents, { sessionID: parent.id, agent: parent.agent })
+      const wake = deps.promptAsync({
+        sessionID: input.parentSessionID,
+        messageID,
+        // Deferred: the default "immediate" delivery interrupts an in-flight
+        // turn to steer it, which would abort whatever the orchestrator is
+        // doing right now. A report queues behind the current turn.
+        delivery: "deferred",
+        ...(agent ? { agent } : {}),
+        parts: [
+          {
+            type: "text",
+            synthetic: true,
+            // See the task tool: the loop answers tagged reports exactly once.
+            metadata: { task_report: true },
+            text: backgroundDelegationMessage({
+              childSessionID: input.childSessionID,
+              role: input.role,
+              state: input.state,
+              text: input.text,
+            }),
+          },
+        ],
+      })
+      const context = {
+        parentSessionID: input.parentSessionID,
+        childSessionID: input.childSessionID,
+        runID: input.runID,
+      }
+      // Exactly one retry after a bounded pause, and every failure is logged:
+      // a `failed` stamp used to be the only trace, and it is terminal for the
+      // claim loop. Anything still `failed` at the next daemon start is
+      // re-delivered by recoverBackgroundDelegations below.
+      yield* wake.pipe(
+        Effect.catchCause((first) =>
+          Effect.logError("background report delivery failed", { ...context, attempt: 1, cause: first }).pipe(
+            Effect.andThen(Effect.sleep(deps.deliveryRetryDelayMs ?? DEFAULT_DELIVERY_RETRY_DELAY_MS)),
+            Effect.andThen(wake),
+            Effect.catchCause((second) =>
+              Effect.logError("background report delivery failed", { ...context, attempt: 2, cause: second }).pipe(
+                Effect.andThen(
+                  sessions.stampDelegationDelivery({
+                    sessionID: input.childSessionID,
+                    runID: input.runID,
+                    outcome: "failed",
+                    claimToken: claim,
+                  }),
+                ),
+                Effect.ignore,
+                Effect.andThen(Effect.failCause(second)),
+              ),
+            ),
           ),
-        )
+        ),
+      )
       yield* sessions.stampDelegationDelivery({
         sessionID: input.childSessionID,
         runID: input.runID,
@@ -561,6 +588,7 @@ export function make(deps: Deps) {
       const childID = row.id
       const parentID = row.parentID
       const role = record.role ?? "delegate"
+      // This also re-delivers records deliverReport stamped `failed` after its single retry.
       log.warn("recovering background delegation after restart", {
         childSessionID: childID,
         parentSessionID: parentID,
@@ -854,6 +882,7 @@ export function make(deps: Deps) {
       ]
       const userMessageID = MessageID.ascending()
       const primary = models[0]
+      const agent = yield* resolveSessionAgent(deps.agents, { sessionID: child.id, agent: role.agent })
       const initial = yield* prompt({
         messageID: userMessageID,
         sessionID: child.id,
@@ -861,7 +890,7 @@ export function make(deps: Deps) {
           providerID: ProviderV2.ID.make(primary.providerID),
           modelID: ProviderV2.ModelID.make(primary.modelID),
         },
-        ...(role.agent ? { agent: role.agent } : {}),
+        ...(agent ? { agent } : {}),
         ...(primary.variant && primary.variant !== "default" ? { variant: primary.variant } : {}),
         parts: [
           { type: "text", text },

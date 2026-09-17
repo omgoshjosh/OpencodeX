@@ -1,12 +1,14 @@
 import { Database } from "@opencode-ai/core/database/database"
 import { OpencodeXProjectFolderTable, OpencodeXSwarmRoleTable } from "@opencode-ai/core/opencodex/sql"
 import { ProviderV2 } from "@opencode-ai/core/provider"
+import { Agent } from "@/agent/agent"
 import { InstanceStore } from "@/project/instance-store"
 import { OpencodeXJob } from "@/opencodex/job"
 import { Provider } from "@/provider/provider"
 import { Session } from "@/session/session"
 import { SessionID } from "@/session/schema"
 import { SessionPrompt } from "@/session/prompt"
+import { resolveSessionAgent } from "@/session/session-agent"
 import { Skill } from "@/skill"
 import { ToolJsonSchema } from "@/tool/json-schema"
 import { asc, eq } from "drizzle-orm"
@@ -52,6 +54,7 @@ export const goalExecutionLayer = Layer.effect(
     const skills = yield* Skill.Service
     const provider = yield* Provider.Service
     const jobs = yield* OpencodeXJob.Service
+    const agents = yield* Agent.Service
 
     /** The model a node inherits when its executor does not name one. */
     const fallbackModel = Effect.fnUntraced(function* (goal: Info) {
@@ -191,6 +194,7 @@ export const goalExecutionLayer = Layer.effect(
             .pipe(Effect.orDie)
           yield* jobs.update({ id: job.id, sessionID: child.id }).pipe(Effect.ignore)
 
+          const agent = yield* resolveSessionAgent(agents, { sessionID: child.id, agent: executor.agent })
           const result = yield* prompt
             .prompt({
               sessionID: child.id,
@@ -198,7 +202,7 @@ export const goalExecutionLayer = Layer.effect(
                 providerID: ProviderV2.ID.make(executor.providerID!),
                 modelID: ProviderV2.ModelID.make(executor.modelID!),
               },
-              ...(executor.agent ? { agent: executor.agent } : {}),
+              ...(agent ? { agent } : {}),
               // "default" is the sentinel for "no variant" in the prompt loop.
               ...(executor.variant && executor.variant !== "default" ? { variant: executor.variant } : {}),
               // A check's verdict is machine-read, so it is a structured

@@ -500,6 +500,13 @@ describe("session HttpApi", () => {
         expect(rejectedCreate.status).toBe(400)
         expect(yield* rejectedCreate.text).toContain("build")
 
+        const rejectedEmptyCreate = yield* request(SessionPaths.create, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ title: "empty agent", agent: "" }),
+        })
+        expect(rejectedEmptyCreate.status).toBe(400)
+
         const created = yield* requestJson<Session.Info>(SessionPaths.create, {
           method: "POST",
           headers,
@@ -510,13 +517,17 @@ describe("session HttpApi", () => {
         const rejectedUpdate = yield* request(pathFor(SessionPaths.update, { sessionID: created.id }), {
           method: "PATCH",
           headers,
-          body: JSON.stringify({ agent: "claude-code" }),
+          body: JSON.stringify({ title: "must not persist", agent: "claude-code" }),
         })
         expect(rejectedUpdate.status).toBe(400)
         const body = yield* rejectedUpdate.text
         expect(body).toContain("claude-code")
         expect(body).toContain("build")
         expect(yield* storedAgent(created.id)).toBe("build")
+        const unchanged = yield* requestJson<Session.Info>(pathFor(SessionPaths.get, { sessionID: created.id }), {
+          headers,
+        })
+        expect(unchanged.title).toBe("agent lifecycle")
       }),
     { git: true, config: { formatter: false, lsp: false } },
   )

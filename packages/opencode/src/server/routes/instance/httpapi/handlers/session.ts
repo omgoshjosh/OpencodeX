@@ -229,7 +229,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     })
 
     const create = Effect.fn("SessionHttpApi.create")(function* (ctx: { payload?: Session.CreateInput }) {
-      if (ctx.payload?.agent) yield* requireRegisteredAgent(ctx.payload.agent)
+      if (ctx.payload?.agent !== undefined) yield* requireRegisteredAgent(ctx.payload.agent)
       const created = yield* session.create(ctx.payload)
       yield* warpToHub(created)
       return created
@@ -264,6 +264,8 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       payload: typeof UpdatePayload.Type
     }) {
       const current = yield* requireSession(ctx.params.sessionID)
+      if (ctx.payload.agent !== undefined && ctx.payload.agent !== null)
+        yield* requireRegisteredAgent(ctx.payload.agent)
       if (ctx.payload.title !== undefined) {
         yield* session.setTitle({ sessionID: ctx.params.sessionID, title: ctx.payload.title })
       }
@@ -286,7 +288,6 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
         yield* session.setModel({ sessionID: ctx.params.sessionID, model: ctx.payload.model ?? undefined })
       }
       if (ctx.payload.agent !== undefined) {
-        if (ctx.payload.agent !== null) yield* requireRegisteredAgent(ctx.payload.agent)
         // null clears the field; setAgent writes NULL for undefined.
         yield* session.setAgent({ sessionID: ctx.params.sessionID, agent: ctx.payload.agent ?? undefined })
       }

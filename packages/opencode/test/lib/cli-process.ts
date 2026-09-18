@@ -168,6 +168,10 @@ export type ServeHandle = {
   readonly kill: () => void
   // Resolves with the exit code once the process exits. Bun returns a number.
   readonly exited: Promise<number>
+  // Everything the child has written to stderr so far. With `--print-logs`
+  // in `extraArgs` this is the server log, so a test can assert on structured
+  // INFO lines (e.g. `db_connection_open`) without a log file.
+  readonly stderr: () => string
 }
 
 // `opencode acp` speaks newline-delimited JSON-RPC over stdin/stdout. It is
@@ -378,6 +382,7 @@ export function withCliFixture<A, E>(
           proc.kill()
         },
         exited: proc.exited,
+        stderr: () => stderrChunks.join(""),
       } satisfies ServeHandle
     })
 

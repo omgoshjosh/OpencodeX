@@ -27,6 +27,7 @@ export const cliSubprocessSuites = [
   "test/cli/serve/serve-authority.test.ts",
   "test/cli/serve/serve-canonical-marker.test.ts",
   "test/cli/serve/serve-process.test.ts",
+  "test/cli/serve/serve-single-database.test.ts",
   "test/cli/smokes/read-only.test.ts",
 ]
 

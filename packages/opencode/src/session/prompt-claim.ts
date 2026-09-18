@@ -105,12 +105,9 @@ export function make(deps: Deps) {
         .get()
         .pipe(Effect.orDie)
       if (!command) {
-        yield* Effect.logInfo("session command recovery", {
-          commandID,
-          statusPresent: false,
-          action,
-          cas,
-        })
+        yield* Effect.logInfo("session command recovery").pipe(
+          Effect.annotateLogs({ commandID, statusPresent: false, action, cas }),
+        )
         return
       }
       const [execution, status] = yield* Effect.all(
@@ -130,16 +127,19 @@ export function make(deps: Deps) {
         ],
         { concurrency: "unbounded" },
       )
-      yield* Effect.logInfo("session command recovery", {
-        commandID,
-        commandAgeMillis: clock() - command.time_created,
-        executionGeneration: execution?.generation,
-        executionOwner: execution?.owner_id,
-        executionLeaseExpiresAt: execution?.lease_expires_at,
-        statusPresent: !!status,
-        action,
-        cas,
-      })
+      yield* Effect.logInfo("session command recovery").pipe(
+        Effect.annotateLogs({
+          commandID,
+          sessionID: command.session_id,
+          commandAgeMillis: clock() - command.time_created,
+          executionGeneration: execution?.generation,
+          executionOwner: execution?.owner_id,
+          executionLeaseExpiresAt: execution?.lease_expires_at,
+          statusPresent: !!status,
+          action,
+          cas,
+        }),
+      )
     })
 
     const claimCommandTurn = Effect.fn("SessionPrompt.claimCommandTurn")(function* (commandID: string) {
@@ -339,11 +339,9 @@ export function make(deps: Deps) {
         .pipe(Effect.orDie)
       if (!session) {
         const skippedAt = clock()
-        yield* Effect.logInfo("session command recovery skipped missing session", {
-          commandID,
-          sessionID: command.session_id,
-          action: "skip",
-        })
+        yield* Effect.logInfo("session command recovery skipped missing session").pipe(
+          Effect.annotateLogs({ commandID, sessionID: command.session_id, action: "skip" }),
+        )
         yield* db
           .update(SessionCommandTable)
           .set({

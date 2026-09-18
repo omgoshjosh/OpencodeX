@@ -1,4 +1,4 @@
-import { Database } from "bun:sqlite"
+import { Database, type Statement as BunStatement } from "bun:sqlite"
 import { drizzle } from "drizzle-orm/bun-sqlite"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
@@ -17,6 +17,8 @@ import * as Statement from "effect/unstable/sql/Statement"
 import { Sqlite } from "./sqlite"
 
 const ATTR_DB_SYSTEM_NAME = "db.system.name"
+// Distinct SQL texts a connection keeps prepared; drizzle emits one per code path.
+const MAX_STATEMENTS = 256
 
 const TypeId = "~@opencode-ai/core/database/SqliteBun" as const
 type TypeId = typeof TypeId
@@ -49,6 +51,30 @@ const make = (options: Config) =>
   Effect.gen(function* () {
     const native = (yield* Sqlite.Native) as Database
 
+    // bun:sqlite's own `query()` cache holds 20 statements; past that every
+    // call returns a fresh Statement nobody finalizes, and `close()` then
+    // leaves the connection (and on Windows the db/-wal/-shm files) open until
+    // GC. Own the cache instead: bounded, and finalized before the scope closes.
+    const statements = new Map<string, BunStatement>()
+    const prepare = (query: string) => {
+      const cached = statements.get(query)
+      if (cached) return cached
+      if (statements.size >= MAX_STATEMENTS) {
+        const [oldest, statement] = statements.entries().next().value!
+        statements.delete(oldest)
+        statement.finalize()
+      }
+      const statement = native.prepare(query)
+      statements.set(query, statement)
+      return statement
+    }
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        for (const statement of statements.values()) statement.finalize()
+        statements.clear()
+      }),
+    )
+
     const compiler = Statement.makeCompilerSqlite(options.transformQueryNames)
     const transformRows = options.transformResultNames
       ? Statement.defaultTransforms(options.transformResultNames).array
@@ -56,7 +82,7 @@ const make = (options: Config) =>
 
     const run = (query: string, params: ReadonlyArray<unknown> = []) =>
       Effect.withFiber<Array<Record<string, unknown>>, SqlError>((fiber) => {
-        const statement = native.query(query)
+        const statement = prepare(query)
         // @ts-ignore bun-types missing safeIntegers method, fixed in https://github.com/oven-sh/bun/pull/26627
         statement.safeIntegers(Context.get(fiber.context, Client.SafeIntegers))
         try {
@@ -72,7 +98,7 @@ const make = (options: Config) =>
 
     const runValues = (query: string, params: ReadonlyArray<unknown> = []) =>
       Effect.withFiber<Array<unknown[]>, SqlError>((fiber) => {
-        const statement = native.query(query)
+        const statement = prepare(query)
         // @ts-ignore bun-types missing safeIntegers method, fixed in https://github.com/oven-sh/bun/pull/26627
         statement.safeIntegers(Context.get(fiber.context, Client.SafeIntegers))
         try {

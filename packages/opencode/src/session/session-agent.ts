@@ -9,8 +9,24 @@ export interface AgentRegistry {
   readonly list: () => Effect.Effect<ReadonlyArray<{ name: string }>, unknown>
 }
 
-/** One warning per (sessionID, agent): a stranded root logs once, not per report. */
+/**
+ * One warning per (sessionID, agent): a stranded root logs once, not per
+ * report. Bounded so the set of pairs a long-lived daemon has seen cannot grow
+ * without limit; once full, the oldest pair is forgotten (and may warn again),
+ * which is a bounded repeat rather than a flood.
+ */
+export const WARNED_AGENT_PAIRS_CAP = 256
 const warned = new Set<string>()
+
+function rememberWarned(key: string) {
+  if (warned.has(key)) return false
+  if (warned.size >= WARNED_AGENT_PAIRS_CAP) {
+    const oldest = warned.values().next().value
+    if (oldest !== undefined) warned.delete(oldest)
+  }
+  warned.add(key)
+  return true
+}
 
 /**
  * A session or swarm role row can carry an `agent` that no registry knows
@@ -28,9 +44,7 @@ export const resolveSessionAgent = Effect.fnUntraced(function* (
   if (!input.agent) return undefined
   const found = yield* agents.get(input.agent).pipe(Effect.orElseSucceed(() => undefined))
   if (found) return found.name
-  const key = `${input.sessionID} ${input.agent}`
-  if (!warned.has(key)) {
-    warned.add(key)
+  if (rememberWarned(`${input.sessionID} ${input.agent}`)) {
     const registered = yield* agents.list().pipe(
       Effect.map((list) => list.map((agent) => agent.name)),
       Effect.orElseSucceed((): string[] => []),

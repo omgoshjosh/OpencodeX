@@ -32,7 +32,6 @@ import { isCanonicalAuthority, writeCanonicalAuthorityMarker } from "./tui/canon
  */
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"])
-const WILDCARD_HOSTS = new Set(["0.0.0.0", "::"])
 const DEFAULT_USERNAME = "opencode"
 
 export type ServeAuthorityOptions = {
@@ -157,7 +156,7 @@ function startServeAuthority(
       if (claimed) return yield* Effect.fail(collidingAuthorityError(claimed))
       if (input.signal?.aborted) return yield* Effect.interrupt
 
-      const needsCompanion = !LOOPBACK_HOSTS.has(input.hostname) && !WILDCARD_HOSTS.has(input.hostname)
+      const needsCompanion = !LOOPBACK_HOSTS.has(input.hostname)
       const primary = {
         hostname: input.hostname,
         port: input.port,
@@ -169,8 +168,8 @@ function startServeAuthority(
         ? [
             primary,
             // A loopback socket sharing the same in-process application state so
-            // LAN and local subscribers see one event bus. Ephemeral port: this
-            // is not the legacy serve port, and 4096 may already be a LAN bind.
+            // local clients can always reach the URL in the manifest. Ephemeral
+            // port: this is not the legacy serve port, and 4096 may already be bound.
             { hostname: "127.0.0.1", port: 0, mdns: false, prefer4096: false },
           ]
         : [primary]

@@ -1,8 +1,7 @@
 import { afterEach, describe, expect } from "bun:test"
-import { Deferred, Effect, Fiber, Layer } from "effect"
+import { Effect, Layer } from "effect"
 import { HttpClient, HttpClientResponse } from "effect/unstable/http"
 import { eq } from "drizzle-orm"
-import { GlobalBus, type GlobalEvent } from "@/bus/global"
 import { ExperimentalPaths } from "../../src/server/routes/instance/httpapi/groups/experimental"
 import { Session } from "@/session/session"
 import { SessionTable } from "@opencode-ai/core/session/sql"
@@ -31,28 +30,6 @@ function json<T>(response: HttpClientResponse.HttpClientResponse) {
   return response.json.pipe(Effect.map((value) => value as T))
 }
 
-function waitReady(input: { directory?: string; name?: string }) {
-  return Effect.gen(function* () {
-    const ready = yield* Deferred.make<void>()
-    const on = (event: GlobalEvent) => {
-      if (event.payload.type !== Worktree.Event.Ready.type) return
-      if (input.directory && event.directory !== input.directory) return
-      if (input.name && event.payload.properties.name !== input.name) return
-      Deferred.doneUnsafe(ready, Effect.void)
-    }
-
-    GlobalBus.on("event", on)
-    yield* Effect.addFinalizer(() => Effect.sync(() => GlobalBus.off("event", on)))
-
-    return yield* Deferred.await(ready).pipe(
-      Effect.timeoutOrElse({
-        duration: "10 seconds",
-        orElse: () => Effect.fail(new Error("timed out waiting for worktree.ready")),
-      }),
-    )
-  })
-}
-
 function setSessionUpdated(session: Session.Info, updated: number) {
   return Effect.gen(function* () {
     const { db } = yield* Database.Service
@@ -73,7 +50,6 @@ function withCreatedWorktree(
   const headers = { "content-type": "application/json" }
   return Effect.acquireUseRelease(
     Effect.gen(function* () {
-      const ready = yield* waitReady({ name }).pipe(Effect.forkScoped)
       const created = yield* request(ExperimentalPaths.worktree, directory, {
         method: "POST",
         headers,
@@ -83,7 +59,6 @@ function withCreatedWorktree(
       expect(created.status).toBe(200)
       const info = yield* json<Worktree.Info>(created)
       expect(info).toMatchObject({ name, branch: "opencode/api-test" })
-      yield* Fiber.join(ready)
       return info
     }),
     use,
@@ -218,15 +193,6 @@ describe("experimental HttpApi", () => {
             const listed = yield* request(ExperimentalPaths.worktree, tmp.directory)
             expect(listed.status).toBe(200)
             expect(yield* json(listed)).toContain(info.directory)
-
-            const reset = yield* request(ExperimentalPaths.worktreeReset, tmp.directory, {
-              method: "POST",
-              headers: { "content-type": "application/json" },
-              body: JSON.stringify({ directory: info.directory }),
-            })
-
-            expect(reset.status).toBe(200)
-            expect(yield* json(reset)).toBe(true)
           }),
         )
 

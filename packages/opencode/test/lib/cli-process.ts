@@ -319,23 +319,13 @@ export function withCliFixture<A, E>(
       if (opts?.hostname) argv.push("--hostname", opts.hostname)
       if (opts?.extraArgs) argv.push(...opts.extraArgs)
 
-      // Acquire the subprocess; release sends SIGTERM and awaits exit on
-      // scope close. Wrapped in Effect.ignore so a flaky kill doesn't surface
-      // as a finalizer error during test teardown.
-      const proc = yield* Effect.acquireRelease(
-        Effect.sync(() =>
-          Bun.spawn(["bun", ...cliArgv(argv)], {
-            cwd: home,
-            env: { ...process.env, ...env, ...opts?.env },
-            stdout: "pipe",
-            stderr: "pipe",
-          }),
-        ),
-        (p) =>
-          Effect.promise(() => {
-            p.kill()
-            return p.exited
-          }).pipe(Effect.ignore),
+      const proc = yield* Effect.sync(() =>
+        Bun.spawn(["bun", ...cliArgv(argv)], {
+          cwd: home,
+          env: { ...process.env, ...env, ...opts?.env },
+          stdout: "pipe",
+          stderr: "pipe",
+        }),
       )
 
       // Tail buffer so timeout failures can include stderr context. The fork
@@ -358,6 +348,16 @@ export function withCliFixture<A, E>(
           }),
           Effect.ignore({ log: true }),
         ),
+      )
+
+      // Register after stream drains so shutdown kills the child before the
+      // drains are interrupted; otherwise a child writing during SIGTERM can
+      // block on a closed pipe and leave the scope waiting for `exited`.
+      yield* Effect.addFinalizer(() =>
+        Effect.promise(() => {
+          proc.kill()
+          return proc.exited
+        }).pipe(Effect.ignore),
       )
 
       const readyTimeoutMs = opts?.readyTimeoutMs ?? Duration.toMillis(cliBootBudget)

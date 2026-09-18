@@ -82,7 +82,7 @@ describe("opencode serve authority (subprocess)", () => {
         const url = yield* Effect.sync(() => new URL(manifest.url))
         expect(url.protocol).toBe("http:")
         expect(url.hostname).toBe("127.0.0.1")
-        expect(Number(url.port)).toBe(first.port)
+        expect(Number(url.port)).not.toBe(first.port)
 
         // The wildcard listener publishes its configured credentials only to
         // the owner-readable local manifest.

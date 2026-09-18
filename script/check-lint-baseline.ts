@@ -31,10 +31,26 @@ export async function checkLintBaseline(command: string[], baselineWarnings: num
 }
 
 if (import.meta.main) {
+  const root = import.meta.dir + "/.."
+  if (await lintBaselineStale(root)) {
+    throw new Error(
+      ".oxlint-baseline.json was committed before .oxlintrc.json changed; re-measure and update its counts.",
+    )
+  }
   await checkLintBaseline(
     ["bunx", "oxlint", "--format", "json"],
-    lintBaselineWarnings(JSON.parse(await Bun.file(import.meta.dir + "/../.oxlint-baseline.json").text())),
+    lintBaselineWarnings(JSON.parse(await Bun.file(root + "/.oxlint-baseline.json").text())),
   )
+}
+
+// Uses commit times, not mtimes: a fresh checkout gives every file the same mtime.
+export async function lintBaselineStale(root: string, baseline = ".oxlint-baseline.json", config = ".oxlintrc.json") {
+  const committedAt = async (file: string) => {
+    const proc = Bun.spawn(["git", "log", "-1", "--format=%ct", "--", file], { cwd: root, stderr: "ignore" })
+    return Number((await new Response(proc.stdout).text()).trim())
+  }
+  const [baselineAt, configAt] = await Promise.all([committedAt(baseline), committedAt(config)])
+  return baselineAt > 0 && configAt > baselineAt
 }
 
 export function lintBaselineWarnings(baseline: unknown, platform = globalThis.process.platform) {

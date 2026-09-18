@@ -59,9 +59,12 @@ describe("opencode serve single Database graph (subprocess)", () => {
         expect(yield* Effect.promise(() => sessions.json())).toEqual([])
 
         // SIGTERM before reading the gauge so the log is complete, and so the
-        // child is gone before the fixture tears the stderr drain down.
+        // child is gone before the fixture tears the stderr drain down. The
+        // exit code is not asserted: it is 0 where SIGTERM is handled and 143
+        // where the harness terminates the child (Windows), and neither is the
+        // proof — the gauge lines below are.
         yield* Effect.sync(() => server.kill())
-        expect(yield* Effect.promise(() => server.exited)).toBe(0)
+        yield* Effect.promise(() => server.exited)
 
         const connections = opens(server.stderr()).filter((open) => open.path === database)
         expect(

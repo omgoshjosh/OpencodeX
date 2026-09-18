@@ -5,6 +5,7 @@ import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import { identity } from "effect/Function"
 import * as Layer from "effect/Layer"
+import * as Option from "effect/Option"
 import * as Scope from "effect/Scope"
 import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
@@ -170,8 +171,17 @@ const drizzleLayer = Layer.effect(
   }),
 )
 
+/**
+ * The node backend is not on a shipped path (the daemon and CLI bundle run on
+ * Bun; the GUI never imports core), so it does not open a second connection:
+ * `Database.read` aliases `db` here. Mirror sqlite.bun.ts `readLayer` if that
+ * ever changes.
+ */
+const readLayer = Layer.succeed(Sqlite.Read, { open: Effect.succeed(Option.none()) })
+
 export const layer = (config: Config) =>
-  Layer.merge(
+  Layer.mergeAll(
     nativeLayer(config),
     Layer.merge(sqliteLayer(config), drizzleLayer).pipe(Layer.provide(nativeLayer(config))),
+    readLayer,
   ).pipe(Layer.provide(Reactivity.layer))

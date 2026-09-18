@@ -5,6 +5,7 @@ import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import { identity } from "effect/Function"
 import * as Layer from "effect/Layer"
+import * as Option from "effect/Option"
 import * as Scope from "effect/Scope"
 import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
@@ -168,6 +169,34 @@ const nativeLayer = (config: Config) =>
 
 const sqliteLayer = (config: Config) => Layer.effect(Client.SqlClient, make(config))
 
+/**
+ * Second bun:sqlite handle on the same file, fenced with `PRAGMA query_only`
+ * rather than a readonly open: WAL readers still need a writable `-shm`, which
+ * a readonly open cannot guarantee on Windows. It never sets `journal_mode`
+ * (the writer already did) and carries its own `Semaphore(1)` through `make`,
+ * so a long select here no longer queues the writer's statements. Opened
+ * lazily by `Database.layer` after migrations; `:memory:` databases are
+ * per-connection, so they report `None` and the caller aliases the writer.
+ */
+const readLayer = (config: Config) =>
+  Layer.succeed(Sqlite.Read, {
+    open:
+      config.filename === ":memory:"
+        ? Effect.succeed(Option.none())
+        : Effect.gen(function* () {
+            const native = new Database(config.filename, { readwrite: true, create: false })
+            yield* Effect.addFinalizer(() => Effect.sync(() => native.close()))
+            native.run("PRAGMA query_only = ON;")
+            native.run("PRAGMA busy_timeout = 5000;")
+            native.run("PRAGMA cache_size = -16000;")
+            const client = yield* make(config).pipe(
+              Effect.provideService(Sqlite.Native, native),
+              Effect.provide(Reactivity.layer),
+            )
+            return Option.some<Client.SqlClient>(client)
+          }),
+  })
+
 const drizzleLayer = Layer.effect(
   Sqlite.Drizzle,
   Effect.gen(function* () {
@@ -176,7 +205,8 @@ const drizzleLayer = Layer.effect(
 )
 
 export const layer = (config: Config) =>
-  Layer.merge(
+  Layer.mergeAll(
     nativeLayer(config),
     Layer.merge(sqliteLayer(config), drizzleLayer).pipe(Layer.provide(nativeLayer(config))),
+    readLayer(config),
   ).pipe(Layer.provide(Reactivity.layer))

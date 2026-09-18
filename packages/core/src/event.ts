@@ -194,7 +194,7 @@ export const layer = Layer.effect(
     const listeners = new Array<Listener>()
     const syncHandlers = new Array<{ handler: Sync; filter?: SyncFilter }>()
     const applicationBarrier = Semaphore.makeUnsafe(1)
-    const { db } = yield* Database.Service
+    const { db, read } = yield* Database.Service
 
     const getOrCreate = (definition: Definition) =>
       Effect.gen(function* () {
@@ -536,7 +536,7 @@ export const layer = Layer.effect(
     // Superseded revisions are dead weight the journal never has to keep. The
     // loop is scoped to this layer, mirroring how the state log starts its own
     // maintenance loop.
-    yield* EventRetention.start(db, barrier)
+    yield* EventRetention.start(db, barrier, { read })
 
     const subscribe = <D extends Definition>(definition: D): Stream.Stream<Payload<D>> =>
       Stream.unwrap(getOrCreate(definition).pipe(Effect.map((pubsub) => Stream.fromPubSub(pubsub)))).pipe(

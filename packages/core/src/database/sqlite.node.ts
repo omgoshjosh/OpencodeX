@@ -15,7 +15,7 @@ import type { Connection } from "effect/unstable/sql/SqlConnection"
 import { classifySqliteError, SqlError } from "effect/unstable/sql/SqlError"
 import * as Statement from "effect/unstable/sql/Statement"
 import { Sqlite } from "./sqlite"
-import { type ConnectionName, executed, now, queued } from "./telemetry"
+import { type ConnectionName, executed, now, opened, queued } from "./telemetry"
 
 const ATTR_DB_SYSTEM_NAME = "db.system.name"
 
@@ -175,7 +175,7 @@ const nativeLayer = (config: Config) =>
         enableForeignKeyConstraints: true,
         open: true,
       })
-      yield* Effect.addFinalizer(() => Effect.sync(() => native.close()))
+      yield* opened("writer", config.filename, () => native.close())
       if (config.disableWAL !== true && config.readonly !== true) native.exec("PRAGMA journal_mode = WAL;")
       return native
     }),
@@ -198,9 +198,13 @@ const drizzleLayer = Layer.effect(
  */
 const readLayer = Layer.succeed(Sqlite.Read, { open: Effect.succeed(Option.none()) })
 
-export const layer = (config: Config) =>
-  Layer.mergeAll(
-    nativeLayer(config),
-    Layer.merge(sqliteLayer(config), drizzleLayer).pipe(Layer.provide(nativeLayer(config))),
+// One `nativeLayer` identity, as in sqlite.bun.ts: a second call would open a
+// second handle (OpencodeX-fs2.5).
+export const layer = (config: Config) => {
+  const native = nativeLayer(config)
+  return Layer.mergeAll(
+    native,
+    Layer.merge(sqliteLayer(config), drizzleLayer).pipe(Layer.provide(native)),
     readLayer,
   ).pipe(Layer.provide(Reactivity.layer))
+}

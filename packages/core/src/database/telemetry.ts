@@ -51,3 +51,51 @@ export const executed = (connection: ConnectionName, fiber: Waiter, started: num
     Effect.annotateLogs({ connection, fiber: fiber.id, read_ms: elapsed, sql: sql.slice(0, SQL_PREVIEW_CHARS) }),
   )
 }
+
+/**
+ * Native handle lifecycle (OpencodeX-fs2.5). One `Database` layer is exactly
+ * one `writer` plus one `reader`; a third open per layer is the defect this
+ * gauge exists to catch. Two INFO lines, structured fields only:
+ *
+ *   db_connection_open   connection_id, role, path, active_connections
+ *   db_connection_close  the same fields, after the handle closed
+ *
+ * `activeConnections()` is the gauge behind `active_connections`: every handle
+ * this process has opened through a sqlite layer and not yet closed.
+ */
+
+export type ConnectionRole = "writer" | "reader"
+
+export interface ActiveConnection {
+  readonly id: number
+  readonly role: ConnectionRole
+  readonly path: string
+}
+
+let sequence = 0
+const active = new Map<number, ActiveConnection>()
+
+export const activeConnections = (): ReadonlyArray<ActiveConnection> => [...active.values()]
+
+const annotate = (connection: ActiveConnection) => ({
+  connection_id: connection.id,
+  role: connection.role,
+  path: connection.path,
+  active_connections: active.size,
+})
+
+/** Registers a handle that `close` will close; the gauge counts it until then. */
+export const opened = (role: ConnectionRole, path: string, close: () => void) =>
+  Effect.gen(function* () {
+    const connection: ActiveConnection = { id: ++sequence, role, path }
+    active.set(connection.id, connection)
+    yield* Effect.logInfo("db_connection_open").pipe(Effect.annotateLogs(annotate(connection)))
+    yield* Effect.addFinalizer(() =>
+      Effect.gen(function* () {
+        yield* Effect.sync(close)
+        active.delete(connection.id)
+        yield* Effect.logInfo("db_connection_close").pipe(Effect.annotateLogs(annotate(connection)))
+      }),
+    )
+    return connection
+  })

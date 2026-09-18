@@ -15,6 +15,7 @@ import type { Connection } from "effect/unstable/sql/SqlConnection"
 import { classifySqliteError, SqlError } from "effect/unstable/sql/SqlError"
 import * as Statement from "effect/unstable/sql/Statement"
 import { Sqlite } from "./sqlite"
+import { type ConnectionName, executed, now, queued } from "./telemetry"
 
 const ATTR_DB_SYSTEM_NAME = "db.system.name"
 // Distinct SQL texts a connection keeps prepared; drizzle emits one per code path.
@@ -47,7 +48,7 @@ interface SqliteConnection extends Connection {
   readonly loadExtension: (path: string) => Effect.Effect<void, SqlError>
 }
 
-const make = (options: Config) =>
+const make = (options: Config, name: ConnectionName) =>
   Effect.gen(function* () {
     const native = (yield* Sqlite.Native) as Database
 
@@ -86,7 +87,9 @@ const make = (options: Config) =>
         // @ts-ignore bun-types missing safeIntegers method, fixed in https://github.com/oven-sh/bun/pull/26627
         statement.safeIntegers(Context.get(fiber.context, Client.SafeIntegers))
         try {
-          return Effect.succeed((statement.all(...(params as any)) ?? []) as Array<Record<string, unknown>>)
+          const started = now(fiber)
+          const rows = (statement.all(...(params as any)) ?? []) as Array<Record<string, unknown>>
+          return Effect.as(executed(name, fiber, started, query), rows)
         } catch (cause) {
           return Effect.fail(
             new SqlError({
@@ -102,7 +105,9 @@ const make = (options: Config) =>
         // @ts-ignore bun-types missing safeIntegers method, fixed in https://github.com/oven-sh/bun/pull/26627
         statement.safeIntegers(Context.get(fiber.context, Client.SafeIntegers))
         try {
-          return Effect.succeed((statement.values(...(params as any)) ?? []) as Array<unknown[]>)
+          const started = now(fiber)
+          const rows = (statement.values(...(params as any)) ?? []) as Array<unknown[]>
+          return Effect.as(executed(name, fiber, started, query), rows)
         } catch (cause) {
           return Effect.fail(
             new SqlError({
@@ -146,12 +151,28 @@ const make = (options: Config) =>
     })
 
     const semaphore = yield* Semaphore.make(1)
-    const acquirer = semaphore.withPermits(1)(Effect.succeed(connection))
+    // A single statement only passes through the permit (it runs synchronously
+    // once it has it), so what it measures is the wait behind a transaction.
+    const acquirer = Effect.withFiber<SqliteConnection>((fiber) => {
+      const requested = now(fiber)
+      return semaphore.withPermits(1)(
+        Effect.as(
+          Effect.suspend(() => queued(name, "statement", fiber, requested)),
+          connection,
+        ),
+      )
+    })
     const transactionAcquirer = Effect.uninterruptibleMask((restore) => {
       const fiber = Fiber.getCurrent()!
       const scope = Context.getUnsafe(fiber.context, Scope.Scope)
+      const requested = now(fiber)
       return Effect.as(
-        Effect.tap(restore(semaphore.take(1)), () => Scope.addFinalizer(scope, semaphore.release(1))),
+        Effect.tap(restore(semaphore.take(1)), () =>
+          Effect.andThen(
+            Scope.addFinalizer(scope, semaphore.release(1)),
+            queued(name, "transaction", fiber, requested),
+          ),
+        ),
         connection,
       )
     })
@@ -193,7 +214,7 @@ const nativeLayer = (config: Config) =>
     }),
   )
 
-const sqliteLayer = (config: Config) => Layer.effect(Client.SqlClient, make(config))
+const sqliteLayer = (config: Config) => Layer.effect(Client.SqlClient, make(config, "db"))
 
 /**
  * Second bun:sqlite handle on the same file, fenced with `PRAGMA query_only`
@@ -215,7 +236,7 @@ const readLayer = (config: Config) =>
             native.run("PRAGMA query_only = ON;")
             native.run("PRAGMA busy_timeout = 5000;")
             native.run("PRAGMA cache_size = -16000;")
-            const client = yield* make(config).pipe(
+            const client = yield* make(config, "read").pipe(
               Effect.provideService(Sqlite.Native, native),
               Effect.provide(Reactivity.layer),
             )

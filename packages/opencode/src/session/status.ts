@@ -440,7 +440,7 @@ const configuredLayer = Layer.effect(
         }),
       )
       yield* Effect.forEach(broadcasts, events.broadcast, { discard: true })
-      yield* SessionInteractionRecovery.recoverWith({ database: { db }, events, sessionID })
+      yield* SessionInteractionRecovery.recoverWith({ database: { db, read }, events, sessionID })
     })
 
     const get = Effect.fn("SessionStatus.get")(function* (sessionID: SessionID) {

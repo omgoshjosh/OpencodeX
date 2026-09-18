@@ -229,7 +229,9 @@ export const makeStateLog = Effect.fn("OpencodeXState.makeLog")(function* (
     //     (Semaphore(1) in packages/core/src/database/sqlite.bun.ts) plus BEGIN
     //     IMMEDIATE. The barrier is already held here, so any unrelated holder
     //     of that connection — or anything blocking the single JS thread, since
-    //     bun:sqlite is synchronous — is charged to this pass.
+    //     bun:sqlite is synchronous — is charged to this pass. The connection
+    //     itself reports the same wait as `db_write_queue_slow scope=transaction`
+    //     (packages/core/src/database/telemetry.ts), naming the queued fiber.
     //   sql_ms   — the pass's own scans and delete. Bounded by maintenanceBatchSize.
     //   commit_ms — COMMIT, i.e. the WAL write.
     //

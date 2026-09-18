@@ -15,7 +15,7 @@ import type { Connection } from "effect/unstable/sql/SqlConnection"
 import { classifySqliteError, SqlError } from "effect/unstable/sql/SqlError"
 import * as Statement from "effect/unstable/sql/Statement"
 import { Sqlite } from "./sqlite"
-import { type ConnectionName, executed, now, queued } from "./telemetry"
+import { type ConnectionName, executed, now, opened, queued } from "./telemetry"
 
 const ATTR_DB_SYSTEM_NAME = "db.system.name"
 // Distinct SQL texts a connection keeps prepared; drizzle emits one per code path.
@@ -208,7 +208,7 @@ const nativeLayer = (config: Config) =>
         readwrite: config.readwrite ?? true,
         create: config.create ?? true,
       })
-      yield* Effect.addFinalizer(() => Effect.sync(() => native.close()))
+      yield* opened("writer", config.filename, () => native.close())
       if (config.disableWAL !== true) native.run("PRAGMA journal_mode = WAL;")
       return native
     }),
@@ -232,7 +232,7 @@ const readLayer = (config: Config) =>
         ? Effect.succeed(Option.none())
         : Effect.gen(function* () {
             const native = new Database(config.filename, { readwrite: true, create: false })
-            yield* Effect.addFinalizer(() => Effect.sync(() => native.close()))
+            yield* opened("reader", config.filename, () => native.close())
             native.run("PRAGMA query_only = ON;")
             native.run("PRAGMA busy_timeout = 5000;")
             native.run("PRAGMA cache_size = -16000;")
@@ -251,9 +251,14 @@ const drizzleLayer = Layer.effect(
   }),
 )
 
-export const layer = (config: Config) =>
-  Layer.mergeAll(
-    nativeLayer(config),
-    Layer.merge(sqliteLayer(config), drizzleLayer).pipe(Layer.provide(nativeLayer(config))),
+// One `nativeLayer` identity: the memo map dedupes a layer by reference, so a
+// second `nativeLayer(config)` here would open a third, write-capable handle
+// (OpencodeX-fs2.5). One `Database` layer is one writer plus one reader.
+export const layer = (config: Config) => {
+  const native = nativeLayer(config)
+  return Layer.mergeAll(
+    native,
+    Layer.merge(sqliteLayer(config), drizzleLayer).pipe(Layer.provide(native)),
     readLayer(config),
   ).pipe(Layer.provide(Reactivity.layer))
+}

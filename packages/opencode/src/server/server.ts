@@ -96,10 +96,22 @@ export async function listen(opts: ListenOptions): Promise<Listener> {
  * All listeners close together: they share one scope, and stopping any of them
  * closes it (application disposal runs once). Call the handles' `stop` in the
  * same order as the return value if ordering matters on shutdown.
+ *
+ * `memoMap` lets the caller build the application in a memo map it already
+ * owns instead of a fresh one. The headless daemon passes the process memo map
+ * `AppRuntime` builds in, so every `*.defaultLayer` — `Database` above all —
+ * resolves to the instance that runtime already holds (OpencodeX-fs2.6): one
+ * writer plus one reader per process instead of a second pair per graph. Memo
+ * entries are reference counted, so closing the listener scope only drops this
+ * graph's hold; the runtime keeps its services until it is disposed.
  */
-export async function listenShared(optsList: ListenOptions[]): Promise<Listener[]> {
-  const listeners = await Effect.runPromise(listenSharedEffect(optsList))
+export async function listenShared(optsList: ListenOptions[], options?: SharedOptions): Promise<Listener[]> {
+  const listeners = await Effect.runPromise(listenSharedEffect(optsList, options))
   return listeners.map(toListenerHandle)
+}
+
+type SharedOptions = {
+  memoMap?: Layer.MemoMap
 }
 
 function toListenerHandle(listener: EffectListener): Listener {
@@ -129,14 +141,17 @@ const listenEffect: (opts: ListenOptions) => Effect.Effect<EffectListener, unkno
   },
 )
 
-function listenSharedEffect(optsList: ListenOptions[]): Effect.Effect<Array<EffectListener>, unknown> {
+function listenSharedEffect(
+  optsList: ListenOptions[],
+  options?: SharedOptions,
+): Effect.Effect<Array<EffectListener>, unknown> {
   if (optsList.length === 0) return Effect.succeed([])
   // A single scope plus a single app layer means every socket serves the same
   // application build: one event bus, one database layer, one WebSocket
   // tracker. Failing to share them would give loopback and LAN subscribers
   // process-local buses that see different events.
   const scope = Scope.makeUnsafe()
-  const memoMap = Layer.makeMemoMapUnsafe()
+  const memoMap = options?.memoMap ?? Layer.makeMemoMapUnsafe()
   // CORS comes from the first listener; the loopback companion is used by
   // local clients and does not need its own origin policy.
   const sharedApp = HttpApiApp.createRoutes(optsList[0])

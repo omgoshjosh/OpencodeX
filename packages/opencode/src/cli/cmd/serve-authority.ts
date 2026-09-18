@@ -1,4 +1,5 @@
 import { Database } from "@opencode-ai/core/database/database"
+import { memoMap } from "@opencode-ai/core/effect/memo-map"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { Log } from "@opencode-ai/core/util/log"
 import { ensureRunID, OPENCODE_PROCESS_ROLE } from "@opencode-ai/core/util/opencode-process"
@@ -173,8 +174,13 @@ function startServeAuthority(
             { hostname: "127.0.0.1", port: 0, mdns: false, prefer4096: false },
           ]
         : [primary]
+      // This handler already runs inside `AppRuntime`, whose graph — `Database`
+      // included — lives in the process memo map. Building the listener there
+      // too keeps the daemon at one writer + one reader (OpencodeX-fs2.6); a
+      // private memo map would open a second pair with its own page cache and
+      // permit, leaving busy_timeout as the only thing between two writers.
       const listeners = yield* Effect.tryPromise({
-        try: () => Server.listenShared(options),
+        try: () => Server.listenShared(options, { memoMap }),
         catch: (error) => new Error(`Failed to bind the requested listener: ${errorMessage(error)}`),
       })
       const companion = needsCompanion ? listeners[1] : undefined

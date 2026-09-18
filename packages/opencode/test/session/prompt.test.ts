@@ -700,7 +700,10 @@ it.instance("promptAsync retains one deterministic deferred report command throu
     const prompt = yield* SessionPrompt.Service
     const sessions = yield* Session.Service
     const { db } = yield* Database.Service
-    const chat = yield* sessions.create({})
+    // Pinned title: a default-titled session forks a title-generator request
+    // off its first turn, and that second hit raced `llm.calls` below (2 vs 1
+    // on CI). With no title request, every hit is the turn's own call.
+    const chat = yield* sessions.create({ title: "Pinned" })
     const reportID = MessageID.make("msg_delegation_recovery_run_durable")
     yield* llm.hang
 

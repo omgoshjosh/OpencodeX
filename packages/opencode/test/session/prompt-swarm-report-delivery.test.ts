@@ -3,7 +3,7 @@ import { Effect, Exit, Logger, Option } from "effect"
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
 import * as Log from "@opencode-ai/core/util/log"
 import * as PromptSwarm from "../../src/session/prompt-swarm"
-import { resetSessionAgentWarnings, resolveSessionAgent } from "../../src/session/session-agent"
+import { resetSessionAgentWarnings, resolveSessionAgent, WARNED_AGENT_PAIRS_CAP } from "../../src/session/session-agent"
 import type { DelegationRecord } from "../../src/session/delegation-outcome"
 import { SessionID } from "../../src/session/schema"
 
@@ -65,6 +65,26 @@ describe("resolveSessionAgent", () => {
       await Effect.runPromise(resolveSessionAgent(agents, { sessionID: "ses_a", agent: "claude-code" })),
     ).toBeUndefined()
     expect(warned).toEqual([expect.objectContaining({ agent: "claude-code", registered: [] })])
+  })
+
+  test("the warned set is bounded: the oldest pair is forgotten past the cap, the newest stays deduped", async () => {
+    const agents = registry()
+    const resolve = (sessionID: string) =>
+      Effect.runPromise(resolveSessionAgent(agents, { sessionID, agent: "claude-code" }))
+    for (let i = 0; i < WARNED_AGENT_PAIRS_CAP; i++) await resolve(`ses_${i}`)
+    expect(warned).toHaveLength(WARNED_AGENT_PAIRS_CAP)
+    // Still inside the cap: every pair is remembered.
+    await resolve("ses_0")
+    expect(warned).toHaveLength(WARNED_AGENT_PAIRS_CAP)
+    // One past the cap evicts the oldest pair only.
+    await resolve("ses_overflow")
+    expect(warned).toHaveLength(WARNED_AGENT_PAIRS_CAP + 1)
+    await resolve("ses_overflow")
+    await resolve(`ses_${WARNED_AGENT_PAIRS_CAP - 1}`)
+    expect(warned).toHaveLength(WARNED_AGENT_PAIRS_CAP + 1)
+    await resolve("ses_0")
+    expect(warned).toHaveLength(WARNED_AGENT_PAIRS_CAP + 2)
+    expect(warned.at(-1)).toMatchObject({ sessionID: "ses_0", agent: "claude-code" })
   })
 })
 

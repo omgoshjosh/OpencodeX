@@ -310,6 +310,11 @@ export const layer = Layer.effect(
       })
     }
 
+    // The three `event_barrier_slow_*` lines below see a holder's total time
+    // only; what part of it was queueing for the SQLite connection permit or
+    // running a slow statement is reported per connection as
+    // `db_write_queue_slow` / `db_read_slow` (database/telemetry.ts).
+    //
     // Whoever currently owns the single permit. Four scalars rather than a
     // snapshot object: `barrier` runs on every write in the process, so nothing
     // here may allocate on the uncontended path. Reentrant calls return before

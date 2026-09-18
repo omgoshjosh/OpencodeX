@@ -15,6 +15,7 @@ import type { Connection } from "effect/unstable/sql/SqlConnection"
 import { classifySqliteError, SqlError } from "effect/unstable/sql/SqlError"
 import * as Statement from "effect/unstable/sql/Statement"
 import { Sqlite } from "./sqlite"
+import { type ConnectionName, executed, now, queued } from "./telemetry"
 
 const ATTR_DB_SYSTEM_NAME = "db.system.name"
 
@@ -45,7 +46,7 @@ interface SqliteConnection extends Connection {
   readonly loadExtension: (path: string) => Effect.Effect<void, SqlError>
 }
 
-const make = (options: Config) =>
+const make = (options: Config, name: ConnectionName) =>
   Effect.gen(function* () {
     const native = (yield* Sqlite.Native) as DatabaseSync
 
@@ -59,7 +60,9 @@ const make = (options: Config) =>
         const statement = native.prepare(query)
         statement.setReadBigInts(Context.get(fiber.context, Client.SafeIntegers))
         try {
-          return Effect.succeed(statement.all(...(params as SQLInputValue[])) as Array<Record<string, unknown>>)
+          const started = now(fiber)
+          const rows = statement.all(...(params as SQLInputValue[])) as Array<Record<string, unknown>>
+          return Effect.as(executed(name, fiber, started, query), rows)
         } catch (cause) {
           return Effect.fail(
             new SqlError({
@@ -75,9 +78,9 @@ const make = (options: Config) =>
         statement.setReadBigInts(Context.get(fiber.context, Client.SafeIntegers))
         statement.setReturnArrays(true)
         try {
-          return Effect.succeed(
-            statement.all(...(params as SQLInputValue[])) as unknown as ReadonlyArray<ReadonlyArray<unknown>>,
-          )
+          const started = now(fiber)
+          const rows = statement.all(...(params as SQLInputValue[])) as unknown as ReadonlyArray<ReadonlyArray<unknown>>
+          return Effect.as(executed(name, fiber, started, query), rows)
         } catch (cause) {
           return Effect.fail(
             new SqlError({
@@ -114,12 +117,28 @@ const make = (options: Config) =>
     })
 
     const semaphore = yield* Semaphore.make(1)
-    const acquirer = semaphore.withPermits(1)(Effect.succeed(connection))
+    // Mirrors sqlite.bun.ts: the same two measures, so a run on either
+    // backend reports `db_write_queue_slow` / `db_read_slow` alike.
+    const acquirer = Effect.withFiber<SqliteConnection>((fiber) => {
+      const requested = now(fiber)
+      return semaphore.withPermits(1)(
+        Effect.as(
+          Effect.suspend(() => queued(name, "statement", fiber, requested)),
+          connection,
+        ),
+      )
+    })
     const transactionAcquirer = Effect.uninterruptibleMask((restore) => {
       const fiber = Fiber.getCurrent()!
       const scope = Context.getUnsafe(fiber.context, Scope.Scope)
+      const requested = now(fiber)
       return Effect.as(
-        Effect.tap(restore(semaphore.take(1)), () => Scope.addFinalizer(scope, semaphore.release(1))),
+        Effect.tap(restore(semaphore.take(1)), () =>
+          Effect.andThen(
+            Scope.addFinalizer(scope, semaphore.release(1)),
+            queued(name, "transaction", fiber, requested),
+          ),
+        ),
         connection,
       )
     })
@@ -162,7 +181,7 @@ const nativeLayer = (config: Config) =>
     }),
   )
 
-const sqliteLayer = (config: Config) => Layer.effect(Client.SqlClient, make(config))
+const sqliteLayer = (config: Config) => Layer.effect(Client.SqlClient, make(config, "db"))
 
 const drizzleLayer = Layer.effect(
   Sqlite.Drizzle,

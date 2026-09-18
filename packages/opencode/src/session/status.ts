@@ -128,6 +128,8 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/Se
 export interface LayerOptions {
   readonly beforeGenerationStatusWrite?: Effect.Effect<void>
   readonly onGenerationStatusLockTimeout?: Effect.Effect<void>
+  /** Runs between `recover`'s unlocked scan and its write transaction. Tests only. */
+  readonly beforeRecoverWrite?: Effect.Effect<void>
 }
 
 class Options extends Context.Service<Options, LayerOptions>()("@opencode/SessionStatusOptions") {}
@@ -194,6 +196,66 @@ function returnedLocally(
   if (record.phase !== "running" || !execution) return false
   if (execution.state === "running" || execution.state === "queued") return false
   return execution.completedAt !== null && execution.completedAt >= record.startedAt
+}
+
+type StatusRow = typeof SessionStatusTable.$inferSelect
+type ExecutionRow = typeof SessionExecutionTable.$inferSelect
+type StaleCandidate = { status: StatusRow; execution: ExecutionRow | undefined }
+type Reader = Pick<Database.Interface["db"], "select">
+
+/**
+ * The stale-status scan, shaped so it runs the same way on the read connection
+ * (no barrier, no lock) and again inside the immediate transaction that idles
+ * the survivors. `sessionIDs` restricts it to the rows a caller already knows
+ * about; `now` is the caller's clock so both passes judge staleness alike.
+ */
+const scanStale = Effect.fnUntraced(function* (
+  reader: Reader,
+  sessionIDs: readonly SessionID[] | undefined,
+  now: number,
+) {
+  const processRunID = ensureRunID()
+  const statusQuery = reader.select().from(SessionStatusTable)
+  const statuses = (yield* (
+    sessionIDs ? statusQuery.where(inArray(SessionStatusTable.session_id, sessionIDs)) : statusQuery
+  ).all()).filter((row) => {
+    const status = Option.getOrUndefined(decode(row.status))
+    return status?.type === "busy" || status?.type === "retry"
+  })
+  if (statuses.length === 0) return [] as StaleCandidate[]
+  const executionQuery = reader.select().from(SessionExecutionTable)
+  const executions = new Map(
+    (yield* (
+      sessionIDs ? executionQuery.where(inArray(SessionExecutionTable.session_id, sessionIDs)) : executionQuery
+    ).all()).map((row) => [row.session_id, row]),
+  )
+  return statuses.flatMap((row): StaleCandidate[] => {
+    const execution = executions.get(row.session_id)
+    const stale = !execution
+      ? row.time_updated + OWNERLESS_STALE_MILLIS <= now
+      : execution.state !== "running" ||
+        !execution.owner_id ||
+        !execution.lease_expires_at ||
+        execution.lease_expires_at <= now ||
+        !SessionExecutionOwner.alive(execution.owner_id, processRunID)
+    return stale ? [{ status: row, execution }] : []
+  })
+})
+
+/**
+ * Compare-and-set between the two recovery phases: the row inside the write
+ * transaction must still be the row the unlocked scan judged stale. Any renewal
+ * in between - a heartbeat extending the lease, a new generation claiming the
+ * session, a fresh status write - changes one of these fields.
+ */
+function unchanged(current: StaleCandidate, observed: StaleCandidate | undefined) {
+  if (!observed || current.status.time_updated !== observed.status.time_updated) return false
+  if (!current.execution || !observed.execution) return current.execution === observed.execution
+  return (
+    current.execution.generation === observed.execution.generation &&
+    current.execution.lease_expires_at === observed.execution.lease_expires_at &&
+    current.execution.time_updated === observed.execution.time_updated
+  )
 }
 
 const configuredLayer = Layer.effect(
@@ -299,73 +361,83 @@ const configuredLayer = Layer.effect(
         : status
 
     // `sessionID` scopes the scan to one row. Reads take that path so a status
-    // lookup stays an indexed point query instead of two full table scans in an
-    // immediate transaction under the event barrier; the periodic sweep below
+    // lookup stays an indexed point query instead of two full table scans for
+    // something as routine as painting the sidebar; the periodic sweep below
     // still covers sessions nobody is looking at.
+    //
+    // Two phases (OpencodeX-fs2): the scan runs on the read connection with no
+    // barrier, so on a large database it neither queues the writer nor holds
+    // the process-wide permit while it scans. Only the candidates it finds go
+    // through the barrier and an immediate transaction, where the same scan
+    // runs again against the writer and each row is compared with what the
+    // first phase saw: a session renewed in between (new generation, extended
+    // lease, fresh status write) no longer matches and is left alone.
+    //
+    // Under the kill switch (`read === db`) there is no second connection to
+    // scan on, so both phases run under the barrier exactly as before; the
+    // barrier is reentrant, so the write phase's own acquisition is free.
+    const guarded = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+      read === db ? events.barrier(effect, "SessionStatus.recover") : effect
     const recover = Effect.fn("SessionStatus.recover")(function* (sessionID?: SessionID) {
       const now = Date.now()
-      const broadcasts = yield* events.barrier(
-        db
-          .transaction(
-            (transaction) =>
-              Effect.gen(function* () {
-                const statusQuery = transaction.select().from(SessionStatusTable)
-                const statuses = (yield* (
-                  sessionID ? statusQuery.where(eq(SessionStatusTable.session_id, sessionID)) : statusQuery
-                ).all()).filter((row) => {
-                  const status = Option.getOrUndefined(decode(row.status))
-                  return status?.type === "busy" || status?.type === "retry"
-                })
-                if (statuses.length === 0) return [] as EventV2.Payload[]
-                const executionQuery = transaction.select().from(SessionExecutionTable)
-                const executions = new Map(
-                  (yield* (
-                    sessionID ? executionQuery.where(eq(SessionExecutionTable.session_id, sessionID)) : executionQuery
-                  ).all()).map((row) => [row.session_id, row]),
-                )
-                const stale = statuses.filter((row) => {
-                  const execution = executions.get(row.session_id)
-                  if (!execution) return row.time_updated + OWNERLESS_STALE_MILLIS <= now
-                  if (execution.state !== "running" || !execution.owner_id) return true
-                  if (!execution.lease_expires_at || execution.lease_expires_at <= now) return true
-                  return !SessionExecutionOwner.alive(execution.owner_id, processRunID)
-                })
-                const result: EventV2.Payload[] = []
-                for (const row of stale) {
-                  const execution = executions.get(row.session_id)
-                  if (execution) {
-                    yield* transaction
-                      .update(SessionExecutionTable)
-                      .set({
-                        state: "interrupted",
-                        owner_id: null,
-                        lease_expires_at: null,
-                        completed_at: now,
-                        time_updated: now,
-                      })
-                      .where(
-                        and(
-                          eq(SessionExecutionTable.session_id, row.session_id),
-                          eq(SessionExecutionTable.generation, execution.generation),
-                        ),
+      const broadcasts = yield* guarded(
+        Effect.gen(function* () {
+          const observed = yield* scanStale(read, sessionID ? [sessionID] : undefined, now).pipe(Effect.orDie)
+          if (observed.length === 0) return [] as EventV2.Payload[]
+          yield* options.beforeRecoverWrite ?? Effect.void
+          return yield* events.barrier(
+            db
+              .transaction(
+                (transaction) =>
+                  Effect.gen(function* () {
+                    const current = yield* scanStale(
+                      transaction,
+                      observed.map((candidate) => candidate.status.session_id),
+                      now,
+                    )
+                    const stale = current.filter((candidate) =>
+                      unchanged(
+                        candidate,
+                        observed.find((item) => item.status.session_id === candidate.status.session_id),
+                      ),
+                    )
+                    const result: EventV2.Payload[] = []
+                    for (const { status: row, execution } of stale) {
+                      if (execution) {
+                        yield* transaction
+                          .update(SessionExecutionTable)
+                          .set({
+                            state: "interrupted",
+                            owner_id: null,
+                            lease_expires_at: null,
+                            completed_at: now,
+                            time_updated: now,
+                          })
+                          .where(
+                            and(
+                              eq(SessionExecutionTable.session_id, row.session_id),
+                              eq(SessionExecutionTable.generation, execution.generation),
+                            ),
+                          )
+                          .run()
+                      }
+                      yield* transaction
+                        .update(SessionStatusTable)
+                        .set({ status: { type: "idle" }, time_updated: now })
+                        .where(eq(SessionStatusTable.session_id, row.session_id))
+                        .run()
+                      result.push(
+                        yield* events.commit(Event.Status, { sessionID: row.session_id, status: { type: "idle" } }),
+                        yield* events.commit(Event.Idle, { sessionID: row.session_id }),
                       )
-                      .run()
-                  }
-                  yield* transaction
-                    .update(SessionStatusTable)
-                    .set({ status: { type: "idle" }, time_updated: now })
-                    .where(eq(SessionStatusTable.session_id, row.session_id))
-                    .run()
-                  result.push(
-                    yield* events.commit(Event.Status, { sessionID: row.session_id, status: { type: "idle" } }),
-                    yield* events.commit(Event.Idle, { sessionID: row.session_id }),
-                  )
-                }
-                return result
-              }),
-            { behavior: "immediate" },
+                    }
+                    return result
+                  }),
+                { behavior: "immediate" },
+              )
+              .pipe(Effect.orDie),
           )
-          .pipe(Effect.orDie),
+        }),
       )
       yield* Effect.forEach(broadcasts, events.broadcast, { discard: true })
       yield* SessionInteractionRecovery.recoverWith({ database: { db }, events, sessionID })

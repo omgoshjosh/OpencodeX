@@ -22,7 +22,7 @@ export const layer = Layer.effect(
   Effect.gen(function* () {
     const database = yield* Database.Service
     const events = yield* EventV2Bridge.Service
-    const log = yield* makeStateLog(database.db, events)
+    const log = yield* makeStateLog(database.db, events, { read: database.read })
     const reader = yield* makeStateReader(database, events, log)
     return Service.of({
       scope: log.scope,

@@ -76,6 +76,11 @@ export type StateLogOptions = {
   maintenanceSlowMs?: number
   maintenanceBudgetMs?: number
   maintenanceSkipStreak?: number
+  /**
+   * Connection for the revision and position lookups the state reader brackets
+   * its payload reads with (`Database.Interface.read`). Defaults to `db`.
+   */
+  read?: Database.Interface["read"]
 }
 
 export interface StateLog {
@@ -110,6 +115,7 @@ export const makeStateLog = Effect.fn("OpencodeXState.makeLog")(function* (
     maintenanceBudgetMs: Math.max(1, options?.maintenanceBudgetMs ?? MAINTENANCE_BUDGET_MS),
     maintenanceSkipStreak: Math.max(1, options?.maintenanceSkipStreak ?? MAINTENANCE_SKIP_STREAK),
   }
+  const read = options?.read ?? db
   const listeners = new Array<{
     scope: OpencodeXStateScope
     listener: (event: OpencodeXStateEvent) => void
@@ -159,7 +165,7 @@ export const makeStateLog = Effect.fn("OpencodeXState.makeLog")(function* (
     ])
 
   const retentionFloor = Effect.fn("OpencodeXState.retentionFloor")(function* (scope: OpencodeXStateScope) {
-    const rows = yield* db
+    const rows = yield* read
       .select({ value: OpencodeXStateMetadataTable.value })
       .from(OpencodeXStateMetadataTable)
       .where(
@@ -176,7 +182,7 @@ export const makeStateLog = Effect.fn("OpencodeXState.makeLog")(function* (
 
   const position = Effect.fn("OpencodeXState.position")(function* (scope: OpencodeXStateScope) {
     const retained =
-      (yield* db
+      (yield* read
         .select({ value: max(OpencodeXStateEventTable.position) })
         .from(OpencodeXStateEventTable)
         .where(whereVisible(scope))
@@ -186,7 +192,7 @@ export const makeStateLog = Effect.fn("OpencodeXState.makeLog")(function* (
   })
 
   const revisionVector = Effect.fn("OpencodeXState.revisionVector")(function* (scope: OpencodeXStateScope) {
-    const rows = yield* db
+    const rows = yield* read
       .select({ domain: OpencodeXStateEventTable.domain, value: max(OpencodeXStateEventTable.position) })
       .from(OpencodeXStateEventTable)
       .where(whereVisible(scope))

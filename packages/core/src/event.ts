@@ -168,6 +168,13 @@ export interface Interface {
    * Serializes the effect against every other application barrier acquisition
    * in this process. `label` is a cheap operation tag used only by the stall
    * instrumentation; omit it and the current tracing span name is used instead.
+   *
+   * Lock order is barrier → connection at every write site: the barrier is
+   * taken first, then the writer's `db.transaction(immediate)` permit. Never
+   * take it from inside a `Database.read` transaction (or while holding either
+   * connection's permit) — that inverts the order and deadlocks against the
+   * next writer. Reads that need a consistent view take a `read` snapshot
+   * instead of the barrier (OpencodeX-fs2).
    */
   readonly barrier: <A, E, R>(effect: Effect.Effect<A, E, R>, label?: string) => Effect.Effect<A, E, R>
   readonly project: <D extends Definition>(definition: D, projector: Projector<D>) => Effect.Effect<void>

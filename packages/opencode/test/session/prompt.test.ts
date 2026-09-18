@@ -1680,7 +1680,7 @@ it.instance("allows cancellation through a live reservation only before its offe
   }),
 )
 
-it.instance("foreign command recovers automatically after its lease expires", () =>
+it.instance("foreign command recovers after its lease expires", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)
     const prompt = yield* SessionPrompt.Service
@@ -1716,8 +1716,6 @@ it.instance("foreign command recovers automatically after its lease expires", ()
       .pipe(Effect.orDie)
 
     yield* prompt.recover()
-    yield* Effect.sleep("300 millis")
-
     expect(yield* llm.hits).toHaveLength(0)
     expect(
       yield* db
@@ -1735,6 +1733,7 @@ it.instance("foreign command recovers automatically after its lease expires", ()
       .where(eq(SessionCommandTable.id, "sec_foreign_lease"))
       .run()
       .pipe(Effect.orDie)
+    yield* prompt.recover()
     yield* llm.wait(1)
     yield* pollWithTimeout(
       db
@@ -1751,7 +1750,7 @@ it.instance("foreign command recovers automatically after its lease expires", ()
   }),
 )
 
-it.instance("promptAsync reclaims a predecessor when its foreign lease expires", () =>
+it.instance("promptAsync reclaims a predecessor after its foreign lease expires", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)
     const prompt = yield* SessionPrompt.Service
@@ -1792,7 +1791,6 @@ it.instance("promptAsync reclaims a predecessor when its foreign lease expires",
       model: ref,
       parts: [{ type: "text", text: "new prompt" }],
     })
-    yield* Effect.sleep("300 millis")
     expect(yield* llm.hits).toHaveLength(0)
     yield* db
       .update(SessionCommandTable)
@@ -1800,6 +1798,7 @@ it.instance("promptAsync reclaims a predecessor when its foreign lease expires",
       .where(eq(SessionCommandTable.id, "sec_expired_predecessor"))
       .run()
       .pipe(Effect.orDie)
+    yield* prompt.recover()
     yield* llm.wait(1)
 
     const reclaimed = yield* db

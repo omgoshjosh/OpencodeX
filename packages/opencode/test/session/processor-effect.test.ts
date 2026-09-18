@@ -4,7 +4,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect } from "bun:test"
 import { tool } from "ai"
-import { Cause, Effect, Exit, Fiber, Layer } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Schema } from "effect"
 import path from "path"
 import z from "zod"
 import type { Agent } from "../../src/agent/agent"
@@ -109,16 +109,26 @@ function defer<T>() {
   return { promise, resolve }
 }
 
-const waitFor = <A>(check: Effect.Effect<A | undefined>, message: string) =>
-  Effect.gen(function* () {
-    const stop = Date.now() + 500
-    while (Date.now() < stop) {
-      const value = yield* check
-      if (value !== undefined) return value
-      yield* Effect.sleep("10 millis")
-    }
-    return yield* Effect.fail(new Error(message))
+// The event definition is its own payload schema, so it doubles as the type
+// guard (same pattern as `isFilePart` in src/session/processor.ts).
+const isPartUpdated = Schema.is(SessionLegacy.Event.PartUpdated)
+
+// Settles once the processor persists the first part of `type` on the message.
+// Subscribe before the run starts so the signal cannot be missed. A wall-clock
+// poll here flaked under CI load (OpencodeX-9uc): the persisted part landed
+// after the budget, and the failure then hid behind the held SSE response for
+// the http server's 20 s graceful shutdown as "All fibers interrupted".
+const firstPart = Effect.fn("test.firstPart")(function* (messageID: MessageID, type: SessionLegacy.Part["type"]) {
+  const events = yield* EventV2Bridge.Service
+  const found = yield* Deferred.make<void>()
+  const off = yield* events.listen((evt) => {
+    if (!isPartUpdated(evt)) return Effect.void
+    if (evt.data.part.messageID !== messageID || evt.data.part.type !== type) return Effect.void
+    return Deferred.succeed(found, void 0)
   })
+  yield* Effect.addFinalizer(() => off)
+  return Deferred.await(found)
+})
 
 const user = Effect.fn("TestSession.user")(function* (sessionID: SessionID, text: string) {
   const session = yield* Session.Service
@@ -298,8 +308,10 @@ it.live("session.processor effect tests preserve text start time", () =>
   provideTmpdirServer(
     ({ dir, llm }) =>
       Effect.gen(function* () {
-        const database = yield* Database.Service
         const gate = defer<void>()
+        // Release the held response on every exit so a failing test cannot
+        // hold the SSE connection open through the server's graceful shutdown.
+        yield* Effect.addFinalizer(() => Effect.sync(() => gate.resolve()))
         const { processors, session, provider } = yield* boot()
 
         yield* llm.push(
@@ -336,6 +348,7 @@ it.live("session.processor effect tests preserve text start time", () =>
           sessionID: chat.id,
           model: mdl,
         })
+        const started = yield* firstPart(msg.id, "text")
 
         const run = yield* handle
           .process({
@@ -356,13 +369,7 @@ it.live("session.processor effect tests preserve text start time", () =>
           })
           .pipe(Effect.forkChild)
 
-        yield* waitFor(
-          MessageV2.parts(msg.id).pipe(
-            Effect.map((parts) => parts.find((part): part is SessionLegacy.TextPart => part.type === "text")),
-            Effect.provideService(Database.Service, database),
-          ),
-          "timed out waiting for text part",
-        )
+        yield* started
         yield* Effect.sleep("20 millis")
         gate.resolve()
 
@@ -789,7 +796,6 @@ it.live("session.processor effect tests mark pending tools as aborted on cleanup
   provideTmpdirServer(
     ({ dir, llm }) =>
       Effect.gen(function* () {
-        const database = yield* Database.Service
         const { processors, session, provider } = yield* boot()
 
         yield* llm.toolHang("bash", { cmd: "pwd" })
@@ -803,6 +809,7 @@ it.live("session.processor effect tests mark pending tools as aborted on cleanup
           sessionID: chat.id,
           model: mdl,
         })
+        const started = yield* firstPart(msg.id, "tool")
 
         const run = yield* handle
           .process({
@@ -823,14 +830,7 @@ it.live("session.processor effect tests mark pending tools as aborted on cleanup
           })
           .pipe(Effect.forkChild)
 
-        yield* llm.wait(1)
-        yield* waitFor(
-          MessageV2.parts(msg.id).pipe(
-            Effect.map((parts) => parts.find((part): part is SessionLegacy.ToolPart => part.type === "tool")),
-            Effect.provideService(Database.Service, database),
-          ),
-          "timed out waiting for tool part",
-        )
+        yield* started
         yield* Fiber.interrupt(run)
 
         const exit = yield* Fiber.await(run)

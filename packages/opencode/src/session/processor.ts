@@ -283,24 +283,30 @@ export const layer = Layer.effect(
           }
           return { call: ctx.toolcalls[input.id], part }
         }
-        const part = yield* session.updatePart({
-          id: PartID.ascending(),
-          messageID: ctx.assistantMessage.id,
-          sessionID: ctx.assistantMessage.sessionID,
-          type: "tool",
-          tool: input.name,
-          callID: input.id,
-          state: { status: "pending", input: {}, raw: "" },
-          metadata: input.providerExecuted ? { providerExecuted: true } : undefined,
-        } satisfies SessionLegacy.ToolPart)
-        ctx.toolcalls[input.id] = {
-          done: yield* Deferred.make<void>(),
-          partID: part.id,
-          messageID: part.messageID,
-          sessionID: part.sessionID,
-          inputEnded: false,
-        }
-        return { call: ctx.toolcalls[input.id], part }
+        // Persist the pending part and register the call as one step: an
+        // interrupt landing between them (the part is published before
+        // `updatePart` returns) leaves a `pending` part that cleanup never
+        // marks aborted, because cleanup only walks `toolcalls`.
+        return yield* Effect.gen(function* () {
+          const part = yield* session.updatePart({
+            id: PartID.ascending(),
+            messageID: ctx.assistantMessage.id,
+            sessionID: ctx.assistantMessage.sessionID,
+            type: "tool",
+            tool: input.name,
+            callID: input.id,
+            state: { status: "pending", input: {}, raw: "" },
+            metadata: input.providerExecuted ? { providerExecuted: true } : undefined,
+          } satisfies SessionLegacy.ToolPart)
+          ctx.toolcalls[input.id] = {
+            done: yield* Deferred.make<void>(),
+            partID: part.id,
+            messageID: part.messageID,
+            sessionID: part.sessionID,
+            inputEnded: false,
+          }
+          return { call: ctx.toolcalls[input.id], part }
+        }).pipe(Effect.uninterruptible)
       })
 
       const setExecuting = (toolCallID: string, executing: ToolCall["executing"]) => {

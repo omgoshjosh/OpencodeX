@@ -344,10 +344,11 @@ export const layer = Layer.effect(
 
       const toolInput = (value: unknown): Record<string, any> => (isRecord(value) ? value : { value })
 
-      const handleEvent = Effect.fnUntraced(function* (value: StreamEvent) {
+      const handleEvent = Effect.fnUntraced(function* (value: StreamEvent, markReplayUnsafe: () => void) {
         switch (value.type) {
           case "reasoning-start":
             if (value.id in ctx.reasoningMap) return
+            markReplayUnsafe()
             ctx.reasoningMap[value.id] = {
               id: PartID.ascending(),
               messageID: ctx.assistantMessage.id,
@@ -385,6 +386,7 @@ export const layer = Layer.effect(
             if (ctx.assistantMessage.summary) {
               throw new Error(`Tool call not allowed while generating summary: ${value.name}`)
             }
+            markReplayUnsafe()
             yield* ensureToolCall(value)
             return
 
@@ -394,6 +396,7 @@ export const layer = Layer.effect(
             return
 
           case "tool-input-end": {
+            markReplayUnsafe()
             const toolCall = yield* ensureToolCall(value)
             ctx.toolcalls[value.id] = { ...toolCall.call, inputEnded: true }
             return
@@ -403,6 +406,7 @@ export const layer = Layer.effect(
             if (ctx.assistantMessage.summary) {
               throw new Error(`Tool call not allowed while generating summary: ${value.name}`)
             }
+            markReplayUnsafe()
             const toolCall = yield* ensureToolCall(value)
             const input = toolInput(value.input)
             if (!toolCall.call.inputEnded) {
@@ -462,6 +466,7 @@ export const layer = Layer.effect(
           }
 
           case "tool-result": {
+            markReplayUnsafe()
             yield* readToolCall(value.id)
             setExecuting(value.id, undefined)
             const rawOutput = toolResultOutput(value)
@@ -491,6 +496,7 @@ export const layer = Layer.effect(
           }
 
           case "tool-error": {
+            markReplayUnsafe()
             yield* readToolCall(value.id)
             setExecuting(value.id, undefined)
             yield* failToolCall(value.id, value.error ?? new Error(value.message))
@@ -512,6 +518,7 @@ export const layer = Layer.effect(
             return
 
           case "step-finish": {
+            markReplayUnsafe()
             const completedSnapshot = yield* snapshot.track()
             yield* Effect.forEach(Object.keys(ctx.reasoningMap), finishReasoning)
             const usage = Session.getUsage({
@@ -563,6 +570,7 @@ export const layer = Layer.effect(
           }
 
           case "text-start":
+            markReplayUnsafe()
             ctx.currentText = {
               id: PartID.ascending(),
               messageID: ctx.assistantMessage.id,
@@ -698,9 +706,14 @@ export const layer = Layer.effect(
         const idleTimeout = cfg.experimental?.stream_idle_timeout ?? STREAM_IDLE_TIMEOUT
         const inflightTimeout = cfg.experimental?.tool_inflight_timeout ?? idleTimeout * TOOL_INFLIGHT_MULTIPLIER
         tools = streamInput.tools
+        // Sticky per attempt: once the provider has emitted anything a replay
+        // could duplicate (reasoning, a tool event, step-finish, text), an
+        // idle timeout on this attempt must fail the turn rather than retry.
+        let replayUnsafe = false
 
         return yield* Effect.gen(function* () {
           yield* Effect.gen(function* () {
+            replayUnsafe = false
             ctx.currentText = undefined
             ctx.reasoningMap = {}
             yield* status.set(ctx.sessionID, { type: "busy" })
@@ -774,7 +787,7 @@ export const layer = Layer.effect(
                     }),
                   ),
                 ),
-              Stream.tap((event) => handleEvent(event)),
+              Stream.tap((event) => handleEvent(event, () => (replayUnsafe = true))),
               Stream.takeUntil(() => ctx.needsCompaction),
               Stream.runDrain,
             )
@@ -796,7 +809,7 @@ export const layer = Layer.effect(
                 parse,
                 // Retrying a stream after text or a tool call risks duplicate
                 // user-visible output and duplicate side effects.
-                canRetry: () => !ctx.currentText && Object.keys(ctx.toolcalls).length === 0,
+                canRetry: () => !replayUnsafe && !ctx.currentText && Object.keys(ctx.toolcalls).length === 0,
                 set: (info) =>
                   status.set(ctx.sessionID, {
                     type: "retry",

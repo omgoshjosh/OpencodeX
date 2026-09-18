@@ -208,6 +208,41 @@ const boot = Effect.fn("test.boot")(function* () {
   return { processors, session, provider }
 })
 
+const processPrompt = Effect.fn("test.processPrompt")(function* (
+  root: string,
+  tools: LLM.StreamInput["tools"] = {},
+) {
+  const { processors, session, provider } = yield* boot()
+  const chat = yield* session.create({})
+  const parent = yield* user(chat.id, "idle stream")
+  const msg = yield* assistant(chat.id, parent.id, path.resolve(root))
+  const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+  const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+  const value = yield* handle.process({
+    user: {
+      id: parent.id,
+      sessionID: chat.id,
+      role: "user",
+      time: parent.time,
+      agent: parent.agent,
+      model: { providerID: ref.providerID, modelID: ref.modelID },
+    } satisfies SessionLegacy.User,
+    sessionID: chat.id,
+    model: mdl,
+    agent: agent(),
+    system: [],
+    messages: [{ role: "user", content: "idle stream" }],
+    tools,
+  })
+  return { handle, msg, value }
+})
+
+const chunk = (delta: Record<string, unknown>, finish?: string) => ({
+  id: "chatcmpl-test",
+  object: "chat.completion.chunk",
+  choices: [{ delta, ...(finish ? { finish_reason: finish } : {}) }],
+})
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -946,6 +981,113 @@ it.live("session.processor effect tests mark interruptions aborted without manua
         expect(state).toMatchObject({ type: "idle" })
       }),
     { config: (url) => providerCfg(url) },
+  ),
+)
+
+it.live("session.processor effect tests do not retry an idle stream after completed text", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        yield* llm.push(
+          raw({
+            head: [chunk({ role: "assistant" }), chunk({ content: "complete" }), chunk({}, "stop")],
+            hang: true,
+          }),
+        )
+
+        const { msg, value } = yield* processPrompt(dir)
+        const parts = yield* MessageV2.parts(msg.id)
+        const text = parts.find((part): part is SessionLegacy.TextPart => part.type === "text")
+
+        expect(value).toBe("stop")
+        expect(yield* llm.calls).toBe(1)
+        expect(text?.text).toBe("complete")
+        expect(text?.time?.end).toBeDefined()
+      }),
+    { config: (url) => ({ ...providerCfg(url), experimental: { stream_idle_timeout: 100 } }) },
+  ),
+)
+
+it.live("session.processor effect tests do not retry an idle stream after reasoning", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        yield* llm.push(
+          raw({
+            head: [chunk({ role: "assistant" }), chunk({ reasoning_content: "thought" }), chunk({}, "stop")],
+            hang: true,
+          }),
+        )
+
+        const { msg, value } = yield* processPrompt(dir)
+        const parts = yield* MessageV2.parts(msg.id)
+
+        expect(value).toBe("stop")
+        expect(yield* llm.calls).toBe(1)
+        expect(parts.some((part) => part.type === "reasoning" && part.text === "thought")).toBe(true)
+      }),
+    { config: (url) => ({ ...providerCfg(url), experimental: { stream_idle_timeout: 100 } }) },
+  ),
+)
+
+it.live("session.processor effect tests do not retry an idle stream after a completed tool", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        let executions = 0
+        yield* llm.push(
+          raw({
+            head: [
+              chunk({ role: "assistant" }),
+              chunk({
+                tool_calls: [
+                  { index: 0, id: "call_1", type: "function", function: { name: "write", arguments: "" } },
+                ],
+              }),
+              chunk({ tool_calls: [{ index: 0, function: { arguments: '{"value":"once"}' } }] }),
+              chunk({}, "tool_calls"),
+            ],
+            hang: true,
+          }),
+        )
+
+        const { msg, value } = yield* processPrompt(dir, {
+          write: tool({
+            inputSchema: z.object({ value: z.string() }),
+            execute: async ({ value }) => {
+              executions += 1
+              return { title: "Write", output: value, metadata: {} }
+            },
+          }),
+        })
+        const parts = yield* MessageV2.parts(msg.id)
+        const call = parts.find((part): part is SessionLegacy.ToolPart => part.type === "tool")
+
+        expect(value).toBe("stop")
+        expect(yield* llm.calls).toBe(1)
+        expect(executions).toBe(1)
+        expect(call?.state.status).toBe("completed")
+      }),
+    { config: (url) => ({ ...providerCfg(url), experimental: { stream_idle_timeout: 100 } }) },
+  ),
+)
+
+it.live("session.processor effect tests retry an idle stream before output", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        yield* llm.hang
+        yield* llm.text("after retry")
+
+        const { handle, msg, value } = yield* processPrompt(dir)
+        const parts = yield* MessageV2.parts(msg.id)
+
+        expect(value).toBe("continue")
+        expect(yield* llm.calls).toBe(2)
+        expect(handle.message.error).toBeUndefined()
+        expect(parts.some((part) => part.type === "text" && part.text === "after retry")).toBe(true)
+      }),
+    { config: (url) => ({ ...providerCfg(url), experimental: { stream_idle_timeout: 100 } }) },
   ),
 )
 

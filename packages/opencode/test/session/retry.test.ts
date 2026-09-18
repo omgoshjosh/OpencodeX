@@ -180,6 +180,27 @@ describe("session.retry.retryable", () => {
     expect(SessionRetry.retryable(error)).toEqual({ message: msg })
   })
 
+  test("does not retry provider usage exhaustion on the same model", () => {
+    // The 2026-09-10 stall: the provider marked its own usage-limit refusal
+    // retryable (statusCode 429, isRetryable true), so the turn spent all three
+    // attempts re-asking a model that was out, then broke the loop. Exhaustion
+    // needs the next route, not a backoff.
+    const error = new SessionLegacy.APIError({
+      message: "The usage limit has been reached",
+      isRetryable: true,
+      statusCode: 429,
+    }).toObject()
+    expect(SessionRetry.retryable(error)).toBeUndefined()
+  })
+
+  test("still retries a rate limit that the provider marks retryable", () => {
+    // Same status and same retryability as the exhaustion case above; only the
+    // prose differs, and this one must still back off in place.
+    const msg = "Rate limit reached for gpt-5.6-sol in organization org-abc on requests per min (RPM)"
+    const error = new SessionLegacy.APIError({ message: msg, isRetryable: true, statusCode: 429 }).toObject()
+    expect(SessionRetry.retryable(error)).toEqual({ message: msg })
+  })
+
   test("retries too many requests in plain text", () => {
     const msg = "Too many requests, please slow down"
     const error = wrap(msg)

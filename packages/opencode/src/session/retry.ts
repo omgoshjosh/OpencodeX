@@ -2,6 +2,7 @@ import type { NamedError } from "@opencode-ai/core/util/error"
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
 import { Cause, Clock, Duration, Effect, Schedule } from "effect"
 import { MessageV2 } from "./message-v2"
+import { classifyProviderFailure } from "./model-fallback"
 import { iife } from "@/util/iife"
 import { isRecord } from "@/util/record"
 
@@ -57,6 +58,21 @@ export function delay(attempt: number, error?: SessionLegacy.APIError) {
 export function retryable(error: Err) {
   // context overflow errors should not be retried
   if (SessionLegacy.ContextOverflowError.isInstance(error)) return undefined
+  // Usage exhaustion is an account condition, not congestion: the same model
+  // returns it again on every attempt, so backing off here only spends the
+  // budget that the route fallback needs. It is deliberately checked ahead of
+  // `isRetryable` - the provider marks exhaustion retryable (statusCode 429,
+  // isRetryable true, indistinguishable from a rate limit except in prose) and
+  // trusting that flag is what stalled four sessions on 2026-09-10.
+  const classification = classifyProviderFailure(error)
+  if (classification === "exhausted") return undefined
+  // An ambiguous RESOURCE_EXHAUSTED may be either of those two things and the
+  // provider will not say which, so it takes the cheaper bet first: back off on
+  // the SAME model, and let the loop advance the role's route only once this
+  // budget is spent. Stated here rather than left to `isRetryable`, which
+  // providers set inconsistently on this exact shape.
+  if (classification === "resource-exhausted" && SessionLegacy.APIError.isInstance(error))
+    return { message: error.data.message }
   if (SessionLegacy.APIError.isInstance(error)) {
     const status = error.data.statusCode
     const code = error.data.metadata?.code

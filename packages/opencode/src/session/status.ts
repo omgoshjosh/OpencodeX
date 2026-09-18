@@ -201,11 +201,14 @@ const configuredLayer = Layer.effect(
   Effect.gen(function* () {
     const options = yield* Options
     const events = yield* EventV2Bridge.Service
-    const { db } = yield* Database.Service
+    const { db, read } = yield* Database.Service
     const processRunID = ensureRunID()
 
+    // Sidebar paints and status lists are read-only projections, so they run
+    // on the read connection: a full session scan here must not queue the
+    // barriered writers behind the writer's single permit.
     const backgrounds = Effect.fnUntraced(function* () {
-      const rows = yield* db
+      const rows = yield* read
         .select({ id: SessionTable.id, metadata: SessionTable.metadata, title: SessionTable.title })
         .from(SessionTable)
         .all()
@@ -226,7 +229,7 @@ const configuredLayer = Layer.effect(
       // stay indexed lookups rather than the two extra table scans a blanket
       // read would cost every time a client paints a sidebar.
       const [executions, questions] = yield* Effect.all([
-        db
+        read
           .select({
             sessionID: SessionExecutionTable.session_id,
             state: SessionExecutionTable.state,
@@ -236,7 +239,7 @@ const configuredLayer = Layer.effect(
           .where(inArray(SessionExecutionTable.session_id, ids))
           .all()
           .pipe(Effect.orDie),
-        db
+        read
           .select({ sessionID: SessionInteractionTable.session_id })
           .from(SessionInteractionTable)
           .where(
@@ -383,7 +386,7 @@ const configuredLayer = Layer.effect(
     })
 
     const snapshot = Effect.fn("SessionStatus.snapshot")(function* () {
-      const rows = yield* db
+      const rows = yield* read
         .select({ sessionID: SessionStatusTable.session_id, status: SessionStatusTable.status })
         .from(SessionStatusTable)
         .all()

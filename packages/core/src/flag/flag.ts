@@ -72,4 +72,8 @@ export const Flag = {
   get OPENCODE_CLIENT() {
     return process.env["OPENCODE_CLIENT"] ?? "cli"
   },
+  /** Kill switch for the read-only SQLite connection: `Database.read` aliases `db`. */
+  get OPENCODE_DB_SINGLE_CONNECTION() {
+    return truthy("OPENCODE_DB_SINGLE_CONNECTION")
+  },
 }

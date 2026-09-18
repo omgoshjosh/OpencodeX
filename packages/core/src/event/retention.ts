@@ -85,6 +85,8 @@ export type RetentionOptions = {
   maintenanceIntervalMs?: number
   maintenanceBatchSize?: number
   aggregatesPerPass?: number
+  /** Connection for the candidate scans (`Database.read`); defaults to `db`. */
+  read?: Database.Interface["read"]
 }
 
 export interface Retention {
@@ -155,6 +157,10 @@ export const make = Effect.fn("EventRetention.make")(function* (
     maintenanceBatchSize: Math.max(1, options?.maintenanceBatchSize ?? MAINTENANCE_BATCH_SIZE),
     aggregatesPerPass: Math.max(1, options?.aggregatesPerPass ?? AGGREGATES_PER_PASS),
   }
+  // Candidate discovery only reads, and on a large journal it reads for
+  // seconds; the read-only connection keeps that occupancy off the writer's
+  // permit so barriered writes stop queueing behind it.
+  const read = options?.read ?? db
 
   // The journal is only indexed by (aggregate_id, seq), so a pass walks a
   // window of aggregates rather than scanning the whole table. The cursor
@@ -181,7 +187,7 @@ export const make = Effect.fn("EventRetention.make")(function* (
   }
 
   const window = Effect.fnUntraced(function* () {
-    const rows = yield* db
+    const rows = yield* read
       .all<{ aggregate: string }>(
         sql`SELECT aggregate_id AS aggregate FROM event_sequence
             WHERE aggregate_id > ${cursor}
@@ -202,7 +208,7 @@ export const make = Effect.fn("EventRetention.make")(function* (
    * applying the output limit.
    */
   const superseded = (aggregates: string[]) =>
-    db.all<{ id: string }>(supersededQuery(aggregates, settings.maintenanceBatchSize)).pipe(Effect.orDie)
+    read.all<{ id: string }>(supersededQuery(aggregates, settings.maintenanceBatchSize)).pipe(Effect.orDie)
 
   const compactResult = Effect.fn("EventRetention.compactResult")(function* () {
     const pass = ++passes

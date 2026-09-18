@@ -23,7 +23,7 @@ function record(value: unknown): value is Record<string, unknown> {
 }
 
 export const recoverWith = Effect.fn("SessionInteractionRecovery.recoverWith")(function* (input: {
-  database: Database.Interface
+  database: Pick<Database.Interface, "db">
   events: EventV2.Interface
   sessionID?: SessionID
 }) {

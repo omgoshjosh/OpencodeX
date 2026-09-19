@@ -77,22 +77,22 @@ describe("Auth", () => {
     }),
   )
 
-  it.instance("retains the last valid snapshot through a malformed external write", () =>
+  it.instance("retains the last valid snapshot through invalid external writes", () =>
     Effect.gen(function* () {
       const auth = yield* Auth.Service
       yield* auth.set("anthropic", { type: "api", key: "before" })
       const initial = yield* auth.snapshot()
 
-      yield* Effect.promise(() => Bun.write(path.join(Global.Path.data, "auth.json"), "{"))
+      const authPath = path.join(Global.Path.data, "auth.json")
+      yield* Effect.promise(() => Bun.write(authPath, "{"))
       const malformed = yield* auth.snapshot()
       expect(malformed).toEqual(initial)
 
-      yield* Effect.promise(() =>
-        Bun.write(
-          path.join(Global.Path.data, "auth.json"),
-          JSON.stringify({ anthropic: { type: "api", key: "after" } }),
-        ),
-      )
+      yield* Effect.promise(() => Bun.write(authPath, JSON.stringify({ anthropic: { type: "api" } })))
+      const invalid = yield* auth.snapshot()
+      expect(invalid).toEqual(initial)
+
+      yield* Effect.promise(() => Bun.write(authPath, JSON.stringify({ anthropic: { type: "api", key: "after" } })))
       const next = yield* auth.snapshot()
       expect(next.revision).not.toBe(initial.revision)
       expect(next.records.anthropic).toMatchObject({ type: "api", key: "after" })

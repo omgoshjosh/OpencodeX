@@ -1,8 +1,9 @@
 import { afterEach, expect, test } from "bun:test"
-import { mkdir, unlink } from "fs/promises"
+import { mkdir } from "fs/promises"
 import path from "path"
 import { Effect, Layer } from "effect"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
+import { EventV2 } from "@opencode-ai/core/event"
 import { AppFileSystem } from "@opencode-ai/core/filesystem"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Global } from "@opencode-ai/core/global"
@@ -56,12 +57,12 @@ afterEach(async () => {
   await disposeAllInstances()
 })
 
-const providerLayer = (flags: Partial<RuntimeFlags.Info> = {}) =>
+const providerLayer = (flags: Partial<RuntimeFlags.Info> = {}, auth = Auth.defaultLayer) =>
   Provider.layer.pipe(
     Layer.provide(AppFileSystem.defaultLayer),
     Layer.provide(Env.defaultLayer),
     Layer.provide(Config.defaultLayer),
-    Layer.provide(Auth.defaultLayer),
+    Layer.provide(auth),
     Layer.provide(Plugin.defaultLayer),
     Layer.provide(ModelsDev.defaultLayer),
     Layer.provide(RuntimeFlags.layer(flags)),
@@ -79,6 +80,9 @@ const paid = (providers: Record<string, { models: Record<string, { cost: { input
 const languageBaseURL = (language: unknown) => (language as { config: { baseURL: string } }).config.baseURL
 
 const it = testEffect(Layer.mergeAll(Provider.defaultLayer, Env.defaultLayer, Plugin.defaultLayer))
+const isolatedProvider = testEffect(
+  Layer.mergeAll(Env.defaultLayer, Plugin.defaultLayer, CrossSpawnSpawner.defaultLayer),
+)
 const experimentalModels = testEffect(providerLayer({ enableExperimentalModels: true }))
 
 const refreshCatalog = {
@@ -1879,41 +1883,36 @@ it.effect("opencode loader keeps paid models when config apiKey is present", () 
   }).pipe(provideMultiInstance),
 )
 
-it.effect("opencode loader refreshes an existing provider state after external auth changes", () =>
+isolatedProvider.effect("opencode loader refreshes an existing provider state after external auth changes", () =>
   Effect.gen(function* () {
     const noneDir = yield* tmpdirScoped()
     const keyedDir = yield* tmpdirScoped()
 
-    const listIn = (directory: string) =>
+    const authPath = path.join(keyedDir, "auth.json")
+    const isolatedAuth = Auth.layer(authPath).pipe(
+      Layer.provide(AppFileSystem.defaultLayer),
+      Layer.provide(EventV2.defaultLayer),
+    )
+    const listWithIsolatedAuth = (directory: string) =>
       Provider.use
         .list()
         .pipe(provideInstanceEffect(directory))
-        .pipe(Effect.provide(InstanceLayer.layer), Effect.provide(CrossSpawnSpawner.defaultLayer))
+        .pipe(Effect.provide(InstanceLayer.layer), Effect.provide(providerLayer({}, isolatedAuth)))
+        .pipe(Effect.provide(CrossSpawnSpawner.defaultLayer))
 
-    const none = paid(yield* listIn(noneDir))
-    expect(paid(yield* listIn(keyedDir))).toBe(0)
+    const none = paid(yield* listWithIsolatedAuth(noneDir))
+    expect(paid(yield* listWithIsolatedAuth(keyedDir))).toBe(0)
 
-    const authPath = path.join(Global.Path.data, "auth.json")
-    const original = yield* Effect.promise(() => Filesystem.readText(authPath).catch(() => undefined))
-
-    yield* Effect.acquireRelease(
-      Effect.promise(() =>
-        Filesystem.writeAtomic(authPath, JSON.stringify({ opencode: { type: "api", key: "test-key" } })),
-      ),
-      () =>
-        Effect.promise(async () => {
-          if (original !== undefined) await Filesystem.write(authPath, original)
-          else await unlink(authPath).catch(() => undefined)
-        }),
+    yield* Effect.promise(() =>
+      Filesystem.writeAtomic(authPath, JSON.stringify({ opencode: { type: "api", key: "test-key" } })),
     )
-
-    const keyedCount = paid(yield* listIn(keyedDir))
+    const keyedCount = paid(yield* listWithIsolatedAuth(keyedDir))
 
     yield* Effect.promise(() => Filesystem.writeAtomic(authPath, "{}"))
-    const disconnected = paid(yield* listIn(keyedDir))
+    const disconnected = paid(yield* listWithIsolatedAuth(keyedDir))
 
     expect(none).toBe(0)
     expect(keyedCount).toBeGreaterThan(0)
     expect(disconnected).toBe(0)
-  }).pipe(provideMultiInstance),
+  }),
 )

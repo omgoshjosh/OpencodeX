@@ -254,6 +254,7 @@ function authLayer(scenario: RecordedScenario) {
   return Layer.mock(Auth.Service)({
     get: (providerID) => Effect.succeed(providerID === scenario.providerID ? replayAuth : undefined),
     all: () => Effect.succeed({ [scenario.providerID]: replayAuth }),
+    snapshot: () => Effect.succeed({ records: { [scenario.providerID]: replayAuth }, revision: "recording" }),
   })
 }
 

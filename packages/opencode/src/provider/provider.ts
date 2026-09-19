@@ -1698,6 +1698,7 @@ export const layer = Layer.effect(
         yield* Effect.promise(() =>
           refreshLocalProviders({
             state: {
+              authRevision: authSnapshot.revision,
               catalogSource: modelsDev,
               models: languages,
               providers,

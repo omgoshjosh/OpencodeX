@@ -6,8 +6,10 @@
 // and kills the process when the test scope closes. The OS-assigned port is
 // parsed off the "listening on http://..." line.
 import { describe, expect } from "bun:test"
-import { Effect, Schema } from "effect"
+import { Effect, Schedule, Schema } from "effect"
 import { HttpClient } from "effect/unstable/http"
+import { mkdir, rename, writeFile } from "node:fs/promises"
+import path from "node:path"
 import { cliIt } from "../../lib/cli-process"
 
 const HealthIdentity = Schema.Struct({
@@ -16,6 +18,16 @@ const HealthIdentity = Schema.Struct({
   databaseID: Schema.String,
   eventBusID: Schema.String,
 })
+
+function writeAuth(home: string, content: string) {
+  const file = path.join(home, ".local/share/opencode/auth.json")
+  const temporary = `${file}.next`
+  return Effect.promise(async () => {
+    await mkdir(path.dirname(file), { recursive: true })
+    await writeFile(temporary, content)
+    await rename(temporary, file)
+  })
+}
 
 describe("opencode serve (subprocess)", () => {
   cliIt.live(
@@ -71,10 +83,9 @@ describe("opencode serve (subprocess)", () => {
         // Serve claims exclusive per-database backend authority: a second
         // process on the same database must fail clearly, never replace the
         // live authority.
-        const second = yield* opencode.spawn(
-          ["serve", "--port", "0", "--hostname", "127.0.0.1", "--mdns", "false"],
-          { env: { OPENCODE_RUN_ID: "serve-second" } },
-        )
+        const second = yield* opencode.spawn(["serve", "--port", "0", "--hostname", "127.0.0.1", "--mdns", "false"], {
+          env: { OPENCODE_RUN_ID: "serve-second" },
+        })
         expect(second.exitCode).not.toBe(0)
         expect(second.stderr).toContain("A backend authority is already serving this database")
 
@@ -83,6 +94,40 @@ describe("opencode serve (subprocess)", () => {
           yield* (yield* client.get(`${first.url}/global/health`)).json,
         )
         expect(stillHealthy).toMatchObject({ processRole: "main", runID: "serve-first" })
+      }),
+    90_000,
+  )
+
+  cliIt.live(
+    "refreshes provider connectivity after isolated atomic auth replacements without exposing secrets",
+    ({ opencode, home }) =>
+      Effect.gen(function* () {
+        const secret = "sentinel-provider-auth-secret"
+        const server = yield* opencode.serve({ extraArgs: ["--print-logs"] })
+        const client = yield* HttpClient.HttpClient
+        const providers = () => client.get(`${server.url}/provider`).pipe(Effect.flatMap((response) => response.json))
+        const connected = (value: unknown) => {
+          if (!value || typeof value !== "object" || !("connected" in value)) return false
+          return Array.isArray(value.connected) && value.connected.includes("anthropic")
+        }
+
+        expect(connected(yield* providers())).toBe(false)
+        yield* writeAuth(home, JSON.stringify({ anthropic: { type: "api", key: secret } }))
+        yield* providers().pipe(
+          Effect.filterOrFail(connected, () => new Error("provider never connected after auth replacement")),
+          Effect.retry({ schedule: Schedule.spaced("250 millis"), times: 20 }),
+        )
+
+        yield* writeAuth(home, "{}")
+        const disconnected = yield* providers().pipe(
+          Effect.filterOrFail(
+            (value) => !connected(value),
+            () => new Error("provider never disconnected after auth replacement"),
+          ),
+          Effect.retry({ schedule: Schedule.spaced("250 millis"), times: 20 }),
+        )
+        expect(JSON.stringify(disconnected)).not.toContain(secret)
+        expect(server.stderr()).not.toContain(secret)
       }),
     90_000,
   )

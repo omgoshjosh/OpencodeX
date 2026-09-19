@@ -79,7 +79,7 @@ export const layer = (file = path.join(Global.Path.data, "auth.json"), hooks?: L
       const parse = (content: string) => {
         const raw = JSON.parse(content)
         if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("Invalid auth snapshot")
-        const records = Record.filterMap(raw as Record<string, unknown>, (value) =>
+        const records = Record.filterMap(Object.fromEntries(Object.entries(raw)), (value) =>
           Result.fromOption(decode(value), () => undefined),
         )
         if (Object.keys(records).length !== Object.keys(raw).length) throw new Error("Invalid auth snapshot")
@@ -112,7 +112,7 @@ export const layer = (file = path.join(Global.Path.data, "auth.json"), hooks?: L
 
       const snapshot = Effect.fn("Auth.snapshot")(() => lock.withPermits(1)(snapshotUnlocked()))
 
-      const mutate = <A>(fn: (records: Record<string, Info>) => Record<string, Info>) =>
+      const mutate = (fn: (records: Record<string, Info>) => Record<string, Info>) =>
         lock.withPermits(1)(
           Effect.gen(function* () {
             const lockFile = `${file}.lock`
@@ -123,8 +123,12 @@ export const layer = (file = path.join(Global.Path.data, "auth.json"), hooks?: L
                   try {
                     return await open(lockFile, "wx", 0o600)
                   } catch (error) {
-                    if ((error as NodeJS.ErrnoException).code !== "EEXIST" || Date.now() >= deadline) {
-                      throw new Error("Timed out acquiring auth mutation lock")
+                    const code =
+                      typeof error === "object" && error !== null && "code" in error && typeof error.code === "string"
+                        ? error.code
+                        : undefined
+                    if (code !== "EEXIST" || Date.now() >= deadline) {
+                      throw new Error("Timed out acquiring auth mutation lock", { cause: error })
                     }
                     await Bun.sleep(25)
                   }

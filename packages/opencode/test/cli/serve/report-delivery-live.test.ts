@@ -39,7 +39,9 @@ const Messages = Schema.Array(
 )
 const Delegation = Schema.Struct({
   metadata: Schema.Struct({
-    opencodex: Schema.Struct({ delegation: Schema.Struct({ deliveryOutcome: Schema.optional(Schema.String) }) }),
+    opencodex: Schema.Struct({
+      delegation: Schema.Struct({ runID: Schema.String, deliveryOutcome: Schema.optional(Schema.String) }),
+    }),
   }),
 })
 
@@ -59,10 +61,41 @@ async function messages(url: string, directory: string, sessionID: string) {
   return Schema.decodeUnknownSync(Messages)(await response.json())
 }
 
-async function deliveryOutcome(url: string, directory: string, sessionID: string) {
+async function delegation(url: string, directory: string, sessionID: string) {
   const response = await request(url, directory, `/session/${sessionID}`)
   if (response.status !== 200) return undefined
-  return Schema.decodeUnknownSync(Delegation)(await response.json()).metadata.opencodex.delegation.deliveryOutcome
+  return Schema.decodeUnknownSync(Delegation)(await response.json()).metadata.opencodex.delegation
+}
+
+async function deliveryOutcome(url: string, directory: string, sessionID: string) {
+  return (await delegation(url, directory, sessionID))?.deliveryOutcome
+}
+
+async function createParent(url: string, home: string) {
+  const created = await request(url, home, "/session", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      title: "orchestrator",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    }),
+  })
+  expect(created.status).toBe(200)
+  return Schema.decodeUnknownSync(Session)(await created.json())
+}
+
+async function promptParent(url: string, parent: { id: string; directory: string }) {
+  const prompt = await request(url, parent.directory, `/session/${parent.id}/prompt_async`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      messageID: "msg_e2e_557_parent_turn",
+      agent: "build",
+      model: { providerID: "test", modelID: "test-model" },
+      parts: [{ type: "text", text: PARENT_PROMPT }],
+    }),
+  })
+  expect(prompt.status).toBe(204)
 }
 
 async function poll<T>(label: string, read: () => Promise<T | undefined>, timeoutMs = 60_000) {
@@ -75,6 +108,14 @@ async function poll<T>(label: string, read: () => Promise<T | undefined>, timeou
   throw new Error(`${label} did not happen within ${timeoutMs}ms`)
 }
 
+// The request bodies: the parent's opening turn carries its prompt and no
+// tool call yet; the child's turn carries the delegated prompt and no tool
+// call. Everything else (the parent's continuation after the tool returns, its
+// follow-up on the report, titles) takes the server's automatic "ok".
+const body = (hit: { body: unknown }) => JSON.stringify(hit.body)
+const parentTurn = (hit: { body: unknown }) => body(hit).includes(PARENT_PROMPT) && !body(hit).includes("tool_calls")
+const childTurn = (hit: { body: unknown }) => body(hit).includes(CHILD_PROMPT) && !body(hit).includes("tool_calls")
+
 const isReport = (message: (typeof Messages)["Type"][number]) =>
   message.info.role === "user" &&
   message.parts.some((part) => part.type === "text" && part.synthetic === true && part.metadata?.task_report === true)
@@ -84,35 +125,17 @@ describe("background report delivery under an unregistered parent agent (subproc
     "delivers the report once, wakes the parent, and stamps the child delivered",
     ({ home, llm, opencode }) =>
       Effect.gen(function* () {
-        // The request bodies: the parent's opening turn carries its prompt and
-        // no tool call yet; the child's turn carries the delegated prompt and
-        // no tool call. Everything else (the parent's continuation after the
-        // tool returns, its follow-up on the report, titles) takes the
-        // server's automatic "ok".
-        const body = (hit: { body: unknown }) => JSON.stringify(hit.body)
-        yield* llm.toolMatch((hit) => body(hit).includes(PARENT_PROMPT) && !body(hit).includes("tool_calls"), "task", {
+        yield* llm.toolMatch(parentTurn, "task", {
           description: "e2e delegate",
           prompt: CHILD_PROMPT,
           subagent_type: "general",
           background: true,
         })
-        yield* llm.textMatch(
-          (hit) => body(hit).includes(CHILD_PROMPT) && !body(hit).includes("tool_calls"),
-          CHILD_REPORT,
-        )
+        yield* llm.textMatch(childTurn, CHILD_REPORT)
         const dbPath = path.join(home, "delivery.db")
         const serve = yield* opencode.serve({ env: { OPENCODE_DB: dbPath } })
         yield* Effect.tryPromise(async () => {
-          const created = await request(serve.url, home, "/session", {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({
-              title: "orchestrator",
-              permission: [{ permission: "*", pattern: "*", action: "allow" }],
-            }),
-          })
-          expect(created.status).toBe(200)
-          const parent = Schema.decodeUnknownSync(Session)(await created.json())
+          const parent = await createParent(serve.url, home)
 
           // The supported route refuses the name the production roots carried...
           const patched = await request(serve.url, parent.directory, `/session/${parent.id}`, {
@@ -129,17 +152,7 @@ describe("background report delivery under an unregistered parent agent (subproc
             db.close()
           }
 
-          const prompt = await request(serve.url, parent.directory, `/session/${parent.id}/prompt_async`, {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({
-              messageID: "msg_e2e_557_parent_turn",
-              agent: "build",
-              model: { providerID: "test", modelID: "test-model" },
-              parts: [{ type: "text", text: PARENT_PROMPT }],
-            }),
-          })
-          expect(prompt.status).toBe(204)
+          await promptParent(serve.url, parent)
 
           const report = await poll("task report", async () =>
             (await messages(serve.url, parent.directory, parent.id)).find(isReport),
@@ -165,6 +178,71 @@ describe("background report delivery under an unregistered parent agent (subproc
           expect(delivered).toBe("delivered")
           // Exactly once: the follow-up turn finished with nothing else queued.
           expect((await messages(serve.url, parent.directory, parent.id)).filter(isReport)).toHaveLength(1)
+        })
+      }),
+    180_000,
+  )
+
+  // A delivery that does fail has to leave a greppable trace: the daemon log
+  // line must carry the run and both session ids as fields. Passing the
+  // payload as a log argument rendered it `[object Object]` (OpencodeX-2kg),
+  // which is unsearchable by runID. The failure is injected at the database:
+  // a trigger refuses the report's session_command row, so the prompt's
+  // durable write dies inside the delivery handler and nowhere else.
+  cliIt.live(
+    "logs a failed delivery with runID and cause as fields, not [object Object]",
+    ({ home, llm, opencode }) =>
+      Effect.gen(function* () {
+        yield* llm.toolMatch(parentTurn, "task", {
+          description: "e2e delegate",
+          prompt: CHILD_PROMPT,
+          subagent_type: "general",
+          background: true,
+        })
+        yield* llm.textMatch(childTurn, CHILD_REPORT)
+        const dbPath = path.join(home, "delivery-failed.db")
+        const serve = yield* opencode.serve({ env: { OPENCODE_DB: dbPath }, extraArgs: ["--print-logs"] })
+        yield* Effect.tryPromise(async () => {
+          const parent = await createParent(serve.url, home)
+          const db = new Database(dbPath)
+          try {
+            db.run(
+              `create trigger e2e_557_refuse_report before insert on session_command
+                 when new.message_id like 'msg_task_report_%'
+                 begin select raise(abort, 'e2e 557: report refused'); end`,
+            )
+            await promptParent(serve.url, parent)
+            const childID = await poll("child session", async () => {
+              const row = db.query(`select id, directory from session where parent_id = ?`).get(parent.id)
+              return row === null ? undefined : Schema.decodeUnknownSync(Session)(row).id
+            })
+            const failed = await poll("failed stamp", async () => {
+              const outcome = await deliveryOutcome(serve.url, parent.directory, childID)
+              return outcome === "failed" ? outcome : undefined
+            })
+            expect(failed).toBe("failed")
+            const runID = (await delegation(serve.url, parent.directory, childID))?.runID
+            expect(runID).toBeDefined()
+
+            // One log entry: fields render before the message, and a pretty
+            // cause spans lines, so the entry runs from its level marker
+            // through the message.
+            const line = await poll("delivery failure log entry", async () => {
+              const text = serve.stderr()
+              const end = text.indexOf("background report delivery failed")
+              if (end === -1) return undefined
+              const start = text.lastIndexOf("\nERROR ", end)
+              return text.slice(start === -1 ? 0 : start + 1, text.indexOf("\n", end))
+            })
+            expect(line).not.toContain("[object Object]")
+            expect(line).toContain(`runID=${runID}`)
+            expect(line).toContain(`childSessionID=${childID}`)
+            expect(line).toContain(`parentSessionID=${parent.id}`)
+            expect(line).toContain("cause=")
+            expect(line).toContain("e2e 557: report refused")
+          } finally {
+            db.close()
+          }
         })
       }),
     180_000,

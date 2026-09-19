@@ -1,4 +1,6 @@
 import path from "path"
+import { open, rename, rm, mkdir } from "node:fs/promises"
+import { randomUUID } from "node:crypto"
 import { Effect, Layer, Record, Result, Schema, Context, Semaphore, Schedule } from "effect"
 import { EventV2 } from "@opencode-ai/core/event"
 import { NonNegativeInt } from "@opencode-ai/core/schema"
@@ -104,6 +106,56 @@ export const layer = (file = path.join(Global.Path.data, "auth.json")) =>
 
       const snapshot = Effect.fn("Auth.snapshot")(() => lock.withPermits(1)(snapshotUnlocked()))
 
+      const mutate = <A>(fn: (records: Record<string, Info>) => Record<string, Info>) =>
+        lock.withPermits(1)(
+          Effect.gen(function* () {
+            const lockFile = `${file}.lock`
+            const handle = yield* Effect.tryPromise({
+              try: async () => {
+                const deadline = Date.now() + 2_000
+                while (true) {
+                  try {
+                    return await open(lockFile, "wx", 0o600)
+                  } catch (error) {
+                    if ((error as NodeJS.ErrnoException).code !== "EEXIST" || Date.now() >= deadline) {
+                      throw new Error("Timed out acquiring auth mutation lock")
+                    }
+                    await Bun.sleep(25)
+                  }
+                }
+              },
+              catch: fail("Failed to acquire auth mutation lock"),
+            })
+            return yield* Effect.gen(function* () {
+              // Cooperating writers serialize through this lock; arbitrary external renames remain last-writer-wins.
+              const next = fn((yield* snapshotFromFile()).records)
+              const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`
+              yield* Effect.tryPromise({
+                try: async () => {
+                  await mkdir(path.dirname(file), { recursive: true })
+                  const output = await open(temporary, "wx", 0o600)
+                  try {
+                    await output.writeFile(JSON.stringify(next, null, 2))
+                    await output.sync()
+                  } finally {
+                    await output.close()
+                  }
+                  await rename(temporary, file)
+                },
+                catch: fail("Failed to write auth data"),
+              }).pipe(Effect.ensuring(Effect.promise(() => rm(temporary, { force: true }))))
+              last = { records: next, revision: Hash.fast(JSON.stringify(next, null, 2)) }
+            }).pipe(
+              Effect.ensuring(
+                Effect.promise(async () => {
+                  await handle.close()
+                  await rm(lockFile, { force: true })
+                }),
+              ),
+            )
+          }),
+        )
+
       const all = Effect.fn("Auth.all")(function* () {
         return (yield* snapshot()).records
       })
@@ -113,31 +165,23 @@ export const layer = (file = path.join(Global.Path.data, "auth.json")) =>
       })
 
       const set = Effect.fn("Auth.set")(function* (key: string, info: Info) {
-        yield* lock.withPermits(1)(
-          Effect.gen(function* () {
-            const norm = key.replace(/\/+$/, "")
-            // External writers replace the file atomically; reload it under our lock before merging.
-            const data = (yield* snapshotFromFile()).records
-            const next = { ...data, [norm]: info }
-            if (norm !== key) delete next[key]
-            delete next[norm + "/"]
-            yield* fsys.writeJson(file, next, 0o600).pipe(Effect.mapError(fail("Failed to write auth data")))
-            last = { records: next, revision: Hash.fast(JSON.stringify(next, null, 2)) }
-          }),
-        )
+        yield* mutate((data) => {
+          const norm = key.replace(/\/+$/, "")
+          const next = { ...data, [norm]: info }
+          if (norm !== key) delete next[key]
+          delete next[norm + "/"]
+          return next
+        })
       })
 
       const remove = Effect.fn("Auth.remove")(function* (key: string) {
-        yield* lock.withPermits(1)(
-          Effect.gen(function* () {
-            const norm = key.replace(/\/+$/, "")
-            const next = { ...(yield* snapshotFromFile()).records }
-            delete next[key]
-            delete next[norm]
-            yield* fsys.writeJson(file, next, 0o600).pipe(Effect.mapError(fail("Failed to write auth data")))
-            last = { records: next, revision: Hash.fast(JSON.stringify(next, null, 2)) }
-          }),
-        )
+        yield* mutate((data) => {
+          const norm = key.replace(/\/+$/, "")
+          const next = { ...data }
+          delete next[key]
+          delete next[norm]
+          return next
+        })
       })
 
       let observedRevision = (yield* snapshot()).revision

@@ -133,7 +133,9 @@ describe("background report delivery under an unregistered parent agent (subproc
         })
         yield* llm.textMatch(childTurn, CHILD_REPORT)
         const dbPath = path.join(home, "delivery.db")
-        const serve = yield* opencode.serve({ env: { OPENCODE_DB: dbPath } })
+        const serve = yield* opencode.serve({
+          env: { OPENCODE_DB: dbPath, OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS: "true" },
+        })
         yield* Effect.tryPromise(async () => {
           const parent = await createParent(serve.url, home)
 
@@ -201,7 +203,10 @@ describe("background report delivery under an unregistered parent agent (subproc
         })
         yield* llm.textMatch(childTurn, CHILD_REPORT)
         const dbPath = path.join(home, "delivery-failed.db")
-        const serve = yield* opencode.serve({ env: { OPENCODE_DB: dbPath }, extraArgs: ["--print-logs"] })
+        const serve = yield* opencode.serve({
+          env: { OPENCODE_DB: dbPath, OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS: "true" },
+          extraArgs: ["--print-logs"],
+        })
         yield* Effect.tryPromise(async () => {
           const parent = await createParent(serve.url, home)
           const db = new Database(dbPath)

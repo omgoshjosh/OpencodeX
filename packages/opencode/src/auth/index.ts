@@ -68,23 +68,17 @@ export const layer = (file = path.join(Global.Path.data, "auth.json")) =>
       const lock = Semaphore.makeUnsafe(1)
       let last: Snapshot | undefined
 
-      const snapshotUnlocked = Effect.fnUntraced(function* () {
-        const parse = (content: string) => {
-          const raw = JSON.parse(content)
-          if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("Invalid auth snapshot")
-          const records = Record.filterMap(raw as Record<string, unknown>, (value) =>
-            Result.fromOption(decode(value), () => undefined),
-          )
-          if (Object.keys(records).length !== Object.keys(raw).length) throw new Error("Invalid auth snapshot")
-          return { records, revision: Hash.fast(content) }
-        }
-        if (process.env.OPENCODE_AUTH_CONTENT) {
-          try {
-            const next = parse(process.env.OPENCODE_AUTH_CONTENT)
-            last = next
-            return next
-          } catch {}
-        }
+      const parse = (content: string) => {
+        const raw = JSON.parse(content)
+        if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("Invalid auth snapshot")
+        const records = Record.filterMap(raw as Record<string, unknown>, (value) =>
+          Result.fromOption(decode(value), () => undefined),
+        )
+        if (Object.keys(records).length !== Object.keys(raw).length) throw new Error("Invalid auth snapshot")
+        return { records, revision: Hash.fast(content) }
+      }
+
+      const snapshotFromFile = Effect.fnUntraced(function* () {
         const content = new TextDecoder().decode(
           yield* fsys.readFile(file).pipe(Effect.orElseSucceed(() => new Uint8Array())),
         )
@@ -95,6 +89,17 @@ export const layer = (file = path.join(Global.Path.data, "auth.json")) =>
         } catch {
           return last ?? { records: {}, revision: Hash.fast("") }
         }
+      })
+
+      const snapshotUnlocked = Effect.fnUntraced(function* () {
+        if (process.env.OPENCODE_AUTH_CONTENT) {
+          try {
+            const next = parse(process.env.OPENCODE_AUTH_CONTENT)
+            last = next
+            return next
+          } catch {}
+        }
+        return yield* snapshotFromFile()
       })
 
       const snapshot = Effect.fn("Auth.snapshot")(() => lock.withPermits(1)(snapshotUnlocked()))
@@ -111,7 +116,8 @@ export const layer = (file = path.join(Global.Path.data, "auth.json")) =>
         yield* lock.withPermits(1)(
           Effect.gen(function* () {
             const norm = key.replace(/\/+$/, "")
-            const data = last?.records ?? (yield* snapshotUnlocked()).records
+            // External writers replace the file atomically; reload it under our lock before merging.
+            const data = (yield* snapshotFromFile()).records
             const next = { ...data, [norm]: info }
             if (norm !== key) delete next[key]
             delete next[norm + "/"]
@@ -125,7 +131,7 @@ export const layer = (file = path.join(Global.Path.data, "auth.json")) =>
         yield* lock.withPermits(1)(
           Effect.gen(function* () {
             const norm = key.replace(/\/+$/, "")
-            const next = { ...(last?.records ?? (yield* snapshotUnlocked()).records) }
+            const next = { ...(yield* snapshotFromFile()).records }
             delete next[key]
             delete next[norm]
             yield* fsys.writeJson(file, next, 0o600).pipe(Effect.mapError(fail("Failed to write auth data")))

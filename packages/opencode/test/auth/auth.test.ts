@@ -124,4 +124,35 @@ describe("Auth", () => {
       }),
     ),
   )
+
+  it.instance("merges locked mutations with the latest valid external snapshot", () =>
+    isolated(
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const auth = yield* Auth.Service
+        const authPath = path.join(test.directory, "auth.json")
+        yield* auth.set("target", { type: "api", key: "old" })
+
+        yield* Effect.promise(() =>
+          Bun.write(
+            authPath,
+            JSON.stringify({ external: { type: "api", key: "external" }, target: { type: "api", key: "stale" } }),
+          ),
+        )
+        yield* auth.set("target", { type: "api", key: "new" })
+        expect((yield* auth.all()).external).toMatchObject({ key: "external" })
+        expect((yield* auth.all()).target).toMatchObject({ key: "new" })
+
+        yield* Effect.promise(() => Bun.write(authPath, "{"))
+        yield* auth.remove("target")
+        expect((yield* auth.all()).external).toMatchObject({ key: "external" })
+        expect((yield* auth.all()).target).toBeUndefined()
+
+        yield* Effect.promise(() => Bun.write(authPath, JSON.stringify({ external: { type: "api" } })))
+        yield* auth.set("replacement", { type: "api", key: "replacement" })
+        expect((yield* auth.all()).external).toMatchObject({ key: "external" })
+        expect((yield* auth.all()).replacement).toMatchObject({ key: "replacement" })
+      }),
+    ),
+  )
 })

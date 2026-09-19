@@ -20,10 +20,22 @@ const it = testEffect(
   Layer.mergeAll(Provider.defaultLayer, Env.defaultLayer, Plugin.defaultLayer, CrossSpawnSpawner.defaultLayer),
 )
 
+// The header deadline is a real setTimeout armed when fetch() starts, so this
+// test has one wall-clock dependency it cannot remove: the loopback request
+// must reach the in-process server and its headers must come back inside the
+// budget. Measured start->first-chunk latency on a 12-core box is ~9 ms idle
+// and up to 358 ms with the CPU 2x oversubscribed (30 runs each); a 50 ms
+// budget failed on the Windows runner. Keep the budget an order of magnitude
+// above the worst measurement. The other half of the property is not wall-clock
+// bound: the server arms its body timer only after the request arrives, i.e.
+// after the header timer was armed, and gives it a longer delay, so it always
+// fires after the header deadline would have.
+const HEADER_BUDGET = 2000
+
 it.live("headerTimeout does not abort delayed SSE body after headers arrive", () =>
   Effect.gen(function* () {
     const server = yield* Effect.acquireRelease(
-      Effect.promise(() => delayedBodyServer(250)),
+      Effect.promise(() => delayedBodyServer(HEADER_BUDGET + 100)),
       (server) => Effect.sync(() => server.server.close()),
     )
 
@@ -32,16 +44,28 @@ it.live("headerTimeout does not abort delayed SSE body after headers arrive", ()
         Effect.gen(function* () {
           const provider = yield* Provider.Service
           const model = yield* provider.getModel(ProviderV2.ID.make("test"), ProviderV2.ModelID.make("test-model"))
+          const started = performance.now()
           const result = streamText({
             model: yield* provider.getLanguage(model),
             messages: [{ role: "user", content: "hello" }],
           })
 
-          expect(yield* Effect.promise(() => result.text)).toBe("late")
+          const text = yield* Effect.tryPromise({
+            try: () => result.text,
+            catch: (error) => {
+              const headers = server.requestAt === undefined ? "never" : `${(server.requestAt - started).toFixed(0)}ms`
+              return new Error(`stream failed; request reached server after ${headers}: ${String(error)}`, {
+                cause: error,
+              })
+            },
+          })
+          expect(text).toBe("late")
         }),
-      { config: providerConfig(server.url, { headerTimeout: 50 }) },
+      { config: providerConfig(server.url, { headerTimeout: HEADER_BUDGET }) },
     )
   }),
+  // Instance bootstrap plus the held body exceed bun's 5 s default; match the package script.
+  { timeout: 30_000 },
 )
 
 it.live("chunkTimeout raises a response stream error when SSE body stalls", () =>
@@ -197,8 +221,13 @@ async function delayedHeaderServer(delay: number): Promise<{ server: Server; url
   return { server, url: `http://127.0.0.1:${address.port}` }
 }
 
-async function delayedBodyServer(delay: number): Promise<{ server: Server; url: string }> {
+// Flushes headers as soon as the request arrives and holds the body for `delay`
+// on a timer armed at that moment. `requestAt` is when the request was seen,
+// for diagnosing a header deadline that expired on a slow runner.
+async function delayedBodyServer(delay: number): Promise<{ server: Server; url: string; requestAt?: number }> {
+  const handle: { requestAt?: number } = {}
   const server = createServer((_, res) => {
+    handle.requestAt = performance.now()
     res.writeHead(200, { "content-type": "text/event-stream" })
     res.flushHeaders()
     setTimeout(() => {
@@ -208,7 +237,7 @@ async function delayedBodyServer(delay: number): Promise<{ server: Server; url: 
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
   const address = server.address()
   if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port")
-  return { server, url: `http://127.0.0.1:${address.port}` }
+  return Object.assign(handle, { server, url: `http://127.0.0.1:${address.port}` })
 }
 
 function withAuthContent<A, E, R>(self: Effect.Effect<A, E, R>, value: Record<string, unknown> = defaultAuthContent()) {

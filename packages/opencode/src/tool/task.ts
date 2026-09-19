@@ -755,13 +755,16 @@ export const TaskTool = Tool.define(
                   sessions
                     .stampDelegationDelivery({ sessionID: nextSession.id, runID, outcome: "delivered" })
                     .pipe(Effect.ignore),
+                // Fields go through annotateLogs: a payload object passed as a
+                // log argument renders as `[object Object]` (OpencodeX-2kg).
                 onFailure: (cause) =>
-                  Effect.logError("background report delivery failed", {
-                    parentSessionID: ctx.sessionID,
-                    childSessionID: nextSession.id,
-                    runID,
-                    cause,
-                  }).pipe(
+                  Effect.logError("background report delivery failed").pipe(
+                    Effect.annotateLogs({
+                      parentSessionID: ctx.sessionID,
+                      childSessionID: nextSession.id,
+                      runID,
+                      cause: Cause.pretty(cause),
+                    }),
                     Effect.andThen(
                       sessions.stampDelegationDelivery({ sessionID: nextSession.id, runID, outcome: "failed" }),
                     ),

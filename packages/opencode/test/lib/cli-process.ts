@@ -162,6 +162,8 @@ export type ServeHandle = {
   readonly url: string
   readonly hostname: string
   readonly port: number
+  // Test-only child identity; never exposed through the server API.
+  readonly pid: number
   // Sends SIGTERM. The scope finalizer also calls this, so tests rarely need
   // to invoke it directly — useful for tests that assert exit behavior.
   readonly kill: () => void
@@ -171,6 +173,8 @@ export type ServeHandle = {
   // in `extraArgs` this is the server log, so a test can assert on structured
   // INFO lines (e.g. `db_connection_open`) without a log file.
   readonly stderr: () => string
+  // Includes the readiness line and any subsequent child stdout.
+  readonly stdout: () => string
 }
 
 // `opencode acp` speaks newline-delimited JSON-RPC over stdin/stdout. It is
@@ -331,6 +335,7 @@ export function withCliFixture<A, E>(
       // also keeps the OS pipe buffer from filling and wedging the child.
       const stderrChunks: string[] = []
       yield* forkStderrDrain(proc.stderr, stderrChunks)
+      const stdoutChunks: string[] = []
 
       // Watch stdout line-by-line for the listening sentinel. Format
       // (see src/cli/cmd/serve.ts):
@@ -342,6 +347,7 @@ export function withCliFixture<A, E>(
           Stream.decodeText(),
           Stream.splitLines,
           Stream.runForEach((line) => {
+            stdoutChunks.push(line + "\n")
             const m = line.match(readyRe)
             return m ? Deferred.succeed(readyDeferred, { url: m[1], hostname: m[2], port: Number(m[3]) }) : Effect.void
           }),
@@ -377,11 +383,13 @@ export function withCliFixture<A, E>(
         url: match.url,
         hostname: match.hostname,
         port: match.port,
+        pid: proc.pid,
         kill: () => {
           proc.kill()
         },
         exited: proc.exited,
         stderr: () => stderrChunks.join(""),
+        stdout: () => stdoutChunks.join(""),
       } satisfies ServeHandle
     })
 

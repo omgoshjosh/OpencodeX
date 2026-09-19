@@ -150,6 +150,7 @@ describe("opencode serve (subprocess)", () => {
         const secret = "sentinel-provider-auth-secret"
         const rotated = "sentinel-provider-auth-secret-rotated"
         const server = yield* opencode.serve({ extraArgs: ["--print-logs"] })
+        const pid = server.pid
         const client = yield* HttpClient.HttpClient
         const events = yield* Effect.acquireRelease(
           Effect.promise(() => openGlobalEvents(server.url)),
@@ -173,6 +174,7 @@ describe("opencode serve (subprocess)", () => {
           )
         const before = yield* identity()
         expect(connected(yield* providers())).toBe(false)
+        const connectEvent = Effect.promise(() => authChanged(events))
         yield* writeAuth(home, JSON.stringify({ anthropic: { type: "api", key: secret } }))
         yield* providers().pipe(
           Effect.filterOrFail(connected, () => new Error("provider never connected after auth replacement")),
@@ -180,8 +182,10 @@ describe("opencode serve (subprocess)", () => {
         )
         const duringConnect = yield* Effect.all(Array.from({ length: 12 }, providers))
         expect(duringConnect.every(connected)).toBe(true)
+        expect(JSON.stringify(yield* connectEvent)).not.toContain(secret)
+        expect(server.pid).toBe(pid)
 
-        const changed = Effect.promise(() => authChanged(events)).pipe(
+        const rotateEvent = Effect.promise(() => authChanged(events)).pipe(
           Effect.timeoutOrElse({
             duration: "5 seconds",
             orElse: () => Effect.die(new Error("auth rotation event timed out")),
@@ -190,8 +194,10 @@ describe("opencode serve (subprocess)", () => {
         yield* writeAuth(home, JSON.stringify({ anthropic: { type: "api", key: rotated } }))
         const duringRotation = yield* Effect.all(Array.from({ length: 12 }, providers))
         expect(duringRotation.every(connected)).toBe(true)
-        expect(JSON.stringify(yield* changed)).not.toContain(rotated)
+        expect(JSON.stringify(yield* rotateEvent)).not.toContain(rotated)
+        expect(server.pid).toBe(pid)
 
+        const disconnectEvent = Effect.promise(() => authChanged(events))
         yield* writeAuth(home, "{}")
         const disconnected = yield* providers().pipe(
           Effect.filterOrFail(
@@ -202,7 +208,10 @@ describe("opencode serve (subprocess)", () => {
         )
         const duringDisconnect = yield* Effect.all(Array.from({ length: 12 }, providers))
         expect(duringDisconnect.every((value) => !connected(value))).toBe(true)
+        expect(JSON.stringify(yield* disconnectEvent)).not.toContain(secret)
+        expect(server.pid).toBe(pid)
 
+        const putEvent = Effect.promise(() => authChanged(events))
         const put = yield* Effect.promise(() =>
           fetch(`${server.url}/auth/anthropic`, {
             method: "PUT",
@@ -211,12 +220,17 @@ describe("opencode serve (subprocess)", () => {
           }),
         )
         expect(put.ok).toBe(true)
+        expect(yield* Effect.promise(() => put.text())).not.toContain(secret)
         yield* providers().pipe(
           Effect.filterOrFail(connected, () => new Error("provider never connected after auth PUT")),
           Effect.retry({ schedule: Schedule.spaced("250 millis"), times: 20 }),
         )
+        expect(JSON.stringify(yield* putEvent)).not.toContain(secret)
+        expect(server.pid).toBe(pid)
+        const deleteEvent = Effect.promise(() => authChanged(events))
         const remove = yield* Effect.promise(() => fetch(`${server.url}/auth/anthropic`, { method: "DELETE" }))
         expect(remove.ok).toBe(true)
+        expect(yield* Effect.promise(() => remove.text())).not.toContain(secret)
         yield* providers().pipe(
           Effect.filterOrFail(
             (value) => !connected(value),
@@ -224,12 +238,16 @@ describe("opencode serve (subprocess)", () => {
           ),
           Effect.retry({ schedule: Schedule.spaced("250 millis"), times: 20 }),
         )
+        expect(JSON.stringify(yield* deleteEvent)).not.toContain(secret)
+        expect(server.pid).toBe(pid)
         expect(yield* identity()).toEqual(before)
         expect(JSON.stringify(disconnected)).not.toContain(secret)
         expect(responses.join("\n")).not.toContain(secret)
         expect(responses.join("\n")).not.toContain(rotated)
         expect(server.stderr()).not.toContain(secret)
         expect(server.stderr()).not.toContain(rotated)
+        expect(server.stdout()).not.toContain(secret)
+        expect(server.stdout()).not.toContain(rotated)
       }),
     90_000,
   )

@@ -1899,6 +1899,19 @@ isolatedProvider.effect("opencode loader refreshes an existing provider state af
         .pipe(provideInstanceEffect(directory))
         .pipe(Effect.provide(InstanceLayer.layer), Effect.provide(providerLayer({}, isolatedAuth)))
         .pipe(Effect.provide(CrossSpawnSpawner.defaultLayer))
+    const languageWithIsolatedAuth = (directory: string) =>
+      Provider.Service.use((provider) =>
+        Effect.gen(function* () {
+          const model = yield* provider.getModel(
+            ProviderV2.ID.anthropic,
+            ProviderV2.ModelID.make("claude-sonnet-4-20250514"),
+          )
+          return yield* provider.getLanguage(model)
+        }),
+      )
+        .pipe(provideInstanceEffect(directory))
+        .pipe(Effect.provide(InstanceLayer.layer), Effect.provide(providerLayer({}, isolatedAuth)))
+        .pipe(Effect.provide(CrossSpawnSpawner.defaultLayer))
 
     const none = paid(yield* listWithIsolatedAuth(noneDir))
     expect(paid(yield* listWithIsolatedAuth(keyedDir))).toBe(0)
@@ -1908,11 +1921,21 @@ isolatedProvider.effect("opencode loader refreshes an existing provider state af
     )
     const keyedCount = paid(yield* listWithIsolatedAuth(keyedDir))
 
+    yield* Effect.promise(() =>
+      Filesystem.writeAtomic(authPath, JSON.stringify({ anthropic: { type: "api", key: "first" } })),
+    )
+    const firstLanguage = yield* languageWithIsolatedAuth(keyedDir)
+    yield* Effect.promise(() =>
+      Filesystem.writeAtomic(authPath, JSON.stringify({ anthropic: { type: "api", key: "second" } })),
+    )
+    const rotatedLanguage = yield* languageWithIsolatedAuth(keyedDir)
+
     yield* Effect.promise(() => Filesystem.writeAtomic(authPath, "{}"))
     const disconnected = paid(yield* listWithIsolatedAuth(keyedDir))
 
     expect(none).toBe(0)
     expect(keyedCount).toBeGreaterThan(0)
+    expect(rotatedLanguage).not.toBe(firstLanguage)
     expect(disconnected).toBe(0)
   }),
 )

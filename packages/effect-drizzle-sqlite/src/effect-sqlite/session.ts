@@ -1,4 +1,5 @@
 /* oxlint-disable */
+import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
@@ -190,10 +191,9 @@ export class EffectSQLiteSession<TRelations extends AnyRelations> extends SQLite
                         )
                     ).pipe(
                       Effect.catchCause((cause) =>
-                        Effect.logDebug("effect-drizzle-sqlite transaction unwind failed", {
-                          transactionID: id,
-                          cause,
-                        }),
+                        Effect.logDebug("effect-drizzle-sqlite transaction unwind failed").pipe(
+                          Effect.annotateLogs({ transactionID: id, cause: Cause.pretty(cause) }),
+                        ),
                       ),
                     )
                 const scoped = scope === undefined ? finalize : Effect.ensuring(finalize, Scope.close(scope, exit))

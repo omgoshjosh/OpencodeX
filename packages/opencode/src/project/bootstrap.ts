@@ -7,7 +7,7 @@ import * as Project from "./project"
 import * as Vcs from "./vcs"
 import { InstanceState } from "@/effect/instance-state"
 import { FileWatcher } from "@/file/watcher"
-import { Effect, Layer } from "effect"
+import { Cause, Effect, Layer } from "effect"
 import { Config } from "@/config/config"
 import { Service } from "./bootstrap-service"
 import { Reference } from "@/reference/reference"
@@ -48,7 +48,9 @@ export const layer = Layer.effect(
         (s) =>
           s.init().pipe(
             Effect.timeout("5 seconds"),
-            Effect.catchCause((cause) => Effect.logWarning("init failed", { cause })),
+            Effect.catchCause((cause) =>
+              Effect.logWarning("init failed").pipe(Effect.annotateLogs({ cause: Cause.pretty(cause) })),
+            ),
           ),
         { concurrency: "unbounded", discard: true },
       ).pipe(Effect.withSpan("InstanceBootstrap.init"))

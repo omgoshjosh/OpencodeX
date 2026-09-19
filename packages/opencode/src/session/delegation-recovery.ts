@@ -2,7 +2,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
 import { SessionExecutionTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { and, eq } from "drizzle-orm"
-import { Context, Effect } from "effect"
+import { Cause, Context, Effect } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import { SessionExecutionOwner } from "./execution-owner"
 import { delegationRecord, settleDelegation } from "./delegation-outcome"
@@ -174,11 +174,10 @@ export function make(deps: Deps) {
           .pipe(
             Effect.as(true),
             Effect.catchCause((cause) =>
-              Effect.logWarning("delegation recovery delivery failed", {
-                child: child.id,
-                runID: settled.runID,
-                cause,
-              }).pipe(Effect.as(false)),
+              Effect.logWarning("delegation recovery delivery failed").pipe(
+                Effect.annotateLogs({ child: child.id, runID: settled.runID, cause: Cause.pretty(cause) }),
+                Effect.as(false),
+              ),
             ),
           )
         yield* deps.sessions.stampDelegationDelivery({
@@ -189,7 +188,11 @@ export function make(deps: Deps) {
         })
         yield* deps.refresh(parent.value.id)
       }).pipe(
-        Effect.catchCause((cause) => Effect.logWarning("delegation recovery failed", { child: childSessionID, cause })),
+        Effect.catchCause((cause) =>
+          Effect.logWarning("delegation recovery failed").pipe(
+            Effect.annotateLogs({ child: childSessionID, cause: Cause.pretty(cause) }),
+          ),
+        ),
       )
     })
 

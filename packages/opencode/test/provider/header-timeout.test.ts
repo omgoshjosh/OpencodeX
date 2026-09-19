@@ -298,7 +298,7 @@ async function echoedCredentialServer(secret: string) {
   }
   const server = createServer(async (request, response) => {
     seen.url = request.url ?? ""
-    seen.body = await new Response(request as never).text()
+    for await (const chunk of request) seen.body += String(chunk)
     seen.authorizationMatched = request.headers.authorization === `Bearer ${secret}`
     response.writeHead(401, { "content-type": "application/json", "x-upstream-echo": secret })
     response.end(JSON.stringify({ error: secret }))

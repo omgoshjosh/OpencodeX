@@ -60,7 +60,13 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Auth") {}
 
-export const layer = (file = path.join(Global.Path.data, "auth.json")) =>
+export interface LayerTestHooks {
+  afterLock?: () => Promise<void>
+  afterRead?: () => Promise<void>
+  afterTempOpen?: (temporary: string) => Promise<void>
+}
+
+export const layer = (file = path.join(Global.Path.data, "auth.json"), hooks?: LayerTestHooks) =>
   Layer.effect(
     Service,
     Effect.gen(function* () {
@@ -128,13 +134,16 @@ export const layer = (file = path.join(Global.Path.data, "auth.json")) =>
             })
             return yield* Effect.gen(function* () {
               // Cooperating writers serialize through this lock; arbitrary external renames remain last-writer-wins.
+              if (hooks?.afterLock) yield* Effect.promise(hooks.afterLock)
               const next = fn((yield* snapshotFromFile()).records)
+              if (hooks?.afterRead) yield* Effect.promise(hooks.afterRead)
               const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`
               yield* Effect.tryPromise({
                 try: async () => {
                   await mkdir(path.dirname(file), { recursive: true })
                   const output = await open(temporary, "wx", 0o600)
                   try {
+                    if (hooks?.afterTempOpen) await hooks.afterTempOpen(temporary)
                     await output.writeFile(JSON.stringify(next, null, 2))
                     await output.sync()
                   } finally {

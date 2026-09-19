@@ -1,7 +1,7 @@
 import { describe, expect } from "bun:test"
 import { Effect, Layer } from "effect"
 import path from "path"
-import { open, rename, rm, writeFile, readdir } from "node:fs/promises"
+import { open, rename, rm, writeFile, readdir, mkdir, stat } from "node:fs/promises"
 import { Auth } from "../../src/auth"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { AppFileSystem } from "@opencode-ai/core/filesystem"
@@ -19,6 +19,19 @@ const isolated = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
     return yield* effect.pipe(
       Effect.provide(
         Auth.layer(path.join(test.directory, "auth.json")).pipe(
+          Layer.provide(AppFileSystem.defaultLayer),
+          Layer.provide(EventV2.defaultLayer),
+        ),
+      ),
+    )
+  })
+
+const isolatedWith = <A, E, R>(hooks: Auth.LayerTestHooks, effect: Effect.Effect<A, E, R>) =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    return yield* effect.pipe(
+      Effect.provide(
+        Auth.layer(path.join(test.directory, "auth.json"), hooks).pipe(
           Layer.provide(AppFileSystem.defaultLayer),
           Layer.provide(EventV2.defaultLayer),
         ),
@@ -246,4 +259,57 @@ describe("Auth", () => {
       ),
     { timeout: 10_000 },
   )
+
+  it.instance("cleans lock and temp after rename failure and creates 0600 files", () => {
+    let temporary = ""
+    return isolatedWith(
+      {
+        afterTempOpen: async (file) => {
+          temporary = file
+          if (process.platform !== "win32") expect((await stat(file)).mode & 0o777).toBe(0o600)
+        },
+      },
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const auth = yield* Auth.Service
+        const authFile = path.join(test.directory, "auth.json")
+        yield* Effect.promise(() => mkdir(authFile))
+        expect((yield* auth.set("fails", { type: "api", key: "secret" }).pipe(Effect.exit))._tag).toBe("Failure")
+        expect(yield* Effect.promise(() => Bun.file(`${authFile}.lock`).exists())).toBe(false)
+        expect(yield* Effect.promise(() => Bun.file(temporary).exists())).toBe(false)
+        yield* Effect.promise(() => rm(authFile, { recursive: true }))
+        yield* auth.set("works", { type: "api", key: "ok" })
+        if (process.platform !== "win32") expect((yield* Effect.promise(() => stat(authFile))).mode & 0o777).toBe(0o600)
+        expect((yield* auth.all()).works).toMatchObject({ key: "ok" })
+      }),
+    )
+  })
+
+  it.instance("treats non-cooperating atomic rename as last-writer-wins whole snapshots", () => {
+    const observed: string[] = []
+    return isolatedWith(
+      {},
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const authFile = path.join(test.directory, "auth.json")
+        const auth = yield* Auth.Service
+        yield* auth.set("initial", { type: "api", key: "initial" })
+        observed.push(yield* Effect.promise(() => Bun.file(authFile).text()))
+        yield* Effect.promise(() => {
+          const temporary = `${authFile}.external.tmp`
+          return writeFile(temporary, JSON.stringify({ external: { type: "api", key: "external" } }), {
+            mode: 0o600,
+          }).then(() => rename(temporary, authFile))
+        })
+        observed.push(yield* Effect.promise(() => Bun.file(authFile).text()))
+        yield* auth.set("internal", { type: "api", key: "internal" })
+        observed.push(yield* Effect.promise(() => Bun.file(authFile).text()))
+        expect(observed.every((content) => typeof JSON.parse(content) === "object")).toBe(true)
+        expect(yield* Effect.promise(() => Bun.file(authFile).json())).toEqual({
+          external: { type: "api", key: "external" },
+          internal: { type: "api", key: "internal" },
+        })
+      }),
+    )
+  })
 })

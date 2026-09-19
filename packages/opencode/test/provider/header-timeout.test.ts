@@ -172,6 +172,39 @@ it.live("header timeout never surfaces a configured credential", () =>
   }),
 )
 
+it.live("upstream credential echoes never reach surfaced provider errors", () =>
+  Effect.gen(function* () {
+    const secret = "sentinel-upstream-echo-secret"
+    const server = yield* Effect.acquireRelease(
+      Effect.promise(() => echoedCredentialServer(secret)),
+      (server) => Effect.sync(() => server.server.close()),
+    )
+    yield* provideTmpdirInstance(
+      () =>
+        Effect.gen(function* () {
+          const provider = yield* Provider.Service
+          const model = yield* provider.getModel(ProviderV2.ID.make("test"), ProviderV2.ModelID.make("test-model"))
+          const result = streamText({
+            model: yield* provider.getLanguage(model),
+            maxRetries: 0,
+            onError() {},
+            messages: [{ role: "user", content: "hello" }],
+          })
+          const errors = yield* Effect.promise(async () => {
+            const errors: string[] = []
+            for await (const part of result.fullStream) if (part.type === "error") errors.push(String(part.error))
+            return errors
+          })
+          expect(server.seen.authorizationMatched).toBe(true)
+          expect(server.seen.url).not.toContain(secret)
+          expect(server.seen.body).not.toContain(secret)
+          expect(errors.join("\n")).not.toContain(secret)
+        }),
+      { config: providerConfig(server.url, { apiKey: secret }) },
+    )
+  }),
+)
+
 it.live("headerTimeout is opt-in for non-OpenAI providers", () =>
   Effect.gen(function* () {
     const server = yield* Effect.acquireRelease(
@@ -255,6 +288,25 @@ async function delayedHeaderServer(delay: number): Promise<{ server: Server; url
   const address = server.address()
   if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port")
   return { server, url: `http://127.0.0.1:${address.port}` }
+}
+
+async function echoedCredentialServer(secret: string) {
+  const seen: { body: string; url: string; authorizationMatched: boolean } = {
+    body: "",
+    url: "",
+    authorizationMatched: false,
+  }
+  const server = createServer(async (request, response) => {
+    seen.url = request.url ?? ""
+    seen.body = await new Response(request as never).text()
+    seen.authorizationMatched = request.headers.authorization === `Bearer ${secret}`
+    response.writeHead(401, { "content-type": "application/json", "x-upstream-echo": secret })
+    response.end(JSON.stringify({ error: secret }))
+  })
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
+  const address = server.address()
+  if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port")
+  return { server, url: `http://127.0.0.1:${address.port}`, seen }
 }
 
 // Flushes headers as soon as the request arrives and holds the body for `delay`

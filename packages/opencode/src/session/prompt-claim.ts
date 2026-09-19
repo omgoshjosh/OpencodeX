@@ -43,6 +43,11 @@ export interface Deps {
    * reports to its parent through the durable delegation delivery path.
    */
   readonly onStaleExecution?: (sessionID: SessionID) => Effect.Effect<void>
+  /**
+   * Runs between a sweep's unlocked scan on the read connection and its write
+   * phase on the writer, once per sweep step that found candidates. Tests only.
+   */
+  readonly beforeRecoveryWrite?: Effect.Effect<void>
 }
 
 /** Matches `experimental.stale_execution_timeout`'s documented default. */
@@ -75,6 +80,47 @@ const decodeFinishedAssistant = Schema.decodeUnknownOption(FinishedAssistant)
 const StepFinishPart = Schema.Struct({ type: Schema.Literal("step-finish") })
 const decodeStepFinishPart = Schema.decodeUnknownOption(StepFinishPart)
 
+type Reader = Pick<Database.Interface["db"], "select">
+type SessionActivity = Effect.Success<ReturnType<typeof sessionActivity>>
+
+/**
+ * What the stale sweep judges a session by: its newest message and the latest
+ * write to any of its messages or parts. Shaped so it runs the same way on the
+ * read connection and again inside the settling transaction (OpencodeX-fs2
+ * two-phase recovery); a turn that woke up in between changes one of these.
+ * `session_execution.time_updated` is deliberately NOT part of it - that is
+ * the renewing heartbeat that hides the stall.
+ */
+const sessionActivity = Effect.fnUntraced(function* (reader: Reader, sessionID: SessionID) {
+  const message = yield* reader
+    .select({ id: MessageTable.id, data: MessageTable.data, updated: MessageTable.time_updated })
+    .from(MessageTable)
+    .where(eq(MessageTable.session_id, sessionID))
+    .orderBy(desc(MessageTable.time_created), desc(MessageTable.id))
+    .limit(1)
+    .get()
+  const parts = yield* reader
+    .select({ latest: max(PartTable.time_updated) })
+    .from(PartTable)
+    .where(eq(PartTable.session_id, sessionID))
+    .get()
+  const messages = yield* reader
+    .select({ latest: max(MessageTable.time_updated) })
+    .from(MessageTable)
+    .where(eq(MessageTable.session_id, sessionID))
+    .get()
+  return { message, latest: Math.max(parts?.latest ?? 0, messages?.latest ?? 0) }
+})
+
+/** Compare-and-set between the two phases: the writer must still see what the unlocked scan saw. */
+function sameActivity(current: SessionActivity, observed: SessionActivity) {
+  return (
+    current.message?.id === observed.message?.id &&
+    current.message?.updated === observed.message?.updated &&
+    current.latest === observed.latest
+  )
+}
+
 /**
  * Durable admission for queued prompts. A prompt is a row in
  * `session_command`; exactly one process may run it at a time, which it proves
@@ -84,7 +130,12 @@ const decodeStepFinishPart = Schema.decodeUnknownOption(StepFinishPart)
 export function make(deps: Deps) {
   return Effect.gen(function* () {
     const { database, events, scope, loop, beforeExecutionAdmission } = deps
-    const { db } = database
+    // `read` is the query_only connection (OpencodeX-fs2): the periodic sweeps
+    // scan on it so a multi-second scan of a large database never holds the
+    // writer's single permit. Under `OPENCODE_DB_SINGLE_CONNECTION=1` it IS the
+    // writer and every statement below runs exactly where it always did.
+    const { db, read } = database
+    const beforeRecoveryWrite = deps.beforeRecoveryWrite ?? Effect.void
     const processRunID = ensureRunID()
     const commandOwner = `local:${process.pid}:${processRunID}:${crypto.randomUUID()}`
     const commandLeaseMillis = deps.commandLeaseMillis ?? 30_000
@@ -584,7 +635,7 @@ export function make(deps: Deps) {
      * call already returned to the model, so nothing is waiting on it.
      */
     const hasLiveRewakeableDelegation = Effect.fnUntraced(function* (sessionID: SessionID) {
-      const children = yield* db
+      const children = yield* read
         .select({ metadata: SessionTable.metadata })
         .from(SessionTable)
         .where(eq(SessionTable.parent_id, sessionID))
@@ -623,7 +674,10 @@ export function make(deps: Deps) {
       const staleAfter = yield* deps.staleExecutionMillis ?? Effect.succeed(STALE_EXECUTION_MILLIS)
       if (staleAfter <= 0) return
       const now = clock()
-      const candidates = yield* db
+      // Phase one, on the read connection with no lock held: find the runs
+      // whose transcript proves the turn is over. Nothing here is atomic with
+      // the settle below; phase two re-reads what this phase judged by.
+      const candidates = yield* read
         .select({
           sessionID: SessionExecutionTable.session_id,
           owner: SessionExecutionTable.owner_id,
@@ -643,130 +697,125 @@ export function make(deps: Deps) {
         .limit(recoveryBatchSize)
         .all()
         .pipe(Effect.orDie)
-      yield* Effect.forEach(
-        candidates,
-        (candidate) =>
-          Effect.gen(function* () {
-            // Another live process's run is its own business; only this
-            // instance can know its heartbeat outlived its work.
-            if (!candidate.owner?.startsWith(`local:${process.pid}:${processRunID}:`)) return
-            const message = yield* db
-              .select({ id: MessageTable.id, data: MessageTable.data, updated: MessageTable.time_updated })
-              .from(MessageTable)
-              .where(eq(MessageTable.session_id, candidate.sessionID))
-              .orderBy(desc(MessageTable.time_created), desc(MessageTable.id))
-              .limit(1)
-              .get()
-              .pipe(Effect.orDie)
-            // A newer user message means the next turn is already starting.
-            if (!message || decodeAssistantMessage(message.data)._tag === "None") return
-            const parts = yield* db
-              .select({ data: PartTable.data })
-              .from(PartTable)
-              .where(eq(PartTable.message_id, message.id))
-              .orderBy(asc(PartTable.id))
-              .all()
-              .pipe(Effect.orDie)
-            if (parts.some((part) => decodeBusyToolPart(part.data)._tag === "Some")) return
-            // Either proof that the model stopped talking. Nothing is appended
-            // after a step-finish until the turn is woken again, so it being
-            // the newest part is what separates "ended" from "mid-stream".
-            const newest = parts.at(-1)
-            const finished =
-              (newest !== undefined && decodeStepFinishPart(newest.data)._tag === "Some") ||
-              decodeFinishedAssistant(message.data)._tag === "Some"
-            if (!finished) return
-            const activity = yield* Effect.all(
-              [
-                db
-                  .select({ latest: max(PartTable.time_updated) })
-                  .from(PartTable)
-                  .where(eq(PartTable.session_id, candidate.sessionID))
+      const stale: Array<{
+        candidate: (typeof candidates)[number] & { owner: string }
+        activity: SessionActivity
+        idleSince: number
+      }> = []
+      for (const candidate of candidates) {
+        // Another live process's run is its own business; only this
+        // instance can know its heartbeat outlived its work.
+        const owner = candidate.owner
+        if (!owner?.startsWith(`local:${process.pid}:${processRunID}:`)) continue
+        const activity = yield* sessionActivity(read, candidate.sessionID).pipe(Effect.orDie)
+        const message = activity.message
+        // A newer user message means the next turn is already starting.
+        if (!message || decodeAssistantMessage(message.data)._tag === "None") continue
+        const parts = yield* read
+          .select({ data: PartTable.data })
+          .from(PartTable)
+          .where(eq(PartTable.message_id, message.id))
+          .orderBy(asc(PartTable.id))
+          .all()
+          .pipe(Effect.orDie)
+        if (parts.some((part) => decodeBusyToolPart(part.data)._tag === "Some")) continue
+        // Either proof that the model stopped talking. Nothing is appended
+        // after a step-finish until the turn is woken again, so it being
+        // the newest part is what separates "ended" from "mid-stream".
+        const newest = parts.at(-1)
+        const finished =
+          (newest !== undefined && decodeStepFinishPart(newest.data)._tag === "Some") ||
+          decodeFinishedAssistant(message.data)._tag === "Some"
+        if (!finished) continue
+        const idleSince = Math.max(candidate.startedAt ?? 0, activity.latest, message.updated)
+        if (now - idleSince < staleAfter) continue
+        if (yield* hasLiveRewakeableDelegation(candidate.sessionID)) continue
+        stale.push({ candidate: { ...candidate, owner }, activity, idleSince })
+      }
+      if (stale.length === 0) return
+      yield* beforeRecoveryWrite
+      for (const { candidate, activity, idleSince } of stale) {
+        // Phase two, an immediate transaction on the writer. The session's
+        // activity fingerprint must still be what phase one judged - a turn
+        // that woke up in between (a delegation reporting back, a new
+        // message, a tool part written) changes it - and the CAS on the exact
+        // execution row means a concurrent settle, a new generation, or a
+        // second sweep pass all lose here, so the notification below runs at
+        // most once per stuck run.
+        const settled = yield* db
+          .transaction(
+            (transaction) =>
+              Effect.gen(function* () {
+                if (!sameActivity(yield* sessionActivity(transaction, candidate.sessionID), activity)) return false
+                const row = yield* transaction
+                  .update(SessionExecutionTable)
+                  .set({
+                    // The transcript shows a clean finish, so this is the state a
+                    // normally-released turn ends in (`SessionRunState.release`
+                    // with `interrupted: false`). There is no `completed` state in
+                    // this vocabulary and `interrupted` would falsely claim the
+                    // work was aborted.
+                    state: "idle",
+                    owner_id: null,
+                    lease_expires_at: null,
+                    completed_at: now,
+                    time_updated: now,
+                  })
+                  .where(
+                    and(
+                      eq(SessionExecutionTable.session_id, candidate.sessionID),
+                      eq(SessionExecutionTable.state, "running"),
+                      eq(SessionExecutionTable.owner_id, candidate.owner),
+                      eq(SessionExecutionTable.generation, candidate.generation),
+                    ),
+                  )
+                  .returning({ sessionID: SessionExecutionTable.session_id })
                   .get()
-                  .pipe(Effect.orDie),
-                db
-                  .select({ latest: max(MessageTable.time_updated) })
-                  .from(MessageTable)
-                  .where(eq(MessageTable.session_id, candidate.sessionID))
-                  .get()
-                  .pipe(Effect.orDie),
-              ],
-              { concurrency: "unbounded" },
-            )
-            const idleSince = Math.max(
-              candidate.startedAt ?? 0,
-              ...activity.map((row) => row?.latest ?? 0),
-              message.updated,
-            )
-            if (now - idleSince < staleAfter) return
-            if (yield* hasLiveRewakeableDelegation(candidate.sessionID)) return
-            // CAS on the exact row this pass inspected: a concurrent settle,
-            // a new generation, or a second sweep pass all lose here, so the
-            // notification below runs at most once per stuck run.
-            const settled = yield* db
-              .update(SessionExecutionTable)
-              .set({
-                // The transcript shows a clean finish, so this is the state a
-                // normally-released turn ends in (`SessionRunState.release`
-                // with `interrupted: false`). There is no `completed` state in
-                // this vocabulary and `interrupted` would falsely claim the
-                // work was aborted.
-                state: "idle",
-                owner_id: null,
-                lease_expires_at: null,
-                completed_at: now,
-                time_updated: now,
-              })
-              .where(
-                and(
-                  eq(SessionExecutionTable.session_id, candidate.sessionID),
-                  eq(SessionExecutionTable.state, "running"),
-                  eq(SessionExecutionTable.owner_id, candidate.owner),
-                  eq(SessionExecutionTable.generation, candidate.generation),
-                ),
-              )
-              .returning({ sessionID: SessionExecutionTable.session_id })
-              .get()
-              .pipe(Effect.orDie)
-            if (!settled) return
-            // The command that drove the finished turn is stuck the same way.
-            // Queued siblings are untouched: they are real work that becomes
-            // launchable now that the execution is free.
-            yield* db
-              .update(SessionCommandTable)
-              .set({
-                status: "cancelled",
-                owner_id: null,
-                lease_expires_at: null,
-                completed_at: now,
-                time_updated: now,
-              })
-              .where(
-                and(eq(SessionCommandTable.session_id, candidate.sessionID), eq(SessionCommandTable.status, "running")),
-              )
-              .run()
-              .pipe(Effect.orDie)
-            yield* Effect.logWarning("stale execution force-settled", {
-              sessionID: candidate.sessionID,
-              executionOwner: candidate.owner,
-              executionGeneration: candidate.generation,
-              messageID: message.id,
-              idleMillis: now - idleSince,
-              staleAfterMillis: staleAfter,
-              action: "force-settle",
-            })
-            if (deps.onStaleExecution)
-              yield* deps.onStaleExecution(candidate.sessionID).pipe(
-                Effect.catchCause((cause) =>
-                  Effect.logWarning("stale execution delegation settle failed", {
-                    sessionID: candidate.sessionID,
-                    cause,
-                  }),
-                ),
-              )
-          }),
-        { discard: true },
-      )
+                if (!row) return false
+                // The command that drove the finished turn is stuck the same way.
+                // Queued siblings are untouched: they are real work that becomes
+                // launchable now that the execution is free.
+                yield* transaction
+                  .update(SessionCommandTable)
+                  .set({
+                    status: "cancelled",
+                    owner_id: null,
+                    lease_expires_at: null,
+                    completed_at: now,
+                    time_updated: now,
+                  })
+                  .where(
+                    and(
+                      eq(SessionCommandTable.session_id, candidate.sessionID),
+                      eq(SessionCommandTable.status, "running"),
+                    ),
+                  )
+                  .run()
+                return true
+              }),
+            { behavior: "immediate" },
+          )
+          .pipe(Effect.orDie)
+        if (!settled) continue
+        yield* Effect.logWarning("stale execution force-settled", {
+          sessionID: candidate.sessionID,
+          executionOwner: candidate.owner,
+          executionGeneration: candidate.generation,
+          messageID: activity.message?.id,
+          idleMillis: now - idleSince,
+          staleAfterMillis: staleAfter,
+          action: "force-settle",
+        })
+        if (deps.onStaleExecution)
+          yield* deps.onStaleExecution(candidate.sessionID).pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("stale execution delegation settle failed", {
+                sessionID: candidate.sessionID,
+                cause,
+              }),
+            ),
+          )
+      }
     })
 
     const recover = Effect.fn("SessionPrompt.recover")(function* () {
@@ -777,7 +826,12 @@ export function make(deps: Deps) {
       yield* sweepStaleExecutions().pipe(
         Effect.catchCause((cause) => Effect.logWarning("stale execution sweep failed", { cause })),
       )
-      const sessions = yield* db
+      // Phase one, on the read connection: the sessions owed work and the
+      // oldest launchable command in each. Nothing is claimed here - the
+      // launch goes through `claimCommandTurn`, whose immediate transaction
+      // re-reads the row on the writer and is the compare-and-set that a
+      // command claimed or settled by someone else in between loses.
+      const sessions = yield* read
         .select({ sessionID: SessionCommandTable.session_id, oldest: min(SessionCommandTable.time_created) })
         .from(SessionCommandTable)
         .where(
@@ -794,39 +848,35 @@ export function make(deps: Deps) {
         .limit(recoveryBatchSize)
         .all()
         .pipe(Effect.orDie)
-      yield* Effect.forEach(
-        sessions,
-        (session) =>
-          db
-            .select({ id: SessionCommandTable.id })
-            .from(SessionCommandTable)
-            .where(
-              and(
-                eq(SessionCommandTable.session_id, session.sessionID),
-                eq(SessionCommandTable.directory, ctx.directory),
-                or(
-                  and(eq(SessionCommandTable.status, "queued"), isNull(SessionCommandTable.owner_id)),
-                  and(eq(SessionCommandTable.status, "running"), lt(SessionCommandTable.lease_expires_at, clock())),
-                ),
-              ),
-            )
-            .orderBy(asc(SessionCommandTable.time_created), asc(SessionCommandTable.id))
-            .limit(1)
-            .get()
-            .pipe(
-              Effect.orDie,
-              Effect.flatMap((command) =>
-                command
-                  ? diagnostic(command.id, "launch", "not-attempted").pipe(
-                      Effect.catchCause(() => Effect.void),
-                      Effect.andThen(launchCommand(command.id)),
-                    )
-                  : Effect.void,
+      const launchable: string[] = []
+      for (const session of sessions) {
+        const command = yield* read
+          .select({ id: SessionCommandTable.id })
+          .from(SessionCommandTable)
+          .where(
+            and(
+              eq(SessionCommandTable.session_id, session.sessionID),
+              eq(SessionCommandTable.directory, ctx.directory),
+              or(
+                and(eq(SessionCommandTable.status, "queued"), isNull(SessionCommandTable.owner_id)),
+                and(eq(SessionCommandTable.status, "running"), lt(SessionCommandTable.lease_expires_at, clock())),
               ),
             ),
-        { discard: true },
-      )
-      const messages = yield* db
+          )
+          .orderBy(asc(SessionCommandTable.time_created), asc(SessionCommandTable.id))
+          .limit(1)
+          .get()
+          .pipe(Effect.orDie)
+        if (command) launchable.push(command.id)
+      }
+      if (launchable.length > 0) yield* beforeRecoveryWrite
+      for (const commandID of launchable) {
+        yield* diagnostic(commandID, "launch", "not-attempted").pipe(Effect.catchCause(() => Effect.void))
+        yield* launchCommand(commandID)
+      }
+      // Diagnostic only, and the sweep's one wide scan: newest messages joined
+      // to their commands, so it belongs on the read connection above all.
+      const messages = yield* read
         .select({
           id: MessageTable.id,
           sessionID: MessageTable.session_id,

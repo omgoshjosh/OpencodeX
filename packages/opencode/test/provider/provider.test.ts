@@ -302,20 +302,22 @@ it.instance("local provider models are discovered from the live endpoint", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
       const api = new URL("/v1", url).toString().replace(/\/$/, "")
-      yield* Effect.promise(() => Bun.write(
-        path.join(test.directory, "opencode.json"),
-        JSON.stringify({
-          enabled_providers: ["lmstudio"],
-          provider: {
-            lmstudio: {
-              api,
-              models: {
-                "stale-model": { name: "Stale Model" },
+      yield* Effect.promise(() =>
+        Bun.write(
+          path.join(test.directory, "opencode.json"),
+          JSON.stringify({
+            enabled_providers: ["lmstudio"],
+            provider: {
+              lmstudio: {
+                api,
+                models: {
+                  "stale-model": { name: "Stale Model" },
+                },
               },
             },
-          },
-        }),
-      ))
+          }),
+        ),
+      )
 
       const providers = yield* list
       const provider = providers[ProviderV2.ID.make("lmstudio")]
@@ -1877,7 +1879,7 @@ it.effect("opencode loader keeps paid models when config apiKey is present", () 
   }).pipe(provideMultiInstance),
 )
 
-it.effect("opencode loader keeps paid models when auth exists", () =>
+it.effect("opencode loader refreshes an existing provider state after external auth changes", () =>
   Effect.gen(function* () {
     const noneDir = yield* tmpdirScoped()
     const keyedDir = yield* tmpdirScoped()
@@ -1889,12 +1891,15 @@ it.effect("opencode loader keeps paid models when auth exists", () =>
         .pipe(Effect.provide(InstanceLayer.layer), Effect.provide(CrossSpawnSpawner.defaultLayer))
 
     const none = paid(yield* listIn(noneDir))
+    expect(paid(yield* listIn(keyedDir))).toBe(0)
 
     const authPath = path.join(Global.Path.data, "auth.json")
     const original = yield* Effect.promise(() => Filesystem.readText(authPath).catch(() => undefined))
 
     yield* Effect.acquireRelease(
-      Effect.promise(() => Filesystem.write(authPath, JSON.stringify({ opencode: { type: "api", key: "test-key" } }))),
+      Effect.promise(() =>
+        Filesystem.writeAtomic(authPath, JSON.stringify({ opencode: { type: "api", key: "test-key" } })),
+      ),
       () =>
         Effect.promise(async () => {
           if (original !== undefined) await Filesystem.write(authPath, original)
@@ -1904,7 +1909,11 @@ it.effect("opencode loader keeps paid models when auth exists", () =>
 
     const keyedCount = paid(yield* listIn(keyedDir))
 
+    yield* Effect.promise(() => Filesystem.writeAtomic(authPath, "{}"))
+    const disconnected = paid(yield* listIn(keyedDir))
+
     expect(none).toBe(0)
     expect(keyedCount).toBeGreaterThan(0)
+    expect(disconnected).toBe(0)
   }).pipe(provideMultiInstance),
 )

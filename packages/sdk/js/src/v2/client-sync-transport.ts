@@ -82,6 +82,7 @@ export function clientStateSyncTransport(options: ClientStateSyncOptions): Clien
 export function clientEventInvalidation(event: Event): "capabilities" | "catalog" | "operations" | undefined {
   if (
     event.type === "models-dev.refreshed" ||
+    event.type === "provider.auth.changed" ||
     event.type === "plugin.added" ||
     event.type === "lsp.updated" ||
     event.type === "mcp.tools.changed"

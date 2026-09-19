@@ -1,10 +1,16 @@
 import path from "path"
-import { Effect, Layer, Record, Result, Schema, Context } from "effect"
+import { Effect, Layer, Record, Result, Schema, Context, Semaphore, Schedule } from "effect"
+import { EventV2 } from "@opencode-ai/core/event"
 import { NonNegativeInt } from "@opencode-ai/core/schema"
 import { Global } from "@opencode-ai/core/global"
 import { AppFileSystem } from "@opencode-ai/core/filesystem"
+import { Hash } from "@opencode-ai/core/util/hash"
 
 export const OAUTH_DUMMY_KEY = "opencode-oauth-dummy-key"
+
+export const Event = {
+  Changed: EventV2.define({ type: "provider.auth.changed", schema: {} }),
+}
 
 const file = path.join(Global.Path.data, "auth.json")
 
@@ -39,9 +45,15 @@ export class AuthError extends Schema.TaggedErrorClass<AuthError>()("AuthError",
   cause: Schema.optional(Schema.Defect),
 }) {}
 
+export interface Snapshot {
+  readonly records: Record<string, Info>
+  readonly revision: string
+}
+
 export interface Interface {
   readonly get: (providerID: string) => Effect.Effect<Info | undefined, AuthError>
   readonly all: () => Effect.Effect<Record<string, Info>, AuthError>
+  readonly snapshot: () => Effect.Effect<Snapshot, AuthError>
   readonly set: (key: string, info: Info) => Effect.Effect<void, AuthError>
   readonly remove: (key: string) => Effect.Effect<void, AuthError>
 }
@@ -52,17 +64,41 @@ export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const fsys = yield* AppFileSystem.Service
+    const events = yield* EventV2.Service
     const decode = Schema.decodeUnknownOption(Info)
+    const lock = Semaphore.makeUnsafe(1)
+    let last: Snapshot | undefined
 
-    const all = Effect.fn("Auth.all")(function* () {
+    const snapshotUnlocked = Effect.fnUntraced(function* () {
+      const parse = (content: string) => ({
+        records: Record.filterMap(JSON.parse(content) as Record<string, unknown>, (value) =>
+          Result.fromOption(decode(value), () => undefined),
+        ),
+        revision: Hash.fast(content),
+      })
       if (process.env.OPENCODE_AUTH_CONTENT) {
         try {
-          return JSON.parse(process.env.OPENCODE_AUTH_CONTENT)
-        } catch (err) {}
+          const next = parse(process.env.OPENCODE_AUTH_CONTENT)
+          last = next
+          return next
+        } catch {}
       }
+      const content = new TextDecoder().decode(
+        yield* fsys.readFile(file).pipe(Effect.orElseSucceed(() => new Uint8Array())),
+      )
+      try {
+        const next = parse(content)
+        last = next
+        return next
+      } catch {
+        return last ?? { records: {}, revision: Hash.fast("") }
+      }
+    })
 
-      const data = (yield* fsys.readJson(file).pipe(Effect.orElseSucceed(() => ({})))) as Record<string, unknown>
-      return Record.filterMap(data, (value) => Result.fromOption(decode(value), () => undefined))
+    const snapshot = Effect.fn("Auth.snapshot")(() => lock.withPermits(1)(snapshotUnlocked()))
+
+    const all = Effect.fn("Auth.all")(function* () {
+      return (yield* snapshot()).records
     })
 
     const get = Effect.fn("Auth.get")(function* (providerID: string) {
@@ -70,27 +106,49 @@ export const layer = Layer.effect(
     })
 
     const set = Effect.fn("Auth.set")(function* (key: string, info: Info) {
-      const norm = key.replace(/\/+$/, "")
-      const data = yield* all()
-      if (norm !== key) delete data[key]
-      delete data[norm + "/"]
-      yield* fsys
-        .writeJson(file, { ...data, [norm]: info }, 0o600)
-        .pipe(Effect.mapError(fail("Failed to write auth data")))
+      yield* lock.withPermits(1)(
+        Effect.gen(function* () {
+          const norm = key.replace(/\/+$/, "")
+          const data = last?.records ?? (yield* snapshotUnlocked()).records
+          const next = { ...data, [norm]: info }
+          if (norm !== key) delete next[key]
+          delete next[norm + "/"]
+          yield* fsys.writeJson(file, next, 0o600).pipe(Effect.mapError(fail("Failed to write auth data")))
+          last = { records: next, revision: Hash.fast(JSON.stringify(next, null, 2)) }
+        }),
+      )
     })
 
     const remove = Effect.fn("Auth.remove")(function* (key: string) {
-      const norm = key.replace(/\/+$/, "")
-      const data = yield* all()
-      delete data[key]
-      delete data[norm]
-      yield* fsys.writeJson(file, data, 0o600).pipe(Effect.mapError(fail("Failed to write auth data")))
+      yield* lock.withPermits(1)(
+        Effect.gen(function* () {
+          const norm = key.replace(/\/+$/, "")
+          const next = { ...(last?.records ?? (yield* snapshotUnlocked()).records) }
+          delete next[key]
+          delete next[norm]
+          yield* fsys.writeJson(file, next, 0o600).pipe(Effect.mapError(fail("Failed to write auth data")))
+          last = { records: next, revision: Hash.fast(JSON.stringify(next, null, 2)) }
+        }),
+      )
     })
 
-    return Service.of({ get, all, set, remove })
+    let observedRevision = (yield* snapshot()).revision
+    yield* Effect.forkScoped(
+      Effect.gen(function* () {
+        const next = yield* snapshot()
+        if (next.revision === observedRevision) return
+        observedRevision = next.revision
+        yield* events.publish(Event.Changed, {})
+      }).pipe(
+        Effect.catch(() => Effect.void),
+        Effect.repeat(Schedule.spaced("1 second")),
+      ),
+    )
+
+    return Service.of({ get, all, snapshot, set, remove })
   }),
 )
 
-export const defaultLayer = layer.pipe(Layer.provide(AppFileSystem.defaultLayer))
+export const defaultLayer = layer.pipe(Layer.provide(AppFileSystem.defaultLayer), Layer.provide(EventV2.defaultLayer))
 
 export * as Auth from "."

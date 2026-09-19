@@ -22,7 +22,7 @@ import { iife } from "@/util/iife"
 import { Global } from "@opencode-ai/core/global"
 import path from "path"
 import { pathToFileURL } from "url"
-import { Effect, Layer, Context, Schema, Types } from "effect"
+import { Effect, Layer, Context, Schema, Types, Semaphore } from "effect"
 import { EffectBridge } from "@/effect/bridge"
 import { InstanceState } from "@/effect/instance-state"
 import { EffectPromise } from "@/effect/promise"
@@ -1233,6 +1233,7 @@ export interface Interface {
 }
 
 interface State {
+  authRevision: string
   catalogSource: Record<string, ModelsDev.Provider>
   models: Map<string, LanguageModelV3>
   providers: Record<ProviderV2.ID, Info>
@@ -1414,6 +1415,7 @@ export const layer = Layer.effect(
     const modelsDevSvc = yield* ModelsDev.Service
     const runtimeFlags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
+    const refreshLock = Semaphore.makeUnsafe(1)
 
     const state = yield* InstanceState.make<State>(() =>
       Effect.gen(function* () {
@@ -1421,6 +1423,7 @@ export const layer = Layer.effect(
         const bridge = yield* EffectBridge.make()
         const cfg = yield* config.get()
         const modelsDev = yield* modelsDevSvc.get()
+        const authSnapshot = yield* auth.snapshot().pipe(Effect.orDie)
         const catalog = mapValues(modelsDev, fromModelsDevProvider)
         const database = mapValues(catalog, toPublicInfo)
         addLocalProviders(database)
@@ -1611,8 +1614,7 @@ export const layer = Layer.effect(
         }
 
         // load apikeys
-        const auths = yield* auth.all().pipe(Effect.orDie)
-        for (const [id, provider] of Object.entries(auths)) {
+        for (const [id, provider] of Object.entries(authSnapshot.records)) {
           const providerID = ProviderV2.ID.make(id)
           if (disabled.has(providerID)) continue
           if (provider.type === "api") {
@@ -1762,6 +1764,7 @@ export const layer = Layer.effect(
         }
 
         return {
+          authRevision: authSnapshot.revision,
           catalogSource: modelsDev,
           models: languages,
           providers,
@@ -1775,9 +1778,23 @@ export const layer = Layer.effect(
 
     const getState = Effect.fn("Provider.getState")(function* () {
       const current = yield* InstanceState.get(state)
-      if (current.catalogSource === (yield* modelsDevSvc.get())) return current
-      yield* InstanceState.invalidate(state)
-      return yield* InstanceState.get(state)
+      if (
+        current.catalogSource === (yield* modelsDevSvc.get()) &&
+        current.authRevision === (yield* auth.snapshot().pipe(Effect.orDie)).revision
+      )
+        return current
+      return yield* refreshLock.withPermits(1)(
+        Effect.gen(function* () {
+          const latest = yield* InstanceState.get(state)
+          if (
+            latest.catalogSource === (yield* modelsDevSvc.get()) &&
+            latest.authRevision === (yield* auth.snapshot().pipe(Effect.orDie)).revision
+          )
+            return latest
+          yield* InstanceState.invalidate(state)
+          return yield* InstanceState.get(state)
+        }),
+      )
     })
 
     /**

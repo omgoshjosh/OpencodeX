@@ -1,5 +1,7 @@
 import { describe, expect } from "bun:test"
 import { Effect, Layer } from "effect"
+import path from "path"
+import { Global } from "@opencode-ai/core/global"
 import { Auth } from "../../src/auth"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { testEffect } from "../lib/effect"
@@ -72,6 +74,28 @@ describe("Auth", () => {
       yield* auth.remove("anthropic")
       const after = yield* auth.all()
       expect(after["anthropic"]).toBeUndefined()
+    }),
+  )
+
+  it.instance("retains the last valid snapshot through a malformed external write", () =>
+    Effect.gen(function* () {
+      const auth = yield* Auth.Service
+      yield* auth.set("anthropic", { type: "api", key: "before" })
+      const initial = yield* auth.snapshot()
+
+      yield* Effect.promise(() => Bun.write(path.join(Global.Path.data, "auth.json"), "{"))
+      const malformed = yield* auth.snapshot()
+      expect(malformed).toEqual(initial)
+
+      yield* Effect.promise(() =>
+        Bun.write(
+          path.join(Global.Path.data, "auth.json"),
+          JSON.stringify({ anthropic: { type: "api", key: "after" } }),
+        ),
+      )
+      const next = yield* auth.snapshot()
+      expect(next.revision).not.toBe(initial.revision)
+      expect(next.records.anthropic).toMatchObject({ type: "api", key: "after" })
     }),
   )
 })

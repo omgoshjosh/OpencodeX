@@ -94,6 +94,7 @@ export function isCapabilityRefreshEvent(event: GlobalEvent) {
   const kind = eventKind(event)
   return (
     kind === "models-dev.refreshed" ||
+    kind === "provider.auth.changed" ||
     kind === "plugin.added" ||
     kind === "lsp.updated" ||
     kind === "mcp.tools.changed" ||
@@ -122,15 +123,11 @@ function stableItems<T>(current: T[], next: T[]) {
 
 function stableRecord<T>(current: Record<string, T>, next: Record<string, T>) {
   const keys = Object.keys(next)
-  return keys.length === Object.keys(current).length && keys.every((key) => current[key] === next[key])
-    ? current
-    : next
+  return keys.length === Object.keys(current).length && keys.every((key) => current[key] === next[key]) ? current : next
 }
 
 function stableGroups<T extends object>(current: T[], next: T[]) {
-  return current.length === next.length && current.every((item, index) => sameGroup(item, next[index]))
-    ? current
-    : next
+  return current.length === next.length && current.every((item, index) => sameGroup(item, next[index])) ? current : next
 }
 
 function sameItems<T>(current: readonly T[], next: readonly T[]) {

@@ -987,13 +987,15 @@ export const ConfigProvidersResult = Schema.Struct({
 export type ConfigProvidersResult = Types.DeepMutable<Schema.Schema.Type<typeof ConfigProvidersResult>>
 
 export function toPublicInfo(provider: Info): Info {
-  return JSON.parse(
+  const result = JSON.parse(
     JSON.stringify(provider, (_, value) => {
       if (typeof value === "function" || typeof value === "symbol" || value === undefined) return undefined
       if (typeof value === "bigint") return value.toString()
       return value
     }),
   )
+  delete result.key
+  return result
 }
 
 export function defaultModelIDs<T extends { models: Record<string, { id: string }> }>(providers: Record<string, T>) {

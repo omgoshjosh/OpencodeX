@@ -29,6 +29,51 @@ function writeAuth(home: string, content: string) {
   })
 }
 
+async function openGlobalEvents(url: string) {
+  const controller = new AbortController()
+  const response = await fetch(`${url}/global/event`, { signal: controller.signal })
+  if (!response.ok || !response.body) throw new Error(`global event stream failed: HTTP ${response.status}`)
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ""
+  return {
+    next: async (): Promise<unknown> => {
+      while (true) {
+        const newline = buffer.indexOf("\n")
+        if (newline >= 0) {
+          const line = buffer.slice(0, newline).trimEnd()
+          buffer = buffer.slice(newline + 1)
+          if (line.startsWith("data:")) return JSON.parse(line.slice(5).trimStart())
+          continue
+        }
+        const chunk = await reader.read()
+        if (chunk.done) throw new Error("global event stream closed")
+        buffer += decoder.decode(chunk.value, { stream: true })
+      }
+    },
+    close: async () => {
+      controller.abort()
+      await reader.cancel().catch(() => undefined)
+    },
+  }
+}
+
+async function authChanged(events: Awaited<ReturnType<typeof openGlobalEvents>>) {
+  while (true) {
+    const event = await events.next()
+    if (
+      event &&
+      typeof event === "object" &&
+      "payload" in event &&
+      event.payload &&
+      typeof event.payload === "object" &&
+      "type" in event.payload &&
+      event.payload.type === "provider.auth.changed"
+    )
+      return event
+  }
+}
+
 describe("opencode serve (subprocess)", () => {
   cliIt.live(
     "fails closed for a passwordless non-loopback listener without a warning",
@@ -103,20 +148,49 @@ describe("opencode serve (subprocess)", () => {
     ({ opencode, home }) =>
       Effect.gen(function* () {
         const secret = "sentinel-provider-auth-secret"
+        const rotated = "sentinel-provider-auth-secret-rotated"
         const server = yield* opencode.serve({ extraArgs: ["--print-logs"] })
         const client = yield* HttpClient.HttpClient
-        const providers = () => client.get(`${server.url}/provider`).pipe(Effect.flatMap((response) => response.json))
+        const events = yield* Effect.acquireRelease(
+          Effect.promise(() => openGlobalEvents(server.url)),
+          (stream) => Effect.promise(() => stream.close()),
+        )
+        const responses: string[] = []
+        const providers = () =>
+          client.get(`${server.url}/provider`).pipe(
+            Effect.flatMap((response) => response.json),
+            Effect.tap((body) => Effect.sync(() => responses.push(JSON.stringify(body)))),
+          )
         const connected = (value: unknown) => {
           if (!value || typeof value !== "object" || !("connected" in value)) return false
           return Array.isArray(value.connected) && value.connected.includes("anthropic")
         }
 
+        const identity = () =>
+          client.get(`${server.url}/global/health`).pipe(
+            Effect.flatMap((response) => response.json),
+            Effect.map(Schema.decodeUnknownSync(HealthIdentity)),
+          )
+        const before = yield* identity()
         expect(connected(yield* providers())).toBe(false)
         yield* writeAuth(home, JSON.stringify({ anthropic: { type: "api", key: secret } }))
         yield* providers().pipe(
           Effect.filterOrFail(connected, () => new Error("provider never connected after auth replacement")),
           Effect.retry({ schedule: Schedule.spaced("250 millis"), times: 20 }),
         )
+        const duringConnect = yield* Effect.all(Array.from({ length: 12 }, providers))
+        expect(duringConnect.every(connected)).toBe(true)
+
+        const changed = Effect.promise(() => authChanged(events)).pipe(
+          Effect.timeoutOrElse({
+            duration: "5 seconds",
+            orElse: () => Effect.die(new Error("auth rotation event timed out")),
+          }),
+        )
+        yield* writeAuth(home, JSON.stringify({ anthropic: { type: "api", key: rotated } }))
+        const duringRotation = yield* Effect.all(Array.from({ length: 12 }, providers))
+        expect(duringRotation.every(connected)).toBe(true)
+        expect(JSON.stringify(yield* changed)).not.toContain(rotated)
 
         yield* writeAuth(home, "{}")
         const disconnected = yield* providers().pipe(
@@ -126,8 +200,36 @@ describe("opencode serve (subprocess)", () => {
           ),
           Effect.retry({ schedule: Schedule.spaced("250 millis"), times: 20 }),
         )
+        const duringDisconnect = yield* Effect.all(Array.from({ length: 12 }, providers))
+        expect(duringDisconnect.every((value) => !connected(value))).toBe(true)
+
+        const put = yield* Effect.promise(() =>
+          fetch(`${server.url}/auth/anthropic`, {
+            method: "PUT",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ type: "api", key: secret }),
+          }),
+        )
+        expect(put.ok).toBe(true)
+        yield* providers().pipe(
+          Effect.filterOrFail(connected, () => new Error("provider never connected after auth PUT")),
+          Effect.retry({ schedule: Schedule.spaced("250 millis"), times: 20 }),
+        )
+        const remove = yield* Effect.promise(() => fetch(`${server.url}/auth/anthropic`, { method: "DELETE" }))
+        expect(remove.ok).toBe(true)
+        yield* providers().pipe(
+          Effect.filterOrFail(
+            (value) => !connected(value),
+            () => new Error("provider never disconnected after auth DELETE"),
+          ),
+          Effect.retry({ schedule: Schedule.spaced("250 millis"), times: 20 }),
+        )
+        expect(yield* identity()).toEqual(before)
         expect(JSON.stringify(disconnected)).not.toContain(secret)
+        expect(responses.join("\n")).not.toContain(secret)
+        expect(responses.join("\n")).not.toContain(rotated)
         expect(server.stderr()).not.toContain(secret)
+        expect(server.stderr()).not.toContain(rotated)
       }),
     90_000,
   )

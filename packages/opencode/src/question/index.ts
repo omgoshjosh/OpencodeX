@@ -1,4 +1,4 @@
-import { Context, Deferred, Effect, Layer, Schema, Scope } from "effect"
+import { Cause, Context, Deferred, Effect, Layer, Schema, Scope } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import { SessionID, MessageID } from "@/session/schema"
 import * as Log from "@opencode-ai/core/util/log"
@@ -283,7 +283,11 @@ export const layer = Layer.effect(
         // must never delay the child's question or turn `ask` into a failure.
         // `notify` also isolates each handler, so this is belt and braces.
         yield* SessionQuestionNotify.notify(info).pipe(
-          Effect.catchCause((cause) => Effect.logWarning("question notification failed", { id, cause })),
+          Effect.catchCause((cause) =>
+            Effect.logWarning("question notification failed").pipe(
+              Effect.annotateLogs({ id, cause: Cause.pretty(cause) }),
+            ),
+          ),
           Effect.forkIn(scope),
         )
         yield* observe(id, deferred).pipe(Effect.forkIn(scope))

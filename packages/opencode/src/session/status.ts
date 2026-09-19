@@ -136,10 +136,7 @@ class Options extends Context.Service<Options, LayerOptions>()("@opencode/Sessio
 
 export const ExecutionGeneration = Context.Reference<
   { sessionID: SessionID; generation: number; owner: string } | undefined
->(
-  "@opencode/SessionStatus/ExecutionGeneration",
-  { defaultValue: () => undefined },
-)
+>("@opencode/SessionStatus/ExecutionGeneration", { defaultValue: () => undefined })
 
 const decode = Schema.decodeUnknownOption(Info)
 const OWNERLESS_STALE_MILLIS = 15_000
@@ -675,7 +672,9 @@ const configuredLayer = Layer.effect(
       // A failed sweep (e.g. SQLITE_BUSY outliving the busy timeout) must not
       // kill the loop for the life of the process; reads still recover inline,
       // but sessions nobody reads would never reconcile again.
-      Effect.catchCause((cause) => Effect.logWarning("session status sweep failed", { cause })),
+      Effect.catchCause((cause) =>
+        Effect.logWarning("session status sweep failed").pipe(Effect.annotateLogs({ cause: Cause.pretty(cause) })),
+      ),
       Effect.repeat(Schedule.forever),
       Effect.forkScoped,
     )

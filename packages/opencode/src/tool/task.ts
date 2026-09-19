@@ -668,7 +668,11 @@ export const TaskTool = Tool.define(
                   ),
                 )
             }),
-            Effect.catchCause((cause) => Effect.logWarning("background monitor wait failed", { cause, jobID: job.id })),
+            Effect.catchCause((cause) =>
+              Effect.logWarning("background monitor wait failed").pipe(
+                Effect.annotateLogs({ cause: Cause.pretty(cause), jobID: job.id }),
+              ),
+            ),
             Effect.forkIn(scope, { startImmediately: true }),
           )
           return true

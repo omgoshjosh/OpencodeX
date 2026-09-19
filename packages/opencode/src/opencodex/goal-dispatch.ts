@@ -2,7 +2,7 @@ import { OpencodeXGoalNodeTable, OpencodeXGoalTable } from "@opencode-ai/core/op
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { OpencodeXJob } from "@/opencodex/job"
 import { and, eq, inArray } from "drizzle-orm"
-import { Context, Effect, Layer, Semaphore } from "effect"
+import { Cause, Context, Effect, Layer, Semaphore } from "effect"
 import { nodeJobKey, parseSpend, runSerial } from "./goal-model"
 import { advanceSchedule, planReconcile, scheduleDue } from "./goal-reconcile"
 import { GoalStoreService, type NodePatch } from "./goal-store"
@@ -226,7 +226,11 @@ export const goalDispatchLayer = Layer.effect(
         // graph with nothing to look at, so it is logged rather than dropped.
         return events.broadcast(committed).pipe(
           Effect.andThen(reconcile(goalID)),
-          Effect.catchCause((cause) => Effect.logError("goal reconcile after settlement failed", { goalID, cause })),
+          Effect.catchCause((cause) =>
+            Effect.logError("goal reconcile after settlement failed").pipe(
+              Effect.annotateLogs({ goalID, cause: Cause.pretty(cause) }),
+            ),
+          ),
         )
       }).pipe(Effect.orDie)
 

@@ -1,4 +1,4 @@
-import { Effect } from "effect"
+import { Cause, Effect } from "effect"
 import type { Question } from "@/question"
 
 /**
@@ -34,7 +34,9 @@ export const notify = Effect.fn("SessionQuestionNotify.notify")(function* (reque
     (handler) =>
       handler(request).pipe(
         Effect.catchCause((cause) =>
-          Effect.logWarning("question notification handler failed", { requestID: request.id, cause }),
+          Effect.logWarning("question notification handler failed").pipe(
+            Effect.annotateLogs({ requestID: request.id, cause: Cause.pretty(cause) }),
+          ),
         ),
       ),
     { discard: true },

@@ -1,8 +1,9 @@
 import { afterEach, expect, test } from "bun:test"
-import { mkdir, unlink } from "fs/promises"
+import { mkdir } from "fs/promises"
 import path from "path"
 import { Effect, Layer } from "effect"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
+import { EventV2 } from "@opencode-ai/core/event"
 import { AppFileSystem } from "@opencode-ai/core/filesystem"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Global } from "@opencode-ai/core/global"
@@ -56,12 +57,12 @@ afterEach(async () => {
   await disposeAllInstances()
 })
 
-const providerLayer = (flags: Partial<RuntimeFlags.Info> = {}) =>
+const providerLayer = (flags: Partial<RuntimeFlags.Info> = {}, auth = Auth.defaultLayer) =>
   Provider.layer.pipe(
     Layer.provide(AppFileSystem.defaultLayer),
     Layer.provide(Env.defaultLayer),
     Layer.provide(Config.defaultLayer),
-    Layer.provide(Auth.defaultLayer),
+    Layer.provide(auth),
     Layer.provide(Plugin.defaultLayer),
     Layer.provide(ModelsDev.defaultLayer),
     Layer.provide(RuntimeFlags.layer(flags)),
@@ -79,6 +80,9 @@ const paid = (providers: Record<string, { models: Record<string, { cost: { input
 const languageBaseURL = (language: unknown) => (language as { config: { baseURL: string } }).config.baseURL
 
 const it = testEffect(Layer.mergeAll(Provider.defaultLayer, Env.defaultLayer, Plugin.defaultLayer))
+const isolatedProvider = testEffect(
+  Layer.mergeAll(Env.defaultLayer, Plugin.defaultLayer, CrossSpawnSpawner.defaultLayer),
+)
 const experimentalModels = testEffect(providerLayer({ enableExperimentalModels: true }))
 
 const refreshCatalog = {
@@ -302,20 +306,22 @@ it.instance("local provider models are discovered from the live endpoint", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
       const api = new URL("/v1", url).toString().replace(/\/$/, "")
-      yield* Effect.promise(() => Bun.write(
-        path.join(test.directory, "opencode.json"),
-        JSON.stringify({
-          enabled_providers: ["lmstudio"],
-          provider: {
-            lmstudio: {
-              api,
-              models: {
-                "stale-model": { name: "Stale Model" },
+      yield* Effect.promise(() =>
+        Bun.write(
+          path.join(test.directory, "opencode.json"),
+          JSON.stringify({
+            enabled_providers: ["lmstudio"],
+            provider: {
+              lmstudio: {
+                api,
+                models: {
+                  "stale-model": { name: "Stale Model" },
+                },
               },
             },
-          },
-        }),
-      ))
+          }),
+        ),
+      )
 
       const providers = yield* list
       const provider = providers[ProviderV2.ID.make("lmstudio")]
@@ -1877,34 +1883,76 @@ it.effect("opencode loader keeps paid models when config apiKey is present", () 
   }).pipe(provideMultiInstance),
 )
 
-it.effect("opencode loader keeps paid models when auth exists", () =>
+isolatedProvider.effect("same-provider auth rotation recreates derived language state without disposal", () =>
   Effect.gen(function* () {
     const noneDir = yield* tmpdirScoped()
     const keyedDir = yield* tmpdirScoped()
 
-    const listIn = (directory: string) =>
+    const authPath = path.join(keyedDir, "auth.json")
+    const isolatedAuth = Auth.layer(authPath).pipe(
+      Layer.provide(AppFileSystem.defaultLayer),
+      Layer.provide(EventV2.defaultLayer),
+    )
+    const listWithIsolatedAuth = (directory: string) =>
       Provider.use
         .list()
         .pipe(provideInstanceEffect(directory))
-        .pipe(Effect.provide(InstanceLayer.layer), Effect.provide(CrossSpawnSpawner.defaultLayer))
-
-    const none = paid(yield* listIn(noneDir))
-
-    const authPath = path.join(Global.Path.data, "auth.json")
-    const original = yield* Effect.promise(() => Filesystem.readText(authPath).catch(() => undefined))
-
-    yield* Effect.acquireRelease(
-      Effect.promise(() => Filesystem.write(authPath, JSON.stringify({ opencode: { type: "api", key: "test-key" } }))),
-      () =>
-        Effect.promise(async () => {
-          if (original !== undefined) await Filesystem.write(authPath, original)
-          else await unlink(authPath).catch(() => undefined)
+        .pipe(Effect.provide(InstanceLayer.layer), Effect.provide(providerLayer({}, isolatedAuth)))
+        .pipe(Effect.provide(CrossSpawnSpawner.defaultLayer))
+    const languageWithIsolatedAuth = (directory: string) =>
+      Provider.Service.use((provider) =>
+        Effect.gen(function* () {
+          const model = yield* provider.getModel(
+            ProviderV2.ID.anthropic,
+            ProviderV2.ModelID.make("claude-sonnet-4-20250514"),
+          )
+          return yield* provider.getLanguage(model)
         }),
-    )
+      )
+        .pipe(provideInstanceEffect(directory))
+        .pipe(Effect.provide(InstanceLayer.layer), Effect.provide(providerLayer({}, isolatedAuth)))
+        .pipe(Effect.provide(CrossSpawnSpawner.defaultLayer))
+    const providerWithIsolatedAuth = (directory: string) =>
+      Provider.Service.use((provider) => provider.getProvider(ProviderV2.ID.anthropic))
+        .pipe(provideInstanceEffect(directory))
+        .pipe(Effect.provide(InstanceLayer.layer), Effect.provide(providerLayer({}, isolatedAuth)))
+        .pipe(Effect.provide(CrossSpawnSpawner.defaultLayer))
+    const concurrentProvidersWithIsolatedAuth = (directory: string) =>
+      Provider.Service.use((provider) =>
+        Effect.all(Array.from({ length: 12 }, () => provider.getProvider(ProviderV2.ID.anthropic))),
+      )
+        .pipe(provideInstanceEffect(directory))
+        .pipe(Effect.provide(InstanceLayer.layer), Effect.provide(providerLayer({}, isolatedAuth)))
+        .pipe(Effect.provide(CrossSpawnSpawner.defaultLayer))
 
-    const keyedCount = paid(yield* listIn(keyedDir))
+    const none = paid(yield* listWithIsolatedAuth(noneDir))
+    expect(paid(yield* listWithIsolatedAuth(keyedDir))).toBe(0)
+
+    yield* Effect.promise(() =>
+      Filesystem.writeAtomic(authPath, JSON.stringify({ opencode: { type: "api", key: "test-key" } })),
+    )
+    const keyedCount = paid(yield* listWithIsolatedAuth(keyedDir))
+
+    yield* Effect.promise(() =>
+      Filesystem.writeAtomic(authPath, JSON.stringify({ anthropic: { type: "api", key: "first" } })),
+    )
+    const firstLanguage = yield* languageWithIsolatedAuth(keyedDir)
+    const firstProvider = yield* providerWithIsolatedAuth(keyedDir)
+    yield* Effect.promise(() =>
+      Filesystem.writeAtomic(authPath, JSON.stringify({ anthropic: { type: "api", key: "second" } })),
+    )
+    const rotatedLanguage = yield* languageWithIsolatedAuth(keyedDir)
+    const rotatedProvider = yield* providerWithIsolatedAuth(keyedDir)
+    const concurrentRotatedProviders = yield* concurrentProvidersWithIsolatedAuth(keyedDir)
+
+    yield* Effect.promise(() => Filesystem.writeAtomic(authPath, "{}"))
+    const disconnected = paid(yield* listWithIsolatedAuth(keyedDir))
 
     expect(none).toBe(0)
     expect(keyedCount).toBeGreaterThan(0)
-  }).pipe(provideMultiInstance),
+    expect(rotatedLanguage).not.toBe(firstLanguage)
+    expect(rotatedProvider).not.toBe(firstProvider)
+    expect(concurrentRotatedProviders.every((provider) => provider === concurrentRotatedProviders[0])).toBe(true)
+    expect(disconnected).toBe(0)
+  }),
 )

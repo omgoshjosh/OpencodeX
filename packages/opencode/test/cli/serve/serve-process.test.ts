@@ -6,8 +6,10 @@
 // and kills the process when the test scope closes. The OS-assigned port is
 // parsed off the "listening on http://..." line.
 import { describe, expect } from "bun:test"
-import { Effect, Schema } from "effect"
+import { Effect, Schedule, Schema } from "effect"
 import { HttpClient } from "effect/unstable/http"
+import { mkdir, rename, writeFile } from "node:fs/promises"
+import path from "node:path"
 import { cliIt } from "../../lib/cli-process"
 
 const HealthIdentity = Schema.Struct({
@@ -16,6 +18,61 @@ const HealthIdentity = Schema.Struct({
   databaseID: Schema.String,
   eventBusID: Schema.String,
 })
+
+function writeAuth(home: string, content: string) {
+  const file = path.join(home, ".local/share/opencode/auth.json")
+  const temporary = `${file}.next`
+  return Effect.promise(async () => {
+    await mkdir(path.dirname(file), { recursive: true })
+    await writeFile(temporary, content)
+    await rename(temporary, file)
+  })
+}
+
+async function openGlobalEvents(url: string) {
+  const controller = new AbortController()
+  const response = await fetch(`${url}/global/event`, { signal: controller.signal })
+  if (!response.ok || !response.body) throw new Error(`global event stream failed: HTTP ${response.status}`)
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ""
+  return {
+    next: async (): Promise<unknown> => {
+      while (true) {
+        const newline = buffer.indexOf("\n")
+        if (newline >= 0) {
+          const line = buffer.slice(0, newline).trimEnd()
+          buffer = buffer.slice(newline + 1)
+          if (line.startsWith("data:")) return JSON.parse(line.slice(5).trimStart())
+          continue
+        }
+        const chunk = await reader.read()
+        if (chunk.done) throw new Error("global event stream closed")
+        buffer += decoder.decode(chunk.value, { stream: true })
+      }
+    },
+    close: async () => {
+      controller.abort()
+      await reader.cancel().catch(() => undefined)
+    },
+  }
+}
+
+async function authChanged(events: Awaited<ReturnType<typeof openGlobalEvents>>) {
+  while (true) {
+    const event = await events.next()
+    if (
+      event &&
+      typeof event === "object" &&
+      "payload" in event &&
+      event.payload &&
+      typeof event.payload === "object" &&
+      "type" in event.payload &&
+      event.payload.type === "provider.auth.changed"
+    )
+      return event
+  }
+}
 
 describe("opencode serve (subprocess)", () => {
   cliIt.live(
@@ -71,10 +128,9 @@ describe("opencode serve (subprocess)", () => {
         // Serve claims exclusive per-database backend authority: a second
         // process on the same database must fail clearly, never replace the
         // live authority.
-        const second = yield* opencode.spawn(
-          ["serve", "--port", "0", "--hostname", "127.0.0.1", "--mdns", "false"],
-          { env: { OPENCODE_RUN_ID: "serve-second" } },
-        )
+        const second = yield* opencode.spawn(["serve", "--port", "0", "--hostname", "127.0.0.1", "--mdns", "false"], {
+          env: { OPENCODE_RUN_ID: "serve-second" },
+        })
         expect(second.exitCode).not.toBe(0)
         expect(second.stderr).toContain("A backend authority is already serving this database")
 
@@ -83,6 +139,115 @@ describe("opencode serve (subprocess)", () => {
           yield* (yield* client.get(`${first.url}/global/health`)).json,
         )
         expect(stillHealthy).toMatchObject({ processRole: "main", runID: "serve-first" })
+      }),
+    90_000,
+  )
+
+  cliIt.live(
+    "refreshes provider connectivity after isolated atomic auth replacements without exposing secrets",
+    ({ opencode, home }) =>
+      Effect.gen(function* () {
+        const secret = "sentinel-provider-auth-secret"
+        const rotated = "sentinel-provider-auth-secret-rotated"
+        const server = yield* opencode.serve({ extraArgs: ["--print-logs"] })
+        const pid = server.pid
+        const client = yield* HttpClient.HttpClient
+        const events = yield* Effect.acquireRelease(
+          Effect.promise(() => openGlobalEvents(server.url)),
+          (stream) => Effect.promise(() => stream.close()),
+        )
+        const responses: string[] = []
+        const providers = () =>
+          client.get(`${server.url}/provider`).pipe(
+            Effect.flatMap((response) => response.json),
+            Effect.tap((body) => Effect.sync(() => responses.push(JSON.stringify(body)))),
+          )
+        const connected = (value: unknown) => {
+          if (!value || typeof value !== "object" || !("connected" in value)) return false
+          return Array.isArray(value.connected) && value.connected.includes("anthropic")
+        }
+
+        const identity = () =>
+          client.get(`${server.url}/global/health`).pipe(
+            Effect.flatMap((response) => response.json),
+            Effect.map(Schema.decodeUnknownSync(HealthIdentity)),
+          )
+        const before = yield* identity()
+        expect(connected(yield* providers())).toBe(false)
+        const connectEvent = Effect.promise(() => authChanged(events))
+        yield* writeAuth(home, JSON.stringify({ anthropic: { type: "api", key: secret } }))
+        yield* providers().pipe(
+          Effect.filterOrFail(connected, () => new Error("provider never connected after auth replacement")),
+          Effect.retry({ schedule: Schedule.spaced("250 millis"), times: 20 }),
+        )
+        const duringConnect = yield* Effect.all(Array.from({ length: 12 }, providers))
+        expect(duringConnect.every(connected)).toBe(true)
+        expect(JSON.stringify(yield* connectEvent)).not.toContain(secret)
+        expect(server.pid).toBe(pid)
+
+        const rotateEvent = Effect.promise(() => authChanged(events)).pipe(
+          Effect.timeoutOrElse({
+            duration: "5 seconds",
+            orElse: () => Effect.die(new Error("auth rotation event timed out")),
+          }),
+        )
+        yield* writeAuth(home, JSON.stringify({ anthropic: { type: "api", key: rotated } }))
+        const duringRotation = yield* Effect.all(Array.from({ length: 12 }, providers))
+        expect(duringRotation.every(connected)).toBe(true)
+        expect(JSON.stringify(yield* rotateEvent)).not.toContain(rotated)
+        expect(server.pid).toBe(pid)
+
+        const disconnectEvent = Effect.promise(() => authChanged(events))
+        yield* writeAuth(home, "{}")
+        const disconnected = yield* providers().pipe(
+          Effect.filterOrFail(
+            (value) => !connected(value),
+            () => new Error("provider never disconnected after auth replacement"),
+          ),
+          Effect.retry({ schedule: Schedule.spaced("250 millis"), times: 20 }),
+        )
+        const duringDisconnect = yield* Effect.all(Array.from({ length: 12 }, providers))
+        expect(duringDisconnect.every((value) => !connected(value))).toBe(true)
+        expect(JSON.stringify(yield* disconnectEvent)).not.toContain(secret)
+        expect(server.pid).toBe(pid)
+
+        const putEvent = Effect.promise(() => authChanged(events))
+        const put = yield* Effect.promise(() =>
+          fetch(`${server.url}/auth/anthropic`, {
+            method: "PUT",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ type: "api", key: secret }),
+          }),
+        )
+        expect(put.ok).toBe(true)
+        expect(yield* Effect.promise(() => put.text())).not.toContain(secret)
+        yield* providers().pipe(
+          Effect.filterOrFail(connected, () => new Error("provider never connected after auth PUT")),
+          Effect.retry({ schedule: Schedule.spaced("250 millis"), times: 20 }),
+        )
+        expect(JSON.stringify(yield* putEvent)).not.toContain(secret)
+        expect(server.pid).toBe(pid)
+        const deleteEvent = Effect.promise(() => authChanged(events))
+        const remove = yield* Effect.promise(() => fetch(`${server.url}/auth/anthropic`, { method: "DELETE" }))
+        expect(remove.ok).toBe(true)
+        expect(yield* Effect.promise(() => remove.text())).not.toContain(secret)
+        yield* providers().pipe(
+          Effect.filterOrFail(
+            (value) => !connected(value),
+            () => new Error("provider never disconnected after auth DELETE"),
+          ),
+          Effect.retry({ schedule: Schedule.spaced("250 millis"), times: 20 }),
+        )
+        expect(JSON.stringify(yield* deleteEvent)).not.toContain(secret)
+        expect(server.pid).toBe(pid)
+        expect(yield* identity()).toEqual(before)
+        expect(JSON.stringify(disconnected)).not.toContain(secret)
+        expect(responses.join("\n")).not.toContain(secret)
+        expect(responses.join("\n")).not.toContain(rotated)
+        expect(server.stderr()).not.toContain(secret)
+        expect(server.stderr()).not.toContain(rotated)
+        expect(server.stdout()).not.toContain(secret)
+        expect(server.stdout()).not.toContain(rotated)
       }),
     90_000,
   )

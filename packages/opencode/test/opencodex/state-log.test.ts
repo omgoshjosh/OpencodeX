@@ -11,6 +11,7 @@ import {
 } from "@opencode-ai/core/opencodex/sql"
 import { PluginV2 } from "@opencode-ai/core/plugin"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
+import { Auth } from "../../src/auth"
 import { and, eq } from "drizzle-orm"
 import { Context, Deferred, Duration, Effect, Fiber, Layer, Logger, Schema } from "effect"
 import * as TestClock from "effect/testing/TestClock"
@@ -51,11 +52,9 @@ function captureLogs(logged: string[]) {
 // lets the pass under test reach its timeout, so the budget expires on the test
 // clock rather than on a wall-clock sleep.
 const advancePast = (budgetMs: number) =>
-  Effect.forEach(
-    [0, 1, 2, 3],
-    () => Effect.andThen(Effect.yieldNow, TestClock.adjust(Duration.millis(budgetMs))),
-    { discard: true },
-  )
+  Effect.forEach([0, 1, 2, 3], () => Effect.andThen(Effect.yieldNow, TestClock.adjust(Duration.millis(budgetMs))), {
+    discard: true,
+  })
 
 function record(value: unknown) {
   return value && typeof value === "object" && !Array.isArray(value) ? Object.fromEntries(Object.entries(value)) : {}
@@ -175,6 +174,28 @@ describe("OpencodeX state log", () => {
     }),
   )
 
+  it.live("publishes auth changes as a global capability invalidation", () =>
+    Effect.gen(function* () {
+      const firstDirectory = yield* tmpdirScoped({ git: true })
+      const secondDirectory = yield* tmpdirScoped({ git: true })
+      const database = yield* Database.Service
+      const eventLayer = EventV2.layer.pipe(Layer.provide(Layer.succeed(Database.Service, database)))
+      const events = Context.get(yield* Layer.build(eventLayer), EventV2.Service)
+      const log = yield* makeStateLog(database.db, events)
+      const received: string[] = []
+      yield* log.listen((event) => received.push(event.payload.eventType)).pipe(provideInstance(firstDirectory))
+      yield* log.listen((event) => received.push(event.payload.eventType)).pipe(provideInstance(secondDirectory))
+
+      yield* events.publish(Auth.Event.Changed, {})
+      yield* pollWithTimeout(
+        Effect.sync(() => (received.length === 2 ? true : undefined)),
+        "provider.auth.changed was not delivered to every connected scope",
+      )
+
+      expect(received).toEqual(["provider.auth.changed", "provider.auth.changed"])
+    }),
+  )
+
   it.live("keeps aggregate sequence after retained event rows are removed", () =>
     Effect.gen(function* () {
       const database = yield* Database.Service
@@ -270,11 +291,7 @@ describe("OpencodeX state log", () => {
       const retained = yield* database.db.select().from(OpencodeXStateEventTable).all().pipe(Effect.orDie)
       expect(retained).toHaveLength(1)
 
-      yield* database.db
-        .update(OpencodeXStateEventTable)
-        .set({ created_at: 0 })
-        .run()
-        .pipe(Effect.orDie)
+      yield* database.db.update(OpencodeXStateEventTable).set({ created_at: 0 }).run().pipe(Effect.orDie)
       yield* log.maintain()
       expect(yield* database.db.select().from(OpencodeXStateEventTable).all().pipe(Effect.orDie)).toHaveLength(0)
 
@@ -310,17 +327,18 @@ describe("OpencodeX state log", () => {
         maintenanceIntervalMs: 10,
       })
 
-      yield* Effect.forEach(
-        ["first", "second", "third"],
-        (id) => events.publish(GlobalInvalidation, { id }),
-        { discard: true },
-      )
+      yield* Effect.forEach(["first", "second", "third"], (id) => events.publish(GlobalInvalidation, { id }), {
+        discard: true,
+      })
       yield* pollWithTimeout(
         database.db
           .select({ position: OpencodeXStateEventTable.position })
           .from(OpencodeXStateEventTable)
           .all()
-          .pipe(Effect.orDie, Effect.map((rows) => (rows.length === 1 ? true : undefined))),
+          .pipe(
+            Effect.orDie,
+            Effect.map((rows) => (rows.length === 1 ? true : undefined)),
+          ),
         "state journal was not pruned by periodic maintenance",
       )
     }),
@@ -400,7 +418,8 @@ describe("OpencodeX state log", () => {
       // The phases partition the hold, so a hold that is not the pass's own SQL
       // is visible as reserve or commit time rather than being unattributable.
       expect(field("reserve_ms") + field("sql_ms") + field("commit_ms")).toBe(field("total_ms"))
-      for (const name of ["total_ms", "reserve_ms", "sql_ms", "commit_ms"]) expect(field(name)).toBeGreaterThanOrEqual(0)
+      for (const name of ["total_ms", "reserve_ms", "sql_ms", "commit_ms"])
+        expect(field(name)).toBeGreaterThanOrEqual(0)
     }),
   )
 
@@ -495,19 +514,22 @@ describe("OpencodeX state log", () => {
 
       yield* skip
       yield* skip
-      expect(logged.some((entry) => entry.includes("state_maintain_skipped") && entry.includes("consecutive_skips=1")))
-        .toBe(true)
+      expect(
+        logged.some((entry) => entry.includes("state_maintain_skipped") && entry.includes("consecutive_skips=1")),
+      ).toBe(true)
       // Past the streak threshold the message changes: one skip is back-pressure,
       // a streak means retention never runs and the journal grows unbounded.
-      expect(logged.some((entry) => entry.includes("state_maintain_starved") && entry.includes("consecutive_skips=2")))
-        .toBe(true)
+      expect(
+        logged.some((entry) => entry.includes("state_maintain_starved") && entry.includes("consecutive_skips=2")),
+      ).toBe(true)
 
       // A pass that lands clears the streak.
       yield* log.maintain().pipe(Effect.provide(captureLogs(logged)))
       logged.length = 0
       yield* skip
-      expect(logged.some((entry) => entry.includes("state_maintain_skipped") && entry.includes("consecutive_skips=1")))
-        .toBe(true)
+      expect(
+        logged.some((entry) => entry.includes("state_maintain_skipped") && entry.includes("consecutive_skips=1")),
+      ).toBe(true)
       expect(logged.some((entry) => entry.includes("state_maintain_starved"))).toBe(false)
     }),
   )
@@ -570,11 +592,9 @@ describe("OpencodeX state log", () => {
         maintenanceIntervalMs: 60_000,
       })
 
-      yield* Effect.forEach(
-        ["first", "second", "third"],
-        (id) => events.publish(GlobalInvalidation, { id }),
-        { discard: true },
-      )
+      yield* Effect.forEach(["first", "second", "third"], (id) => events.publish(GlobalInvalidation, { id }), {
+        discard: true,
+      })
       const scope = yield* log.scope().pipe(provideInstance(directory))
       expect(yield* log.replay(log.cursorAt(scope, 0)).pipe(provideInstance(directory))).toMatchObject({
         reset: true,

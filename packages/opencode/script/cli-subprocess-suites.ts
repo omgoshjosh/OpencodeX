@@ -23,6 +23,7 @@ export const cliSubprocessSuites = [
   "test/cli/run/run-process.test.ts",
   "test/cli/serve/authority-attach.test.ts",
   "test/cli/serve/cross-client.test.ts",
+  "test/cli/serve/report-delivery-live.test.ts",
   "test/cli/serve/report-redelivery.test.ts",
   "test/cli/serve/serve-authority.test.ts",
   "test/cli/serve/serve-canonical-marker.test.ts",

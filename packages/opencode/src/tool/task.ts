@@ -29,6 +29,7 @@ import { OpencodeXSwarmRoleTable } from "@opencode-ai/core/opencodex/sql"
 import { SwarmBriefing } from "@/opencodex/swarm-briefing"
 import { isSwarmProvider } from "@/provider/swarm-provider"
 import { SessionStatus } from "@/session/status"
+import { resolveSessionAgent } from "@/session/session-agent"
 import { ensureRunID } from "@opencode-ai/core/util/opencode-process"
 
 const log = Log.create({ service: "tool.task" })
@@ -709,6 +710,13 @@ export const TaskTool = Tool.define(
           text: string,
         ) {
           const currentParent = yield* sessions.get(ctx.sessionID)
+          // A parent whose stored agent is not registered would make the
+          // prompt throw "Agent not found" and strand the report as a silent
+          // `failed` stamp (OpencodeX-557) - the same hole deliverReport had.
+          const parentAgent = yield* resolveSessionAgent(agent, {
+            sessionID: ctx.sessionID,
+            agent: currentParent.agent,
+          })
           // Durable, deferred delivery (#38 Task 13). `ops.prompt` only writes
           // the message and joins whatever turn is running; if that turn dies
           // (2026-09-05: a 15-minute stream hang ended in ECONNRESET) nothing
@@ -720,7 +728,7 @@ export const TaskTool = Tool.define(
               sessionID: ctx.sessionID,
               messageID: MessageID.make(`msg_task_report_${runID}`),
               delivery: "deferred",
-              agent: currentParent.agent ?? ctx.agent,
+              agent: parentAgent ?? ctx.agent,
               parts: [
                 {
                   type: "text",
@@ -747,10 +755,18 @@ export const TaskTool = Tool.define(
                   sessions
                     .stampDelegationDelivery({ sessionID: nextSession.id, runID, outcome: "delivered" })
                     .pipe(Effect.ignore),
-                onFailure: () =>
-                  sessions
-                    .stampDelegationDelivery({ sessionID: nextSession.id, runID, outcome: "failed" })
-                    .pipe(Effect.ignore),
+                onFailure: (cause) =>
+                  Effect.logError("background report delivery failed", {
+                    parentSessionID: ctx.sessionID,
+                    childSessionID: nextSession.id,
+                    runID,
+                    cause,
+                  }).pipe(
+                    Effect.andThen(
+                      sessions.stampDelegationDelivery({ sessionID: nextSession.id, runID, outcome: "failed" }),
+                    ),
+                    Effect.ignore,
+                  ),
               }),
               Effect.forkIn(scope, { startImmediately: true }),
             )

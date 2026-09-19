@@ -32,38 +32,41 @@ const it = testEffect(
 // fires after the header deadline would have.
 const HEADER_BUDGET = 2000
 
-it.live("headerTimeout does not abort delayed SSE body after headers arrive", () =>
-  Effect.gen(function* () {
-    const server = yield* Effect.acquireRelease(
-      Effect.promise(() => delayedBodyServer(HEADER_BUDGET + 100)),
-      (server) => Effect.sync(() => server.server.close()),
-    )
+it.live(
+  "headerTimeout does not abort delayed SSE body after headers arrive",
+  () =>
+    Effect.gen(function* () {
+      const server = yield* Effect.acquireRelease(
+        Effect.promise(() => delayedBodyServer(HEADER_BUDGET + 100)),
+        (server) => Effect.sync(() => server.server.close()),
+      )
 
-    yield* provideTmpdirInstance(
-      () =>
-        Effect.gen(function* () {
-          const provider = yield* Provider.Service
-          const model = yield* provider.getModel(ProviderV2.ID.make("test"), ProviderV2.ModelID.make("test-model"))
-          const started = performance.now()
-          const result = streamText({
-            model: yield* provider.getLanguage(model),
-            messages: [{ role: "user", content: "hello" }],
-          })
+      yield* provideTmpdirInstance(
+        () =>
+          Effect.gen(function* () {
+            const provider = yield* Provider.Service
+            const model = yield* provider.getModel(ProviderV2.ID.make("test"), ProviderV2.ModelID.make("test-model"))
+            const started = performance.now()
+            const result = streamText({
+              model: yield* provider.getLanguage(model),
+              messages: [{ role: "user", content: "hello" }],
+            })
 
-          const text = yield* Effect.tryPromise({
-            try: () => result.text,
-            catch: (error) => {
-              const headers = server.requestAt === undefined ? "never" : `${(server.requestAt - started).toFixed(0)}ms`
-              return new Error(`stream failed; request reached server after ${headers}: ${String(error)}`, {
-                cause: error,
-              })
-            },
-          })
-          expect(text).toBe("late")
-        }),
-      { config: providerConfig(server.url, { headerTimeout: HEADER_BUDGET }) },
-    )
-  }),
+            const text = yield* Effect.tryPromise({
+              try: () => result.text,
+              catch: (error) => {
+                const headers =
+                  server.requestAt === undefined ? "never" : `${(server.requestAt - started).toFixed(0)}ms`
+                return new Error(`stream failed; request reached server after ${headers}: ${String(error)}`, {
+                  cause: error,
+                })
+              },
+            })
+            expect(text).toBe("late")
+          }),
+        { config: providerConfig(server.url, { headerTimeout: HEADER_BUDGET }) },
+      )
+    }),
   // Instance bootstrap plus the held body exceed bun's 5 s default; match the package script.
   { timeout: 30_000 },
 )
@@ -132,6 +135,39 @@ it.live("headerTimeout aborts when response headers do not arrive", () =>
           expect(errors.join("\n")).toContain("response headers timed out")
         }),
       { config: providerConfig(server.url, { headerTimeout: 50 }) },
+    )
+  }),
+)
+
+it.live("header timeout never surfaces a configured credential", () =>
+  Effect.gen(function* () {
+    const secret = "sentinel-header-timeout-secret"
+    const server = yield* Effect.acquireRelease(
+      Effect.promise(() => delayedHeaderServer(250)),
+      (server) => Effect.sync(() => server.server.close()),
+    )
+    yield* provideTmpdirInstance(
+      () =>
+        Effect.gen(function* () {
+          const provider = yield* Provider.Service
+          const model = yield* provider.getModel(ProviderV2.ID.make("test"), ProviderV2.ModelID.make("test-model"))
+          const result = streamText({
+            model: yield* provider.getLanguage(model),
+            maxRetries: 0,
+            onError() {},
+            messages: [{ role: "user", content: "hello" }],
+          })
+          const errors = yield* Effect.promise(async () => {
+            const errors: string[] = []
+            for await (const part of result.fullStream) {
+              if (part.type === "error") errors.push(String(part.error))
+            }
+            return errors
+          })
+          expect(errors.join("\n")).toContain("response headers timed out")
+          expect(errors.join("\n")).not.toContain(secret)
+        }),
+      { config: providerConfig(server.url, { apiKey: secret, headerTimeout: 50 }) },
     )
   }),
 )

@@ -1883,7 +1883,7 @@ it.effect("opencode loader keeps paid models when config apiKey is present", () 
   }).pipe(provideMultiInstance),
 )
 
-isolatedProvider.effect("opencode loader refreshes an existing provider state after external auth changes", () =>
+isolatedProvider.effect("same-provider auth rotation recreates derived language state without disposal", () =>
   Effect.gen(function* () {
     const noneDir = yield* tmpdirScoped()
     const keyedDir = yield* tmpdirScoped()
@@ -1912,6 +1912,18 @@ isolatedProvider.effect("opencode loader refreshes an existing provider state af
         .pipe(provideInstanceEffect(directory))
         .pipe(Effect.provide(InstanceLayer.layer), Effect.provide(providerLayer({}, isolatedAuth)))
         .pipe(Effect.provide(CrossSpawnSpawner.defaultLayer))
+    const providerWithIsolatedAuth = (directory: string) =>
+      Provider.Service.use((provider) => provider.getProvider(ProviderV2.ID.anthropic))
+        .pipe(provideInstanceEffect(directory))
+        .pipe(Effect.provide(InstanceLayer.layer), Effect.provide(providerLayer({}, isolatedAuth)))
+        .pipe(Effect.provide(CrossSpawnSpawner.defaultLayer))
+    const concurrentProvidersWithIsolatedAuth = (directory: string) =>
+      Provider.Service.use((provider) =>
+        Effect.all(Array.from({ length: 12 }, () => provider.getProvider(ProviderV2.ID.anthropic))),
+      )
+        .pipe(provideInstanceEffect(directory))
+        .pipe(Effect.provide(InstanceLayer.layer), Effect.provide(providerLayer({}, isolatedAuth)))
+        .pipe(Effect.provide(CrossSpawnSpawner.defaultLayer))
 
     const none = paid(yield* listWithIsolatedAuth(noneDir))
     expect(paid(yield* listWithIsolatedAuth(keyedDir))).toBe(0)
@@ -1925,10 +1937,13 @@ isolatedProvider.effect("opencode loader refreshes an existing provider state af
       Filesystem.writeAtomic(authPath, JSON.stringify({ anthropic: { type: "api", key: "first" } })),
     )
     const firstLanguage = yield* languageWithIsolatedAuth(keyedDir)
+    const firstProvider = yield* providerWithIsolatedAuth(keyedDir)
     yield* Effect.promise(() =>
       Filesystem.writeAtomic(authPath, JSON.stringify({ anthropic: { type: "api", key: "second" } })),
     )
     const rotatedLanguage = yield* languageWithIsolatedAuth(keyedDir)
+    const rotatedProvider = yield* providerWithIsolatedAuth(keyedDir)
+    const concurrentRotatedProviders = yield* concurrentProvidersWithIsolatedAuth(keyedDir)
 
     yield* Effect.promise(() => Filesystem.writeAtomic(authPath, "{}"))
     const disconnected = paid(yield* listWithIsolatedAuth(keyedDir))
@@ -1936,6 +1951,8 @@ isolatedProvider.effect("opencode loader refreshes an existing provider state af
     expect(none).toBe(0)
     expect(keyedCount).toBeGreaterThan(0)
     expect(rotatedLanguage).not.toBe(firstLanguage)
+    expect(rotatedProvider).not.toBe(firstProvider)
+    expect(concurrentRotatedProviders.every((provider) => provider === concurrentRotatedProviders[0])).toBe(true)
     expect(disconnected).toBe(0)
   }),
 )

@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, test } from "bun:test"
 import { Effect, Exit, Logger, Option } from "effect"
+import { CurrentLogAnnotations } from "effect/References"
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
 import * as Log from "@opencode-ai/core/util/log"
 import * as PromptSwarm from "../../src/session/prompt-swarm"
@@ -201,9 +202,11 @@ function harness(input: { parentAgent?: string; promptFailures?: number }) {
   }
   let started: Effect.Effect<string, unknown> | undefined
   const { runSwarmRole } = PromptSwarm.make(deps as unknown as PromptSwarm.Deps)
-  const logger = Logger.make<unknown, void>(({ logLevel, message }) => {
-    const [first, data] = Array.isArray(message) ? message : [message, {}]
-    logged.push({ level: logLevel, message: first, data })
+  // Fields arrive as log annotations, never as a second log argument
+  // (that shape renders `[object Object]`; see test/effect/log-shape.test.ts).
+  const logger = Logger.make<unknown, void>(({ logLevel, message, fiber }) => {
+    const [first] = Array.isArray(message) ? message : [message]
+    logged.push({ level: logLevel, message: first, data: fiber.getRef(CurrentLogAnnotations) })
   })
   const withLogger = <A, E>(effect: Effect.Effect<A, E>) => effect.pipe(Effect.provide(Logger.layer([logger])))
   const deliver = () =>

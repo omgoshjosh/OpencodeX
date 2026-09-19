@@ -1,5 +1,5 @@
 import { stat } from "node:fs/promises"
-import { Context, Duration, Effect, Layer, Option } from "effect"
+import { Cause, Context, Duration, Effect, Layer, Option } from "effect"
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
 import type { SessionSchema } from "@opencode-ai/core/session/schema"
 import { Agent } from "@/agent/agent"
@@ -640,7 +640,11 @@ export function makeLayer(options: LayerOptions = {}) {
             // recovers from both typed failures and defects.
             yield* todos
               .update({ sessionID, todos: write.todos as never })
-              .pipe(Effect.catchCause((cause) => Effect.logWarning("todos update failed", { cause })))
+              .pipe(
+                Effect.catchCause((cause) =>
+                  Effect.logWarning("todos update failed").pipe(Effect.annotateLogs({ cause: Cause.pretty(cause) })),
+                ),
+              )
         }
       })
 

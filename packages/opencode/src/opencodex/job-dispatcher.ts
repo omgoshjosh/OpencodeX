@@ -146,10 +146,7 @@ export function layer(options: Options = {}) {
         current.controller.abort("Job dispatcher stopped")
         const job = yield* jobs.get(jobID)
         if (job.cancelRequestedAt) {
-          yield* jobs.settle(
-            { jobID, owner: current.owner, outcome: { status: "cancelled" } },
-            current.handler.settled,
-          )
+          yield* jobs.settle({ jobID, owner: current.owner, outcome: { status: "cancelled" } }, current.handler.settled)
           return
         }
         const failed = yield* jobs.fail({
@@ -202,7 +199,11 @@ export function layer(options: Options = {}) {
               active.set(job.id, current)
               yield* execute(claimed.value, handler, owner, controller).pipe(
                 Effect.onInterrupt(() => release(job.id, current).pipe(Effect.ignore)),
-                Effect.catchCause((cause) => Effect.logError("job execution fiber failed", { jobID: job.id, cause })),
+                Effect.catchCause((cause) =>
+                  Effect.logError("job execution fiber failed").pipe(
+                    Effect.annotateLogs({ jobID: job.id, cause: Cause.pretty(cause) }),
+                  ),
+                ),
                 Effect.ensuring(
                   Effect.sync(() => {
                     active.delete(job.id)

@@ -146,7 +146,7 @@ function questionRequestMessage(input: { child: Session.Info; request: Question.
     ...questions,
     "<instructions>",
     `Answer with the question_reply tool: question_reply({ requestID: "${encodeQuestionID(input.request.id)}", action: "answer", answers: [["<label>"]] }).`,
-    "Give one array of chosen labels per question, in order. Use action \"reject\" to dismiss the question and let the child continue without an answer.",
+    'Give one array of chosen labels per question, in order. Use action "reject" to dismiss the question and let the child continue without an answer.',
     "If this is genuinely a human's call, do not answer it — leave the request pending and say so, and a human can still answer it directly.",
     "</instructions>",
     "</question_request>",
@@ -1093,7 +1093,11 @@ export const layer = Layer.effect(
     // reports are waited on.
     const unregisterDelegationRecovery = SessionPromptRecovery.register(() =>
       recoverBackgroundDelegations().pipe(
-        Effect.catchCause((cause) => Effect.logWarning("background delegation recovery failed", { cause })),
+        Effect.catchCause((cause) =>
+          Effect.logWarning("background delegation recovery failed").pipe(
+            Effect.annotateLogs({ cause: Cause.pretty(cause) }),
+          ),
+        ),
       ),
     )
     yield* Effect.addFinalizer(() => Effect.sync(unregisterDelegationRecovery))
@@ -1243,9 +1247,7 @@ export const layer = Layer.effect(
      * still-pending row, short-circuits on the existing command row instead of
      * writing a second message.
      */
-    const notifyQuestionParent = Effect.fn("SessionPrompt.notifyQuestionParent")(function* (
-      request: Question.Request,
-    ) {
+    const notifyQuestionParent = Effect.fn("SessionPrompt.notifyQuestionParent")(function* (request: Question.Request) {
       const child = yield* sessions.get(request.sessionID).pipe(Effect.option)
       if (child._tag === "None") return
       const parentID = child.value.parentID
@@ -1281,7 +1283,9 @@ export const layer = Layer.effect(
     const questionParentNotification = (request: Question.Request) =>
       notifyQuestionParent(request).pipe(
         Effect.catchCause((cause) =>
-          Effect.logWarning("question parent notification failed", { requestID: request.id, cause }),
+          Effect.logWarning("question parent notification failed").pipe(
+            Effect.annotateLogs({ requestID: request.id, cause: Cause.pretty(cause) }),
+          ),
         ),
       )
     const unregisterQuestionNotify = SessionQuestionNotify.register(questionParentNotification)
@@ -1292,7 +1296,11 @@ export const layer = Layer.effect(
     const unregisterQuestionRecovery = SessionPromptRecovery.register(() =>
       question.list().pipe(
         Effect.flatMap((pending) => Effect.forEach(pending, questionParentNotification, { discard: true })),
-        Effect.catchCause((cause) => Effect.logWarning("question notification recovery failed", { cause })),
+        Effect.catchCause((cause) =>
+          Effect.logWarning("question notification recovery failed").pipe(
+            Effect.annotateLogs({ cause: Cause.pretty(cause) }),
+          ),
+        ),
       ),
     )
     yield* Effect.addFinalizer(() => Effect.sync(unregisterQuestionRecovery))

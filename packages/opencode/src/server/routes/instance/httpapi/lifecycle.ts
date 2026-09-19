@@ -1,7 +1,7 @@
 import { EffectBridge } from "@/effect/bridge"
 import type { InstanceContext } from "@/project/instance-context"
 import { InstanceStore } from "@/project/instance-store"
-import { Effect } from "effect"
+import { Cause, Effect } from "effect"
 import { HttpEffect, HttpMiddleware, HttpServerRequest } from "effect/unstable/http"
 
 type MarkedInstance = {
@@ -48,7 +48,9 @@ export const disposeMiddleware: HttpMiddleware.HttpMiddleware = (effect) =>
     if (!marked) return response
     disposeAfterResponse.delete(request.source)
     yield* Effect.uninterruptible(marked.bridge.run(marked.store.dispose(marked.ctx))).pipe(
-      Effect.catchCause((cause) => Effect.logWarning("instance disposal failed", { cause })),
+      Effect.catchCause((cause) =>
+        Effect.logWarning("instance disposal failed").pipe(Effect.annotateLogs({ cause: Cause.pretty(cause) })),
+      ),
     )
     return response
   })

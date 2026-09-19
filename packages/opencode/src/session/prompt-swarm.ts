@@ -279,16 +279,14 @@ export function make(deps: Deps) {
    * concurrent workers; the message identity lets recovery resume after a
    * crash between the command write and the delivery stamp.
    */
-  const deliverReport = (
-    input: {
-      parentSessionID: SessionID
-      childSessionID: SessionID
-      runID: string
-      role: string
-      state: "completed" | "error"
-      text: string
-    },
-  ): Effect.Effect<void, Image.Error> =>
+  const deliverReport = (input: {
+    parentSessionID: SessionID
+    childSessionID: SessionID
+    runID: string
+    role: string
+    state: "completed" | "error"
+    text: string
+  }): Effect.Effect<void, Image.Error> =>
     Effect.gen(function* () {
       const parent = yield* sessions.get(input.parentSessionID).pipe(Effect.orDie)
       let claim: string | undefined
@@ -345,11 +343,13 @@ export function make(deps: Deps) {
       // re-delivered by recoverBackgroundDelegations below.
       yield* wake.pipe(
         Effect.catchCause((first) =>
-          Effect.logError("background report delivery failed", { ...context, attempt: 1, cause: first }).pipe(
+          Effect.logError("background report delivery failed").pipe(
+            Effect.annotateLogs({ ...context, attempt: 1, cause: Cause.pretty(first) }),
             Effect.andThen(Effect.sleep(deps.deliveryRetryDelayMs ?? DEFAULT_DELIVERY_RETRY_DELAY_MS)),
             Effect.andThen(wake),
             Effect.catchCause((second) =>
-              Effect.logError("background report delivery failed", { ...context, attempt: 2, cause: second }).pipe(
+              Effect.logError("background report delivery failed").pipe(
+                Effect.annotateLogs({ ...context, attempt: 2, cause: Cause.pretty(second) }),
                 Effect.andThen(
                   sessions.stampDelegationDelivery({
                     sessionID: input.childSessionID,
@@ -459,10 +459,7 @@ export function make(deps: Deps) {
    * without this the poller can hand the orchestrator a preamble as the
    * delegate's report and interrupt the turn that was about to answer.
    */
-  const childReport = Effect.fnUntraced(function* (
-    childSessionID: SessionID,
-    options?: { requireFinished?: boolean },
-  ) {
+  const childReport = Effect.fnUntraced(function* (childSessionID: SessionID, options?: { requireFinished?: boolean }) {
     const messages = yield* sessions.messages({ sessionID: childSessionID }).pipe(Effect.orElseSucceed(() => []))
     const last = messages.findLast((message) => message.info.role === "assistant")
     if (!last || last.info.role !== "assistant") return undefined
@@ -583,7 +580,7 @@ export function make(deps: Deps) {
     for (const row of rows) {
       const record = delegationRecord(row.metadata)
       if (!record?.background || !row.parentID) continue
-       const undelivered = record.phase === "running" || record.deliveryOutcome !== "delivered"
+      const undelivered = record.phase === "running" || record.deliveryOutcome !== "delivered"
       if (!undelivered) continue
       const childID = row.id
       const parentID = row.parentID
@@ -822,14 +819,22 @@ export function make(deps: Deps) {
         : {}),
     }
     const stamp = (record: DelegationRecord, expectRunID?: string) =>
-      sessions.stampDelegation({ sessionID: child.id, record, ...(expectRunID ? { expectRunID } : {}) }).pipe(
-        Effect.catchCause((cause) =>
-          Effect.logError("swarm delegation stamp failed").pipe(
-            Effect.annotateLogs({ sessionID: child.id, action: "stamp-delegation", runID, state: record.phase, cause }),
-            Effect.as(false),
+      sessions
+        .stampDelegation({ sessionID: child.id, record, ...(expectRunID ? { expectRunID } : {}) })
+        .pipe(
+          Effect.catchCause((cause) =>
+            Effect.logError("swarm delegation stamp failed").pipe(
+              Effect.annotateLogs({
+                sessionID: child.id,
+                action: "stamp-delegation",
+                runID,
+                state: record.phase,
+                cause,
+              }),
+              Effect.as(false),
+            ),
           ),
-        ),
-      )
+        )
     // The first terminal settlement wins in this process as well as in the
     // record: a foreground run is settled by whichever of the role fiber and
     // the durable poller gets there first, and the loser is then interrupted -
@@ -1142,21 +1147,23 @@ export function make(deps: Deps) {
       // Delivered through the ordinary prompt path (not "immediate"), so it
       // never interrupts the in-flight work it is adopting.
       adoptOrphan: (orphan: { toolName: string }) =>
-        deps.promptAsync({
-          sessionID,
-          parts: [
-            {
-              type: "text",
-              synthetic: true,
-              text: [
-                "<system-reminder>",
-                `OpencodeX adopted work this session started outside a turn (a peer message woke it; first gated tool: ${orphan.toolName}).`,
-                "Finish that work, then reply briefly with what was done. Approvals you see here belong to that work.",
-                "</system-reminder>",
-              ].join("\n"),
-            },
-          ],
-        }).pipe(Effect.orDie),
+        deps
+          .promptAsync({
+            sessionID,
+            parts: [
+              {
+                type: "text",
+                synthetic: true,
+                text: [
+                  "<system-reminder>",
+                  `OpencodeX adopted work this session started outside a turn (a peer message woke it; first gated tool: ${orphan.toolName}).`,
+                  "Finish that work, then reply briefly with what was done. Approvals you see here belong to that work.",
+                  "</system-reminder>",
+                ].join("\n"),
+              },
+            ],
+          })
+          .pipe(Effect.orDie),
       directory: session.directory,
       providerID: turnProviderID,
       modelID: turnModelID,

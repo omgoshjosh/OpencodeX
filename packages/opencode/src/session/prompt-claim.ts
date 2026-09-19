@@ -584,7 +584,11 @@ export function make(deps: Deps) {
               ),
             ),
         ),
-        Effect.catchCause((cause) => Effect.logError("prompt_async recovery failed", { commandID, cause })),
+        Effect.catchCause((cause) =>
+          Effect.logError("prompt_async recovery failed").pipe(
+            Effect.annotateLogs({ commandID, cause: Cause.pretty(cause) }),
+          ),
+        ),
         Effect.ensuring(Effect.sync(() => launching.delete(commandID))),
         Effect.forkIn(scope, { startImmediately: true }),
       )
@@ -797,24 +801,27 @@ export function make(deps: Deps) {
           )
           .pipe(Effect.orDie)
         if (!settled) continue
-        yield* Effect.logWarning("stale execution force-settled", {
-          sessionID: candidate.sessionID,
-          executionOwner: candidate.owner,
-          executionGeneration: candidate.generation,
-          messageID: activity.message?.id,
-          idleMillis: now - idleSince,
-          staleAfterMillis: staleAfter,
-          action: "force-settle",
-        })
+        yield* Effect.logWarning("stale execution force-settled").pipe(
+          Effect.annotateLogs({
+            sessionID: candidate.sessionID,
+            executionOwner: candidate.owner,
+            executionGeneration: candidate.generation,
+            messageID: activity.message?.id,
+            idleMillis: now - idleSince,
+            staleAfterMillis: staleAfter,
+            action: "force-settle",
+          }),
+        )
         if (deps.onStaleExecution)
-          yield* deps.onStaleExecution(candidate.sessionID).pipe(
-            Effect.catchCause((cause) =>
-              Effect.logWarning("stale execution delegation settle failed", {
-                sessionID: candidate.sessionID,
-                cause,
-              }),
-            ),
-          )
+          yield* deps
+            .onStaleExecution(candidate.sessionID)
+            .pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning("stale execution delegation settle failed").pipe(
+                  Effect.annotateLogs({ sessionID: candidate.sessionID, cause: Cause.pretty(cause) }),
+                ),
+              ),
+            )
       }
     })
 
@@ -824,7 +831,9 @@ export function make(deps: Deps) {
       // commands this same pass is about to launch. Isolated so a watchdog
       // failure never costs the rest of the sweep.
       yield* sweepStaleExecutions().pipe(
-        Effect.catchCause((cause) => Effect.logWarning("stale execution sweep failed", { cause })),
+        Effect.catchCause((cause) =>
+          Effect.logWarning("stale execution sweep failed").pipe(Effect.annotateLogs({ cause: Cause.pretty(cause) })),
+        ),
       )
       // Phase one, on the read connection: the sessions owed work and the
       // oldest launchable command in each. Nothing is claimed here - the
@@ -911,20 +920,27 @@ export function make(deps: Deps) {
           continue
         // Legacy transcript-only messages are observable but not recoverable;
         // repeated sweeps must not manufacture operator warnings for no-op work.
-        yield* Effect.logDebug("session transcript has pending message without durable command", {
-          messageID: message.id,
-          sessionID: message.sessionID,
-          messageAgeMillis: clock() - message.created,
-          action: "transcript-only",
-          cas: "not-attempted",
-        }).pipe(Effect.catchCause(() => Effect.void))
+        yield* Effect.logDebug("session transcript has pending message without durable command").pipe(
+          Effect.annotateLogs({
+            messageID: message.id,
+            sessionID: message.sessionID,
+            messageAgeMillis: clock() - message.created,
+            action: "transcript-only",
+            cas: "not-attempted",
+          }),
+          Effect.catchCause(() => Effect.void),
+        )
       }
     })
     const recovery = yield* InstanceState.make(() =>
       Effect.gen(function* () {
         yield* Effect.sleep(recoveryInterval).pipe(
           Effect.andThen(recover()),
-          Effect.catchCause((cause) => Effect.logWarning("session command recovery sweep failed", { cause })),
+          Effect.catchCause((cause) =>
+            Effect.logWarning("session command recovery sweep failed").pipe(
+              Effect.annotateLogs({ cause: Cause.pretty(cause) }),
+            ),
+          ),
           Effect.repeat(Schedule.forever),
           Effect.forkScoped,
         )

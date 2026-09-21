@@ -509,6 +509,7 @@ describe("session.llm.ai-sdk adapter", () => {
           toolName: "bash",
           input: {},
           error: apiError(),
+          providerMetadata: { upstream: { debug: secret } },
         }),
         redact,
       ),
@@ -516,6 +517,7 @@ describe("session.llm.ai-sdk adapter", () => {
     expect(events).toHaveLength(1)
     expect(JSON.stringify(events[0])).not.toContain(secret)
     expect(events[0]).toMatchObject({ type: "tool-error", id: "call_secret", name: "bash" })
+    expect(events[0]).not.toHaveProperty("providerMetadata")
   })
 
   test("emits undefined usage when every AI SDK usage field is missing", async () => {

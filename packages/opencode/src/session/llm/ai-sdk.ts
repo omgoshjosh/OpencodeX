@@ -230,7 +230,6 @@ export function toLLMEvents(
             name,
             message: errorMessage(error),
             error,
-            providerMetadata: providerMetadata(event.providerMetadata),
           }),
         ]
       })

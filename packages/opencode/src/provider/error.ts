@@ -3,6 +3,115 @@ import { STATUS_CODES } from "http"
 import { iife } from "@/util/iife"
 import type { ProviderV2 } from "@opencode-ai/core/provider"
 
+const REDACTED = "[REDACTED]"
+const SECRET_KEY = /(?:api[-_]?key|authorization|credential|password|secret|token)/i
+const SECRET_HEADER =
+  /^(?:authorization|proxy-authorization|.*(?:api[-_]?key|access[-_]?token|auth(?:entication)?|credential|secret|token).*)$/i
+
+export type Redactor = {
+  readonly value: (value: unknown) => unknown
+  readonly error: (error: unknown) => Error
+}
+
+/** Builds a per-request boundary; the secret list never leaves this closure. */
+export function redactor(input: {
+  auth?: unknown
+  providerKey?: unknown
+  providerOptions?: unknown
+  headers?: Record<string, string>
+}): Redactor {
+  const values = new Set<string>()
+  collectAuth(input.auth, values)
+  if (typeof input.providerKey === "string") values.add(input.providerKey)
+  collect(input.providerOptions, values, false)
+  for (const [key, value] of Object.entries(input.headers ?? {})) {
+    if (SECRET_HEADER.test(key)) values.add(value)
+  }
+  const secrets = [...values]
+    .filter((value) => value.length >= 4 && !/^(?:local|public|true|false|null|undefined)$/i.test(value))
+    .flatMap((value) => [value, encodeURIComponent(value)])
+    .sort((a, b) => b.length - a.length)
+
+  const string = (value: string) => secrets.reduce((result, secret) => result.split(secret).join(REDACTED), value)
+  const value = (input: unknown, key?: string): unknown => {
+    if (key && SECRET_KEY.test(key)) return REDACTED
+    if (typeof input === "string") return string(input)
+    if (Array.isArray(input)) return input.map((item) => value(item))
+    if (!input || typeof input !== "object") return input
+    return Object.fromEntries(
+      Object.entries(input).map(([key, item]) => [key, SECRET_HEADER.test(key) ? REDACTED : value(item, key)]),
+    )
+  }
+  const error = (input: unknown): Error => {
+    if (APICallError.isInstance(input)) {
+      return new APICallError({
+        message: string(input.message),
+        url: safeURL(input.url, string),
+        requestBodyValues: value(input.requestBodyValues) as Record<string, unknown>,
+        statusCode: input.statusCode,
+        responseHeaders: value(input.responseHeaders) as Record<string, string>,
+        responseBody: typeof input.responseBody === "string" ? string(input.responseBody) : input.responseBody,
+        isRetryable: input.isRetryable,
+      })
+    }
+    if (input instanceof ResponseStreamError) {
+      return new ResponseStreamError(string(input.message), {
+        statusCode: input.statusCode,
+        responseHeaders: value(input.responseHeaders) as Record<string, string> | undefined,
+        responseBody: typeof input.responseBody === "string" ? string(input.responseBody) : input.responseBody,
+        isRetryable: input.isRetryable,
+      })
+    }
+    const result = new Error(input instanceof Error ? string(input.message) : string(String(input)))
+    if (input instanceof Error && input.stack) result.stack = string(input.stack)
+    return result
+  }
+  return { value, error }
+}
+
+export function publicValue(value: unknown): unknown {
+  if (typeof value === "string") return value
+  if (Array.isArray(value)) return value.map(publicValue)
+  if (!value || typeof value !== "object") return value
+  return Object.fromEntries(
+    Object.entries(value).flatMap(([key, item]) => {
+      if (SECRET_KEY.test(key) || SECRET_HEADER.test(key)) return []
+      if (key === "headers" && item && typeof item === "object") {
+        return [[key, Object.fromEntries(Object.entries(item).filter(([name]) => !SECRET_HEADER.test(name)))]]
+      }
+      return [[key, publicValue(item)]]
+    }),
+  )
+}
+
+function collect(value: unknown, output: Set<string>, allStrings: boolean, key?: string): void {
+  if (typeof value === "string") {
+    if (allStrings || (key && (SECRET_KEY.test(key) || SECRET_HEADER.test(key)))) output.add(value)
+    return
+  }
+  if (Array.isArray(value)) return value.forEach((item) => collect(item, output, allStrings))
+  if (!value || typeof value !== "object") return
+  Object.entries(value).forEach(([key, item]) => collect(item, output, allStrings, key))
+}
+
+function collectAuth(value: unknown, output: Set<string>): void {
+  if (!value || typeof value !== "object") return
+  Object.entries(value).forEach(([key, item]) => {
+    if (key === "key" || key === "access" || key === "refresh" || key === "token") collect(item, output, true)
+    if (SECRET_KEY.test(key) || SECRET_HEADER.test(key)) collect(item, output, true)
+  })
+}
+
+function safeURL(value: string, redact: (value: string) => string) {
+  try {
+    const url = new URL(value)
+    const query = [...url.searchParams.keys()].map((key) => `${key}=${REDACTED}`).join("&")
+    return redact(`${url.origin}${url.pathname}${query ? `?${query}` : ""}${url.hash}`)
+  } catch {
+    return redact(value)
+  }
+}
+
 export class HeaderTimeoutError extends Error {
   public override readonly name = "ProviderHeaderTimeoutError"
 

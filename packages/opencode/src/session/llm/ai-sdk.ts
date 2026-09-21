@@ -2,6 +2,7 @@ import { FinishReason, LLMEvent, ProviderMetadata, ToolResultValue } from "@open
 import { Effect, Schema } from "effect"
 import { type streamText } from "ai"
 import { errorMessage } from "@/util/error"
+import type { ProviderError } from "@/provider/error"
 
 type Result = Awaited<ReturnType<typeof streamText>>
 type AISDKEvent = Result["fullStream"] extends AsyncIterable<infer T> ? T : never
@@ -61,6 +62,7 @@ function currentReasoningID(state: ReturnType<typeof adapterState>, id: string |
 export function toLLMEvents(
   state: ReturnType<typeof adapterState>,
   event: AISDKEvent,
+  redactor?: ProviderError.Redactor,
 ): Effect.Effect<ReadonlyArray<LLMEvent>, unknown> {
   switch (event.type) {
     case "start":
@@ -220,20 +222,21 @@ export function toLLMEvents(
     case "tool-error":
       return Effect.sync(() => {
         const name = state.toolNames[event.toolCallId] ?? ("toolName" in event ? event.toolName : "unknown")
+        const error = redactor?.error(event.error) ?? event.error
         delete state.toolNames[event.toolCallId]
         return [
           LLMEvent.toolError({
             id: event.toolCallId,
             name,
-            message: errorMessage(event.error),
-            error: event.error,
+            message: errorMessage(error),
+            error,
             providerMetadata: providerMetadata(event.providerMetadata),
           }),
         ]
       })
 
     case "error":
-      return Effect.fail(event.error)
+      return Effect.fail(redactor?.error(event.error) ?? event.error)
 
     case "abort":
     case "source":

@@ -27,6 +27,7 @@ import * as OtelTracer from "@effect/opentelemetry/Tracer"
 import { LLMAISDK } from "./llm/ai-sdk"
 import { LLMNativeRuntime } from "./llm/native-runtime"
 import { LLMRequestPrep } from "./llm/request"
+import { ProviderError } from "@/provider/error"
 
 const log = Log.create({ service: "llm" })
 export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
@@ -140,6 +141,12 @@ const live: Layer.Layer<
         plugin,
         flags,
         isWorkflow,
+      })
+      const redactor = ProviderError.redactor({
+        auth: info,
+        providerKey: item.key,
+        providerOptions: item.options,
+        headers: prepared.headers,
       })
 
       // Wire up toolExecutor for DWS workflow models so that tool calls
@@ -283,7 +290,8 @@ const live: Layer.Layer<
           )
           return {
             type: "native" as const,
-            stream: native.stream,
+            stream: native.stream.pipe(Stream.mapError(redactor.error)),
+            redactor,
           }
         }
         yield* Effect.logInfo("llm runtime selected").pipe(
@@ -308,10 +316,11 @@ const live: Layer.Layer<
       // LLMAISDK.toLLMEvents below normalizes fullStream parts for the processor.
       return {
         type: "ai-sdk" as const,
+        redactor,
         result: streamText({
           onError(error) {
             l.error("stream error", {
-              error: sanitizeStreamError(error),
+              error: sanitizeStreamError({ error: redactor.error(error) }),
             })
           },
           async experimental_repairToolCall(failed) {
@@ -398,7 +407,8 @@ const live: Layer.Layer<
             return Stream.fromAsyncIterable(result.result.fullStream, (e) =>
               e instanceof Error ? e : new Error(String(e)),
             ).pipe(
-              Stream.mapEffect((event) => LLMAISDK.toLLMEvents(state, event)),
+              Stream.mapEffect((event) => LLMAISDK.toLLMEvents(state, event, result.redactor)),
+              Stream.mapError(result.redactor.error),
               Stream.flatMap((events) => Stream.fromIterable(events)),
             )
           }),

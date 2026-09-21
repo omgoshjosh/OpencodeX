@@ -443,7 +443,9 @@ describe("client state sync", () => {
     expect(second.sessionDetails["session-1"]?.messages["message-1"]).toBe(
       first.sessionDetails["session-1"]?.messages["message-1"],
     )
-    expect(second.sessionDetails["session-1"]?.parts["message-1"]?.["part-1"]).toBe(first.sessionDetails["session-1"]?.parts["message-1"]?.["part-1"])
+    expect(second.sessionDetails["session-1"]?.parts["message-1"]?.["part-1"]).toBe(
+      first.sessionDetails["session-1"]?.parts["message-1"]?.["part-1"],
+    )
     expect(second.sessionDetails["session-1"]?.parts["message-2"]?.["part-2"]).not.toBe(
       first.sessionDetails["session-1"]?.parts["message-2"]?.["part-2"],
     )
@@ -2362,10 +2364,7 @@ describe("client state sync", () => {
     await controller.start()
     await controller.refreshSessionTail("session-1")
     await waitFor(
-      () =>
-        connections === 2 &&
-        sessionLoads === 2 &&
-        controller.getState().lifecycle.status === "connected",
+      () => connections === 2 && sessionLoads === 2 && controller.getState().lifecycle.status === "connected",
     )
 
     expect(controller.getState().sessionDetails["session-1"]?.snapshot.digest).toBe("detail-2")
@@ -2525,7 +2524,9 @@ describe("client state sync", () => {
     await controller.start()
     await controller.refreshSessionTail("session-1")
     releaseEvent.resolve()
-    await waitFor(() => controller.getState().sessionDetails["session-1"]?.parts["message-2"]?.["part-2"]?.text === "recovered")
+    await waitFor(
+      () => controller.getState().sessionDetails["session-1"]?.parts["message-2"]?.["part-2"]?.text === "recovered",
+    )
 
     expect(sessionLoads).toBe(3)
     expect(controller.getState().dirtySessions["session-1"]).toBeUndefined()
@@ -2594,7 +2595,9 @@ describe("client state sync", () => {
     await controller.refreshSessionTail("session-1")
 
     version = 2
-    await waitFor(() => controller.getState().sessionDetails["session-1"]?.parts["message-2"]?.["part-2"]?.text === "polled")
+    await waitFor(
+      () => controller.getState().sessionDetails["session-1"]?.parts["message-2"]?.["part-2"]?.text === "polled",
+    )
 
     expect(sessionLoads).toBe(2)
     expect(controller.getState().sessions.records["session-1"]?.time.updated).toBe(2)
@@ -2778,7 +2781,9 @@ describe("client state sync", () => {
 
     await controller.refreshSessionTail("session-1")
 
-    expect(controller.getState().sessionDetails["session-1"]?.parts["message-2"]?.["part-2"]).toMatchObject({ text: "corrected" })
+    expect(controller.getState().sessionDetails["session-1"]?.parts["message-2"]?.["part-2"]).toMatchObject({
+      text: "corrected",
+    })
     expect(controller.getState().sessionDetails["session-1"]?.livePartText).toBeUndefined()
     controller.stop()
   })
@@ -3048,7 +3053,9 @@ describe("client state sync", () => {
       type: "message.updated",
       properties: { sessionID: "session-1", info: message("message-5", 5) },
     })
-    expect(controller.getState().sessionDetails["session-1"]?.parts["message-5"]?.["part-5"]).toEqual(completedBufferedPart)
+    expect(controller.getState().sessionDetails["session-1"]?.parts["message-5"]?.["part-5"]).toEqual(
+      completedBufferedPart,
+    )
     expect(controller.getState().sessionDetails["session-1"]?.livePartText?.["part-5"]).toBeUndefined()
     expect(controller.getMetrics().sessionSnapshots).toBe(1)
     expect(controller.getMetrics().liveEvents).toBe(9)
@@ -3416,6 +3423,9 @@ describe("client state sync", () => {
           (item) => item.id === "opencode" && item.models["x-preview-f-free"]?.name === "Ox Alpha Free",
         ),
     ).toBe(true)
+    controller.applyEvent({ id: "provider-auth-changed", type: "provider.auth.changed", properties: {} })
+    await Bun.sleep(0)
+    expect(loads).toBe(5)
     controller.stop()
   })
 })

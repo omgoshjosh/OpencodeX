@@ -5,6 +5,7 @@ export type ClientOptions = {
 }
 
 export type Event =
+  | EventProviderAuthChanged
   | EventModelsDevRefreshed
   | EventPluginAdded
   | EventCatalogModelUpdated
@@ -785,6 +786,13 @@ export type GlobalEvent = {
   project?: string
   workspace?: string
   payload:
+    | {
+        id: string
+        type: "provider.auth.changed"
+        properties: {
+          [key: string]: unknown
+        }
+      }
     | {
         id: string
         type: "models-dev.refreshed"
@@ -3749,6 +3757,14 @@ export type ConfigV2ExperimentalPolicy = {
 }
 
 export type SessionDelivery = "immediate" | "deferred"
+
+export type EventProviderAuthChanged = {
+  id: string
+  type: "provider.auth.changed"
+  properties: {
+    [key: string]: unknown
+  }
+}
 
 export type EventModelsDevRefreshed = {
   id: string

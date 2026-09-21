@@ -78,7 +78,7 @@ export function aggregateID(event: EventV2.Payload) {
 export function eventVisibility(event: EventV2.Payload, domain: NonNullable<ReturnType<typeof durableDomain>>) {
   // A catalog refresh is system-wide and is published outside any instance
   // scope, so it has to stay visible to every connected client.
-  if (event.type === "models-dev.refreshed") return "global" as const
+  if (event.type === "models-dev.refreshed" || event.type === "provider.auth.changed") return "global" as const
   if (event.type === "opencodex.settings.updated") return "global" as const
   if (event.type === "opencodex.plugin_config.updated") {
     const data = event.data && typeof event.data === "object" ? event.data : undefined
@@ -113,6 +113,7 @@ function eventDomain(event: EventV2.Payload): "capabilities" | "catalog" | "oper
 function isCapabilitiesEvent(event: EventV2.Payload) {
   return (
     event.type === "models-dev.refreshed" ||
+    event.type === "provider.auth.changed" ||
     event.type === "plugin.added" ||
     event.type === "lsp.updated" ||
     event.type === "mcp.tools.changed" ||

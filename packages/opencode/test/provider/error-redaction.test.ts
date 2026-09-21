@@ -112,6 +112,49 @@ test("redacts short and encoded credentials from arbitrary upstream fields", () 
   expect(result.url).toContain("safe=%5BREDACTED%5D")
 })
 
+test("redacts bare scheme payloads and decoded configured credentials", () => {
+  const headerSecret = "header-only-secret-abc123"
+  const basicSecret = "basic-only-secret-xyz789"
+  const encodedSecret = "credential%2Fsegment"
+  const decodedSecret = "credential/segment"
+  const redact = ProviderError.redactor({
+    providerKey: encodedSecret,
+    headers: {
+      authorization: `Bearer ${headerSecret}`,
+      "x-basic-auth": `Basic ${basicSecret}`,
+    },
+  })
+  const error = redact.error(
+    new APICallError({
+      message: `denied ${headerSecret} ${basicSecret} ${decodedSecret}`,
+      url: "https://example.test/v1",
+      requestBodyValues: {},
+      statusCode: 401,
+      responseHeaders: { "x-debug": `${headerSecret} ${basicSecret} ${decodedSecret}`, "x-request-id": "req-safe" },
+      responseBody: JSON.stringify({ error: { message: `${headerSecret} ${basicSecret} ${decodedSecret}` } }),
+      isRetryable: false,
+    }),
+  )
+  const surfaced = MessageV2.fromError(error, { providerID: ProviderV2.ID.make("test") })
+
+  expect(inspect(error)).not.toContain(headerSecret)
+  expect(inspect(error)).not.toContain(basicSecret)
+  expect(inspect(error)).not.toContain(decodedSecret)
+  expect(JSON.stringify(surfaced)).not.toContain(headerSecret)
+  expect(JSON.stringify(surfaced)).not.toContain(basicSecret)
+  expect(JSON.stringify(surfaced)).not.toContain(decodedSecret)
+  expect(JSON.stringify(surfaced)).toContain("req-safe")
+})
+
+test("keeps the redaction marker stable across repeated sanitization", () => {
+  const redact = ProviderError.redactor({ providerKey: "RE" })
+  const once = redact.error(new Error("RE prompt is too long"))
+  const twice = redact.error(once)
+
+  expect(once.message).toBe("[REDACTED] prompt is too long")
+  expect(twice.message).toBe(once.message)
+})
+
 test("flattens wrapped API errors without losing safe retry diagnostics", () => {
   const cause = new APICallError({
     message: `rate limited ${sentinel}`,

@@ -80,6 +80,10 @@ export function sanitizeEvent(event: LLMEvent, redactor: ProviderError.Redactor)
   return event
 }
 
+export function sanitizeErrorMessage(error: unknown, redactor: ProviderError.Redactor) {
+  return redactor.error(error).message
+}
+
 export type StreamInput = {
   user: SessionLegacy.User
   sessionID: string
@@ -367,7 +371,7 @@ const live: Layer.Layer<
                   ...failed.toolCall,
                   input: JSON.stringify({
                     tool: failed.toolCall.toolName,
-                    error: failed.error.message,
+                    error: sanitizeErrorMessage(failed.error, redactor),
                   }),
                   toolName: "invalid",
                 }

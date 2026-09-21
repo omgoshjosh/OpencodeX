@@ -281,6 +281,13 @@ describe("session.llm stream error logging", () => {
     expect(provider).toEqual({ type: "provider-error", message: "denied [REDACTED]", retryable: false })
     expect(toolError).toMatchObject({ type: "tool-error", id: "call_native", name: "bash" })
   })
+
+  test("sanitizes invalid tool repair errors before making them visible", () => {
+    const secret = "repair-upstream-secret"
+    const redact = ProviderError.redactor({ providerKey: secret })
+
+    expect(LLM.sanitizeErrorMessage(new Error(`invalid input ${secret}`), redact)).toBe("invalid input [REDACTED]")
+  })
 })
 
 describe("session.llm.ai-sdk adapter", () => {

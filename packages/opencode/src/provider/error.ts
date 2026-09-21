@@ -32,12 +32,19 @@ export function redactor(input: {
   collectSource(input.providerOptions, values)
   collectSource(input.requestOptions, values)
   const secrets = [...new Set([...values].flatMap(variants).filter(Boolean))].toSorted((a, b) => b.length - a.length)
-  const encoded = secrets.filter((secret) => /%[0-9a-f]{2}/i.test(secret)).map(percentPattern)
-  const string = (value: string) =>
-    encoded.reduce(
-      (result, pattern) => result.replace(pattern, REDACTED),
-      secrets.reduce((result, secret) => result.split(secret).join(REDACTED), value),
-    )
+  const protectedSecrets = secrets.filter((secret) => secret.includes(REDACTED))
+  const unprotectedSecrets = secrets.filter((secret) => !secret.includes(REDACTED))
+  const replacer = (source: string[]) => {
+    const encoded = source.filter((secret) => /%[0-9a-f]{2}/i.test(secret)).map(percentPattern)
+    return (value: string) =>
+      encoded.reduce(
+        (result, pattern) => result.replace(pattern, REDACTED),
+        source.reduce((result, secret) => result.split(secret).join(REDACTED), value),
+      )
+  }
+  const replaceProtected = replacer(protectedSecrets)
+  const replaceUnprotected = replacer(unprotectedSecrets)
+  const string = (value: string) => replaceProtected(value).split(REDACTED).map(replaceUnprotected).join(REDACTED)
   const value = (item: unknown) => {
     try {
       return sanitizeValue(item, string)
@@ -146,7 +153,9 @@ function collectHeaders(value: unknown, output: Set<string>) {
   if (!value || typeof value !== "object") return
   try {
     Object.values(Object.getOwnPropertyDescriptors(value)).forEach((descriptor) => {
-      if ("value" in descriptor) add(output, descriptor.value)
+      if (!("value" in descriptor) || typeof descriptor.value !== "string") return
+      add(output, descriptor.value)
+      add(output, /^\S+\s+(.+)$/.exec(descriptor.value)?.[1])
     })
   } catch {}
 }
@@ -187,16 +196,26 @@ function addURLValue(output: Set<string>, value: string) {
 }
 
 function variants(value: string) {
-  const uri = encode(value)
-  const form = new URLSearchParams([["value", value]]).toString().slice("value=".length)
-  const json = JSON.stringify(value).slice(1, -1)
-  const initial = [value, uri, uri.replace(/%[0-9A-F]{2}/g, (part) => part.toLowerCase()), form, json]
+  const initial = [value, decode(value)].flatMap((item) => {
+    const uri = encode(item)
+    const form = new URLSearchParams([["value", item]]).toString().slice("value=".length)
+    const json = JSON.stringify(item).slice(1, -1)
+    return [item, uri, uri.replace(/%[0-9A-F]{2}/g, (part) => part.toLowerCase()), form, json]
+  })
   return [...new Set([...initial, ...initial.map(encode)])]
 }
 
 function encode(value: string) {
   try {
     return encodeURIComponent(value)
+  } catch {
+    return value
+  }
+}
+
+function decode(value: string) {
+  try {
+    return decodeURIComponent(value)
   } catch {
     return value
   }

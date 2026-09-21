@@ -995,7 +995,7 @@ export function toPublicInfo(provider: Info): Info {
     }),
   )
   delete result.key
-  return ProviderError.publicValue(result) as Info
+  return result
 }
 
 export function defaultModelIDs<T extends { models: Record<string, { id: string }> }>(providers: Record<string, T>) {

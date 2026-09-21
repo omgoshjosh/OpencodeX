@@ -4,9 +4,11 @@ import { iife } from "@/util/iife"
 import type { ProviderV2 } from "@opencode-ai/core/provider"
 
 const REDACTED = "[REDACTED]"
-const SECRET_KEY = /(?:api[-_]?key|authorization|credential|password|secret|token)/i
 const SECRET_HEADER =
   /^(?:authorization|proxy-authorization|.*(?:api[-_]?key|access[-_]?token|auth(?:entication)?|credential|secret|token).*)$/i
+const MAX_DEPTH = 12
+const MAX_VALUES = 256
+const overflowErrors = new WeakSet<APICallError>()
 
 export type Redactor = {
   readonly value: (value: unknown) => unknown
@@ -18,97 +20,253 @@ export function redactor(input: {
   auth?: unknown
   providerKey?: unknown
   providerOptions?: unknown
+  requestOptions?: unknown
   headers?: Record<string, string>
+  urls?: ReadonlyArray<string>
 }): Redactor {
   const values = new Set<string>()
   collectAuth(input.auth, values)
-  if (typeof input.providerKey === "string") values.add(input.providerKey)
-  collect(input.providerOptions, values, false)
-  for (const [key, value] of Object.entries(input.headers ?? {})) {
-    if (SECRET_HEADER.test(key)) values.add(value)
-  }
-  const secrets = [...values]
-    .filter((value) => value.length >= 4 && !/^(?:local|public|true|false|null|undefined)$/i.test(value))
-    .flatMap((value) => [value, encodeURIComponent(value)])
-    .sort((a, b) => b.length - a.length)
-
-  const string = (value: string) => secrets.reduce((result, secret) => result.split(secret).join(REDACTED), value)
-  const value = (input: unknown, key?: string): unknown => {
-    if (key && SECRET_KEY.test(key)) return REDACTED
-    if (typeof input === "string") return string(input)
-    if (Array.isArray(input)) return input.map((item) => value(item))
-    if (!input || typeof input !== "object") return input
-    return Object.fromEntries(
-      Object.entries(input).map(([key, item]) => [key, SECRET_HEADER.test(key) ? REDACTED : value(item, key)]),
+  add(values, input.providerKey)
+  collectHeaders(input.headers, values)
+  input.urls?.forEach((url) => collectURL(url, values))
+  collectSource(input.providerOptions, values)
+  collectSource(input.requestOptions, values)
+  const secrets = [...new Set([...values].flatMap(variants).filter(Boolean))].toSorted((a, b) => b.length - a.length)
+  const encoded = secrets.filter((secret) => /%[0-9a-f]{2}/i.test(secret)).map(percentPattern)
+  const string = (value: string) =>
+    encoded.reduce(
+      (result, pattern) => result.replace(pattern, REDACTED),
+      secrets.reduce((result, secret) => result.split(secret).join(REDACTED), value),
     )
+  const value = (item: unknown) => {
+    try {
+      return sanitizeValue(item, string)
+    } catch {
+      return REDACTED
+    }
   }
-  const error = (input: unknown): Error => {
-    if (APICallError.isInstance(input)) {
-      return new APICallError({
-        message: string(input.message),
-        url: safeURL(input.url, string),
-        requestBodyValues: value(input.requestBodyValues) as Record<string, unknown>,
-        statusCode: input.statusCode,
-        responseHeaders: value(input.responseHeaders) as Record<string, string>,
-        responseBody: typeof input.responseBody === "string" ? string(input.responseBody) : input.responseBody,
-        isRetryable: input.isRetryable,
-      })
+  const error = (item: unknown): Error => {
+    try {
+      if (APICallError.isInstance(item)) return apiCallError(item, string)
+      if (item instanceof ResponseStreamError) {
+        if (APICallError.isInstance(item.cause)) return apiCallError(item.cause, string)
+        return new ResponseStreamError(string(item.message), {
+          statusCode: validStatus(item.statusCode),
+          responseHeaders: sanitizeHeaders(item.responseHeaders, string),
+          responseBody: typeof item.responseBody === "string" ? string(item.responseBody) : undefined,
+          isRetryable: typeof item.isRetryable === "boolean" ? item.isRetryable : undefined,
+        })
+      }
+      if (item instanceof ToolInflightTimeoutError) {
+        return new ToolInflightTimeoutError(string(item.tool), string(item.callID), item.ms)
+      }
+      if (item instanceof HeaderTimeoutError) return new HeaderTimeoutError(item.ms)
+      if (item instanceof StreamIdleTimeoutError) return new StreamIdleTimeoutError(item.ms, string(item.message))
+      if (item instanceof DOMException && item.name === "AbortError") {
+        return new DOMException(string(item.message), "AbortError")
+      }
+      if (item instanceof Error) {
+        return new Error(string(item.message))
+      }
+      if (typeof item === "string") return new Error(string(item))
+      return new Error("Provider request failed")
+    } catch {
+      return new Error("Provider request failed")
     }
-    if (input instanceof ResponseStreamError) {
-      return new ResponseStreamError(string(input.message), {
-        statusCode: input.statusCode,
-        responseHeaders: value(input.responseHeaders) as Record<string, string> | undefined,
-        responseBody: typeof input.responseBody === "string" ? string(input.responseBody) : input.responseBody,
-        isRetryable: input.isRetryable,
-      })
-    }
-    const result = new Error(input instanceof Error ? string(input.message) : string(String(input)))
-    if (input instanceof Error && input.stack) result.stack = string(input.stack)
-    return result
   }
   return { value, error }
 }
 
-export function publicValue(value: unknown): unknown {
-  if (typeof value === "string") return value
-  if (Array.isArray(value)) return value.map(publicValue)
-  if (!value || typeof value !== "object") return value
+function apiCallError(input: APICallError, redact: (value: string) => string) {
+  const overflow = overflowErrors.has(input) || isAPICallOverflow(input)
+  const result = new APICallError({
+    message: redact(input.message),
+    url: safeURL(input.url, redact),
+    requestBodyValues: {},
+    statusCode: validStatus(input.statusCode),
+    responseHeaders: sanitizeHeaders(input.responseHeaders, redact) ?? {},
+    responseBody: typeof input.responseBody === "string" ? redact(input.responseBody) : undefined,
+    isRetryable: input.isRetryable,
+  })
+  if (overflow) overflowErrors.add(result)
+  return result
+}
+
+function isAPICallOverflow(input: APICallError) {
+  const body = json(input.responseBody)
+  return isOverflow(input.message) || input.statusCode === 413 || body?.error?.code === "context_length_exceeded"
+}
+
+function collect(
+  value: unknown,
+  output: Set<string>,
+  allStrings = false,
+  depth = 0,
+  seen = new WeakSet<object>(),
+): void {
+  if (depth > MAX_DEPTH || output.size >= MAX_VALUES) return
+  if (typeof value === "string") {
+    if (allStrings) add(output, value)
+    return
+  }
+  if (!value || typeof value !== "object" || seen.has(value)) return
+  seen.add(value)
+  try {
+    for (const [key, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(value))) {
+      if (!("value" in descriptor)) continue
+      if (isURLKey(key) && typeof descriptor.value === "string") collectURL(descriptor.value, output)
+      collect(
+        descriptor.value,
+        output,
+        allStrings || key.toLowerCase() === "headers" || isSecretKey(key),
+        depth + 1,
+        seen,
+      )
+    }
+  } catch {}
+}
+
+function collectSource(value: unknown, output: Set<string>) {
+  const source = new Set<string>()
+  collect(value, source)
+  source.forEach((item) => output.add(item))
+}
+
+function collectAuth(value: unknown, output: Set<string>) {
+  if (!value || typeof value !== "object") return
+  try {
+    for (const key of ["key", "access", "refresh", "token"]) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key)
+      if (descriptor && "value" in descriptor) add(output, descriptor.value)
+    }
+  } catch {}
+}
+
+function collectHeaders(value: unknown, output: Set<string>) {
+  if (!value || typeof value !== "object") return
+  try {
+    Object.values(Object.getOwnPropertyDescriptors(value)).forEach((descriptor) => {
+      if ("value" in descriptor) add(output, descriptor.value)
+    })
+  } catch {}
+}
+
+function add(output: Set<string>, value: unknown) {
+  if (typeof value === "string" && value) output.add(value)
+}
+
+function isSecretKey(key: string) {
+  const normalized = key.replace(/[-_]/g, "").toLowerCase()
+  if (["key", "access", "refresh", "token", "secret", "credential", "password", "authorization"].includes(normalized)) {
+    return true
+  }
+  if (/(?:apikey|accesskeyid|privatekey|secretaccesskey)$/.test(normalized)) return true
+  return /(?:token|secret|credential|password|authorization)$/.test(normalized) && !normalized.endsWith("tokens")
+}
+
+function isURLKey(key: string) {
+  return /^(?:base)?url$/i.test(key)
+}
+
+function collectURL(value: string, output: Set<string>) {
+  try {
+    const url = new URL(value)
+    addURLValue(output, url.username)
+    addURLValue(output, url.password)
+    url.pathname.split("/").forEach((item) => addURLValue(output, item))
+    url.searchParams.forEach((item) => addURLValue(output, item))
+    addURLValue(output, url.hash.slice(1))
+  } catch {}
+}
+
+function addURLValue(output: Set<string>, value: string) {
+  add(output, value)
+  try {
+    add(output, decodeURIComponent(value))
+  } catch {}
+}
+
+function variants(value: string) {
+  const uri = encode(value)
+  const form = new URLSearchParams([["value", value]]).toString().slice("value=".length)
+  const json = JSON.stringify(value).slice(1, -1)
+  const initial = [value, uri, uri.replace(/%[0-9A-F]{2}/g, (part) => part.toLowerCase()), form, json]
+  return [...new Set([...initial, ...initial.map(encode)])]
+}
+
+function encode(value: string) {
+  try {
+    return encodeURIComponent(value)
+  } catch {
+    return value
+  }
+}
+
+function percentPattern(value: string) {
+  const pattern: string[] = []
+  for (let index = 0; index < value.length; index++) {
+    const triplet = value.slice(index, index + 3)
+    if (/^%[0-9a-f]{2}$/i.test(triplet)) {
+      pattern.push(
+        `%${triplet
+          .slice(1)
+          .split("")
+          .map((char) => (/[a-f]/i.test(char) ? `[${char.toLowerCase()}${char.toUpperCase()}]` : char))
+          .join("")}`,
+      )
+      index += 2
+      continue
+    }
+    pattern.push(value[index].replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+  }
+  return new RegExp(pattern.join(""), "g")
+}
+
+function sanitizeValue(
+  input: unknown,
+  redact: (value: string) => string,
+  depth = 0,
+  seen = new WeakSet<object>(),
+): unknown {
+  if (typeof input === "string") return redact(input)
+  if (!input || typeof input !== "object") return input
+  if (depth > MAX_DEPTH || seen.has(input)) return REDACTED
+  seen.add(input)
+  const output: Record<string, unknown> = {}
+  for (const [key, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(input))) {
+    if (!("value" in descriptor)) continue
+    output[key] =
+      SECRET_HEADER.test(key) || isSecretKey(key) ? REDACTED : sanitizeValue(descriptor.value, redact, depth + 1, seen)
+  }
+  return Array.isArray(input) ? Object.values(output) : output
+}
+
+function sanitizeHeaders(input: unknown, redact: (value: string) => string) {
+  if (!input || typeof input !== "object") return undefined
   return Object.fromEntries(
-    Object.entries(value).flatMap(([key, item]) => {
-      if (SECRET_KEY.test(key) || SECRET_HEADER.test(key)) return []
-      if (key === "headers" && item && typeof item === "object") {
-        return [[key, Object.fromEntries(Object.entries(item).filter(([name]) => !SECRET_HEADER.test(name)))]]
-      }
-      return [[key, publicValue(item)]]
+    Object.entries(Object.getOwnPropertyDescriptors(input)).flatMap(([key, descriptor]) => {
+      if (!("value" in descriptor) || typeof descriptor.value !== "string") return []
+      return [[key, SECRET_HEADER.test(key) ? REDACTED : redact(descriptor.value)]]
     }),
   )
 }
 
-function collect(value: unknown, output: Set<string>, allStrings: boolean, key?: string): void {
-  if (typeof value === "string") {
-    if (allStrings || (key && (SECRET_KEY.test(key) || SECRET_HEADER.test(key)))) output.add(value)
-    return
-  }
-  if (Array.isArray(value)) return value.forEach((item) => collect(item, output, allStrings))
-  if (!value || typeof value !== "object") return
-  Object.entries(value).forEach(([key, item]) => collect(item, output, allStrings, key))
+function validStatus(value: unknown) {
+  return typeof value === "number" && Number.isInteger(value) && value >= 100 && value <= 599 ? value : undefined
 }
 
-function collectAuth(value: unknown, output: Set<string>): void {
-  if (!value || typeof value !== "object") return
-  Object.entries(value).forEach(([key, item]) => {
-    if (key === "key" || key === "access" || key === "refresh" || key === "token") collect(item, output, true)
-    if (SECRET_KEY.test(key) || SECRET_HEADER.test(key)) collect(item, output, true)
-  })
-}
-
-function safeURL(value: string, redact: (value: string) => string) {
+function safeURL(value: unknown, redact: (value: string) => string) {
+  if (typeof value !== "string") return ""
   try {
     const url = new URL(value)
-    const query = [...url.searchParams.keys()].map((key) => `${key}=${REDACTED}`).join("&")
-    return redact(`${url.origin}${url.pathname}${query ? `?${query}` : ""}${url.hash}`)
+    url.username = ""
+    url.password = ""
+    url.pathname = redact(url.pathname)
+    url.searchParams.forEach((_, key) => url.searchParams.set(key, REDACTED))
+    url.hash = ""
+    return url.toString()
   } catch {
-    return redact(value)
+    return ""
   }
 }
 
@@ -360,7 +518,12 @@ export type ParsedAPICallError =
 export function parseAPICallError(input: { providerID: ProviderV2.ID; error: APICallError }): ParsedAPICallError {
   const m = message(input.providerID, input.error)
   const body = json(input.error.responseBody)
-  if (isOverflow(m) || input.error.statusCode === 413 || body?.error?.code === "context_length_exceeded") {
+  if (
+    overflowErrors.has(input.error) ||
+    isOverflow(m) ||
+    input.error.statusCode === 413 ||
+    body?.error?.code === "context_length_exceeded"
+  ) {
     return {
       type: "context_overflow",
       message: m,

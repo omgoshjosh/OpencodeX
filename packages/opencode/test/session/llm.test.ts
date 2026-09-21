@@ -11,6 +11,7 @@ import { LLMClient, RequestExecutor, WebSocketExecutor } from "@opencode-ai/llm/
 import { Auth } from "@/auth"
 import { Config } from "@/config/config"
 import { Provider } from "@/provider/provider"
+import { ProviderError } from "@/provider/error"
 import { ProviderTransform } from "@/provider/transform"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
 import { Plugin } from "@/plugin"
@@ -201,19 +202,22 @@ describe("session.llm stream error logging", () => {
   test("returns a bounded fallback for circular and throwing values", () => {
     const circular: { self?: unknown } = {}
     circular.self = circular
-    const throwing = new Proxy(new APICallError({
-      message: "ignored",
-      url: "https://api.example.com",
-      requestBodyValues: {},
-      statusCode: 500,
-      responseHeaders: {},
-      responseBody: "ignored",
-      isRetryable: false,
-    }), {
-      get() {
-        throw new Error("getter must not escape")
+    const throwing = new Proxy(
+      new APICallError({
+        message: "ignored",
+        url: "https://api.example.com",
+        requestBodyValues: {},
+        statusCode: 500,
+        responseHeaders: {},
+        responseBody: "ignored",
+        isRetryable: false,
+      }),
+      {
+        get() {
+          throw new Error("getter must not escape")
+        },
       },
-    })
+    )
 
     expect(() => LLM.sanitizeStreamError({ error: circular })).not.toThrow()
     expect(LLM.sanitizeStreamError({ error: circular })).toEqual({ name: "UnknownStreamError" })
@@ -250,6 +254,32 @@ describe("session.llm stream error logging", () => {
     const result = LLM.sanitizeStreamError({ error })
     expect(result).toEqual({ name: "AI_APICallError", isRetryable: false })
     expect(new TextEncoder().encode(JSON.stringify(result)).byteLength).toBeLessThanOrEqual(512)
+  })
+
+  test("sanitizes native provider and tool error events", () => {
+    const secret = "native-upstream-secret"
+    const redact = ProviderError.redactor({ providerKey: secret })
+
+    const provider = LLM.sanitizeEvent(
+      { type: "provider-error", message: `denied ${secret}`, retryable: false, providerMetadata: { test: { secret } } },
+      redact,
+    )
+    const toolError = LLM.sanitizeEvent(
+      {
+        type: "tool-error",
+        id: "call_native",
+        name: "bash",
+        message: secret,
+        error: new Error(secret),
+        providerMetadata: { test: { secret } },
+      },
+      redact,
+    )
+
+    expect(JSON.stringify(provider)).not.toContain(secret)
+    expect(JSON.stringify(toolError)).not.toContain(secret)
+    expect(provider).toEqual({ type: "provider-error", message: "denied [REDACTED]", retryable: false })
+    expect(toolError).toMatchObject({ type: "tool-error", id: "call_native", name: "bash" })
   })
 })
 
@@ -434,6 +464,51 @@ describe("session.llm.ai-sdk adapter", () => {
       message: error.message,
       error,
     })
+  })
+
+  test("redacts provider errors before emitting adapter failures and tool errors", async () => {
+    const secret = "adapter-upstream-secret"
+    const redact = ProviderError.redactor({ headers: { "x-custom-auth": secret } })
+    const apiError = () =>
+      new APICallError({
+        message: `denied ${secret}`,
+        url: `https://example.test/v1?token=${secret}`,
+        requestBodyValues: { token: secret },
+        statusCode: 401,
+        responseHeaders: { "x-debug": secret, "x-request-id": "req-safe" },
+        responseBody: `echo ${secret}`,
+        isRetryable: false,
+      })
+
+    const failure = await Effect.runPromise(
+      Effect.flip(
+        LLMAISDK.toLLMEvents(
+          LLMAISDK.adapterState(),
+          uncheckedAdapterEvent({ type: "error", error: apiError() }),
+          redact,
+        ),
+      ),
+    )
+    expect(JSON.stringify(MessageV2.fromError(failure, { providerID: ProviderV2.ID.make("test") }))).not.toContain(
+      secret,
+    )
+
+    const events = await Effect.runPromise(
+      LLMAISDK.toLLMEvents(
+        LLMAISDK.adapterState(),
+        uncheckedAdapterEvent({
+          type: "tool-error",
+          toolCallId: "call_secret",
+          toolName: "bash",
+          input: {},
+          error: apiError(),
+        }),
+        redact,
+      ),
+    )
+    expect(events).toHaveLength(1)
+    expect(JSON.stringify(events[0])).not.toContain(secret)
+    expect(events[0]).toMatchObject({ type: "tool-error", id: "call_secret", name: "bash" })
   })
 
   test("emits undefined usage when every AI SDK usage field is missing", async () => {

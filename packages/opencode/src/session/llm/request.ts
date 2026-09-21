@@ -4,7 +4,6 @@ import type { RuntimeFlags } from "@/effect/runtime-flags"
 import { InstanceState } from "@/effect/instance-state"
 import { Permission } from "@/permission"
 import type { Agent } from "@/agent/agent"
-import type { MessageV2 } from "../message-v2"
 import type { Provider } from "@/provider/provider"
 import { ProviderTransform } from "@/provider/transform"
 import { SystemPrompt } from "../system"
@@ -47,6 +46,7 @@ export type Prepared = {
   }
   readonly messageTransformOptions: Record<string, any>
   readonly headers: Record<string, string>
+  readonly sensitiveHeaders: Record<string, string>
 }
 
 const mergeOptions = (target: Record<string, any>, source: Record<string, any> | undefined): Record<string, any> =>
@@ -166,6 +166,10 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
     tools: Object.fromEntries(Object.entries(tools).toSorted(([a], [b]) => a.localeCompare(b))),
     params,
     messageTransformOptions: options,
+    sensitiveHeaders: {
+      ...input.model.headers,
+      ...headers,
+    },
     headers: {
       ...(input.model.providerID.startsWith("opencode")
         ? {

@@ -59,6 +59,27 @@ export function sanitizeStreamError(input: { error: unknown }) {
   }
 }
 
+export function sanitizeEvent(event: LLMEvent, redactor: ProviderError.Redactor): LLMEvent {
+  if (event.type === "provider-error") {
+    return {
+      type: "provider-error",
+      message: redactor.error(event.message).message,
+      retryable: event.retryable,
+    }
+  }
+  if (event.type === "tool-error") {
+    const error = redactor.error(event.error ?? event.message)
+    return {
+      type: "tool-error",
+      id: event.id,
+      name: event.name,
+      message: error.message,
+      error,
+    }
+  }
+  return event
+}
+
 export type StreamInput = {
   user: SessionLegacy.User
   sessionID: string
@@ -146,7 +167,9 @@ const live: Layer.Layer<
         auth: info,
         providerKey: item.key,
         providerOptions: item.options,
-        headers: prepared.headers,
+        requestOptions: prepared.params.options,
+        headers: prepared.sensitiveHeaders,
+        urls: [item.options.baseURL, input.model.api.url].filter((value): value is string => typeof value === "string"),
       })
 
       // Wire up toolExecutor for DWS workflow models so that tool calls
@@ -290,7 +313,10 @@ const live: Layer.Layer<
           )
           return {
             type: "native" as const,
-            stream: native.stream.pipe(Stream.mapError(redactor.error)),
+            stream: native.stream.pipe(
+              Stream.map((event) => sanitizeEvent(event, redactor)),
+              Stream.mapError(redactor.error),
+            ),
             redactor,
           }
         }
@@ -317,73 +343,77 @@ const live: Layer.Layer<
       return {
         type: "ai-sdk" as const,
         redactor,
-        result: streamText({
-          onError(error) {
-            l.error("stream error", {
-              error: sanitizeStreamError({ error: redactor.error(error) }),
-            })
-          },
-          async experimental_repairToolCall(failed) {
-            const lower = failed.toolCall.toolName.toLowerCase()
-            if (lower !== failed.toolCall.toolName && prepared.tools[lower]) {
-              l.info("repairing tool call", {
-                tool: failed.toolCall.toolName,
-                repaired: lower,
-              })
-              return {
-                ...failed.toolCall,
-                toolName: lower,
-              }
-            }
-            return {
-              ...failed.toolCall,
-              input: JSON.stringify({
-                tool: failed.toolCall.toolName,
-                error: failed.error.message,
-              }),
-              toolName: "invalid",
-            }
-          },
-          temperature: prepared.params.temperature,
-          topP: prepared.params.topP,
-          topK: prepared.params.topK,
-          providerOptions: ProviderTransform.providerOptions(input.model, prepared.params.options),
-          activeTools: Object.keys(prepared.tools).filter((x) => x !== "invalid"),
-          tools: prepared.tools,
-          toolChoice: input.toolChoice,
-          maxOutputTokens: prepared.params.maxOutputTokens,
-          abortSignal: input.abort,
-          headers: prepared.headers,
-          maxRetries: input.retries ?? 0,
-          messages: prepared.messages,
-          model: wrapLanguageModel({
-            model: language,
-            middleware: [
-              {
-                specificationVersion: "v3" as const,
-                async transformParams(args) {
-                  if (args.type === "stream") {
-                    // @ts-expect-error
-                    args.params.prompt = ProviderTransform.message(
-                      args.params.prompt,
-                      input.model,
-                      prepared.messageTransformOptions,
-                    )
+        result: yield* Effect.try({
+          try: () =>
+            streamText({
+              onError(error) {
+                l.error("stream error", {
+                  error: sanitizeStreamError({ error: redactor.error(error) }),
+                })
+              },
+              async experimental_repairToolCall(failed) {
+                const lower = failed.toolCall.toolName.toLowerCase()
+                if (lower !== failed.toolCall.toolName && prepared.tools[lower]) {
+                  l.info("repairing tool call", {
+                    tool: failed.toolCall.toolName,
+                    repaired: lower,
+                  })
+                  return {
+                    ...failed.toolCall,
+                    toolName: lower,
                   }
-                  return args.params
+                }
+                return {
+                  ...failed.toolCall,
+                  input: JSON.stringify({
+                    tool: failed.toolCall.toolName,
+                    error: failed.error.message,
+                  }),
+                  toolName: "invalid",
+                }
+              },
+              temperature: prepared.params.temperature,
+              topP: prepared.params.topP,
+              topK: prepared.params.topK,
+              providerOptions: ProviderTransform.providerOptions(input.model, prepared.params.options),
+              activeTools: Object.keys(prepared.tools).filter((x) => x !== "invalid"),
+              tools: prepared.tools,
+              toolChoice: input.toolChoice,
+              maxOutputTokens: prepared.params.maxOutputTokens,
+              abortSignal: input.abort,
+              headers: prepared.headers,
+              maxRetries: input.retries ?? 0,
+              messages: prepared.messages,
+              model: wrapLanguageModel({
+                model: language,
+                middleware: [
+                  {
+                    specificationVersion: "v3" as const,
+                    async transformParams(args) {
+                      if (args.type === "stream") {
+                        // @ts-expect-error
+                        args.params.prompt = ProviderTransform.message(
+                          args.params.prompt,
+                          input.model,
+                          prepared.messageTransformOptions,
+                        )
+                      }
+                      return args.params
+                    },
+                  },
+                ],
+              }),
+              experimental_telemetry: {
+                isEnabled: cfg.experimental?.openTelemetry,
+                functionId: "session.llm",
+                tracer: telemetryTracer,
+                metadata: {
+                  userId: cfg.username ?? "unknown",
+                  sessionId: input.sessionID,
                 },
               },
-            ],
-          }),
-          experimental_telemetry: {
-            isEnabled: cfg.experimental?.openTelemetry,
-            functionId: "session.llm",
-            tracer: telemetryTracer,
-            metadata: {
-              userId: cfg.username ?? "unknown",
-              sessionId: input.sessionID,
-            },
-          },
+            }),
+          catch: redactor.error,
         }),
       }
     })
@@ -404,11 +434,8 @@ const live: Layer.Layer<
             // Adapter seam: both runtimes expose the same LLMEvent stream. Native
             // already returns one; AI SDK streams are converted here.
             const state = LLMAISDK.adapterState()
-            return Stream.fromAsyncIterable(result.result.fullStream, (e) =>
-              e instanceof Error ? e : new Error(String(e)),
-            ).pipe(
+            return Stream.fromAsyncIterable(result.result.fullStream, result.redactor.error).pipe(
               Stream.mapEffect((event) => LLMAISDK.toLLMEvents(state, event, result.redactor)),
-              Stream.mapError(result.redactor.error),
               Stream.flatMap((events) => Stream.fromIterable(events)),
             )
           }),

@@ -1,6 +1,5 @@
 import { Config } from "@/config/config"
 import { Provider } from "@/provider/provider"
-import { ProviderError } from "@/provider/error"
 import * as InstanceState from "@/effect/instance-state"
 import { Effect } from "effect"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
@@ -13,13 +12,13 @@ export const configHandlers = HttpApiBuilder.group(InstanceHttpApi, "config", (h
     const configSvc = yield* Config.Service
 
     const get = Effect.fn("ConfigHttpApi.get")(function* () {
-      return ProviderError.publicValue(yield* configSvc.get()) as Config.Info
+      return yield* configSvc.get()
     })
 
     const update = Effect.fn("ConfigHttpApi.update")(function* (ctx) {
       yield* configSvc.update(ctx.payload)
       yield* markInstanceForDisposal(yield* InstanceState.context)
-      return ProviderError.publicValue(ctx.payload) as typeof ctx.payload
+      return ctx.payload
     })
 
     const providers = Effect.fn("ConfigHttpApi.providers")(function* () {

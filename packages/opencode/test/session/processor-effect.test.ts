@@ -218,10 +218,7 @@ const boot = Effect.fn("test.boot")(function* () {
   return { processors, session, provider }
 })
 
-const processPrompt = Effect.fn("test.processPrompt")(function* (
-  root: string,
-  tools: LLM.StreamInput["tools"] = {},
-) {
+const processPrompt = Effect.fn("test.processPrompt")(function* (root: string, tools: LLM.StreamInput["tools"] = {}) {
   const { processors, session, provider } = yield* boot()
   const chat = yield* session.create({})
   const parent = yield* user(chat.id, "idle stream")
@@ -567,6 +564,68 @@ it.live("session.processor effect tests do not retry unknown json errors", () =>
 
         expect(value).toBe("stop")
         expect(yield* llm.calls).toBe(1)
+        expect(handle.message.error?.name).toBe("APIError")
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
+it.live("session.processor redacts credential echoes before events and persistence", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const secret = "test-key"
+        const { processors, session, provider } = yield* boot()
+        const events = yield* EventV2Bridge.Service
+        const surfaced: string[] = []
+
+        yield* llm.error(
+          401,
+          { error: { message: `denied ${secret}` }, echo: encodeURIComponent(secret), safe: "diagnostic" },
+          { "x-upstream-debug": secret, "x-request-id": "req-redaction" },
+        )
+
+        const chat = yield* session.create({})
+        const off = yield* events.listen((event) => {
+          if (event.type !== Session.Event.Error.type) return Effect.void
+          const data = event.data as typeof Session.Event.Error.data.Type
+          if (data.sessionID === chat.id && data.error) surfaced.push(JSON.stringify(data.error))
+          return Effect.void
+        })
+        const parent = yield* user(chat.id, "redact")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+
+        const value = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionLegacy.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "redact" }],
+          tools: {},
+        })
+        yield* off
+
+        const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })
+        const serialized = JSON.stringify({
+          event: surfaced,
+          handle: handle.message.error,
+          stored: stored.info.role === "assistant" ? stored.info.error : undefined,
+        })
+        expect(value).toBe("stop")
+        expect(serialized).not.toContain(secret)
+        expect(serialized).not.toContain(encodeURIComponent(secret))
+        expect(serialized).toContain("diagnostic")
+        expect(serialized).toContain("req-redaction")
         expect(handle.message.error?.name).toBe("APIError")
       }),
     { config: (url) => providerCfg(url) },
@@ -1040,9 +1099,7 @@ it.live("session.processor effect tests do not retry an idle stream after a comp
             head: [
               chunk({ role: "assistant" }),
               chunk({
-                tool_calls: [
-                  { index: 0, id: "call_1", type: "function", function: { name: "write", arguments: "" } },
-                ],
+                tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "write", arguments: "" } }],
               }),
               chunk({ tool_calls: [{ index: 0, function: { arguments: '{"value":"once"}' } }] }),
               chunk({}, "tool_calls"),

@@ -271,6 +271,47 @@ describe("plugin.codex", () => {
     expect(models["gpt-5.6-sol"]?.limit).toEqual({ context: 256_000, input: 256_000, output: 128_000 })
   })
 
+  test("filters ChatGPT OAuth models by version, including major-only gpt-6 ids", async () => {
+    const hooks = await CodexAuthPlugin({} as never)
+    const ids = ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-4o", "gpt-5.1", "gpt-5.4-mini", "gpt-5.7"]
+    const models = await hooks.provider!.models!(
+      {
+        models: Object.fromEntries(
+          ids.map((id) => [
+            id,
+            {
+              id,
+              name: id,
+              api: { id },
+              variants: {
+                low: { reasoningEffort: "low" },
+                medium: { reasoningEffort: "medium" },
+                high: { reasoningEffort: "high" },
+              },
+              limit: {
+                context: 1_050_000,
+                input: 922_000,
+                output: 128_000,
+              },
+              cost: {
+                input: 5,
+                output: 30,
+                cache: { read: 0.5, write: 0 },
+              },
+            },
+          ]),
+        ),
+      } as never,
+      { auth: { type: "oauth" } } as never,
+    )
+
+    expect(Object.keys(models).sort()).toEqual(
+      ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.4-mini", "gpt-5.7"].sort(),
+    )
+    expect(models["gpt-4o"]).toBeUndefined()
+    expect(models["gpt-5.1"]).toBeUndefined()
+  })
+
   test("deduplicates concurrent Codex token refreshes", async () => {
     let auth = {
       type: "oauth" as const,

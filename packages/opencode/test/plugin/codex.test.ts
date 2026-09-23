@@ -6,6 +6,7 @@ import {
   extractAccountId,
   type IdTokenClaims,
 } from "../../src/plugin/openai/codex"
+import type { Model, Provider } from "@opencode-ai/sdk/v2"
 
 function createTestJwt(payload: object): string {
   const header = Buffer.from(JSON.stringify({ alg: "none" })).toString("base64url")
@@ -269,6 +270,55 @@ describe("plugin.codex", () => {
     expect(models["gpt-5.6-sol"]?.variants?.max).toEqual({ reasoningEffort: "max" })
     expect(models["gpt-5.6-sol"]?.variants?.ultra).toBeUndefined()
     expect(models["gpt-5.6-sol"]?.limit).toEqual({ context: 256_000, input: 256_000, output: 128_000 })
+  })
+
+  test("filters ChatGPT OAuth models by version, including major-only gpt-6 ids", async () => {
+    const hooks = await CodexAuthPlugin({} as never)
+    const ids = ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-4o", "gpt-5.1", "gpt-5.4-mini", "gpt-5.7"]
+    const flag = { text: true, audio: false, image: false, video: false, pdf: false }
+    const provider: Provider = {
+      id: "openai",
+      name: "OpenAI",
+      source: "custom",
+      env: [],
+      options: {},
+      models: Object.fromEntries(
+        ids.map((id): [string, Model] => [
+          id,
+          {
+            id,
+            providerID: "openai",
+            name: id,
+            api: { id, url: "", npm: "@ai-sdk/openai" },
+            capabilities: {
+              temperature: false,
+              reasoning: true,
+              attachment: false,
+              toolcall: true,
+              input: flag,
+              output: flag,
+              interleaved: false,
+            },
+            cost: { input: 5, output: 30, cache: { read: 0.5, write: 0 } },
+            limit: { context: 1_050_000, input: 922_000, output: 128_000 },
+            status: "active",
+            options: {},
+            headers: {},
+            release_date: "",
+          },
+        ]),
+      ),
+    }
+    const models = await hooks.provider!.models!(
+      provider,
+      { auth: { type: "oauth", refresh: "", access: "", expires: 0 } },
+    )
+
+    expect(Object.keys(models).sort()).toEqual(
+      ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.4-mini", "gpt-5.7"].sort(),
+    )
+    expect(models["gpt-4o"]).toBeUndefined()
+    expect(models["gpt-5.1"]).toBeUndefined()
   })
 
   test("deduplicates concurrent Codex token refreshes", async () => {

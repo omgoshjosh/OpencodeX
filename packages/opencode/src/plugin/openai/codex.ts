@@ -381,7 +381,9 @@ export async function CodexAuthPlugin(input: PluginInput, options: CodexAuthPlug
             .filter(([, model]) => {
               if (ALLOWED_MODELS.has(model.api.id)) return true
               const match = model.api.id.match(/^gpt-(\d+)[.-](\d+)/)
-              return match ? Number(`${match[1]}.${match[2]}`) > 5.4 : false
+              if (match) return Number(`${match[1]}.${match[2]}`) > 5.4
+              const majorOnly = model.api.id.match(/^gpt-(\d+)(?:-\D|$)/)
+              return majorOnly ? Number(majorOnly[1]) > 5.4 : false
             })
             .map(([modelID, model]) => [
               modelID,

@@ -333,6 +333,15 @@ export function closePersistentChannel(sessionKey: string) {
 }
 
 /**
+ * In-process liveness of the session's attached persistent Claude turn, for the
+ * stale-execution sweep: a backgrounded native subagent keeps the turn open
+ * while writing no transcript rows, so the transcript alone reads it as idle.
+ */
+export function persistentChannelLiveWork(sessionKey: string) {
+  return persistentChannels.liveWork(sessionKey)
+}
+
+/**
  * Pushes a human follow-up into an already-attached persistent Claude turn.
  * This is intentionally opt-in until session-level adoption can make the
  * delivery durable.
@@ -389,6 +398,7 @@ export function createSdkTransport(): ClaudeTransport {
               toolInput: Record<string, unknown>,
               extra: { toolUseID?: string; signal?: AbortSignal },
             ) => {
+              registry.get(channelKey)?.touch()
               let handlers = input.handlers()
               if (
                 !handlers &&

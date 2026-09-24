@@ -44,6 +44,14 @@ export interface Deps {
    */
   readonly onStaleExecution?: (sessionID: SessionID) => Effect.Effect<void>
   /**
+   * In-process liveness of a session's external turn (a Claude CLI channel)
+   * that the transcript cannot show: a backgrounded native subagent keeps the
+   * turn open and asks for permissions while writing no message or part rows.
+   * `backgroundWork` vetoes the stale settle outright - the channel bounds that
+   * wait itself - and `lastActivityAt` counts as session activity.
+   */
+  readonly liveTurnWork?: (sessionID: SessionID) => { backgroundWork: boolean; lastActivityAt?: number } | undefined
+  /**
    * Runs between a sweep's unlocked scan on the read connection and its write
    * phase on the writer, once per sweep step that found candidates. Tests only.
    */
@@ -664,8 +672,9 @@ export function make(deps: Deps) {
      * every condition below must hold: the session's newest message is an
      * assistant turn that ended (its newest part is a step-finish, or it
      * recorded `time.completed`), none of its tool parts is still pending or
-     * running, the session has no live re-wakeable delegation, and no message
-     * or part in the session has been written or updated for
+     * running, the session has no live re-wakeable delegation, its in-process
+     * external turn (`liveTurnWork`) holds no live background work, and no
+     * message, part, or in-process turn activity has happened for
      * `staleExecutionMillis`. `session_execution.time_updated` is deliberately
      * NOT an activity signal - it is the renewing heartbeat that hides the stall.
      *
@@ -731,7 +740,14 @@ export function make(deps: Deps) {
           (newest !== undefined && decodeStepFinishPart(newest.data)._tag === "Some") ||
           decodeFinishedAssistant(message.data)._tag === "Some"
         if (!finished) continue
-        const idleSince = Math.max(candidate.startedAt ?? 0, activity.latest, message.updated)
+        const liveWork = deps.liveTurnWork?.(candidate.sessionID)
+        if (liveWork?.backgroundWork) continue
+        const idleSince = Math.max(
+          candidate.startedAt ?? 0,
+          activity.latest,
+          message.updated,
+          liveWork?.lastActivityAt ?? 0,
+        )
         if (now - idleSince < staleAfter) continue
         if (yield* hasLiveRewakeableDelegation(candidate.sessionID)) continue
         stale.push({ candidate: { ...candidate, owner }, activity, idleSince })
@@ -739,6 +755,9 @@ export function make(deps: Deps) {
       if (stale.length === 0) return
       yield* beforeRecoveryWrite
       for (const { candidate, activity, idleSince } of stale) {
+        // The in-process turn is not part of the fingerprint below, so re-ask:
+        // background work that started during the write gap still vetoes.
+        if (deps.liveTurnWork?.(candidate.sessionID)?.backgroundWork) continue
         // Phase two, an immediate transaction on the writer. The session's
         // activity fingerprint must still be what phase one judged - a turn
         // that woke up in between (a delegation reporting back, a new

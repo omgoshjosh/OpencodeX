@@ -53,6 +53,7 @@ import { Identifier } from "@opencode-ai/core/util/identifier"
 import { Question } from "@/question"
 import { QuestionID } from "@/question/schema"
 import { OpencodeXClaudeDriver } from "@/opencodex/claude-driver"
+import { persistentChannelLiveWork } from "@/opencodex/claude-transport"
 import { PromptInput, LoopInput, ShellInput, CommandInput } from "./prompt-schema"
 import { STRUCTURED_OUTPUT_SYSTEM_PROMPT, createStructuredOutputTool } from "./prompt-structured-output"
 import * as PromptClaim from "./prompt-claim"
@@ -1086,6 +1087,9 @@ export const layer = Layer.effect(
         .get()
         .pipe(Effect.map((cfg) => cfg.experimental?.stale_execution_timeout ?? PromptClaim.STALE_EXECUTION_MILLIS)),
       onStaleExecution: (sessionID) => (settleFinishedDelegation ? settleFinishedDelegation(sessionID) : Effect.void),
+      // A Claude turn waiting on a native background agent writes no rows
+      // while the agent works; the channel is the only witness (#49).
+      liveTurnWork: persistentChannelLiveWork,
     })
 
     // Registered after PromptClaim's handler (registration order is run

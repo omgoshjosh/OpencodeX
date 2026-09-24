@@ -10,6 +10,23 @@ import { Session } from "./session"
 import { MessageID, SessionID } from "./schema"
 import { ensureRunID } from "@opencode-ai/core/util/opencode-process"
 
+const RESTART_SUMMARY =
+  "Daemon restarted. Runtime execution cannot safely resume; do not assume completion or automatically repeat work/side effects. Inspect the child transcript and decide whether to verify, continue, or start a new attempt."
+const RESTART_NOTICE =
+  "Daemon restarted, so runtime execution cannot safely resume. Do not assume completion or automatically repeat work/side effects; inspect the child transcript and decide whether to verify, continue, or start a new attempt."
+/**
+ * The stale-execution watchdog settles a run inside a live daemon, so the
+ * restart wording would send the parent hunting for a restart that never
+ * happened (#49). The opening phrase doubles as the durable marker of which
+ * cause settled the run; stored summaries are whitespace-collapsed and capped.
+ */
+const WATCHDOG_MARKER = "The stale-execution watchdog settled this run"
+const WATCHDOG_SUMMARY = `${WATCHDOG_MARKER} after it went quiet; the daemon did not restart. Do not assume completion or automatically repeat work/side effects; inspect the child transcript and decide whether to verify, continue, or start a new attempt.`
+
+function settledByWatchdog(record: { summary?: string }) {
+  return record.summary?.startsWith(WATCHDOG_MARKER) === true
+}
+
 export interface Deps {
   readonly database: Context.Service.Shape<typeof Database.Service>
   readonly sessions: Context.Service.Shape<typeof Session.Service>
@@ -107,10 +124,9 @@ export function make(deps: Deps) {
                     ? "completed"
                     : "abandoned"
               : "abandoned"
+          // `requireOwnerDead` is false only for the watchdog, whose daemon is alive.
           const summary =
-            outcome === "abandoned"
-              ? "Daemon restarted. Runtime execution cannot safely resume; do not assume completion or automatically repeat work/side effects. Inspect the child transcript and decide whether to verify, continue, or start a new attempt."
-              : report
+            outcome === "abandoned" ? (options.requireOwnerDead ? RESTART_SUMMARY : WATCHDOG_SUMMARY) : report
           yield* deps.sessions.stampDelegation({
             sessionID: child.id,
             record: settleDelegation(record, { outcome, summary, deliveryOutcome: "pending" }),
@@ -118,7 +134,13 @@ export function make(deps: Deps) {
           })
           yield* deps.refresh(SessionID.make(record.parentSessionID))
           if (parent._tag === "Some" && parentPart && !foreground)
-            yield* finalizeDanglingPart(deps.sessions, parentPart)
+            yield* finalizeDanglingPart(
+              deps.sessions,
+              parentPart,
+              options.requireOwnerDead
+                ? "Interrupted by daemon restart; inspect the child transcript before continuing."
+                : "Settled by the stale-execution watchdog; inspect the child transcript before continuing.",
+            )
         }
 
         const settled = delegationRecord((yield* deps.sessions.get(child.id)).metadata)
@@ -146,12 +168,14 @@ export function make(deps: Deps) {
         // durable claim prevents concurrent recovery passes from entering
         // it twice before that unique insertion can arbitrate.
         if (!claim) return
+        const body = report ?? settled.summary ?? `The child run is recorded as ${settled.outcome}.`
+        const notice =
+          settled.outcome !== "abandoned" ? undefined : settledByWatchdog(settled) ? WATCHDOG_SUMMARY : RESTART_NOTICE
         const text = [
           `Background delegation recovery for child ${child.id}, run ${settled.runID}.`,
-          report ?? settled.summary ?? `The child run is recorded as ${settled.outcome}.`,
-          settled.outcome === "abandoned"
-            ? "Daemon restarted, so runtime execution cannot safely resume. Do not assume completion or automatically repeat work/side effects; inspect the child transcript and decide whether to verify, continue, or start a new attempt."
-            : undefined,
+          body,
+          // The watchdog summary already is the notice when there is no report.
+          body.startsWith(WATCHDOG_MARKER) ? undefined : notice,
         ]
           .filter(Boolean)
           .join("\n\n")
@@ -243,6 +267,7 @@ const taskPart = Effect.fn("SessionDelegationRecovery.taskPart")(function* (
 const finalizeDanglingPart = Effect.fn("SessionDelegationRecovery.finalizeDanglingPart")(function* (
   sessions: Context.Service.Shape<typeof Session.Service>,
   part: SessionLegacy.ToolPart,
+  error: string,
 ) {
   yield* sessions.updatePartIfPendingOrRunning({
     sessionID: part.sessionID,
@@ -253,7 +278,7 @@ const finalizeDanglingPart = Effect.fn("SessionDelegationRecovery.finalizeDangli
       state: {
         ...current.state,
         status: "error",
-        error: "Interrupted by daemon restart; inspect the child transcript before continuing.",
+        error,
         time: { start: current.state.status === "running" ? current.state.time.start : Date.now(), end: Date.now() },
       },
     }),
@@ -294,7 +319,9 @@ const finalizeRecoveredPart = Effect.fn("SessionDelegationRecovery.finalizeRecov
         } satisfies SessionLegacy.ToolPart
       const error =
         record.outcome === "abandoned"
-          ? "Delegated child run was orphaned after daemon restart; inspect the child transcript before continuing."
+          ? settledByWatchdog(record)
+            ? "Delegated child run was settled by the stale-execution watchdog; inspect the child transcript before continuing."
+            : "Delegated child run was orphaned after daemon restart; inspect the child transcript before continuing."
           : report || record.summary || `Delegated child run ended as ${record.outcome}.`
       return {
         ...current,

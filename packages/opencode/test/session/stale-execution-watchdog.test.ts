@@ -3,6 +3,8 @@ import { BackgroundJob } from "@/background/job"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { SessionDelegationRecovery } from "@/session/delegation-recovery"
+import { createChannelRegistry, createPushable, type CreateQuery } from "@/opencodex/claude-channel"
+import type { ClaudeEvent } from "@/opencodex/claude-mapper"
 import {
   DELEGATION_RECORD_VERSION,
   delegationRecord,
@@ -165,6 +167,7 @@ const buildClaim = Effect.fn("StaleExecutionTest.buildClaim")(function* (input?:
   staleAfter?: number
   clockOffset?: number
   onStaleExecution?: (sessionID: SessionID) => Effect.Effect<void>
+  liveTurnWork?: PromptClaim.Deps["liveTurnWork"]
 }) {
   const database = yield* Database.Service
   const events = yield* EventV2Bridge.Service
@@ -180,6 +183,7 @@ const buildClaim = Effect.fn("StaleExecutionTest.buildClaim")(function* (input?:
     clock: () => Date.now() + offset,
     staleExecutionMillis: Effect.succeed(input?.staleAfter ?? STALE_AFTER),
     onStaleExecution: input?.onStaleExecution,
+    liveTurnWork: input?.liveTurnWork,
   })
 })
 
@@ -383,7 +387,7 @@ function delegation(parentSessionID: SessionID, childMessageID: MessageID): Dele
   }
 }
 
-const staleChild = Effect.fn("StaleExecutionTest.staleChild")(function* () {
+const staleChild = Effect.fn("StaleExecutionTest.staleChild")(function* (input?: { completed?: boolean }) {
   const sessions = yield* Session.Service
   const parent = yield* sessions.create({})
   const child = yield* sessions.create({ parentID: parent.id })
@@ -397,7 +401,12 @@ const staleChild = Effect.fn("StaleExecutionTest.staleChild")(function* () {
     agent: "build",
     model: { providerID: ProviderV2.ID.make("test"), modelID: ProviderV2.ModelID.make("test") },
   })
-  yield* finishedTurn({ sessionID: child.id, parentID: boundary, text: "child report" })
+  yield* finishedTurn({
+    sessionID: child.id,
+    parentID: boundary,
+    text: "child report",
+    ...(input?.completed === false ? { completed: false } : {}),
+  })
   yield* insertExecution({ sessionID: child.id })
   return { parent, child }
 })
@@ -455,5 +464,116 @@ it.instance("restart recovery still refuses to settle a run whose owner is alive
     yield* (yield* buildClaim()).sweepStaleExecutions()
     yield* recovery.recover()
     expect(delegationRecord((yield* sessions.get(child.id)).metadata)?.phase).toBe("running")
+  }),
+)
+
+/** Stands in for the SDK query behind a persistent Claude channel. */
+function fakeClaudeQuery() {
+  const stream = createPushable<ClaudeEvent>()
+  const state = { interrupts: 0, aborts: 0 }
+  const create: CreateQuery<Record<string, never>> = async (input) => {
+    void (async () => {
+      for await (const _ of input.prompt);
+    })()
+    return {
+      events: stream.iterable,
+      interrupt: async () => {
+        state.interrupts += 1
+      },
+      abort: () => {
+        state.aborts += 1
+        stream.end()
+      },
+    }
+  }
+  return { create, emit: (value: ClaudeEvent) => stream.push(value), state }
+}
+
+// #49, live 2026-09-23 21:01:53 PDT: a Claude-backed child launched a native
+// background Agent, step-finished, and waited in drain while the sidechain
+// worked for 10+ minutes - asking for permissions, writing no rows. The sweep
+// read "step-finish, no writes for 10 min", force-settled the live turn, and
+// the driver interrupted it.
+it.instance("stale sweep does not settle a Claude turn with a live background agent", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({})
+    yield* finishedTurn({ sessionID: session.id, completed: false })
+    yield* insertExecution({ sessionID: session.id })
+
+    const registry = createChannelRegistry<Record<string, never>>({ idleTtlMs: Infinity })
+    const query = fakeClaudeQuery()
+    const channel = yield* Effect.promise(() => registry.acquire(session.id, "config", query.create))
+    channel.turn([], {})
+    query.emit({ type: "system", subtype: "background_tasks_changed", tasks: [{ task_id: "a1", task_type: "local_agent" }] })
+    query.emit({ type: "result", subtype: "success" })
+    yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 10)))
+
+    // An hour past the transcript's last write, but the agent is still working.
+    const claim = yield* buildClaim({ liveTurnWork: (sessionID) => registry.liveWork(sessionID) })
+    yield* claim.sweepStaleExecutions()
+    expect((yield* executionRow(session.id))?.state).toBe("running")
+    expect(channel.busy).toBe(true)
+    expect(query.state.interrupts).toBe(0)
+
+    // The agent reports back, the model answers, and the turn goes quiet: now
+    // the transcript is the whole truth again and the idle turn is settled.
+    query.emit({ type: "system", subtype: "background_tasks_changed", tasks: [] })
+    query.emit({ type: "assistant", message: { content: [] } })
+    query.emit({ type: "result", subtype: "success" })
+    yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 10)))
+    expect(registry.liveWork(session.id)?.backgroundWork).toBe(false)
+    const later = yield* buildClaim({
+      liveTurnWork: (sessionID) => registry.liveWork(sessionID),
+      // The channel's own clock saw that output moments ago; idle beyond it.
+      clockOffset: 2 * HOUR,
+      staleAfter: HOUR,
+    })
+    yield* later.sweepStaleExecutions()
+    expect((yield* executionRow(session.id))?.state).toBe("idle")
+    yield* Effect.promise(() => registry.close(session.id))
+  }),
+)
+
+it.instance("stale sweep counts recent Claude permission requests as activity", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({})
+    yield* finishedTurn({ sessionID: session.id, completed: false })
+    yield* insertExecution({ sessionID: session.id })
+
+    const claim = yield* buildClaim({
+      staleAfter: HOUR,
+      clockOffset: 2 * HOUR,
+      // No background task reported, but the CLI asked for a permission just now.
+      liveTurnWork: () => ({ backgroundWork: false, lastActivityAt: Date.now() + HOUR + HOUR / 2 }),
+    })
+    yield* claim.sweepStaleExecutions()
+    expect((yield* executionRow(session.id))?.state).toBe("running")
+  }),
+)
+
+it.instance("a watchdog-settled abandoned child is not reported as a daemon restart", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const database = yield* Database.Service
+    const { child } = yield* staleChild({ completed: false })
+    const notices = yield* Ref.make<Array<{ sessionID: SessionID; text: string }>>([])
+    const recovery = yield* SessionDelegationRecovery.make({
+      database,
+      sessions,
+      notify: (input) => Ref.update(notices, (items) => [...items, input]),
+      refresh: () => Effect.void,
+    })
+    const claim = yield* buildClaim({ onStaleExecution: recovery.settleFinished })
+    yield* claim.sweepStaleExecutions()
+
+    const record = delegationRecord((yield* sessions.get(child.id)).metadata)
+    expect(record?.outcome).toBe("abandoned")
+    expect(record?.summary).toContain("stale-execution watchdog")
+    expect(record?.summary).not.toContain("Daemon restarted")
+    const [notice] = yield* Ref.get(notices)
+    expect(notice?.text).toContain("stale-execution watchdog")
+    expect(notice?.text).not.toContain("Daemon restarted")
   }),
 )

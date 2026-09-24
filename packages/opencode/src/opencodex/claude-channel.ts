@@ -149,12 +149,37 @@ export class Channel<H> {
   private liveBackgroundTasks = 0
   private backgroundWait: "drain" | "final-output" | undefined
   private backgroundTaskDeadline: number | undefined
+  /**
+   * When the CLI last showed signs of life for the attached turn: a routed
+   * event or a permission request. A backgrounded subagent's work reaches the
+   * daemon only as these, never as transcript rows.
+   */
+  private lastActivityAt: number | undefined
   /** Input reached EOF (for native images); finish this query, never reuse it. */
   retiring = false
 
   /** True while a turn is attached; an idle reaper must not close one. */
   get busy() {
     return this.sink !== undefined
+  }
+
+  /** Records CLI activity the event stream does not carry (permission requests). */
+  touch() {
+    if (this.sink) this.lastActivityAt = this.now()
+  }
+
+  /**
+   * The attached turn's in-process liveness, for watchdogs that otherwise judge
+   * a turn by its transcript alone. `backgroundWork` is true while the turn is
+   * held open for re-wakeable background tasks (drain) or their final output.
+   * Undefined when no turn is attached.
+   */
+  liveWork(): { backgroundWork: boolean; lastActivityAt?: number } | undefined {
+    if (this.dead || !this.sink) return undefined
+    return {
+      backgroundWork: this.liveBackgroundTasks > 0 || this.backgroundWait !== undefined,
+      ...(this.lastActivityAt !== undefined ? { lastActivityAt: this.lastActivityAt } : {}),
+    }
   }
 
   constructor(
@@ -218,6 +243,7 @@ export class Channel<H> {
       log.info("dropped out-of-turn event", { channel: this.key, type: eventType(event) })
       return
     }
+    this.lastActivityAt = this.now()
     if (eventType(event) === "system" && (event as { subtype?: string }).subtype === "background_tasks_changed") {
       // Shell/monitor tasks are excluded: nothing re-wakes the model for them,
       // so counting one holds the turn open until the drain deadline at best
@@ -396,6 +422,7 @@ export class Channel<H> {
     if (this.retiring) throw new Error("The Claude channel is retiring.")
     if (this.sink) throw new Error("A turn is already active on this Claude channel.")
     this.resetBackgroundWait()
+    this.lastActivityAt = this.now()
     this.handlers = handlers
     this.lastHandlers = handlers
 
@@ -606,6 +633,8 @@ export function createChannelRegistry<H>(options?: { idleTtlMs?: number; sweepMs
 
   return {
     get: (sessionKey: string) => channels.get(sessionKey)?.channel,
+    /** The session's attached turn's in-process liveness; see {@link Channel.liveWork}. */
+    liveWork: (sessionKey: string) => channels.get(sessionKey)?.channel.liveWork(),
     /** Adds input only when the session still has an attached live turn. */
     offer: (sessionKey: string, messages: SDKUserMessage[]) => channels.get(sessionKey)?.channel.offer(messages) ?? false,
     /** Live channel count; the reaper's observable surface for tests. */

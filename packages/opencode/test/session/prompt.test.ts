@@ -313,6 +313,7 @@ const racingRunState = Layer.succeed(
     assertNotBusy: () => Effect.void,
     cancel: (sessionID) => (cancelHooks.shift()?.(sessionID) ?? Effect.void).pipe(Effect.as(1)),
     interrupt: () => Effect.succeed(false),
+    executionOwnerLive: () => Effect.succeed(false),
     ensureRunning: (_sessionID, _onInterrupt, work) => work,
     startShell: (_sessionID, _onInterrupt, work) => work,
   }),

@@ -56,6 +56,12 @@ export interface Deps {
    * phase on the writer, once per sweep step that found candidates. Tests only.
    */
   readonly beforeRecoveryWrite?: Effect.Effect<void>
+  /**
+   * Whether a `running` execution whose lease lapsed still has a live owner
+   * (#51). A lapsed lease alone only proves a starved heartbeat; without this
+   * seam the lapsed lease is taken at face value, as before.
+   */
+  readonly executionOwnerLive?: (input: { sessionID: SessionID; owner: string; generation: number }) => Effect.Effect<boolean>
 }
 
 /** Matches `experimental.stale_execution_timeout`'s documented default. */
@@ -151,6 +157,31 @@ export function make(deps: Deps) {
     const recoveryBatchSize = 32
     const recoveryInterval = deps.recoveryInterval ?? "20 seconds"
     const launching = new Set<string>()
+    /** Commands whose turn is running in this instance, by claim generation (#51). */
+    const executing = new Map<string, number>()
+
+    /**
+     * A lapsed lease on an execution only proves its heartbeat was late (#51).
+     * It still blocks admission while its owner is live.
+     */
+    const executionBusy = Effect.fnUntraced(function* (
+      sessionID: SessionID,
+      execution: { state: string; owner: string | null; generation: number; leaseExpiresAt: number | null } | undefined,
+      now: number,
+    ) {
+      if (execution?.state !== "running") return false
+      if (execution.leaseExpiresAt && execution.leaseExpiresAt > now) return true
+      if (!execution.owner || !deps.executionOwnerLive) return false
+      return yield* deps.executionOwnerLive({ sessionID, owner: execution.owner, generation: execution.generation })
+    })
+
+    /** Whether a `running` command's owner still runs it, whatever its lease says (#51). */
+    const commandOwnerLive = (commandID: string, owner: string, generation: number) => {
+      if (owner === commandOwner) return executing.get(commandID) === generation
+      const match = /^local:(\d+):([^:]+):/.exec(owner)
+      if (!match || Number(match[1]) === process.pid) return false
+      return SessionExecutionOwner.alive(owner, processRunID)
+    }
 
     const diagnostic = Effect.fnUntraced(function* (
       commandID: string,
@@ -219,14 +250,13 @@ export function make(deps: Deps) {
                 .select({
                   state: SessionExecutionTable.state,
                   owner: SessionExecutionTable.owner_id,
+                  generation: SessionExecutionTable.generation,
                   leaseExpiresAt: SessionExecutionTable.lease_expires_at,
                 })
                 .from(SessionExecutionTable)
                 .where(eq(SessionExecutionTable.session_id, current.session_id))
                 .get()
-              if (execution?.state === "running" && execution.leaseExpiresAt && execution.leaseExpiresAt > now) {
-                return { state: "waiting" as const }
-              }
+              if (yield* executionBusy(current.session_id, execution, now)) return { state: "waiting" as const }
               const parent = current.adopted_by
                 ? yield* transaction
                     .select()
@@ -306,6 +336,38 @@ export function make(deps: Deps) {
               ) {
                 return { state: "waiting" as const }
               }
+              if (current.status === "running" && !reclaimDeadOwner && current.owner_id) {
+                // The lease lapsed. Its owner may just have lost the DB to
+                // contention for longer than the lease (#51): if it is still
+                // running the turn, re-lease it for the owner and keep waiting.
+                const ownerLive = commandOwnerLive(commandID, current.owner_id, current.claim_generation)
+                yield* (ownerLive ? Effect.logWarning : Effect.logInfo)("session command lease reclaim decision").pipe(
+                  Effect.annotateLogs({
+                    commandID,
+                    sessionID: current.session_id,
+                    claimGeneration: current.claim_generation,
+                    commandOwner: current.owner_id,
+                    leaseAgeMillis: current.lease_expires_at === null ? undefined : now - current.lease_expires_at,
+                    ownerLive,
+                    action: ownerLive ? "keep" : "reclaim",
+                  }),
+                )
+                if (ownerLive) {
+                  yield* transaction
+                    .update(SessionCommandTable)
+                    .set({ lease_expires_at: now + commandLeaseMillis, time_updated: now })
+                    .where(
+                      and(
+                        eq(SessionCommandTable.id, commandID),
+                        eq(SessionCommandTable.status, "running"),
+                        eq(SessionCommandTable.owner_id, current.owner_id),
+                        eq(SessionCommandTable.claim_generation, current.claim_generation),
+                      ),
+                    )
+                    .run()
+                  return { state: "waiting" as const }
+                }
+              }
               const active = yield* transaction
                 .select({
                   id: SessionCommandTable.id,
@@ -369,7 +431,12 @@ export function make(deps: Deps) {
             .get()
             .pipe(Effect.orDie),
           db
-            .select({ state: SessionExecutionTable.state, leaseExpiresAt: SessionExecutionTable.lease_expires_at })
+            .select({
+              state: SessionExecutionTable.state,
+              owner: SessionExecutionTable.owner_id,
+              generation: SessionExecutionTable.generation,
+              leaseExpiresAt: SessionExecutionTable.lease_expires_at,
+            })
             .from(SessionExecutionTable)
             .where(eq(SessionExecutionTable.session_id, sessionID))
             .get()
@@ -378,7 +445,7 @@ export function make(deps: Deps) {
         { concurrency: "unbounded" },
       )
       if (!command || ["succeeded", "failed", "cancelled"].includes(command.status)) return false
-      return execution?.state !== "running" || !execution.leaseExpiresAt || execution.leaseExpiresAt <= clock()
+      return !(yield* executionBusy(sessionID, execution, clock()))
     })
 
     const executeCommand = Effect.fn("SessionPrompt.executeCommand")(function* (commandID: string) {
@@ -465,14 +532,31 @@ export function make(deps: Deps) {
         .pipe(Effect.orDie)
       if (!admitted) return
 
-      const heartbeat = yield* Effect.sleep(Math.floor(commandLeaseMillis / 3)).pipe(
+      const beatMillis = Math.floor(commandLeaseMillis / 3)
+      let lastBeat = clock()
+      executing.set(commandID, command.claim_generation)
+      const heartbeat = yield* Effect.sleep(beatMillis).pipe(
         Effect.andThen(
           // Suspended so the clock is read on EVERY beat. Built eagerly, drizzle
           // bakes the first timestamp into the statement and every later beat
           // rewrites the same already-expiring lease.
           Effect.suspend(() => {
             const now = clock()
-            return db
+            // Late by more than one beat: the writer starved this heartbeat
+            // (#51). The owner is live, so the claim path re-leases it anyway.
+            const late =
+              now - lastBeat > 2 * beatMillis
+                ? Effect.logWarning("session command lease renewal late").pipe(
+                    Effect.annotateLogs({
+                      commandID,
+                      sessionID: command.session_id,
+                      claimGeneration: command.claim_generation,
+                      lateMillis: now - lastBeat - beatMillis,
+                    }),
+                  )
+                : Effect.void
+            lastBeat = now
+            return late.pipe(Effect.andThen(db
               .update(SessionCommandTable)
               .set({ lease_expires_at: now + commandLeaseMillis, time_updated: now })
               .where(
@@ -483,9 +567,15 @@ export function make(deps: Deps) {
                   eq(SessionCommandTable.claim_generation, command.claim_generation),
                 ),
               )
-              .run()
-              .pipe(Effect.orDie)
+              .run()))
           }),
+        ),
+        // A failed beat (SQLITE_BUSY under contention) must not end the
+        // heartbeat for the rest of the turn; the next beat retries.
+        Effect.catch((error) =>
+          Effect.logWarning("session command lease renewal failed").pipe(
+            Effect.annotateLogs({ commandID, error: String(error) }),
+          ),
         ),
         Effect.repeat(Schedule.forever),
         Effect.forkIn(scope),
@@ -499,7 +589,18 @@ export function make(deps: Deps) {
             claimGeneration: command.claim_generation,
             claimOwner: commandOwner,
           }).pipe(Effect.onInterrupt(() => requeue())),
-        ).pipe(Effect.exit, Effect.ensuring(Fiber.interrupt(heartbeat))),
+        ).pipe(
+          Effect.exit,
+          Effect.ensuring(
+            Fiber.interrupt(heartbeat).pipe(
+              Effect.andThen(
+                Effect.sync(() => {
+                  if (executing.get(commandID) === command.claim_generation) executing.delete(commandID)
+                }),
+              ),
+            ),
+          ),
+        ),
       )
       const completedAt = clock()
       // A turn that returns an errored assistant message is a FAILED command,

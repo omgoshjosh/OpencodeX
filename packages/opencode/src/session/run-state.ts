@@ -36,6 +36,8 @@ export interface Interface {
   readonly assertNotBusy: (sessionID: SessionID) => Effect.Effect<void, Session.BusyError>
   readonly cancel: (sessionID: SessionID) => Effect.Effect<number>
   readonly interrupt: (sessionID: SessionID) => Effect.Effect<boolean>
+  /** Whether a `running` execution's owner is still working, lease or not (#51). */
+  readonly executionOwnerLive: (input: { sessionID: SessionID; owner: string; generation: number }) => Effect.Effect<boolean>
   readonly ensureRunning: (
     sessionID: SessionID,
     onInterrupt: Effect.Effect<SessionLegacy.WithParts>,
@@ -655,7 +657,10 @@ const configuredLayer = Layer.effect(
       )
     })
 
-    return Service.of({ assertNotBusy, cancel, interrupt, ensureRunning, startShell })
+    const executionOwnerLive = (input: { sessionID: SessionID; owner: string; generation: number }) =>
+      liveOwner(input.sessionID, input.owner, input.generation)
+
+    return Service.of({ assertNotBusy, cancel, interrupt, executionOwnerLive, ensureRunning, startShell })
   }),
 )
 

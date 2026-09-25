@@ -61,7 +61,11 @@ export interface Deps {
    * (#51). A lapsed lease alone only proves a starved heartbeat; without this
    * seam the lapsed lease is taken at face value, as before.
    */
-  readonly executionOwnerLive?: (input: { sessionID: SessionID; owner: string; generation: number }) => Effect.Effect<boolean>
+  readonly executionOwnerLive?: (input: {
+    sessionID: SessionID
+    owner: string
+    generation: number
+  }) => Effect.Effect<boolean>
 }
 
 /** Matches `experimental.stale_execution_timeout`'s documented default. */
@@ -556,18 +560,22 @@ export function make(deps: Deps) {
                   )
                 : Effect.void
             lastBeat = now
-            return late.pipe(Effect.andThen(db
-              .update(SessionCommandTable)
-              .set({ lease_expires_at: now + commandLeaseMillis, time_updated: now })
-              .where(
-                and(
-                  eq(SessionCommandTable.id, commandID),
-                  eq(SessionCommandTable.status, "running"),
-                  eq(SessionCommandTable.owner_id, commandOwner),
-                  eq(SessionCommandTable.claim_generation, command.claim_generation),
-                ),
-              )
-              .run()))
+            return late.pipe(
+              Effect.andThen(
+                db
+                  .update(SessionCommandTable)
+                  .set({ lease_expires_at: now + commandLeaseMillis, time_updated: now })
+                  .where(
+                    and(
+                      eq(SessionCommandTable.id, commandID),
+                      eq(SessionCommandTable.status, "running"),
+                      eq(SessionCommandTable.owner_id, commandOwner),
+                      eq(SessionCommandTable.claim_generation, command.claim_generation),
+                    ),
+                  )
+                  .run(),
+              ),
+            )
           }),
         ),
         // A failed beat (SQLITE_BUSY under contention) must not end the

@@ -37,7 +37,11 @@ export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<number>
   readonly interrupt: (sessionID: SessionID) => Effect.Effect<boolean>
   /** Whether a `running` execution's owner is still working, lease or not (#51). */
-  readonly executionOwnerLive: (input: { sessionID: SessionID; owner: string; generation: number }) => Effect.Effect<boolean>
+  readonly executionOwnerLive: (input: {
+    sessionID: SessionID
+    owner: string
+    generation: number
+  }) => Effect.Effect<boolean>
   readonly ensureRunning: (
     sessionID: SessionID,
     onInterrupt: Effect.Effect<SessionLegacy.WithParts>,

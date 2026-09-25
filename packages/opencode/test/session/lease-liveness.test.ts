@@ -22,7 +22,12 @@ import { Context, Effect, Fiber, Latch, Layer, Ref, Scope } from "effect"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 
 const it = testEffect(
-  Layer.mergeAll(Database.defaultLayer, EventV2Bridge.defaultLayer, BackgroundJob.defaultLayer, CrossSpawnSpawner.defaultLayer),
+  Layer.mergeAll(
+    Database.defaultLayer,
+    EventV2Bridge.defaultLayer,
+    BackgroundJob.defaultLayer,
+    CrossSpawnSpawner.defaultLayer,
+  ),
 )
 
 const sessionID = SessionID.make("ses_lease_liveness")
@@ -269,12 +274,7 @@ it.instance("a running command whose own turn is live is re-leased, not reclaime
     const fiber = yield* claim.executeCommand("sec_lease_live").pipe(Effect.forkScoped)
     yield* awaitWithTimeout(started.await, "command turn never started")
     const command = () =>
-      db
-        .select()
-        .from(SessionCommandTable)
-        .where(eq(SessionCommandTable.id, "sec_lease_live"))
-        .get()
-        .pipe(Effect.orDie)
+      db.select().from(SessionCommandTable).where(eq(SessionCommandTable.id, "sec_lease_live")).get().pipe(Effect.orDie)
     const claimed = yield* command()
     // Heartbeat starved past the lease while the turn is still running here.
     yield* db

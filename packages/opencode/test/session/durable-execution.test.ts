@@ -1069,9 +1069,11 @@ it.instance("rejects stale status writes after a newer execution generation clai
     )
 
     const { db } = yield* Database.Service
+    // A dead owner, not just a lapsed lease: a live owner extends a lapsed
+    // lease instead of losing it (https://github.com/ecgreen/OpencodeX/issues/51).
     yield* db
       .update(SessionExecutionTable)
-      .set({ lease_expires_at: Date.now() - 1 })
+      .set({ lease_expires_at: Date.now() - 1, owner_id: "local:2147483646:deadrun:owner" })
       .where(eq(SessionExecutionTable.session_id, sessionID))
       .run()
       .pipe(Effect.orDie)

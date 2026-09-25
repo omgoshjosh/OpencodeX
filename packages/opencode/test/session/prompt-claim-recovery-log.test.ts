@@ -37,12 +37,14 @@ const it = testEffect(env)
 const logText = () => Effect.promise(() => fs.readFile(Log.file(), "utf8").catch(() => ""))
 
 /** The first daemon log line written after `offset` that carries `marker`, via the file logger production uses. */
-const renderedLine = Effect.fn("RecoveryLogTest.renderedLine")(function* (marker: string, offset: number) {
-  for (let attempt = 0; attempt < 50; attempt++) {
+const renderedLine = Effect.fn("RecoveryLogTest.renderedLine")(function* (marker: string, id: string, offset: number) {
+  // Deterministic on slow (Windows) runners: match this test's own line, not
+  // another test's, and give the async file sink up to 10 s to flush.
+  for (let attempt = 0; attempt < 500; attempt++) {
     const line = (yield* logText())
       .slice(offset)
       .split("\n")
-      .find((entry) => entry.includes(marker))
+      .find((entry) => entry.includes(marker) && entry.includes(id))
     if (line) return line
     yield* Effect.sleep("20 millis")
   }
@@ -83,7 +85,7 @@ it.instance("recovery diagnostic renders its payload as fields, not [object Obje
     // A settled command: claim reports "done" and the diagnostic logs the row.
     yield* claim.executeCommand(commandID).pipe(Effect.provide(EffectLogger.layer))
 
-    const line = yield* renderedLine("session command recovery", offset)
+    const line = yield* renderedLine("session command recovery", commandID, offset)
     expect(line).toBeDefined()
     expect(line).toContain(`commandID=${commandID}`)
     expect(line).toContain(`session.id=${session.id}`)

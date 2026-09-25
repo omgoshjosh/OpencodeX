@@ -1003,47 +1003,42 @@ export function make(deps: Deps) {
         yield* diagnostic(commandID, "launch", "not-attempted").pipe(Effect.catchCause(() => Effect.void))
         yield* launchCommand(commandID)
       }
-      // Diagnostic only, and the sweep's one wide scan: newest messages joined
-      // to their commands, so it belongs on the read connection above all.
-      const messages = yield* read
-        .select({
-          id: MessageTable.id,
-          sessionID: MessageTable.session_id,
-          data: MessageTable.data,
-          created: MessageTable.time_created,
-          commandID: SessionCommandTable.id,
-        })
-        .from(MessageTable)
-        .innerJoin(SessionTable, eq(SessionTable.id, MessageTable.session_id))
-        .leftJoin(
-          SessionCommandTable,
-          and(
-            eq(SessionCommandTable.session_id, MessageTable.session_id),
-            eq(SessionCommandTable.message_id, MessageTable.id),
-          ),
-        )
+      // Diagnostic only. Bounded (#51): the old form joined message to
+      // session and sorted the whole message table every sweep (20 s on a
+      // 5.75 GB database). Now it starts from the directory's most recently
+      // updated sessions and takes one index seek per session for its newest
+      // message (message_session_time_created_id_idx). No migration needed.
+      const recent = yield* read
+        .select({ id: SessionTable.id })
+        .from(SessionTable)
         .where(eq(SessionTable.directory, ctx.directory))
-        .orderBy(desc(MessageTable.time_created))
+        .orderBy(desc(SessionTable.time_updated), desc(SessionTable.id))
         .limit(recoveryBatchSize)
         .all()
         .pipe(Effect.orDie)
-      for (const message of messages) {
-        if (message.data.role !== "user" || message.commandID) continue
-        if (
-          messages.some(
-            (other) =>
-              other.sessionID === message.sessionID &&
-              other.created > message.created &&
-              other.data.role === "assistant",
-          )
-        )
-          continue
+      for (const session of recent) {
+        const message = yield* read
+          .select({ id: MessageTable.id, data: MessageTable.data, created: MessageTable.time_created })
+          .from(MessageTable)
+          .where(eq(MessageTable.session_id, session.id))
+          .orderBy(desc(MessageTable.time_created), desc(MessageTable.id))
+          .limit(1)
+          .get()
+          .pipe(Effect.orDie)
+        if (!message || message.data.role !== "user") continue
+        const command = yield* read
+          .select({ id: SessionCommandTable.id })
+          .from(SessionCommandTable)
+          .where(and(eq(SessionCommandTable.session_id, session.id), eq(SessionCommandTable.message_id, message.id)))
+          .get()
+          .pipe(Effect.orDie)
+        if (command) continue
         // Legacy transcript-only messages are observable but not recoverable;
         // repeated sweeps must not manufacture operator warnings for no-op work.
         yield* Effect.logDebug("session transcript has pending message without durable command").pipe(
           Effect.annotateLogs({
             messageID: message.id,
-            sessionID: message.sessionID,
+            sessionID: session.id,
             messageAgeMillis: clock() - message.created,
             action: "transcript-only",
             cas: "not-attempted",

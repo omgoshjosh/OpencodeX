@@ -5,7 +5,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
 import { SessionCommandTable, SessionExecutionTable } from "@opencode-ai/core/session/sql"
 import { ensureRunID } from "@opencode-ai/core/util/opencode-process"
-import { and, eq, gt, inArray, isNull, sql } from "drizzle-orm"
+import { and, eq, inArray, isNull, sql } from "drizzle-orm"
 import { Cause, Context, Effect, Latch, Layer, Scope } from "effect"
 import { isSqlError, isSqlErrorReason } from "effect/unstable/sql/SqlError"
 import * as Session from "./session"
@@ -36,6 +36,12 @@ export interface Interface {
   readonly assertNotBusy: (sessionID: SessionID) => Effect.Effect<void, Session.BusyError>
   readonly cancel: (sessionID: SessionID) => Effect.Effect<number>
   readonly interrupt: (sessionID: SessionID) => Effect.Effect<boolean>
+  /** Whether a `running` execution's owner is still working, lease or not (#51). */
+  readonly executionOwnerLive: (input: {
+    sessionID: SessionID
+    owner: string
+    generation: number
+  }) => Effect.Effect<boolean>
   readonly ensureRunning: (
     sessionID: SessionID,
     onInterrupt: Effect.Effect<SessionLegacy.WithParts>,
@@ -67,6 +73,55 @@ const configuredLayer = Layer.effect(
     const processRunID = ensureRunID()
     const ownerPrefix = `local:${process.pid}:${processRunID}:${crypto.randomUUID()}`
 
+    /**
+     * Whether a `running` execution's owner is still working (#51). This
+     * instance's own rows are live exactly while their runner is registered;
+     * another instance in this process with the same run is a disposed one; a
+     * foreign `local:` owner is live while its pid is. Anything else - a dead
+     * pid, a previous run of this pid, an unparseable owner - is dead.
+     */
+    const liveOwner = Effect.fnUntraced(function* (sessionID: SessionID, owner: string, generation: number) {
+      if (owner.startsWith(`${ownerPrefix}:`)) {
+        const active = (yield* InstanceState.get(state)).runners.get(sessionID)
+        return active?.lease.owner === owner && active.lease.generation === generation
+      }
+      const match = /^local:(\d+):([^:]+):/.exec(owner)
+      if (!match || Number(match[1]) === process.pid) return false
+      return SessionExecutionOwner.alive(owner, processRunID)
+    })
+
+    /** Live by lease for a leased row, by `liveOwner` once the lease lapsed. */
+    const ownerAlive = (
+      sessionID: SessionID,
+      row: { owner_id: string | null; generation: number; lease_expires_at: number | null },
+      now: number,
+    ) =>
+      !row.owner_id
+        ? Effect.succeed(false)
+        : row.lease_expires_at && row.lease_expires_at > now
+          ? Effect.succeed(SessionExecutionOwner.alive(row.owner_id, processRunID))
+          : liveOwner(sessionID, row.owner_id, row.generation)
+
+    const logReclaimDecision = (input: {
+      sessionID: SessionID
+      generation: number
+      owner: string
+      leaseExpiresAt: number | null
+      now: number
+      ownerLive: boolean
+      action: "keep" | "reclaim"
+    }) =>
+      (input.ownerLive ? Effect.logWarning : Effect.logInfo)("session execution lease reclaim decision").pipe(
+        Effect.annotateLogs({
+          sessionID: input.sessionID,
+          executionGeneration: input.generation,
+          executionOwner: input.owner,
+          leaseAgeMillis: input.leaseExpiresAt === null ? undefined : input.now - input.leaseExpiresAt,
+          ownerLive: input.ownerLive,
+          action: input.action,
+        }),
+      )
+
     const claim = Effect.fn("SessionRunState.claim")(function* (sessionID: SessionID) {
       const ctx = yield* InstanceState.context
       return yield* db
@@ -79,15 +134,25 @@ const configuredLayer = Layer.effect(
                 .from(SessionExecutionTable)
                 .where(eq(SessionExecutionTable.session_id, sessionID))
                 .get()
-              if (
-                execution?.state === "running" &&
-                execution.owner_id &&
-                execution.lease_expires_at &&
-                now &&
-                execution.lease_expires_at > now.now &&
-                SessionExecutionOwner.alive(execution.owner_id, processRunID)
-              )
-                return undefined
+              if (execution?.state === "running" && execution.owner_id && now) {
+                const leased = !!execution.lease_expires_at && execution.lease_expires_at > now.now
+                if (leased && SessionExecutionOwner.alive(execution.owner_id, processRunID)) return undefined
+                if (!leased) {
+                  // #51: a lapsed lease only proves the heartbeat was late, not
+                  // that the owner died. Reclaim only a provably dead owner.
+                  const ownerLive = yield* liveOwner(sessionID, execution.owner_id, execution.generation)
+                  yield* logReclaimDecision({
+                    sessionID,
+                    generation: execution.generation,
+                    owner: execution.owner_id,
+                    leaseExpiresAt: execution.lease_expires_at,
+                    now: now.now,
+                    ownerLive,
+                    action: ownerLive ? "keep" : "reclaim",
+                  })
+                  if (ownerLive) return undefined
+                }
+              }
 
               const identity = {
                 owner: `${ownerPrefix}:${sessionID}`,
@@ -212,9 +277,7 @@ const configuredLayer = Layer.effect(
               current.state !== "running" ||
               current.owner !== lease.owner ||
               current.generation !== lease.generation ||
-              current.cancelRequestedAt ||
-              !current.leaseExpiresAt ||
-              current.leaseExpiresAt <= current.now
+              current.cancelRequestedAt
             )
               return { _tag: "Interrupted" } as const
 
@@ -230,8 +293,10 @@ const configuredLayer = Layer.effect(
                   eq(SessionExecutionTable.state, "running"),
                   eq(SessionExecutionTable.owner_id, lease.owner),
                   eq(SessionExecutionTable.generation, lease.generation),
+                  // No `lease_expires_at > now` guard (#51): this runs inside the
+                  // live owner, so a lapsed lease still on our owner+generation
+                  // is extended. A reclaimer changes both and loses this CAS.
                   isNull(SessionExecutionTable.cancel_requested_at),
-                  gt(SessionExecutionTable.lease_expires_at, DATABASE_NOW_MILLIS),
                 ),
               )
               .returning({ expiresAt: SessionExecutionTable.lease_expires_at })
@@ -277,13 +342,26 @@ const configuredLayer = Layer.effect(
             !current ||
             current.state !== "running" ||
             current.owner !== lease.owner ||
-            current.generation !== lease.generation ||
-            !current.leaseExpiresAt ||
-            current.leaseExpiresAt <= current.now
+            current.generation !== lease.generation
           )
             return { _tag: "Interrupted" } as const
           if (current.cancelRequestedAt) return { _tag: "Interrupted" } as const
           if (current.now < expiresAt - Math.floor((LEASE_MILLIS * 3) / 4)) continue
+          // Renewal is due at expiresAt - 3/4 lease; late by more than one
+          // renewal interval means the DB starved this heartbeat (#51). The
+          // turn is alive (this monitor only runs beside it), so extend.
+          const lateMillis = current.now - (expiresAt - Math.floor((LEASE_MILLIS * 3) / 4))
+          if (lateMillis > Math.floor(LEASE_MILLIS / 4))
+            yield* Effect.logWarning("session execution lease renewal late").pipe(
+              Effect.annotateLogs({
+                sessionID,
+                executionGeneration: lease.generation,
+                executionOwner: lease.owner,
+                lateMillis,
+                lapsed: !current.leaseExpiresAt || current.leaseExpiresAt <= current.now,
+                action: "extend",
+              }),
+            )
           const result = yield* renew()
           if (result._tag === "Interrupted") return result
           expiresAt = result.expiresAt
@@ -397,11 +475,7 @@ const configuredLayer = Layer.effect(
                 .where(eq(SessionExecutionTable.session_id, sessionID))
                 .get()
               const active =
-                current?.state === "running" &&
-                !!current.owner_id &&
-                !!current.lease_expires_at &&
-                current.lease_expires_at > now &&
-                SessionExecutionOwner.alive(current.owner_id, processRunID)
+                current?.state === "running" && !!current.owner_id && (yield* ownerAlive(sessionID, current, now))
               yield* transaction
                 .insert(SessionExecutionTable)
                 .values({
@@ -490,15 +564,12 @@ const configuredLayer = Layer.effect(
                 .from(SessionExecutionTable)
                 .where(eq(SessionExecutionTable.session_id, sessionID))
                 .get()
-              if (
-                !current ||
-                current.state !== "running" ||
-                !current.owner_id ||
-                !current.lease_expires_at ||
-                current.lease_expires_at <= now
-              )
-                return undefined
-              const alive = SessionExecutionOwner.alive(current.owner_id, processRunID)
+              if (!current || current.state !== "running" || !current.owner_id) return undefined
+              const leased = !!current.lease_expires_at && current.lease_expires_at > now
+              // A lapsed lease whose owner is dead is the reclaim's job; a live
+              // owner whose heartbeat is merely late still gets the request (#51).
+              if (!leased && !(yield* liveOwner(sessionID, current.owner_id, current.generation))) return undefined
+              const alive = yield* ownerAlive(sessionID, current, now)
               yield* transaction
                 .update(SessionExecutionTable)
                 .set(
@@ -590,7 +661,10 @@ const configuredLayer = Layer.effect(
       )
     })
 
-    return Service.of({ assertNotBusy, cancel, interrupt, ensureRunning, startShell })
+    const executionOwnerLive = (input: { sessionID: SessionID; owner: string; generation: number }) =>
+      liveOwner(input.sessionID, input.owner, input.generation)
+
+    return Service.of({ assertNotBusy, cancel, interrupt, executionOwnerLive, ensureRunning, startShell })
   }),
 )
 

@@ -1090,6 +1090,7 @@ export const layer = Layer.effect(
       // A Claude turn waiting on a native background agent writes no rows
       // while the agent works; the channel is the only witness (#49).
       liveTurnWork: persistentChannelLiveWork,
+      executionOwnerLive: (input) => state.executionOwnerLive(input),
     })
 
     // Registered after PromptClaim's handler (registration order is run

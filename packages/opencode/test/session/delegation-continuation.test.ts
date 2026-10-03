@@ -25,7 +25,6 @@ import { FetchHttpClient } from "effect/unstable/http"
 import { expect } from "bun:test"
 import { Effect, Exit, Fiber, Layer, Scope } from "effect"
 import path from "path"
-import { pathToFileURL } from "url"
 import { RESERVATION_GRACE_MS } from "../../src/session/delegation-recovery"
 import { Agent as AgentSvc } from "../../src/agent/agent"
 import { BackgroundJob } from "@/background/job"
@@ -95,6 +94,9 @@ void Log.init({ print: false })
 
 const ref = { providerID: ProviderV2.ID.make("test"), modelID: ProviderV2.ModelID.make("test-model") }
 
+/** MCP resource reads held open by a test (portable acceptance stall), keyed by URI. */
+const heldResources = new Map<string, Promise<void>>()
+
 const mcp = Layer.succeed(
   MCP.Service,
   MCP.Service.of({
@@ -107,7 +109,10 @@ const mcp = Layer.succeed(
     connect: () => Effect.void,
     disconnect: () => Effect.void,
     getPrompt: () => Effect.succeed(undefined),
-    readResource: () => Effect.succeed(undefined),
+    readResource: (_client: string, uri: string) => {
+      const held = heldResources.get(uri)
+      return held ? Effect.promise(() => held.then(() => ({ contents: [{ uri, text: "resumed" }] }))) : Effect.succeed(undefined)
+    },
     startAuth: () => Effect.die("unexpected MCP auth"),
     authenticate: () => Effect.die("unexpected MCP auth"),
     finishAuth: () => Effect.die("unexpected MCP auth"),
@@ -1131,10 +1136,10 @@ it.instance("fence 1: a live owner's reservation stalled past the grace is never
   Effect.gen(function* () {
     const h = yield* boot()
     const worker = yield* h.sessions.create({ title: "worker" })
-    const { directory } = yield* TestInstance
-    // A's acceptance blocks reading a FIFO between reservation and command insert.
-    const fifo = path.join(directory, "stall.fifo")
-    expect(Bun.spawnSync(["mkfifo", fifo]).exitCode).toBe(0)
+    // A's acceptance blocks on an MCP resource read between reservation and command insert.
+    const gate = Promise.withResolvers<void>()
+    const uri = `stall://${worker.id}`
+    heldResources.set(uri, gate.promise)
     yield* h.llm.text(h.marker)
     const a = MessageID.ascending()
     const runA = `run_report_${a}`
@@ -1146,7 +1151,7 @@ it.instance("fence 1: a live owner's reservation stalled past the grace is never
         reportTo: h.owner.id,
         parts: [
           { type: "text", text: "task A" },
-          { type: "file", mime: "image/png", filename: "stall.png", url: pathToFileURL(fifo).href },
+          { type: "file", mime: "text/plain", filename: "stall.txt", url: uri, source: { type: "resource", clientName: "fixture", uri, text: { value: "", start: 0, end: 0 } } },
         ],
       })
       .pipe(Effect.forkScoped)
@@ -1167,10 +1172,11 @@ it.instance("fence 1: a live owner's reservation stalled past the grace is never
     expect(Exit.isFailure(exit) && JSON.stringify(exit.cause)).toContain("outstanding")
     expect(yield* h.command(b, worker.id)).toHaveLength(0)
     expect((yield* h.record(worker.id))).toMatchObject({ runID: runA, ownerID: reserved.ownerID, parentSessionID: h.owner.id })
-    // A resumes: its acceptance completes and it reports to its own owner.
-    const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
-    yield* Effect.promise(() => Bun.write(fifo, Buffer.from(png, "base64")))
+    // Still stalled before its command insert; now A resumes and reports to its own owner.
+    expect(yield* h.command(a, worker.id)).toHaveLength(0)
+    gate.resolve()
     yield* Fiber.join(fiberA)
+    heldResources.delete(uri)
     expect((yield* h.settled(a, worker.id)).status).toBe("succeeded")
     const report = MessageID.make(`msg_delegation_recovery_${runA}`)
     expect((yield* h.settled(report)).status).toBe("succeeded")

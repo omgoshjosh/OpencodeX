@@ -1028,6 +1028,9 @@ function harness(input: {
           text: promptInput.parts.flatMap((part) => (part.type === "text" && part.text ? [part.text] : [])).join("\n"),
         })
       }),
+    // No owner gates in this mocked graph (OpencodeX-k30 gates are covered
+    // against the real database in delegation-continuation.test.ts).
+    ownerGate: () => Effect.succeed(undefined),
     loop: (loopInput: { messageID?: string }) => {
       loopCount++
       return Effect.succeed(record(input.promptResults?.shift() ?? success("done"), loopInput.messageID ?? "msg_user"))

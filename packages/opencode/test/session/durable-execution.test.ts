@@ -781,7 +781,9 @@ it.instance(
               yield* Ref.update(providerInvocations, (value) => value + 1)
               yield* Ref.update(reportDeliveries, (value) => value + 1)
               yield* Ref.update(toolExecutions, (value) => value + 1)
-              return output
+              // The turn answers the report: a report command is consumed only
+              // by an assistant replying to it (OpencodeX-k30).
+              return { ...output, info: { ...output.info, parentID: reportID } }
             }),
           ),
           "1 hour",

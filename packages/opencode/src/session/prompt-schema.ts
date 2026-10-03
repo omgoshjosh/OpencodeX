@@ -15,6 +15,19 @@ export const ModelRef = Schema.Struct({
   modelID: ProviderV2.ModelID,
 })
 
+/**
+ * A `reportTo` contract that cannot be honored (OpencodeX-k30). Raised before
+ * the prompt is accepted, so a refused contract accepts nothing.
+ */
+export class ReportToRefusedError extends Schema.TaggedErrorClass<ReportToRefusedError>()(
+  "SessionReportToRefusedError",
+  {
+    sessionID: SessionID,
+    reportTo: SessionID,
+    reason: Schema.Literals(["self", "no-reply", "owner-missing", "owner-retired", "outstanding"]),
+  },
+) {}
+
 export const PromptInput = Schema.Struct({
   sessionID: SessionID,
   messageID: Schema.optional(MessageID),
@@ -22,6 +35,10 @@ export const PromptInput = Schema.Struct({
   model: Schema.optional(ModelRef),
   agent: Schema.optional(Schema.String),
   noReply: Schema.optional(Schema.Boolean),
+  reportTo: Schema.optional(SessionID).annotate({
+    description:
+      "Session that owns this prompt's result. When this prompt's turn settles, its final answer is delivered to that session as a tagged report with a durable consumption receipt. Refused (nothing accepted) when the owner is missing or retired, or this session still owes a report.",
+  }),
   tools: Schema.optional(Schema.Record(Schema.String, Schema.Boolean)).annotate({
     description:
       "@deprecated tools and permissions have been merged, you can set permissions on the session itself now",

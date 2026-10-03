@@ -36,12 +36,17 @@ import { SessionID, MessageID, PartID } from "./schema"
 import {
   DELEGATION_DELIVERY_CLAIM_GRACE,
   delegationRecord,
+  MAX_DELIVERY_ATTEMPTS,
+  receiptOpen,
+  reportOutstanding,
   withDelegationFailure,
   withDelegationRecord,
   withoutDelegationRecord,
+  type DelegationEscalation,
   type DelegationRecord,
   type DelegationFailure,
 } from "./delegation-outcome"
+import { reportAnswered } from "./report-receipt"
 import { Identifier } from "@/id/id"
 
 import type { Provider } from "@/provider/provider"
@@ -490,6 +495,8 @@ export interface Interface {
     sessionID: SessionID
     record: DelegationRecord
     expectRunID?: string
+    /** Refuse (no write) when the stored record still owes its owner a report (OpencodeX-k30). */
+    unlessOutstanding?: boolean
   }) => Effect.Effect<boolean>
   /**
    * Marks whether the run's report durably reached the parent - the fact the
@@ -502,7 +509,30 @@ export interface Interface {
     outcome: "delivered" | "failed"
     claimToken?: string
     at?: number
+    /** The tagged report message the owner accepted; opens a consumption receipt. */
+    reportMessageID?: string
+    /** Recorded when admission decided the report may never run an owner turn. */
+    escalation?: DelegationEscalation
   }) => Effect.Effect<boolean>
+  /**
+   * Advances an open consumption receipt (OpencodeX-k30). Compare-and-set on
+   * `runID` and `reportMessageID`, and on `continuationAttempts` when
+   * `expectAttempts` is given, so concurrent reconcilers count one attempt.
+   * Never reopens a consumed or escalated receipt.
+   */
+  readonly updateDelegationReceipt: (input: {
+    sessionID: SessionID
+    runID: string
+    reportMessageID: string
+    expectAttempts?: number
+    patch: Pick<DelegationRecord, "consumedAt" | "continuationAttempts" | "escalatedAt" | "escalation">
+  }) => Effect.Effect<boolean>
+  /**
+   * Removes a report-to reservation that never got a command (its prompt
+   * failed or crashed before acceptance). Compare-and-set on `runID` while
+   * still `running`; anything else is left alone.
+   */
+  readonly releaseReservation: (input: { sessionID: SessionID; runID: string }) => Effect.Effect<boolean>
   /** Claims one pending report delivery before its idempotent notification write. */
   readonly claimDelegationDelivery: (input: {
     sessionID: SessionID
@@ -1112,8 +1142,24 @@ export const layer: Layer.Layer<
       sessionID: SessionID
       record: DelegationRecord
       expectRunID?: string
+      /** Refuse (no write) when the stored record still owes its owner a report. */
+      unlessOutstanding?: boolean
     }) {
+      // A receipt whose report a finished owner turn already answered is
+      // closed by this write (OpencodeX-k30); the reconciler need not run first.
+      const prior = delegationRecord(Option.getOrUndefined(yield* get(input.sessionID).pipe(Effect.option))?.metadata)
+      const answered =
+        receiptOpen(prior) &&
+        prior.runID !== input.record.runID &&
+        (yield* reportAnswered(db, SessionID.make(prior.parentSessionID), prior.reportMessageID))
       return yield* mutate(input.sessionID, (current) => {
+        // No new run overwrites a report still owed (any open receipt, and for
+        // report-to contracts anything outstanding): the writer is refused.
+        const owed = delegationRecord(current.metadata)
+        const closed = answered && owed?.reportMessageID === prior?.reportMessageID
+        if (owed && owed.runID !== input.record.runID && !closed)
+          if (input.unlessOutstanding || owed.contract === "report-to" ? reportOutstanding(owed) : receiptOpen(owed))
+            return undefined
         if (input.expectRunID) {
           const stored = delegationRecord(current.metadata)
           // Another run has claimed the session since; this writer is stale.
@@ -1135,6 +1181,8 @@ export const layer: Layer.Layer<
       outcome: "delivered" | "failed"
       claimToken?: string
       at?: number
+      reportMessageID?: string
+      escalation?: DelegationEscalation
     }) {
       return yield* mutate(input.sessionID, (current) => {
         const stored = delegationRecord(current.metadata)
@@ -1151,7 +1199,43 @@ export const layer: Layer.Layer<
             deliveryClaimedAt: undefined,
             deliveryClaimToken: undefined,
             ...(input.outcome === "delivered" ? { deliveredAt: input.at ?? Date.now() } : {}),
+            ...(input.outcome === "delivered" && input.reportMessageID
+              ? { reportMessageID: input.reportMessageID }
+              : {}),
+            ...(input.escalation ? { escalatedAt: Date.now(), escalation: input.escalation } : {}),
           }),
+          time: { ...current.time, updated: Date.now() },
+        }
+      }).pipe(Effect.orDie)
+    })
+
+    const releaseReservation = Effect.fn("Session.releaseReservation")(function* (input: {
+      sessionID: SessionID
+      runID: string
+    }) {
+      return yield* mutate(input.sessionID, (current) => {
+        const stored = delegationRecord(current.metadata)
+        if (stored?.runID !== input.runID || stored.phase !== "running" || stored.contract !== "report-to") return undefined
+        return { ...current, metadata: withoutDelegationRecord(current.metadata), time: { ...current.time, updated: Date.now() } }
+      }).pipe(Effect.orDie)
+    })
+
+    const updateDelegationReceipt = Effect.fn("Session.updateDelegationReceipt")(function* (input: {
+      sessionID: SessionID
+      runID: string
+      reportMessageID: string
+      expectAttempts?: number
+      patch: Pick<DelegationRecord, "consumedAt" | "continuationAttempts" | "escalatedAt" | "escalation">
+    }) {
+      return yield* mutate(input.sessionID, (current) => {
+        const stored = delegationRecord(current.metadata)
+        if (!receiptOpen(stored) || stored.runID !== input.runID) return undefined
+        if (stored.reportMessageID !== input.reportMessageID) return undefined
+        if (input.expectAttempts !== undefined && (stored.continuationAttempts ?? 0) !== input.expectAttempts)
+          return undefined
+        return {
+          ...current,
+          metadata: withDelegationRecord(current.metadata, { ...stored, ...input.patch }),
           time: { ...current.time, updated: Date.now() },
         }
       }).pipe(Effect.orDie)
@@ -1163,18 +1247,36 @@ export const layer: Layer.Layer<
       at?: number
       token?: string
     }) {
-      const token = input.token ?? Identifier.ascending("run")
+      let token: string | undefined = input.token ?? Identifier.ascending("run")
       return yield* mutate(input.sessionID, (current) => {
         const stored = delegationRecord(current.metadata)
         if (!stored || stored.runID !== input.runID) return undefined
         const at = input.at ?? Date.now()
-        if (stored.deliveryOutcome === "delivered") return undefined
+        if (stored.deliveryOutcome === "delivered" || stored.escalatedAt !== undefined) return undefined
         if (
           stored.deliveryOutcome === "delivering" &&
           stored.deliveryClaimedAt !== undefined &&
           at - stored.deliveryClaimedAt < DELEGATION_DELIVERY_CLAIM_GRACE
         )
           return undefined
+        const attempts = stored.deliveryAttempts ?? 0
+        // Bounded (OpencodeX-k30): a report that keeps failing or crashing in
+        // delivery escalates durably instead of prompting forever.
+        if (attempts >= MAX_DELIVERY_ATTEMPTS) {
+          token = undefined
+          return {
+            ...current,
+            metadata: withDelegationRecord(current.metadata, {
+              ...stored,
+              deliveryOutcome: "failed",
+              deliveryClaimedAt: undefined,
+              deliveryClaimToken: undefined,
+              escalatedAt: at,
+              escalation: "delivery-failed",
+            }),
+            time: { ...current.time, updated: Date.now() },
+          }
+        }
         return {
           ...current,
           metadata: withDelegationRecord(current.metadata, {
@@ -1182,6 +1284,7 @@ export const layer: Layer.Layer<
             deliveryOutcome: "delivering",
             deliveryClaimedAt: at,
             deliveryClaimToken: token,
+            deliveryAttempts: attempts + 1,
           }),
           time: { ...current.time, updated: Date.now() },
         }
@@ -1357,6 +1460,8 @@ export const layer: Layer.Layer<
       setMetadata,
       stampDelegation,
       stampDelegationDelivery,
+      updateDelegationReceipt,
+      releaseReservation,
       claimDelegationDelivery,
       recordDelegationFailure,
       setPermission,

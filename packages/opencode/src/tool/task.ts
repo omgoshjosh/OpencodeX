@@ -24,6 +24,7 @@ import {
 } from "../session/delegation-outcome"
 import { Identifier } from "@/id/id"
 import * as Log from "@opencode-ai/core/util/log"
+import { admission, ownerGate } from "@/session/report-receipt"
 import { Database } from "@opencode-ai/core/database/database"
 import { OpencodeXSwarmRoleTable } from "@opencode-ai/core/opencodex/sql"
 import { SwarmBriefing } from "@/opencodex/swarm-briefing"
@@ -463,7 +464,10 @@ export const TaskTool = Tool.define(
       // stamp records user intent, even though the report text still flows
       // back to the parent.
       const cancelState = { requested: false }
-      yield* stamp(started)
+      // Refused when the session still owes its parent an unconsumed report
+      // (OpencodeX-k30): never overwrite it, never run without a record.
+      if (!(yield* stamp(started)))
+        return yield* Effect.fail(new Error(`Task ${nextSession.id} still owes an unconsumed report; not restarted.`))
 
       return yield* Effect.gen(function* () {
         const msg = yield* MessageV2.get({ sessionID: ctx.sessionID, messageID: ctx.messageID }).pipe(
@@ -727,11 +731,15 @@ export const TaskTool = Tool.define(
           // re-reads the report and the parent sits idle with no
           // session_command to recover. `promptAsync` queues a command row
           // behind the current turn, so the sweep can always find it.
+          // Admission gates (OpencodeX-k30): a gated owner records the report
+          // without a turn; a retired/terminal/cancelled owner gets no receipt.
+          const { noReply, escalation } = admission(yield* ownerGate(database.db, ctx.sessionID, nextSession.id))
           yield* ops
             .promptAsync({
               sessionID: ctx.sessionID,
               messageID: MessageID.make(`msg_task_report_${runID}`),
               delivery: "deferred",
+              ...(noReply ? { noReply } : {}),
               agent: parentAgent ?? ctx.agent,
               parts: [
                 {
@@ -757,7 +765,13 @@ export const TaskTool = Tool.define(
               Effect.matchCauseEffect({
                 onSuccess: () =>
                   sessions
-                    .stampDelegationDelivery({ sessionID: nextSession.id, runID, outcome: "delivered" })
+                    .stampDelegationDelivery({
+                      sessionID: nextSession.id,
+                      runID,
+                      outcome: "delivered",
+                      // Accepted, not consumed (OpencodeX-k30): opens the receipt.
+                      ...(escalation ? { escalation } : { reportMessageID: MessageID.make(`msg_task_report_${runID}`) }),
+                    })
                     .pipe(Effect.ignore),
                 // Fields go through annotateLogs: a payload object passed as a
                 // log argument renders as `[object Object]` (OpencodeX-2kg).

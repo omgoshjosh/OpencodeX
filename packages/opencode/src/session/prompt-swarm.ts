@@ -17,6 +17,7 @@ import { Skill } from "@/skill"
 import { CLAUDE_CODE_DEFAULT_MODEL_ID, isClaudeCodeProvider } from "@/provider/claude-code-provider"
 import { isSwarmProvider } from "@/provider/swarm-provider"
 import { MessageID, PartID, SessionID } from "./schema"
+import { admission, ownerGate, type OwnerGate } from "./report-receipt"
 import type { PromptInput } from "./prompt-schema"
 import {
   DELEGATION_RECORD_VERSION,
@@ -61,6 +62,8 @@ export interface Deps {
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionLegacy.WithParts, Image.Error>
   /** Queues a prompt without waiting for its turn, with durable message and command intent. */
   readonly promptAsync: (input: PromptInput) => Effect.Effect<void, Image.Error>
+  /** Test seam; defaults to the durable owner gates (OpencodeX-k30). */
+  readonly ownerGate?: (ownerID: SessionID, childID: SessionID) => Effect.Effect<OwnerGate | undefined>
   readonly loop: (input: {
     sessionID: SessionID
     messageID?: MessageID
@@ -309,9 +312,18 @@ export function make(deps: Deps) {
       // A parent whose stored agent is not registered would make the prompt
       // throw "Agent not found" and strand every report (OpencodeX-557).
       const agent = yield* resolveSessionAgent(deps.agents, { sessionID: parent.id, agent: parent.agent })
+      // Admission gates (OpencodeX-k30): a gated owner records the report
+      // without a turn; a retired/terminal/cancelled owner gets no receipt.
+      const { noReply, escalation } = admission(
+        yield* (deps.ownerGate ?? ((owner, child) => ownerGate(deps.database.db, owner, child)))(
+          input.parentSessionID,
+          input.childSessionID,
+        ),
+      )
       const wake = deps.promptAsync({
         sessionID: input.parentSessionID,
         messageID,
+        ...(noReply ? { noReply } : {}),
         // Deferred: the default "immediate" delivery interrupts an in-flight
         // turn to steer it, which would abort whatever the orchestrator is
         // doing right now. A report queues behind the current turn.
@@ -365,11 +377,14 @@ export function make(deps: Deps) {
           ),
         ),
       )
+      // Accepted, not consumed: the receipt lets the reconciler confirm an
+      // owner turn answered this message (OpencodeX-k30).
       yield* sessions.stampDelegationDelivery({
         sessionID: input.childSessionID,
         runID: input.runID,
         outcome: "delivered",
         claimToken: claim,
+        ...(escalation ? { escalation } : { reportMessageID: messageID }),
       })
     })
 
@@ -579,7 +594,8 @@ export function make(deps: Deps) {
       .pipe(Effect.orElseSucceed(() => []))
     for (const row of rows) {
       const record = delegationRecord(row.metadata)
-      if (!record?.background || !row.parentID) continue
+      // A report-to prompt is settled by its own command and delegation recovery.
+      if (!record?.background || !row.parentID || record.contract === "report-to") continue
       const undelivered = record.phase === "running" || record.deliveryOutcome !== "delivered"
       if (!undelivered) continue
       const childID = row.id
@@ -860,7 +876,8 @@ export function make(deps: Deps) {
           runID,
         ).pipe(Effect.asVoid)
       })
-    yield* stamp(started)
+    if (!(yield* stamp(started)))
+      return ClaudeDelegate.failure("rejected", `Role session ${child.id} refused a new run (an unconsumed report is owed).`)
     const runRole: Effect.Effect<ClaudeDelegate.Result> = Effect.gen(function* () {
       // The role's skill is its base definition; the built-in role skills carry
       // the full role prompt. The task-tool path gets it through the specialist

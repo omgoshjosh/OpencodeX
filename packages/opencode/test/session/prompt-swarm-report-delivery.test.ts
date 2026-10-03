@@ -122,6 +122,18 @@ describe("background report delivery", () => {
     expect(String(errors[0]?.cause)).toContain("Agent not found")
   })
 
+  // OpencodeX-k30 defect 3/4: the swarm wake passes the same owner gates as
+  // recovery. A retired owner records the report without a turn, escalated.
+  test("the swarm report wake never asks a retired owner for a turn", async () => {
+    const h = harness({ parentArchived: true })
+    await Effect.runPromise(h.deliver())
+    expect(h.asyncPrompts).toHaveLength(1)
+    expect(h.asyncPrompts[0]?.noReply).toBe(true)
+    expect(h.asyncPrompts[0]?.delivery).toBe("deferred")
+    expect(h.deliveries).toEqual(["delivered"])
+    expect(h.escalations).toEqual(["owner-retired"])
+  })
+
   test("a prompt that fails once and then succeeds is delivered", async () => {
     const h = harness({ promptFailures: 1 })
     await Effect.runPromise(h.deliver())
@@ -131,9 +143,10 @@ describe("background report delivery", () => {
   })
 })
 
-function harness(input: { parentAgent?: string; promptFailures?: number }) {
+function harness(input: { parentAgent?: string; promptFailures?: number; parentArchived?: boolean }) {
   const asyncPrompts: Array<Record<string, unknown>> = []
   const deliveries: string[] = []
+  const escalations: string[] = []
   const logged: Array<{ level: string; message: unknown; data: unknown }> = []
   let failures = input.promptFailures ?? 0
   let delegation: DelegationRecord | undefined
@@ -149,7 +162,12 @@ function harness(input: { parentAgent?: string; promptFailures?: number }) {
       get: (sessionID: string) =>
         Effect.succeed(
           sessionID === "ses_parent"
-            ? { id: "ses_parent", agent: input.parentAgent, metadata: {} }
+            ? {
+                id: "ses_parent",
+                agent: input.parentAgent,
+                metadata: {},
+                time: { created: 0, updated: 0, ...(input.parentArchived ? { archived: 1 } : {}) },
+              }
             : { id: "ses_child", metadata: { opencodex: { swarmID: "swm_1", delegation } } },
         ),
       create: () => Effect.succeed({ id: "ses_child" }),
@@ -161,9 +179,10 @@ function harness(input: { parentAgent?: string; promptFailures?: number }) {
           delegation = write.record
           return true
         }),
-      stampDelegationDelivery: (write: { outcome: string }) =>
+      stampDelegationDelivery: (write: { outcome: string; escalation?: string }) =>
         Effect.sync(() => {
           deliveries.push(write.outcome)
+          if (write.escalation) escalations.push(write.escalation)
         }),
       claimDelegationDelivery: () =>
         Effect.sync(() => {
@@ -197,6 +216,7 @@ function harness(input: { parentAgent?: string; promptFailures?: number }) {
         return Effect.void
       }),
     loop: () => Effect.die("unused"),
+    ownerGate: () => Effect.succeed(input.parentArchived ? ("owner-retired" as const) : undefined),
     backgroundCompletionGraceMs: 0,
     deliveryRetryDelayMs: 1,
   }
@@ -239,6 +259,7 @@ function harness(input: { parentAgent?: string; promptFailures?: number }) {
   return {
     asyncPrompts,
     deliveries,
+    escalations,
     deliver,
     errors: () =>
       logged

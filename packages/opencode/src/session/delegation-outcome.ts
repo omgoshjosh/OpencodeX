@@ -258,7 +258,7 @@ function finite(value: unknown): value is number {
 }
 
 function isEscalation(value: unknown): value is DelegationEscalation {
-  return ESCALATIONS.includes(value as DelegationEscalation)
+  return ESCALATIONS.some((escalation) => escalation === value)
 }
 
 /**

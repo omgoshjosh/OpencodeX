@@ -23,8 +23,10 @@ import { and, eq } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { FetchHttpClient } from "effect/unstable/http"
 import { expect } from "bun:test"
-import { Effect, Exit, Layer, Scope } from "effect"
+import { Effect, Exit, Fiber, Layer, Scope } from "effect"
 import path from "path"
+import { pathToFileURL } from "url"
+import { RESERVATION_GRACE_MS } from "../../src/session/delegation-recovery"
 import { Agent as AgentSvc } from "../../src/agent/agent"
 import { BackgroundJob } from "@/background/job"
 import { Command } from "../../src/command"
@@ -40,6 +42,7 @@ import { Image } from "../../src/image/image"
 import { Question } from "../../src/question"
 import { Todo } from "../../src/session/todo"
 import { Session } from "@/session/session"
+import type { SessionLegacy } from "@opencode-ai/core/session/legacy"
 import {
   SessionCommandTable,
   SessionExecutionTable,
@@ -702,7 +705,7 @@ it.instance("defect 1: placeholder, error, abort and unlinked answers never cons
     yield* h.llm.error(400, { error: { message: "usage limit reached" } })
     yield* h.recover
     expect((yield* h.settled()).status).toBe("failed")
-    const assistant = (extra: Record<string, unknown>) =>
+    const assistant = (extra: Partial<SessionLegacy.Assistant>) =>
       h.sessions.updateMessage({
         id: MessageID.ascending(),
         role: "assistant",
@@ -717,7 +720,7 @@ it.instance("defect 1: placeholder, error, abort and unlinked answers never cons
         providerID: ref.providerID,
         time: { created: Date.now() },
         ...extra,
-      } as never)
+      })
     // A streaming placeholder (no completion stamp).
     yield* assistant({})
     // A completed, finished answer - but its command failed: not consumed.
@@ -1098,5 +1101,143 @@ it.instance("fix 7: a failed or crashed reportTo acceptance reports nothing and 
       expect((yield* h.record(sessionID))?.runID).toBe(`run_report_${messageID}`)
       yield* h.settled(messageID, sessionID)
     }
+  }),
+)
+
+/** A process identity whose pid is verifiably gone: a scratch process that already exited. */
+const deadOwner = Effect.promise(async () => {
+  const scratch = Bun.spawn(["true"])
+  await scratch.exited
+  return (runID: string) => `local:${scratch.pid}:dead:${runID}`
+})
+
+const reservation = (h: { owner: { id: SessionID } }, messageID: MessageID, startedAt: number, ownerID?: string) =>
+  ({
+    version: DELEGATION_RECORD_VERSION,
+    runID: `run_report_${messageID}`,
+    parentSessionID: h.owner.id,
+    mode: "background",
+    background: true,
+    contract: "report-to",
+    role: "report",
+    childMessageID: messageID,
+    attempt: 1,
+    phase: "running",
+    startedAt,
+    ...(ownerID ? { ownerID } : {}),
+  }) as const
+
+it.instance("fence 1: a live owner's reservation stalled past the grace is never replaced; A completes bound to its owner", () =>
+  Effect.gen(function* () {
+    const h = yield* boot()
+    const worker = yield* h.sessions.create({ title: "worker" })
+    const { directory } = yield* TestInstance
+    // A's acceptance blocks reading a FIFO between reservation and command insert.
+    const fifo = path.join(directory, "stall.fifo")
+    expect(Bun.spawnSync(["mkfifo", fifo]).exitCode).toBe(0)
+    yield* h.llm.text(h.marker)
+    const a = MessageID.ascending()
+    const runA = `run_report_${a}`
+    const fiberA = yield* h.prompt
+      .promptAsync({
+        sessionID: worker.id,
+        messageID: a,
+        model: ref,
+        reportTo: h.owner.id,
+        parts: [
+          { type: "text", text: "task A" },
+          { type: "file", mime: "image/png", filename: "stall.png", url: pathToFileURL(fifo).href },
+        ],
+      })
+      .pipe(Effect.forkScoped)
+    const reserved = yield* pollWithTimeout(
+      h.record(worker.id).pipe(Effect.map((r) => (r?.runID === runA ? r : undefined))),
+      "A never reserved",
+      "15 seconds",
+    )
+    expect(reserved.ownerID).toStartWith(`local:${process.pid}:`)
+    // The stall outlives the 60s grace.
+    expect(yield* h.sessions.stampDelegation({ sessionID: worker.id, record: { ...reserved, startedAt: 1 }, expectRunID: runA })).toBe(true)
+    yield* h.recover
+    expect((yield* h.record(worker.id))?.runID).toBe(runA)
+    const b = MessageID.ascending()
+    const exit = yield* h.prompt
+      .promptAsync({ sessionID: worker.id, messageID: b, model: ref, reportTo: h.owner.id, parts: [{ type: "text", text: "task B" }] })
+      .pipe(Effect.exit)
+    expect(Exit.isFailure(exit) && JSON.stringify(exit.cause)).toContain("outstanding")
+    expect(yield* h.command(b, worker.id)).toHaveLength(0)
+    expect((yield* h.record(worker.id))).toMatchObject({ runID: runA, ownerID: reserved.ownerID, parentSessionID: h.owner.id })
+    // A resumes: its acceptance completes and it reports to its own owner.
+    const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+    yield* Effect.promise(() => Bun.write(fifo, Buffer.from(png, "base64")))
+    yield* Fiber.join(fiberA)
+    expect((yield* h.settled(a, worker.id)).status).toBe("succeeded")
+    const report = MessageID.make(`msg_delegation_recovery_${runA}`)
+    expect((yield* h.settled(report)).status).toBe("succeeded")
+    expect((yield* h.record(worker.id))).toMatchObject({ runID: runA, deliveryOutcome: "delivered", reportMessageID: report })
+    expect(yield* h.messages(MessageID.make(`msg_delegation_recovery_run_report_${b}`))).toHaveLength(0)
+  }),
+)
+
+it.instance("fence 2: a dead owner's reservation is reclaimed at once and never locks the worker out", () =>
+  Effect.gen(function* () {
+    const h = yield* boot()
+    const worker = yield* h.sessions.create({ title: "worker" })
+    const lost = MessageID.ascending()
+    const owner = (yield* deadOwner)(`run_report_${lost}`)
+    yield* h.sessions.stampDelegation({ sessionID: worker.id, record: reservation(h, lost, Date.now(), owner) })
+    yield* h.recover
+    expect((yield* h.record(worker.id))?.runID).toBeUndefined()
+    const next = MessageID.ascending()
+    yield* h.prompt.promptAsync({ sessionID: worker.id, messageID: next, model: ref, reportTo: h.owner.id, parts: [{ type: "text", text: "go" }] })
+    expect((yield* h.record(worker.id))?.runID).toBe(`run_report_${next}`)
+    yield* h.settled(next, worker.id)
+  }),
+)
+
+it.instance("fence 3: a command that appears before the release transaction keeps the reservation; owner CAS is exact", () =>
+  Effect.gen(function* () {
+    const h = yield* boot()
+    const worker = yield* h.sessions.create({ title: "worker" })
+    const messageID = MessageID.ascending()
+    const runID = `run_report_${messageID}`
+    const owner = (yield* deadOwner)(runID)
+    yield* h.sessions.stampDelegation({ sessionID: worker.id, record: reservation(h, messageID, 1, owner) })
+    // Wrong owner (or ownerless) never releases an owned reservation.
+    expect(yield* h.sessions.releaseReservation({ sessionID: worker.id, runID })).toBe(false)
+    expect(yield* h.sessions.releaseReservation({ sessionID: worker.id, runID, ownerID: `${owner}x` })).toBe(false)
+    // The accepted command landed after the caller's own check.
+    const ctx = yield* InstanceState.context
+    yield* h.db
+      .insert(SessionCommandTable)
+      .values({
+        id: `sec_fence_${messageID}`,
+        session_id: worker.id,
+        message_id: messageID,
+        project_id: ctx.project.id,
+        directory: ctx.directory,
+        status: "queued",
+        time_created: Date.now(),
+        time_updated: Date.now(),
+      })
+      .run()
+      .pipe(Effect.orDie)
+    expect(yield* h.sessions.releaseReservation({ sessionID: worker.id, runID, ownerID: owner })).toBe(false)
+    expect((yield* h.record(worker.id))).toMatchObject({ runID, ownerID: owner, phase: "running" })
+  }),
+)
+
+it.instance("fence 4: a legacy ownerless reservation still ages out after the bounded grace only", () =>
+  Effect.gen(function* () {
+    const h = yield* boot()
+    const fresh = yield* h.sessions.create({ title: "fresh" })
+    const stale = yield* h.sessions.create({ title: "stale" })
+    const kept = MessageID.ascending()
+    const lost = MessageID.ascending()
+    yield* h.sessions.stampDelegation({ sessionID: fresh.id, record: reservation(h, kept, Date.now() - RESERVATION_GRACE_MS + 10_000) })
+    yield* h.sessions.stampDelegation({ sessionID: stale.id, record: reservation(h, lost, Date.now() - RESERVATION_GRACE_MS - 1) })
+    yield* h.recover
+    expect((yield* h.record(fresh.id))?.runID).toBe(`run_report_${kept}`)
+    expect((yield* h.record(stale.id))?.runID).toBeUndefined()
   }),
 )

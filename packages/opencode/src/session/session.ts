@@ -23,7 +23,7 @@ import { inArray } from "drizzle-orm"
 import { lt } from "drizzle-orm"
 import { or } from "drizzle-orm"
 import type { SQL } from "drizzle-orm"
-import { MessageTable, PartTable, SessionTable, TodoTable } from "@opencode-ai/core/session/sql"
+import { MessageTable, PartTable, SessionCommandTable, SessionTable, TodoTable } from "@opencode-ai/core/session/sql"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import * as Log from "@opencode-ai/core/util/log"
 import { MessageV2 } from "./message-v2"
@@ -529,10 +529,10 @@ export interface Interface {
   }) => Effect.Effect<boolean>
   /**
    * Removes a report-to reservation that never got a command (its prompt
-   * failed or crashed before acceptance). Compare-and-set on `runID` while
-   * still `running`; anything else is left alone.
+   * failed or crashed before acceptance). In one transaction: compare-and-set
+   * on `runID` and `ownerID` while still `running`, and its command still absent.
    */
-  readonly releaseReservation: (input: { sessionID: SessionID; runID: string }) => Effect.Effect<boolean>
+  readonly releaseReservation: (input: { sessionID: SessionID; runID: string; ownerID?: string }) => Effect.Effect<boolean>
   /** Claims one pending report delivery before its idempotent notification write. */
   readonly claimDelegationDelivery: (input: {
     sessionID: SessionID
@@ -1091,7 +1091,7 @@ export const layer: Layer.Layer<
      * next value depends on the current one. `compute` returning undefined
      * declines the write; the return value says whether a revision committed.
      */
-    const mutate = (sessionID: SessionID, compute: (current: Info) => Info | undefined) =>
+    const mutate = (sessionID: SessionID, compute: (current: Info) => Info | undefined, guard?: (current: Info) => Effect.Effect<boolean, unknown>) =>
       events.barrier(
         Effect.gen(function* () {
           const event = yield* db.transaction(
@@ -1099,7 +1099,7 @@ export const layer: Layer.Layer<
               Effect.gen(function* () {
                 const current = yield* get(sessionID)
                 const next = compute(current)
-                if (!next) return undefined
+                if (!next || (guard && !(yield* guard(current)))) return undefined
                 return yield* events.commit(
                   SessionLegacy.Event.Updated,
                   { sessionID, info: next },
@@ -1212,12 +1212,22 @@ export const layer: Layer.Layer<
     const releaseReservation = Effect.fn("Session.releaseReservation")(function* (input: {
       sessionID: SessionID
       runID: string
+      ownerID?: string
     }) {
-      return yield* mutate(input.sessionID, (current) => {
-        const stored = delegationRecord(current.metadata)
-        if (stored?.runID !== input.runID || stored.phase !== "running" || stored.contract !== "report-to") return undefined
-        return { ...current, metadata: withoutDelegationRecord(current.metadata), time: { ...current.time, updated: Date.now() } }
-      }).pipe(Effect.orDie)
+      const reserved = (current: Info) => delegationRecord(current.metadata)
+      return yield* mutate(
+        input.sessionID,
+        (current) => {
+          const stored = reserved(current)
+          if (stored?.runID !== input.runID || stored.ownerID !== input.ownerID) return undefined
+          if (stored.phase !== "running" || stored.contract !== "report-to") return undefined
+          return { ...current, metadata: withoutDelegationRecord(current.metadata), time: { ...current.time, updated: Date.now() } }
+        },
+        // Rechecked under the write lock: an accepted command means it stays.
+        (current) =>
+          db.select({ id: SessionCommandTable.id }).from(SessionCommandTable).where(and(eq(SessionCommandTable.session_id, input.sessionID),
+            eq(SessionCommandTable.message_id, MessageID.make(reserved(current)?.childMessageID ?? "")))).get().pipe(Effect.map((row) => !row)),
+      ).pipe(Effect.orDie)
     })
 
     const updateDelegationReceipt = Effect.fn("Session.updateDelegationReceipt")(function* (input: {

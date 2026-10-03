@@ -24,7 +24,7 @@ const RESTART_NOTICE =
 const WATCHDOG_MARKER = "The stale-execution watchdog settled this run"
 const WATCHDOG_SUMMARY = `${WATCHDOG_MARKER} after it went quiet; the daemon did not restart. Do not assume completion or automatically repeat work/side effects; inspect the child transcript and decide whether to verify, continue, or start a new attempt.`
 
-/** A report-to reservation without a command younger than this may still be mid-acceptance. */
+/** A legacy ownerless report-to reservation without a command younger than this may be mid-acceptance. */
 export const RESERVATION_GRACE_MS = 60_000
 
 function settledByWatchdog(record: { summary?: string }) {
@@ -114,12 +114,13 @@ export function make(deps: Deps) {
             .get()
             .pipe(Effect.orDie)
           if (command?.status === "queued" || command?.status === "running") return
-          // No command: the prompt was never accepted, so nothing ran and
-          // nothing reports. Release the reservation once it is too old to
-          // be an acceptance still in flight; it never blocks the worker.
+          // No command: never accepted, nothing ran. An owned reservation is
+          // freed only on dead-owner evidence, never by age (its acceptance may
+          // just be slow); only a legacy ownerless one ages out after the grace.
           if (!command) {
-            if (Date.now() - record.startedAt >= RESERVATION_GRACE_MS)
-              yield* deps.sessions.releaseReservation({ sessionID: child.id, runID: record.runID })
+            const { runID, ownerID } = record
+            if (ownerID ? !SessionExecutionOwner.alive(ownerID, processRunID) : Date.now() - record.startedAt >= RESERVATION_GRACE_MS)
+              yield* deps.sessions.releaseReservation({ sessionID: child.id, runID, ownerID })
             return
           }
         }

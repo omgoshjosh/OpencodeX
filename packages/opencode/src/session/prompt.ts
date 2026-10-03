@@ -61,6 +61,7 @@ import { SessionDelegationRecovery } from "./delegation-recovery"
 import { DelegationContinuation } from "./delegation-continuation"
 import { DELEGATION_RECORD_VERSION, delegationAttempts, delegationRecord } from "./delegation-outcome"
 import { ownerRetired } from "./report-receipt"
+import { ensureRunID } from "@opencode-ai/core/util/opencode-process"
 import { SessionPromptRecovery } from "./prompt-recovery"
 import { SessionQuestionNotify } from "./question-notify"
 import * as PromptShell from "./prompt-shell"
@@ -1147,11 +1148,13 @@ export const layer = Layer.effect(
      * closes that receipt in the same write. LIMITATION: a follow-up issued
      * from INSIDE the owner's still-running report turn (e.g. a tool call) is
      * refused `outstanding` - an unfinished turn is not consumption - until
-     * that turn settles with an answer. Returns whether this call reserved.
+     * that turn settles with an answer. Returns the reservation this call made,
+     * owned by this process: recovery frees it only once that owner is dead.
      */
     const declareReportTo = Effect.fnUntraced(function* (input: PromptInput & { messageID: MessageID }) {
       const reportTo = input.reportTo!
       const runID = `run_report_${input.messageID}`
+      const ownerID = `local:${process.pid}:${ensureRunID()}:${runID}`
       const refuse = (reason: ReportToRefusedError["reason"]) =>
         Effect.logWarning("report-to contract refused").pipe(
           Effect.annotateLogs({ sessionID: input.sessionID, reportTo, messageID: input.messageID, reason }),
@@ -1184,15 +1187,16 @@ export const layer = Layer.effect(
           attempt: delegationAttempts(target.metadata) + 1,
           phase: "running",
           startedAt: Date.now(),
+          ownerID,
         },
       })
-      if (yield* reserve) return true
+      if (yield* reserve) return { runID, ownerID }
       // A stale reservation a crash left without a command is released by
       // delegation recovery; give it one chance before refusing.
       const current = delegationRecord((yield* sessions.get(input.sessionID).pipe(Effect.orDie)).metadata)
       if (current?.contract === "report-to" && current.phase === "running" && settleFinishedDelegation) {
         yield* settleFinishedDelegation(input.sessionID)
-        if (yield* reserve) return true
+        if (yield* reserve) return { runID, ownerID }
       }
       return yield* refuse("outstanding")
     })
@@ -1215,18 +1219,16 @@ export const layer = Layer.effect(
           return
         }
       }
-      let reserved: string | undefined
+      let reserved: { runID: string; ownerID: string } | undefined
       if (input.reportTo) {
         const messageID = input.messageID ?? MessageID.ascending()
-        if (yield* declareReportTo({ ...input, messageID })) reserved = `run_report_${messageID}`
+        reserved = (yield* declareReportTo({ ...input, messageID })) || undefined
         input = { ...input, messageID }
       }
       // A reservation whose prompt is never accepted (no command row) is
       // released, compare-and-set on its own run: nothing ran, nothing reports.
-      const releaseOnError = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-        reserved
-          ? effect.pipe(Effect.onError(() => sessions.releaseReservation({ sessionID: input.sessionID, runID: reserved! })))
-          : effect
+      const release = reserved && sessions.releaseReservation({ sessionID: input.sessionID, ...reserved })
+      const releaseOnError = <A, E, R>(effect: Effect.Effect<A, E, R>) => (release ? effect.pipe(Effect.onError(() => release)) : effect)
       const message = yield* releaseOnError(acceptPrompt(input))
       const ctx = yield* InstanceState.context
       const now = Date.now()

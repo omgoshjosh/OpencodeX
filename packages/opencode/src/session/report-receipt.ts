@@ -43,9 +43,9 @@ const TERMINAL = ["completed", "failed", "cancelled"]
  * reason is "success" (claude-mapper.ts `finishTurn`). Tool-call steps,
  * failed results and placeholders match neither.
  */
-export function finished(info: { finish?: string }, parts: readonly { type: string }[] = []) {
+export function finished(info: { finish?: string }, parts: readonly { type: string; reason?: unknown }[] = []) {
   if (info.finish !== undefined) return FINISHED.includes(info.finish)
-  return (parts.findLast((part) => part.type === "step-finish") as { reason?: string } | undefined)?.reason === NATIVE
+  return parts.findLast((part) => part.type === "step-finish")?.reason === NATIVE
 }
 
 /** A live assistant message that answers `messageID` (the in-memory form of {@link reportAnswered}). */
@@ -108,7 +108,7 @@ export const reportAnswered = Effect.fnUntraced(function* (
     .where(
       and(
         eq(SessionCommandTable.session_id, sessionID),
-        eq(SessionCommandTable.message_id, messageID as MessageID),
+        sql`${SessionCommandTable.message_id} = ${messageID}`,
         eq(SessionCommandTable.status, "succeeded"),
       ),
     )

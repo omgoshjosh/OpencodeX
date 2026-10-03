@@ -955,6 +955,39 @@ describe("HttpApi SDK", () => {
     ),
   )
 
+  serverPathParity("sync prompt has no reportTo contract; prompt_async refuses a missing owner (k30)", (serverPath) =>
+    withStandardProject(serverPath, ({ sdk }) =>
+      Effect.gen(function* () {
+        const create = (title: string) =>
+          capture(() => sdk.session.create({ title })).pipe(Effect.map((r) => String(record(r.data).id)))
+        const owner = yield* create("owner")
+        const worker = yield* create("worker")
+        const parts = [{ type: "text" as const, text: "hi" }]
+        // @ts-expect-error the generated sync method no longer advertises reportTo
+        void ({ sessionID: worker, parts, reportTo: owner } satisfies Parameters<Sdk["session"]["prompt"]>[0])
+        // A stray body field is still sent raw and ignored like any unknown field: no contract recorded.
+        const raw = { sessionID: worker, agent: "build", noReply: true, parts, $body_reportTo: owner }
+        const sync = yield* capture(() => sdk.session.prompt(raw))
+        const after = yield* capture(() => sdk.session.get({ sessionID: worker }))
+        const missing = yield* capture(() =>
+          sdk.session.promptAsync({ sessionID: worker, noReply: true, parts, reportTo: "ses_does_not_exist" }),
+        )
+        const messages = yield* capture(() => sdk.session.messages({ sessionID: worker }))
+        return {
+          statuses: statuses({ sync, missing }),
+          delegation: record(record(record(after.data).metadata).opencodex).delegation,
+          messageCount: array(messages.data).length,
+        }
+      }).pipe(
+        Effect.tap((result) =>
+          Effect.sync(() =>
+            expect(result).toEqual({ statuses: { sync: 200, missing: 400 }, delegation: undefined, messageCount: 1 }),
+          ),
+        ),
+      ),
+    ),
+  )
+
   serverPathParity("matches generated SDK prompt streaming through fake LLM", (serverPath) =>
     withFakeLlm(serverPath, ({ sdk, llm }) =>
       Effect.gen(function* () {

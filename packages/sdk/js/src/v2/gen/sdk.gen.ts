@@ -6427,7 +6427,6 @@ export class Session3 extends HeyApiClient {
       }
       agent?: string
       noReply?: boolean
-      reportTo?: string
       tools?: {
         [key: string]: boolean
       }
@@ -6451,7 +6450,6 @@ export class Session3 extends HeyApiClient {
             { in: "body", key: "model" },
             { in: "body", key: "agent" },
             { in: "body", key: "noReply" },
-            { in: "body", key: "reportTo" },
             { in: "body", key: "tools" },
             { in: "body", key: "format" },
             { in: "body", key: "system" },

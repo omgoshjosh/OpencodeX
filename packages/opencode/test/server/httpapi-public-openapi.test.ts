@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test"
+import { Schema } from "effect"
 import { OpenApi } from "effect/unstable/httpapi"
+import { SessionApi } from "../../src/server/routes/instance/httpapi/groups/session"
 import { PublicApi } from "../../src/server/routes/instance/httpapi/public"
 
 type Method = "get" | "post" | "put" | "delete" | "patch"
@@ -138,5 +140,34 @@ describe("PublicApi OpenAPI v2 errors", () => {
     expect(componentName(responseRef(spec.paths["/project/{projectID}"]?.patch?.responses?.["404"]) ?? "")).toBe(
       "ProjectNotFoundError",
     )
+  })
+})
+
+// OpencodeX-k30: only prompt_async declares and delivers `reportTo`; the sync route must not
+// advertise it (the SDK is generated from this spec) nor decode it into SessionPrompt.prompt.
+describe("PublicApi prompt reportTo contract", () => {
+  const bodyKeys = (path: string) => {
+    const body = OpenApi.fromApi(PublicApi).paths[path]?.post?.requestBody
+    return Object.keys(body?.content["application/json"]?.schema.properties ?? {})
+  }
+  const body = { parts: [{ type: "text", text: "x" }], reportTo: "ses_does_not_exist" }
+
+  test("OpenAPI: sync message route omits reportTo, prompt_async keeps it", () => {
+    const sync = bodyKeys("/session/{sessionID}/message")
+    expect(sync).toContain("parts")
+    expect(sync).not.toContain("reportTo")
+    expect(bodyKeys("/session/{sessionID}/prompt_async")).toContain("reportTo")
+  })
+
+  test("route decoding: sync drops reportTo before the handler, async forwards it", () => {
+    // Decode with the routes' own payload schemas. Boundary: like every other route, unknown body
+    // fields are ignored (not rejected), so a stray sync `reportTo` never reaches SessionPrompt.prompt.
+    const decode = (name: "prompt" | "promptAsync") => {
+      const ast = SessionApi.groups.session.endpoints[name].payload.get("application/json")!.schemas[0].ast
+      return Schema.decodeUnknownSync(Schema.make<Schema.Codec<object>>(ast))(body)
+    }
+    expect(decode("prompt")).toMatchObject({ parts: body.parts })
+    expect(Object.keys(decode("prompt"))).not.toContain("reportTo")
+    expect(decode("promptAsync")).toMatchObject({ reportTo: "ses_does_not_exist" })
   })
 })

@@ -178,8 +178,7 @@ export function make(deps: Deps) {
         // transcript as the newer run's result when the settle CAS loses.
         if (!settled || settled.runID !== record.runID || settled.phase !== "settled") return
         if (parent._tag !== "Some") {
-          // A missing owner is a recorded, visible failure, never a report
-          // silently waiting forever (OpencodeX-k30).
+          // A missing owner is a visible failure, never a silent wait (OpencodeX-k30).
           if (foreground || settled.deliveryOutcome === "delivered" || settled.escalatedAt !== undefined) return
           const claim = yield* deps.sessions.claimDelegationDelivery({ sessionID: child.id, runID: settled.runID })
           if (!claim) return

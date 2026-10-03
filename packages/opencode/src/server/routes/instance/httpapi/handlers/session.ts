@@ -34,6 +34,7 @@ import {
   MessagesQuery,
   PermissionResponsePayload,
   PromptPayload,
+  PromptSyncPayload,
   RevertPayload,
   ShellPayload,
   SummarizePayload,
@@ -380,7 +381,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
 
     const prompt = Effect.fn("SessionHttpApi.prompt")(function* (ctx: {
       params: { sessionID: SessionID }
-      payload: typeof PromptPayload.Type
+      payload: typeof PromptSyncPayload.Type
     }) {
       yield* requireSession(ctx.params.sessionID)
       const message = yield* promptSvc

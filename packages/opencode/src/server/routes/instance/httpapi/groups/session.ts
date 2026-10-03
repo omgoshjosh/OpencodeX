@@ -94,6 +94,7 @@ export const SummarizePayload = Schema.Struct({
   auto: Schema.optional(Schema.Boolean),
 })
 export const PromptPayload = Schema.Struct(Struct.omit(SessionPrompt.PromptInput.fields, ["sessionID"]))
+export const PromptSyncPayload = Schema.Struct(Struct.omit(PromptPayload.fields, ["reportTo"]))
 export const CommandPayload = Schema.Struct(Struct.omit(SessionPrompt.CommandInput.fields, ["sessionID"]))
 export const ShellPayload = Schema.Struct(Struct.omit(SessionPrompt.ShellInput.fields, ["sessionID"]))
 export const RevertPayload = Schema.Struct(Struct.omit(SessionRevert.RevertInput.fields, ["sessionID"]))
@@ -367,7 +368,7 @@ export const SessionApi = HttpApi.make("session")
         HttpApiEndpoint.post("prompt", SessionPaths.prompt, {
           params: { sessionID: SessionID },
           query: WorkspaceRoutingQuery,
-          payload: PromptPayload,
+          payload: PromptSyncPayload,
           success: described(SessionLegacy.WithParts, "Created message"),
           error: [HttpApiError.BadRequest, ApiNotFoundError],
         }).annotateMerge(

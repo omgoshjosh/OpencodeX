@@ -10518,7 +10518,6 @@ export type SessionPromptData = {
     }
     agent?: string
     noReply?: boolean
-    reportTo?: string
     tools?: {
       [key: string]: boolean
     }

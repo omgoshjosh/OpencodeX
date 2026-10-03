@@ -1,11 +1,12 @@
 import { Database } from "@opencode-ai/core/database/database"
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
-import { SessionExecutionTable, SessionTable } from "@opencode-ai/core/session/sql"
+import { MessageTable, SessionCommandTable, SessionExecutionTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { and, eq } from "drizzle-orm"
 import { Cause, Context, Effect } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import { SessionExecutionOwner } from "./execution-owner"
 import { delegationRecord, settleDelegation } from "./delegation-outcome"
+import { admission, finished, ownerGate } from "./report-receipt"
 import { Session } from "./session"
 import { MessageID, SessionID } from "./schema"
 import { ensureRunID } from "@opencode-ai/core/util/opencode-process"
@@ -22,6 +23,9 @@ const RESTART_NOTICE =
  */
 const WATCHDOG_MARKER = "The stale-execution watchdog settled this run"
 const WATCHDOG_SUMMARY = `${WATCHDOG_MARKER} after it went quiet; the daemon did not restart. Do not assume completion or automatically repeat work/side effects; inspect the child transcript and decide whether to verify, continue, or start a new attempt.`
+
+/** A legacy ownerless report-to reservation without a command younger than this may be mid-acceptance. */
+export const RESERVATION_GRACE_MS = 60_000
 
 function settledByWatchdog(record: { summary?: string }) {
   return record.summary?.startsWith(WATCHDOG_MARKER) === true
@@ -95,6 +99,31 @@ export function make(deps: Deps) {
           message?.info.role === "assistant" && message.info.error
             ? [JSON.stringify(message.info.error), reportText].filter(Boolean).join("\n")
             : reportText
+        // A report-to prompt settles from its own command, never while that
+        // command is still queued or running (e.g. replayed after a restart).
+        if (record.phase === "running" && record.contract === "report-to" && record.childMessageID) {
+          const command = yield* db
+            .select({ status: SessionCommandTable.status })
+            .from(SessionCommandTable)
+            .where(
+              and(
+                eq(SessionCommandTable.session_id, child.id),
+                eq(SessionCommandTable.message_id, MessageID.make(record.childMessageID)),
+              ),
+            )
+            .get()
+            .pipe(Effect.orDie)
+          if (command?.status === "queued" || command?.status === "running") return
+          // No command: never accepted, nothing ran. An owned reservation is
+          // freed only on dead-owner evidence, never by age (its acceptance may
+          // just be slow); only a legacy ownerless one ages out after the grace.
+          if (!command) {
+            const { runID, ownerID } = record
+            if (ownerID ? !SessionExecutionOwner.alive(ownerID, processRunID) : Date.now() - record.startedAt >= RESERVATION_GRACE_MS)
+              yield* deps.sessions.releaseReservation({ sessionID: child.id, runID, ownerID })
+            return
+          }
+        }
         if (record.phase === "running") {
           const execution = yield* db
             .select()
@@ -120,7 +149,7 @@ export function make(deps: Deps) {
                 ? "errored"
                 : message.info.finish === "abort"
                   ? "cancelled"
-                  : ["stop", "length"].includes(message.info.finish ?? "")
+                  : finished(message.info, message.parts)
                     ? "completed"
                     : "abandoned"
               : "abandoned"
@@ -147,7 +176,24 @@ export function make(deps: Deps) {
         // A reused child session may have started a newer run while this
         // recovery pass was inspecting the old one. Never deliver the old
         // transcript as the newer run's result when the settle CAS loses.
-        if (!settled || settled.runID !== record.runID || settled.phase !== "settled" || parent._tag !== "Some") return
+        if (!settled || settled.runID !== record.runID || settled.phase !== "settled") return
+        if (parent._tag !== "Some") {
+          // A missing owner is a visible failure, never a silent wait (OpencodeX-k30).
+          if (foreground || settled.deliveryOutcome === "delivered" || settled.escalatedAt !== undefined) return
+          const claim = yield* deps.sessions.claimDelegationDelivery({ sessionID: child.id, runID: settled.runID })
+          if (!claim) return
+          yield* deps.sessions.stampDelegationDelivery({
+            sessionID: child.id,
+            runID: settled.runID,
+            outcome: "failed",
+            claimToken: claim,
+            escalation: "owner-missing",
+          })
+          yield* Effect.logWarning("report owner missing; report escalated").pipe(
+            Effect.annotateLogs({ child: child.id, runID: settled.runID, owner: record.parentSessionID }),
+          )
+          return
+        }
         // A foreground result is the parent task part itself. Repair it
         // before honoring delivery evidence: the child can be marked
         // delivered while its provider stream lost the terminal part frame.
@@ -172,29 +218,29 @@ export function make(deps: Deps) {
         const notice =
           settled.outcome !== "abandoned" ? undefined : settledByWatchdog(settled) ? WATCHDOG_SUMMARY : RESTART_NOTICE
         const text = [
-          `Background delegation recovery for child ${child.id}, run ${settled.runID}.`,
+          settled.contract === "report-to"
+            ? `Report from session ${child.id} (run ${settled.runID}), which was asked to report to this session.`
+            : `Background delegation recovery for child ${child.id}, run ${settled.runID}.`,
           body,
           // The watchdog summary already is the notice when there is no report.
           body.startsWith(WATCHDOG_MARKER) ? undefined : notice,
         ]
           .filter(Boolean)
           .join("\n\n")
-        const execution = yield* db
-          .select({
-            state: SessionExecutionTable.state,
-            cancelRequestedAt: SessionExecutionTable.cancel_requested_at,
-          })
-          .from(SessionExecutionTable)
-          .where(eq(SessionExecutionTable.session_id, parent.value.id))
+        // The task tool reports under its own id; a crash between its persist
+        // and its delivered stamp must not deliver the report a second time.
+        const taskReport = MessageID.make(`msg_task_report_${settled.runID}`)
+        const persisted = yield* db
+          .select({ id: MessageTable.id })
+          .from(MessageTable)
+          .where(and(eq(MessageTable.id, taskReport), eq(MessageTable.session_id, parent.value.id)))
           .get()
           .pipe(Effect.orDie)
+        const messageID = persisted ? taskReport : MessageID.make(`msg_delegation_recovery_${settled.runID}`)
+        // Admission gates (OpencodeX-k30), see `admission`.
+        const { noReply, escalation } = admission(yield* ownerGate(db, parent.value.id, child.id))
         const delivered = yield* deps
-          .notify({
-            sessionID: parent.value.id,
-            messageID: MessageID.make(`msg_delegation_recovery_${settled.runID}`),
-            text,
-            noReply: execution?.state === "interrupted" && !!execution.cancelRequestedAt,
-          })
+          .notify({ sessionID: parent.value.id, messageID, text, noReply })
           .pipe(
             Effect.as(true),
             Effect.catchCause((cause) =>
@@ -209,7 +255,12 @@ export function make(deps: Deps) {
           runID: settled.runID,
           outcome: delivered ? "delivered" : "failed",
           claimToken: claim,
+          ...(escalation ? { escalation } : { reportMessageID: messageID }),
         })
+        if (escalation && delivered)
+          yield* Effect.logWarning("report recorded without an owner turn").pipe(
+            Effect.annotateLogs({ child: child.id, runID: settled.runID, owner: parent.value.id, escalation }),
+          )
         yield* deps.refresh(parent.value.id)
       }).pipe(
         Effect.catchCause((cause) =>

@@ -54,10 +54,14 @@ import { Question } from "@/question"
 import { QuestionID } from "@/question/schema"
 import { OpencodeXClaudeDriver } from "@/opencodex/claude-driver"
 import { persistentChannelLiveWork } from "@/opencodex/claude-transport"
-import { PromptInput, LoopInput, ShellInput, CommandInput } from "./prompt-schema"
+import { PromptInput, LoopInput, ShellInput, CommandInput, ReportToRefusedError } from "./prompt-schema"
 import { STRUCTURED_OUTPUT_SYSTEM_PROMPT, createStructuredOutputTool } from "./prompt-structured-output"
 import * as PromptClaim from "./prompt-claim"
 import { SessionDelegationRecovery } from "./delegation-recovery"
+import { DelegationContinuation } from "./delegation-continuation"
+import { DELEGATION_RECORD_VERSION, delegationAttempts, delegationRecord } from "./delegation-outcome"
+import { ownerRetired } from "./report-receipt"
+import { ensureRunID } from "@opencode-ai/core/util/opencode-process"
 import { SessionPromptRecovery } from "./prompt-recovery"
 import { SessionQuestionNotify } from "./question-notify"
 import * as PromptShell from "./prompt-shell"
@@ -73,7 +77,7 @@ globalThis.AI_SDK_LOG_WARNINGS = false
 
 // Re-exported so `SessionPrompt.PromptInput` and friends keep working from
 // every existing import path; the definitions live in ./prompt-schema.
-export { PromptInput, LoopInput, ShellInput, CommandInput }
+export { PromptInput, LoopInput, ShellInput, CommandInput, ReportToRefusedError }
 export { createStructuredOutputTool }
 
 const elog = EffectLogger.create({ service: "session.prompt" })
@@ -227,8 +231,13 @@ export interface Interface {
     messageID: MessageID
   }) => Effect.Effect<"cancelled" | "running" | "settled" | "missing">
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionLegacy.WithParts, Image.Error>
-  readonly promptAsync: (input: PromptInput) => Effect.Effect<void, Image.Error>
+  readonly promptAsync: (input: PromptInput) => Effect.Effect<void, Image.Error | ReportToRefusedError>
   readonly recover: () => Effect.Effect<void>
+  /**
+   * One unthrottled pass over accepted-but-unconsumed report receipts
+   * (OpencodeX-k30). The recovery sweep runs the throttled form on its own.
+   */
+  readonly reconcileReports: () => Effect.Effect<void>
   readonly loop: (input: LoopInput) => Effect.Effect<SessionLegacy.WithParts>
   readonly shell: (input: ShellInput) => Effect.Effect<SessionLegacy.WithParts, Session.BusyError>
   readonly command: (input: CommandInput) => Effect.Effect<SessionLegacy.WithParts, Image.Error>
@@ -1053,7 +1062,8 @@ export const layer = Layer.effect(
       background,
       status,
       prompt: (input) => prompt(input),
-      promptAsync: (input) => promptAsync(input),
+      // Swarm wakes never declare `reportTo`, so a refusal there is a defect.
+      promptAsync: (input) => promptAsync(input).pipe(Effect.catchTag("SessionReportToRefusedError", Effect.die)),
       loop: (input) => loop(input),
       liveQueue,
     })
@@ -1078,7 +1088,9 @@ export const layer = Layer.effect(
     // which is built below because it needs `promptAsync`. Held in a ref so
     // the two can reference each other without a construction cycle.
     let settleFinishedDelegation: ((sessionID: SessionID) => Effect.Effect<void>) | undefined
-    const { wakeSession, recover, cancelCommand, start } = yield* PromptClaim.make({
+    // Built below for the same reason (they need `promptAsync`/`requeueReport`).
+    let reconcileReceipts: Effect.Effect<void> | undefined
+    const { wakeSession, recover, cancelCommand, start, requeueReport } = yield* PromptClaim.make({
       database,
       events,
       scope,
@@ -1091,6 +1103,18 @@ export const layer = Layer.effect(
       // while the agent works; the channel is the only witness (#49).
       liveTurnWork: persistentChannelLiveWork,
       executionOwnerLive: (input) => state.executionOwnerLive(input),
+      // A raw prompt with a report-to contract reports once its own command
+      // settles (OpencodeX-k30); every other command is left alone.
+      onCommandSettled: (input) =>
+        Effect.gen(function* () {
+          const found = yield* sessions.get(input.sessionID).pipe(Effect.option)
+          if (found._tag === "None") return
+          const record = delegationRecord(found.value.metadata)
+          if (record?.contract !== "report-to" || record.phase !== "running") return
+          if (record.childMessageID !== input.messageID || !settleFinishedDelegation) return
+          yield* settleFinishedDelegation(input.sessionID)
+        }),
+      afterRecover: Effect.suspend(() => reconcileReceipts ?? Effect.void),
     })
 
     // Registered after PromptClaim's handler (registration order is run
@@ -1106,6 +1130,76 @@ export const layer = Layer.effect(
       ),
     )
     yield* Effect.addFinalizer(() => Effect.sync(unregisterDelegationRecovery))
+
+    /**
+     * The explicit owner contract for a raw prompt (OpencodeX-k30): the turn
+     * this prompt starts reports its final answer to `reportTo` through the
+     * durable delegation path - a `running` record keyed by this message
+     * (`run_report_<messageID>`), settled and delivered as a tagged report
+     * with a consumption receipt when the command settles, and picked up by
+     * restart recovery if the process dies first. Declared BEFORE the prompt
+     * is accepted: a missing or retired owner, or a session that still owes
+     * a report (running, undelivered, or an open receipt), refuses the whole
+     * prompt visibly instead of overwriting that record or accepting work
+     * whose report would go nowhere. A replay of the same message is a no-op.
+     *
+     * A follow-up to a worker whose last report the owner already answered is
+     * admitted: `stampDelegation` checks the finished, successful answer and
+     * closes that receipt in the same write. LIMITATION: a follow-up issued
+     * from INSIDE the owner's still-running report turn (e.g. a tool call) is
+     * refused `outstanding` - an unfinished turn is not consumption - until
+     * that turn settles with an answer. Returns the reservation this call made,
+     * owned by this process: recovery frees it only once that owner is dead.
+     */
+    const declareReportTo = Effect.fnUntraced(function* (input: PromptInput & { messageID: MessageID }) {
+      const reportTo = input.reportTo!
+      const runID = `run_report_${input.messageID}`
+      const ownerID = `local:${process.pid}:${ensureRunID()}:${runID}`
+      const refuse = (reason: ReportToRefusedError["reason"]) =>
+        Effect.logWarning("report-to contract refused").pipe(
+          Effect.annotateLogs({ sessionID: input.sessionID, reportTo, messageID: input.messageID, reason }),
+          Effect.andThen(Effect.fail(new ReportToRefusedError({ sessionID: input.sessionID, reportTo, reason }))),
+        )
+      if (reportTo === input.sessionID) return yield* refuse("self")
+      if (input.noReply === true) return yield* refuse("no-reply")
+      const owner = yield* db
+        .select({ title: SessionTable.title, time_archived: SessionTable.time_archived })
+        .from(SessionTable)
+        .where(eq(SessionTable.id, reportTo))
+        .get()
+        .pipe(Effect.orDie)
+      if (!owner) return yield* refuse("owner-missing")
+      if (ownerRetired(owner)) return yield* refuse("owner-retired")
+      const target = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+      if (delegationRecord(target.metadata)?.runID === runID) return false
+      const reserve = sessions.stampDelegation({
+        sessionID: input.sessionID,
+        unlessOutstanding: true,
+        record: {
+          version: DELEGATION_RECORD_VERSION,
+          runID,
+          parentSessionID: reportTo,
+          mode: "background",
+          background: true,
+          contract: "report-to",
+          role: "report",
+          childMessageID: input.messageID,
+          attempt: delegationAttempts(target.metadata) + 1,
+          phase: "running",
+          startedAt: Date.now(),
+          ownerID,
+        },
+      })
+      if (yield* reserve) return { runID, ownerID }
+      // A stale reservation a crash left without a command is released by
+      // delegation recovery; give it one chance before refusing.
+      const current = delegationRecord((yield* sessions.get(input.sessionID).pipe(Effect.orDie)).metadata)
+      if (current?.contract === "report-to" && current.phase === "running" && settleFinishedDelegation) {
+        yield* settleFinishedDelegation(input.sessionID)
+        if (yield* reserve) return { runID, ownerID }
+      }
+      return yield* refuse("outstanding")
+    })
 
     const promptAsync = Effect.fn("SessionPrompt.promptAsync")(function* (input: PromptInput) {
       if (input.messageID) {
@@ -1125,7 +1219,17 @@ export const layer = Layer.effect(
           return
         }
       }
-      const message = yield* acceptPrompt(input)
+      let reserved: { runID: string; ownerID: string } | undefined
+      if (input.reportTo) {
+        const messageID = input.messageID ?? MessageID.ascending()
+        reserved = (yield* declareReportTo({ ...input, messageID })) || undefined
+        input = { ...input, messageID }
+      }
+      // A reservation whose prompt is never accepted (no command row) is
+      // released, compare-and-set on its own run: nothing ran, nothing reports.
+      const release = reserved && sessions.releaseReservation({ sessionID: input.sessionID, ...reserved })
+      const releaseOnError = <A, E, R>(effect: Effect.Effect<A, E, R>) => (release ? effect.pipe(Effect.onError(() => release)) : effect)
+      const message = yield* releaseOnError(acceptPrompt(input))
       const ctx = yield* InstanceState.context
       const now = Date.now()
       const commandID = `sec_${Identifier.ascending()}`
@@ -1207,7 +1311,7 @@ export const layer = Layer.effect(
             }),
           { behavior: "immediate" },
         )
-        .pipe(Effect.orDie)
+        .pipe(Effect.orDie, releaseOnError)
       const steering = input.delivery === "immediate" && (yield* state.interrupt(input.sessionID))
       if (steering) yield* markSteering(message)
       if (input.noReply !== true) {
@@ -1227,12 +1331,19 @@ export const layer = Layer.effect(
         promptAsync({
           sessionID: input.sessionID,
           messageID: input.messageID,
-          parts: [{ type: "text", synthetic: true, text: input.text }],
+          // Tagged like the swarm and task-tool reports (OpencodeX-k30): an
+          // untagged synthetic message lets the loop return the prior final
+          // without a turn, so the report was "delivered" and never read.
+          parts: [{ type: "text", synthetic: true, metadata: { task_report: true }, text: input.text }],
           noReply: input.noReply,
+          // Never steer a busy owner: the report queues behind its turn.
+          delivery: "deferred",
         }).pipe(Effect.orDie),
       refresh: status.refresh,
     })
     settleFinishedDelegation = delegationRecovery.settleFinished
+    const continuation = DelegationContinuation.make({ database, sessions, requeueReport })
+    reconcileReceipts = continuation.reconcile()
     const unregisterRecovery = SessionPromptRecovery.register(() =>
       start().pipe(Effect.andThen(delegationRecovery.recover()), Effect.andThen(recover)),
     )
@@ -1459,6 +1570,7 @@ export const layer = Layer.effect(
       // FOREIGN owner died: nothing else polls for an expired lease, so a
       // caller that recovers once and then waits would wait forever.
       recover: () => start().pipe(Effect.andThen(recover)),
+      reconcileReports: () => continuation.reconcile({ force: true }),
       loop,
       shell,
       command,

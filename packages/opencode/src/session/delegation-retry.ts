@@ -87,7 +87,7 @@ export const retryBlockedChild = Effect.fn("DelegationRetry.retryBlockedChild")(
   const attempt = delegationAttempts(child.metadata) + 1
   const runID = Identifier.ascending()
   const agent = yield* resolveSessionAgent(yield* Agent.Service, { sessionID: child.id, agent: role.agent })
-  yield* sessions.stampDelegation({
+  const stamped = yield* sessions.stampDelegation({
     sessionID: child.id,
     record: {
       version: DELEGATION_RECORD_VERSION,
@@ -98,6 +98,12 @@ export const retryBlockedChild = Effect.fn("DelegationRetry.retryBlockedChild")(
       startedAt: Date.now(),
     },
   })
+  // Refused while the child still owes an unconsumed report (OpencodeX-k30).
+  if (!stamped) {
+    const message = "Child still owes an unconsumed report; retry refused."
+    yield* status.set(parent.id, { ...blocked, error: message })
+    return yield* new RetryError({ message })
+  }
   yield* prompt
     .promptAsync({
       sessionID: child.id,

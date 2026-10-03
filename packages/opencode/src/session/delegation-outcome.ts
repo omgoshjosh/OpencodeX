@@ -79,7 +79,35 @@ export type DelegationRecord = {
    * would have delivered it died with the old process).
    */
   background?: true
+  /**
+   * `report-to`: a raw prompt that declared a report owner (PromptInput
+   * `reportTo`). Settled when its own command settles, never by the in-memory
+   * delegation job that native and swarm delegations use.
+   */
+  contract?: "report-to"
+  /**
+   * The durable receipt (OpencodeX-k30). `deliveryOutcome: "delivered"` only
+   * means the owner ACCEPTED the report message; `consumedAt` is the separate
+   * fact that a FINISHED assistant turn answered it (see report-receipt.ts).
+   * Keyed by (runID, reportMessageID) on the recorded owner `parentSessionID`.
+   * A newer unrelated owner turn never closes it.
+   */
+  reportMessageID?: string
+  consumedAt?: number
+  /** Delivery claims taken for this run; bounded by MAX_DELIVERY_ATTEMPTS. */
+  deliveryAttempts?: number
+  /** Continuations the reconciler started for an accepted-but-unconsumed receipt. */
+  continuationAttempts?: number
+  /** Terminal for the reconciler: no further automatic prompts. */
+  escalatedAt?: number
+  escalation?: DelegationEscalation
 }
+
+const ESCALATIONS = ["retry-limit", "owner-retired", "owner-missing", "report-missing", "goal-terminal", "cancelled", "delivery-failed"] as const
+export type DelegationEscalation = (typeof ESCALATIONS)[number]
+
+/** Failed or crashed report deliveries are retried this many times, then escalated. */
+export const MAX_DELIVERY_ATTEMPTS = 3
 
 /** Parent-owned, durable evidence for a child failure. */
 export type DelegationFailure = {
@@ -225,6 +253,42 @@ function isOutcome(value: unknown): value is DelegationOutcome {
   return value === "completed" || value === "errored" || value === "cancelled" || value === "abandoned"
 }
 
+function finite(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value)
+}
+
+function isEscalation(value: unknown): value is DelegationEscalation {
+  return ESCALATIONS.some((escalation) => escalation === value)
+}
+
+/**
+ * A delivered receipt the reconciler still owes a decision on: accepted by
+ * the owner, not yet answered or escalated.
+ */
+export function receiptOpen(record: DelegationRecord | undefined): record is DelegationRecord & {
+  reportMessageID: string
+} {
+  return !!(
+    record &&
+    record.phase === "settled" &&
+    record.deliveryOutcome === "delivered" &&
+    record.reportMessageID &&
+    record.consumedAt === undefined &&
+    record.escalatedAt === undefined
+  )
+}
+
+/**
+ * Whether the record still owes its owner a report: running, settled but not
+ * yet delivered or escalated, or an open receipt. A new report-to contract
+ * must never overwrite such a record (OpencodeX-k30).
+ */
+export function reportOutstanding(record: DelegationRecord | undefined) {
+  if (!record || record.escalatedAt !== undefined) return false
+  if (record.phase !== "settled") return true
+  return record.deliveryOutcome !== "delivered" ? record.deliveryOutcome !== undefined : receiptOpen(record)
+}
+
 function isDelivery(value: unknown): value is DelegationDelivery {
   return value === "pending" || value === "delivering" || value === "delivered" || value === "failed"
 }
@@ -295,6 +359,13 @@ export function delegationRecord(metadata: Record<string, unknown> | undefined |
       ? { deliveredAt: raw.deliveredAt }
       : {}),
     ...(raw.background === true ? { background: true as const } : {}),
+    ...(raw.contract === "report-to" ? { contract: "report-to" as const } : {}),
+    ...(typeof raw.reportMessageID === "string" && raw.reportMessageID ? { reportMessageID: raw.reportMessageID } : {}),
+    ...(finite(raw.consumedAt) ? { consumedAt: raw.consumedAt } : {}),
+    ...(finite(raw.deliveryAttempts) ? { deliveryAttempts: raw.deliveryAttempts } : {}),
+    ...(finite(raw.continuationAttempts) ? { continuationAttempts: raw.continuationAttempts } : {}),
+    ...(finite(raw.escalatedAt) ? { escalatedAt: raw.escalatedAt } : {}),
+    ...(isEscalation(raw.escalation) ? { escalation: raw.escalation } : {}),
     ...(typeof raw.role === "string" && raw.role ? { role: raw.role } : {}),
     ...(typeof raw.title === "string" && raw.title ? { title: raw.title } : {}),
   }

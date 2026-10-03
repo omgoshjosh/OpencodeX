@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test"
 import { SessionLegacy } from "@opencode-ai/core/session/legacy"
 import { Database } from "@opencode-ai/core/database/database"
-import { Effect, Exit, Fiber, Layer } from "effect"
+import { Cause, Effect, Exit, Fiber, Layer } from "effect"
 import { Agent } from "../../src/agent/agent"
 import { BackgroundJob } from "@/background/job"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -1549,6 +1549,41 @@ describe("tool.task", () => {
       expect(firstRecord).toMatchObject({ attempt: 1, phase: "settled", outcome: "completed" })
       expect(secondRecord).toMatchObject({ attempt: 2, phase: "settled", outcome: "completed" })
       expect(secondRecord!.runID).not.toBe(firstRecord!.runID)
+    }),
+  )
+
+  it.instance("a reused task session that still owes an unconsumed report refuses the new run visibly (OpencodeX-k30)", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const sessions = yield* Session.Service
+      const def = yield* (yield* TaskTool).init()
+      const exec = (task_id?: string) =>
+        def.execute(
+          { description: "do work", prompt: "do it", subagent_type: "general", ...(task_id ? { task_id } : {}) },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            directory: chat.directory,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps({ text: "done" }) },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+      const first = yield* exec()
+      const childID = SessionID.make(first.metadata.sessionId)
+      const settled = delegationRecord((yield* sessions.get(childID)).metadata)!
+      // The parent accepted the report but no finished turn has answered it.
+      const open = { ...settled, deliveryOutcome: "delivered" as const, reportMessageID: "msg_unanswered_report" }
+      expect(yield* sessions.stampDelegation({ sessionID: childID, record: open })).toBe(true)
+      const exit = yield* exec(childID).pipe(Effect.exit)
+      expect(Exit.isFailure(exit) && Cause.pretty(exit.cause)).toContain("unconsumed report")
+      expect(delegationRecord((yield* sessions.get(childID)).metadata)).toMatchObject({
+        runID: settled.runID,
+        reportMessageID: "msg_unanswered_report",
+      })
     }),
   )
 

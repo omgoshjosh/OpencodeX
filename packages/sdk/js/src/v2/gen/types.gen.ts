@@ -10827,6 +10827,7 @@ export type SessionPromptAsyncData = {
     }
     agent?: string
     noReply?: boolean
+    reportTo?: string
     tools?: {
       [key: string]: boolean
     }

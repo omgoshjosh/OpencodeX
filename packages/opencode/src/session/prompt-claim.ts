@@ -19,6 +19,14 @@ import type { LoopInput } from "./prompt-schema"
 import { SessionExecutionOwner } from "./execution-owner"
 import * as Session from "./session"
 import { ensureRunID } from "@opencode-ai/core/util/opencode-process"
+import { answers, isReportMessage, ownerGate, reportAnswered, type OwnerGate } from "./report-receipt"
+
+/**
+ * The error a report command settles with when its turn returned without an
+ * assistant answering the report (OpencodeX-k30): a joined runner's or a
+ * prior final is not consumption. The receipt reconciler decides what next.
+ */
+export const REPORT_UNCONSUMED = "Report turn ended without an assistant answer to the report message."
 
 export interface Deps {
   readonly database: Context.Service.Shape<typeof Database.Service>
@@ -66,6 +74,10 @@ export interface Deps {
     owner: string
     generation: number
   }) => Effect.Effect<boolean>
+  /** Runs after a command reaches a terminal status (report-to settlement). Failures are logged. */
+  readonly onCommandSettled?: (input: { sessionID: SessionID; messageID: MessageID }) => Effect.Effect<void>
+  /** Runs at the end of every recovery sweep (receipt reconciliation). Failures are logged. */
+  readonly afterRecover?: Effect.Effect<void>
 }
 
 /** Matches `experimental.stale_execution_timeout`'s documented default. */
@@ -623,13 +635,25 @@ export function make(deps: Deps) {
           ? JSON.stringify(exit.value.info.error)
           : undefined
       if (Exit.isSuccess(exit)) {
+        // A report is consumed only by a FINISHED turn that answered it.
+        // Ordinary prompts keep their old settlement; only a tagged report is checked.
+        const unconsumed =
+          !assistantError &&
+          !(exit.value && answers(exit.value.info, command.message_id, exit.value.parts)) &&
+          (yield* isReportMessage(db, command.message_id)) &&
+          !(yield* reportAnswered(db, command.session_id, command.message_id, true))
+        if (unconsumed)
+          yield* Effect.logWarning("report command settled without consuming its report").pipe(
+            Effect.annotateLogs({ commandID, sessionID: command.session_id, messageID: command.message_id }),
+          )
+        const error = assistantError ?? (unconsumed ? REPORT_UNCONSUMED : undefined)
         yield* db
           .update(SessionCommandTable)
           .set({
-            status: assistantError ? "failed" : "succeeded",
+            status: error ? "failed" : "succeeded",
             owner_id: null,
             lease_expires_at: null,
-            ...(assistantError ? { error: assistantError } : {}),
+            ...(error ? { error } : {}),
             completed_at: completedAt,
             time_updated: completedAt,
           })
@@ -682,13 +706,27 @@ export function make(deps: Deps) {
     })
 
     let wakeQueued = (_sessionID: SessionID): Effect.Effect<void> => Effect.void
+    const settled = (sessionID: SessionID, messageID: MessageID) =>
+      deps.onCommandSettled
+        ? deps.onCommandSettled({ sessionID, messageID }).pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("command settlement hook failed").pipe(
+                Effect.annotateLogs({ sessionID, messageID, cause: Cause.pretty(cause) }),
+              ),
+            ),
+          )
+        : Effect.void
     const launchCommand = Effect.fn("SessionPrompt.launchCommand")(function* (commandID: string) {
       if (launching.has(commandID)) return
       launching.add(commandID)
       yield* executeCommand(commandID).pipe(
         Effect.andThen(
           db
-            .select({ sessionID: SessionCommandTable.session_id, status: SessionCommandTable.status })
+            .select({
+              sessionID: SessionCommandTable.session_id,
+              messageID: SessionCommandTable.message_id,
+              status: SessionCommandTable.status,
+            })
             .from(SessionCommandTable)
             .where(eq(SessionCommandTable.id, commandID))
             .get()
@@ -696,7 +734,7 @@ export function make(deps: Deps) {
               Effect.orDie,
               Effect.flatMap((command) =>
                 command && ["succeeded", "failed", "cancelled"].includes(command.status)
-                  ? wakeQueued(command.sessionID)
+                  ? settled(command.sessionID, command.messageID).pipe(Effect.andThen(wakeQueued(command.sessionID)))
                   : Effect.void,
               ),
             ),
@@ -1054,6 +1092,96 @@ export function make(deps: Deps) {
           Effect.catchCause(() => Effect.void),
         )
       }
+      if (deps.afterRecover)
+        yield* deps.afterRecover.pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("post-recovery reconciliation failed").pipe(
+              Effect.annotateLogs({ cause: Cause.pretty(cause) }),
+            ),
+          ),
+        )
+    })
+
+    /**
+     * Re-runs a settled report command as ONE continuation (OpencodeX-k30),
+     * only when its owner is idle: no other queued or running command, no
+     * busy execution, and no owner gate (retired, terminal goal, cancelled,
+     * held), all read in the same immediate transaction as the write. A
+     * compare-and-set on the terminal status means concurrent reconcilers
+     * start it once; a cancelled command (a human withdrew it) is never revived.
+     */
+    const requeueReport = Effect.fn("SessionPrompt.requeueReport")(function* (input: {
+      sessionID: SessionID
+      messageID: MessageID
+      childID?: SessionID
+    }) {
+      const now = clock()
+      const result = yield* db
+        .transaction(
+          (transaction) =>
+            Effect.gen(function* () {
+              const current = yield* transaction
+                .select()
+                .from(SessionCommandTable)
+                .where(
+                  and(
+                    eq(SessionCommandTable.session_id, input.sessionID),
+                    eq(SessionCommandTable.message_id, input.messageID),
+                  ),
+                )
+                .get()
+              if (!current) return "missing" as const
+              if (current.status === "queued" || current.status === "running") return "in-flight" as const
+              if (current.status === "cancelled") return "cancelled" as const
+              const gate: OwnerGate | undefined = yield* ownerGate(transaction, input.sessionID, input.childID)
+              if (gate) return gate
+              const others = yield* transaction
+                .select({ id: SessionCommandTable.id })
+                .from(SessionCommandTable)
+                .where(
+                  and(
+                    eq(SessionCommandTable.session_id, input.sessionID),
+                    inArray(SessionCommandTable.status, ["queued", "running"]),
+                  ),
+                )
+                .limit(1)
+                .get()
+              if (others) return "busy" as const
+              const execution = yield* transaction
+                .select({
+                  state: SessionExecutionTable.state,
+                  owner: SessionExecutionTable.owner_id,
+                  generation: SessionExecutionTable.generation,
+                  leaseExpiresAt: SessionExecutionTable.lease_expires_at,
+                })
+                .from(SessionExecutionTable)
+                .where(eq(SessionExecutionTable.session_id, input.sessionID))
+                .get()
+              if (yield* executionBusy(input.sessionID, execution, now)) return "busy" as const
+              const requeued = yield* transaction
+                .update(SessionCommandTable)
+                .set({
+                  status: "queued",
+                  owner_id: null,
+                  lease_expires_at: null,
+                  error: null,
+                  completed_at: null,
+                  adopted_by: null,
+                  adopted_generation: null,
+                  offer_ordinal: null,
+                  offered_at: null,
+                  time_updated: now,
+                })
+                .where(and(eq(SessionCommandTable.id, current.id), eq(SessionCommandTable.status, current.status)))
+                .returning({ id: SessionCommandTable.id })
+                .get()
+              return requeued ? ("requeued" as const) : ("in-flight" as const)
+            }),
+          { behavior: "immediate" },
+        )
+        .pipe(Effect.orDie)
+      if (result === "requeued") yield* wakeSession(input.sessionID)
+      return result
     })
     const recovery = yield* InstanceState.make(() =>
       Effect.gen(function* () {
@@ -1138,6 +1266,7 @@ export function make(deps: Deps) {
       executeCommand,
       launchCommand,
       wakeSession,
+      requeueReport,
       recover,
       sweepStaleExecutions,
       start,
